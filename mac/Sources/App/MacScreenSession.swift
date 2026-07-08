@@ -20,6 +20,9 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var didInitializeSSL = false
     private var isClosingWindow = false
     private var forwardedKeyCodes = Set<UInt16>()
+    private var lastPointerMoveSentAt: TimeInterval = 0
+    private var pendingPointerMove: CtrlPointerBody?
+    private var pointerMoveFlushWorkItem: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -113,6 +116,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         status = "Stopped"
         screenMeta = nil
         hasRemoteVideo = false
+        cancelPendingPointerMove()
         if sendRemoteStop {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
@@ -242,10 +246,13 @@ final class MacScreenSession: NSObject, ObservableObject {
             DiagnosticsLog.warn("screen.mac.pointer_ignored no_screen_meta action=\(action)")
             return
         }
-        sendEnvelope(
-            type: EnvelopeType.ctrlPointer,
-            body: CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: action, wheelDy: wheelDy)
-        )
+        let body = CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: action, wheelDy: wheelDy)
+        if action == "move" {
+            sendCoalescedPointerMove(body)
+            return
+        }
+        flushPendingPointerMove()
+        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
@@ -275,6 +282,50 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func sendKey(_ key: String, down: Bool, modifiers: [String]) {
         sendEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
+    }
+
+    private func sendCoalescedPointerMove(_ body: CtrlPointerBody) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now - lastPointerMoveSentAt
+        if elapsed >= Self.pointerMoveIntervalSeconds, pendingPointerMove == nil {
+            sendPointerMoveNow(body, now: now)
+            return
+        }
+
+        pendingPointerMove = body
+        schedulePointerMoveFlush(after: max(0, Self.pointerMoveIntervalSeconds - elapsed))
+    }
+
+    private func schedulePointerMoveFlush(after delay: TimeInterval) {
+        guard pointerMoveFlushWorkItem == nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushPendingPointerMove()
+        }
+        pointerMoveFlushWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func flushPendingPointerMove() {
+        pointerMoveFlushWorkItem?.cancel()
+        pointerMoveFlushWorkItem = nil
+        guard let body = pendingPointerMove else {
+            return
+        }
+        pendingPointerMove = nil
+        sendPointerMoveNow(body, now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func cancelPendingPointerMove() {
+        pointerMoveFlushWorkItem?.cancel()
+        pointerMoveFlushWorkItem = nil
+        pendingPointerMove = nil
+    }
+
+    private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
+        lastPointerMoveSentAt = now
+        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func screenCoordinate(for event: NSEvent) -> (x: Int, y: Int)? {
@@ -377,6 +428,8 @@ final class MacScreenSession: NSObject, ObservableObject {
             DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
         }
     }
+
+    private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
 }
 
 extension MacScreenSession: NSWindowDelegate {
