@@ -82,7 +82,25 @@ export class RelayDO implements DurableObject {
       deviceId: body.b.deviceId,
       role
     } satisfies RelaySocketAttachment);
+
+    if (role === "host") {
+      this.closeReplacedHostSockets(sender, body.b.deviceId);
+    }
+
     sender.send(JSON.stringify({ t: "relay.ready", b: { role } }));
+  }
+
+  private closeReplacedHostSockets(sender: WebSocket, deviceId: string): void {
+    for (const socket of this.state.getWebSockets()) {
+      if (socket === sender) {
+        continue;
+      }
+
+      const attachment = readAttachment(socket);
+      if (attachment.authenticated && attachment.role === "host" && attachment.deviceId === deviceId) {
+        socket.close(1000, "replaced_by_new_host");
+      }
+    }
   }
 
   private async authorize(hostId: string, deviceId: string, ts: number, sig: string): Promise<"host" | "client" | null> {

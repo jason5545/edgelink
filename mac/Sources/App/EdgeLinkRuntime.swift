@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CryptoKit
 import EdgeLinkKit
@@ -31,6 +32,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var pairingTask: Task<Void, Never>?
     private var pendingPairing: MacPendingPairing?
     private var task: Task<Void, Never>?
+    private var currentChannel: ByteChannel?
+    private var currentChannelGeneration: UUID?
+    private var systemSleepWakeCancellables = Set<AnyCancellable>()
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -42,12 +46,14 @@ final class EdgeLinkRuntime: ObservableObject {
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
+        observeSystemSleepWake()
         task = Task { await run() }
     }
 
     deinit {
         task?.cancel()
         pairingTask?.cancel()
+        currentChannel?.close()
         screenSession.closeWindow(sendRemoteStop: false)
     }
 
@@ -257,17 +263,32 @@ final class EdgeLinkRuntime: ObservableObject {
         var retryDelay: UInt64 = 1_000_000_000
 
         while !Task.isCancelled {
+            var channel: ByteChannel?
+            let channelGeneration = UUID()
+
             do {
+                defer {
+                    channel?.close()
+                    if currentChannelGeneration == channelGeneration {
+                        currentChannel = nil
+                        currentChannelGeneration = nil
+                    }
+                }
+
                 DiagnosticsLog.info("relay.mac.connect_start hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 isConnected = false
                 connectionStatus = "Connecting relay"
-                let channel = try await relayTransport.connect(hostId: identity.deviceId, identity: identity)
+                let connectedChannel = try await relayTransport.connect(hostId: identity.deviceId, identity: identity)
+                channel = connectedChannel
+                currentChannel = connectedChannel
+                currentChannelGeneration = channelGeneration
+
                 let dispatcher = CommandDispatcher(
                     clipboardSync: clipboardSync,
                     screenSession: screenSession
                 )
                 let session = SecureSessionHost(
-                    channel: channel,
+                    channel: connectedChannel,
                     identity: identity,
                     peer: peer,
                     dispatcher: dispatcher
@@ -309,6 +330,36 @@ final class EdgeLinkRuntime: ObservableObject {
                 retryDelay = min(retryDelay * 2, 30_000_000_000)
             }
         }
+    }
+
+    private func observeSystemSleepWake() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+
+        notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    self?.handleSystemSleep()
+                }
+            }
+            .store(in: &systemSleepWakeCancellables)
+
+        notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    self?.handleSystemWake()
+                }
+            }
+            .store(in: &systemSleepWakeCancellables)
+    }
+
+    private func handleSystemSleep() {
+        DiagnosticsLog.info("runtime.mac.system_sleep")
+        currentChannel?.close()
+    }
+
+    private func handleSystemWake() {
+        DiagnosticsLog.info("runtime.mac.system_wake")
+        currentChannel?.close()
     }
 
     private func clipboardLoop(session: SecureSessionHost) async {
