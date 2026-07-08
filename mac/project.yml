@@ -19,6 +19,10 @@ targets:
       - Sources/App
     dependencies:
       - target: EdgeLinkKit
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MW4GWYGX56
     info:
       path: Sources/App/Info.plist
       properties:
