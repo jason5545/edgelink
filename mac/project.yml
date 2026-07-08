@@ -19,10 +19,12 @@ targets:
       - Sources/App
     dependencies:
       - target: EdgeLinkKit
+      - sdk: libsqlite3.tbd
     settings:
       base:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: MW4GWYGX56
+        PRODUCT_BUNDLE_IDENTIFIER: com.edgelink.mac
     info:
       path: Sources/App/Info.plist
       properties:

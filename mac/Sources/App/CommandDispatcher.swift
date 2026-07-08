@@ -4,12 +4,18 @@ import Foundation
 final class CommandDispatcher {
     private let inputInjector: InputInjector
     private let clipboardSync: ClipboardSync
+    private let notificationPresenter: MacNotificationPresenter
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    init(inputInjector: InputInjector = InputInjector(), clipboardSync: ClipboardSync = ClipboardSync()) {
+    init(
+        inputInjector: InputInjector = InputInjector(),
+        clipboardSync: ClipboardSync = ClipboardSync(),
+        notificationPresenter: MacNotificationPresenter = MacNotificationPresenter()
+    ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
+        self.notificationPresenter = notificationPresenter
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -32,6 +38,14 @@ final class CommandDispatcher {
         case EnvelopeType.clipboardSet:
             let envelope = try decoder.decode(Envelope<ClipboardSetBody>.self, from: plaintext)
             clipboardSync.applyRemoteText(envelope.b.text, hash: envelope.b.hash)
+            return nil
+        case EnvelopeType.notificationPost:
+            let envelope = try decoder.decode(Envelope<NotificationPostBody>.self, from: plaintext)
+            notificationPresenter.show(envelope.b)
+            return nil
+        case EnvelopeType.notificationRemove:
+            let envelope = try decoder.decode(Envelope<NotificationRemoveBody>.self, from: plaintext)
+            notificationPresenter.remove(envelope.b)
             return nil
         default:
             return nil

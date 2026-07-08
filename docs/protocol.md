@@ -346,6 +346,8 @@ AEAD：
 {"t":"input.key","b":{"key":"a","mods":["cmd"]}}
 {"t":"input.text","b":{"text":"你好"}}
 {"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"..."}}
+{"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
+{"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
 {"t":"status.ping","b":{}}
 ```
 
@@ -356,6 +358,20 @@ AEAD：
 - MVP 使用 JSON；若之後滑鼠或檔案傳輸量太大，再新增 CBOR 或 side channel。
 - 滑鼠移動以 16ms 合併 delta，一則 envelope 是一個 batch。
 - 大檔案不要進控制通道。
+
+### Notification Sync
+
+`notification.post` 與 `notification.remove` 是雙向 envelope。接收端用 `id + sourceDeviceId`
+建立本機顯示用 identifier，讓 remove 可以取消之前由 EdgeLink 顯示的遠端通知。
+
+Android 可以用 `NotificationListenerService` 讀系統通知；為了 app 不在前景時也能同步，
+Android 端由 foreground service 持有 relay / secure session。Android 必須過濾 EdgeLink
+自己顯示的通知，避免遠端通知被 listener 再送回去造成迴圈。
+
+macOS app 用 `UserNotifications` 顯示遠端通知。Mac -> Android 鏡射使用本機
+`usernoted` SQLite DB backend，這是 local non-sandbox build 的能力，不是 App Store/public
+API 路線；不接 entitlement-gated private XPC。Mac notification source 調查見
+`docs/macos-notifications.md`。
 
 ## 7. Transports
 
@@ -408,12 +424,15 @@ macOS：
 - 身分金鑰存 Keychain。
 - CryptoKit：Ed25519、X25519、HKDF、ChaChaPoly。
 - `CGEventKeyboardSetUnicodeString` 用於文字輸入，避免鍵盤配置問題。
+- `UserNotifications` 僅用於顯示遠端通知；macOS 不提供讀取其他 app 通知的公開 API。
 
 Android：
 
 - 身分金鑰種子存 EncryptedSharedPreferences，由 Android Keystore 包裝 master key。
 - libsodium / Lazysodium：Ed25519、X25519、HKDF-SHA256、ChaCha20-Poly1305。
 - 配對畫面使用自製大按鍵數字鍵盤，不叫系統鍵盤。
+- Foreground service 持有長連線；`NotificationListenerService` 只負責把本機通知事件交給
+  現有 secure session。
 
 Cloudflare：
 

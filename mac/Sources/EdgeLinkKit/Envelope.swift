@@ -21,6 +21,8 @@ public enum EnvelopeType {
     public static let inputKey = "input.key"
     public static let inputText = "input.text"
     public static let clipboardSet = "clipboard.set"
+    public static let notificationPost = "notification.post"
+    public static let notificationRemove = "notification.remove"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -66,5 +68,49 @@ public struct ClipboardSetBody: Codable, Equatable, Sendable {
         self.text = text
         self.ts = ts
         self.hash = hash
+    }
+}
+
+public struct NotificationPostBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let sourceDeviceId: String?
+    public let sourcePlatform: String?
+    public let app: String
+    public let bundle: String?
+    public let title: String
+    public let text: String
+    public let subtitle: String?
+    public let ts: Int64
+
+    public init(
+        id: String,
+        sourceDeviceId: String? = nil,
+        sourcePlatform: String? = nil,
+        app: String,
+        bundle: String? = nil,
+        title: String,
+        text: String,
+        subtitle: String? = nil,
+        ts: Int64
+    ) {
+        self.id = id
+        self.sourceDeviceId = sourceDeviceId
+        self.sourcePlatform = sourcePlatform
+        self.app = app
+        self.bundle = bundle
+        self.title = title
+        self.text = text
+        self.subtitle = subtitle
+        self.ts = ts
+    }
+}
+
+public struct NotificationRemoveBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let sourceDeviceId: String?
+
+    public init(id: String, sourceDeviceId: String? = nil) {
+        self.id = id
+        self.sourceDeviceId = sourceDeviceId
     }
 }

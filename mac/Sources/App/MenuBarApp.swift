@@ -31,6 +31,17 @@ struct EdgeLinkMacApp: App {
 
                 Divider()
 
+                Toggle(
+                    "Mac Notifications",
+                    isOn: Binding(
+                        get: { runtime.macNotificationSyncEnabled },
+                        set: { runtime.setMacNotificationSyncEnabled($0) }
+                    )
+                )
+                .toggleStyle(.switch)
+
+                Divider()
+
                 if runtime.isPairing {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(runtime.pairingStatus)

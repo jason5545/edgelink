@@ -65,7 +65,10 @@ data class EdgeLinkUiState(
     val pairingPeerName: String = "",
     val isPairing: Boolean = false,
     val canConfirmPairing: Boolean = false,
-    val autoReconnectEnabled: Boolean = true
+    val autoReconnectEnabled: Boolean = true,
+    val notificationSyncEnabled: Boolean = true,
+    val notificationAccessGranted: Boolean = false,
+    val notificationPostGranted: Boolean = true
 )
 
 interface EdgeLinkActions {
@@ -78,6 +81,8 @@ interface EdgeLinkActions {
     fun onConfirmPairing()
     fun onReconnect()
     fun onAutoReconnectChange(enabled: Boolean)
+    fun onNotificationSyncChange(enabled: Boolean)
+    fun onOpenNotificationSettings()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -89,6 +94,8 @@ interface EdgeLinkActions {
         override fun onConfirmPairing() = Unit
         override fun onReconnect() = Unit
         override fun onAutoReconnectChange(enabled: Boolean) = Unit
+        override fun onNotificationSyncChange(enabled: Boolean) = Unit
+        override fun onOpenNotificationSettings() = Unit
     }
 }
 
@@ -109,8 +116,13 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             connected = state.isConnected,
             hasPeer = state.peerDeviceId.isNotEmpty(),
             autoReconnectEnabled = state.autoReconnectEnabled,
+            notificationSyncEnabled = state.notificationSyncEnabled,
+            notificationAccessGranted = state.notificationAccessGranted,
+            notificationPostGranted = state.notificationPostGranted,
             onReconnect = actions::onReconnect,
-            onAutoReconnectChange = actions::onAutoReconnectChange
+            onAutoReconnectChange = actions::onAutoReconnectChange,
+            onNotificationSyncChange = actions::onNotificationSyncChange,
+            onOpenNotificationSettings = actions::onOpenNotificationSettings
         )
 
         if (state.peerDeviceId.isEmpty()) {
@@ -152,8 +164,13 @@ private fun DeviceCard(
     connected: Boolean,
     hasPeer: Boolean,
     autoReconnectEnabled: Boolean,
+    notificationSyncEnabled: Boolean,
+    notificationAccessGranted: Boolean,
+    notificationPostGranted: Boolean,
     onReconnect: () -> Unit,
-    onAutoReconnectChange: (Boolean) -> Unit
+    onAutoReconnectChange: (Boolean) -> Unit,
+    onNotificationSyncChange: (Boolean) -> Unit,
+    onOpenNotificationSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -189,32 +206,86 @@ private fun DeviceCard(
         )
 
         if (hasPeer) {
+            Button(
+                onClick = onReconnect,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+            ) {
+                Text("Reconnect")
+            }
+
+            SettingsToggleRow(
+                label = "Auto reconnect",
+                checked = autoReconnectEnabled,
+                onCheckedChange = onAutoReconnectChange
+            )
+
+            NotificationToggleRow(
+                enabled = notificationSyncEnabled,
+                accessGranted = notificationAccessGranted,
+                postGranted = notificationPostGranted,
+                onCheckedChange = onNotificationSyncChange,
+                onOpenSettings = onOpenNotificationSettings
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsToggleRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
+        )
+    }
+}
+
+@Composable
+private fun NotificationToggleRow(
+    enabled: Boolean,
+    accessGranted: Boolean,
+    postGranted: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsToggleRow(
+            label = "Notifications",
+            checked = enabled,
+            onCheckedChange = onCheckedChange
+        )
+        if (enabled && (!accessGranted || !postGranted)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = onReconnect,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(56.dp)
+                Text(
+                    text = if (!accessGranted) "Access needed" else "Alerts blocked",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f)
+                )
+                FilledTonalButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier.height(48.dp)
                 ) {
-                    Text("Reconnect")
-                }
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Auto reconnect",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Switch(
-                        checked = autoReconnectEnabled,
-                        onCheckedChange = onAutoReconnectChange
-                    )
+                    Text("Open")
                 }
             }
         }

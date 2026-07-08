@@ -1,9 +1,13 @@
 package com.edgelink.app
 
 import android.content.Context
+import android.content.ComponentName
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
+import android.os.SystemClock
+import android.provider.Settings
 import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.DeviceId
 import com.edgelink.core.EmptyBody
@@ -13,6 +17,8 @@ import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
+import com.edgelink.core.NotificationPostBody
+import com.edgelink.core.NotificationRemoveBody
 import com.edgelink.core.PairConfirmRequest
 import com.edgelink.core.Pairing
 import com.edgelink.core.PairingTypes
@@ -50,6 +56,8 @@ import java.util.Base64
 private const val HANDSHAKE_TIMEOUT_MS = 4_000L
 private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
+private const val PING_INTERVAL_MS = 5_000L
+private const val PONG_TIMEOUT_MS = 15_000L
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
@@ -63,10 +71,19 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val relayTransport = RelayTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
+    private val notificationPresenter = AndroidNotificationPresenter(appContext)
+    @Volatile
+    private var lastPongElapsedMs = 0L
     private val stateFlow = MutableStateFlow(
-        EdgeLinkUiState(autoReconnectEnabled = settingsStore.autoReconnectEnabled())
+        EdgeLinkUiState(
+            autoReconnectEnabled = settingsStore.autoReconnectEnabled(),
+            notificationSyncEnabled = settingsStore.notificationSyncEnabled(),
+            notificationAccessGranted = isNotificationListenerEnabled(),
+            notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+        )
     )
-    private val dispatcher = AndroidCommandDispatcher(clipboardSync) {
+    private val dispatcher = AndroidCommandDispatcher(clipboardSync, notificationPresenter) {
+        lastPongElapsedMs = SystemClock.elapsedRealtime()
         stateFlow.update { it.copy(connectionStatus = "Connected") }
     }
 
@@ -188,6 +205,62 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             signalAutoReconnect("auto_reconnect_enabled")
             onReconnect()
         }
+    }
+
+    override fun onNotificationSyncChange(enabled: Boolean) {
+        settingsStore.saveNotificationSyncEnabled(enabled)
+        EdgeLinkLog.info("notification.android.sync_enabled enabled=$enabled")
+        stateFlow.update {
+            it.copy(
+                notificationSyncEnabled = enabled,
+                notificationAccessGranted = isNotificationListenerEnabled(),
+                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+            )
+        }
+    }
+
+    override fun onOpenNotificationSettings() {
+        EdgeLinkLog.info("notification.android.open_settings")
+        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        appContext.startActivity(intent)
+    }
+
+    fun refreshNotificationAccess() {
+        stateFlow.update {
+            it.copy(
+                notificationAccessGranted = isNotificationListenerEnabled(),
+                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+            )
+        }
+    }
+
+    fun isNotificationListenerEnabled(): Boolean {
+        val componentName = ComponentName(appContext, AndroidNotificationListenerService::class.java)
+        val enabledListeners = Settings.Secure.getString(
+            appContext.contentResolver,
+            "enabled_notification_listeners"
+        ).orEmpty()
+        return enabledListeners.split(':').any { it == componentName.flattenToString() }
+    }
+
+    fun onLocalNotificationPosted(body: NotificationPostBody) {
+        if (!stateFlow.value.notificationSyncEnabled) {
+            return
+        }
+        val sourceDeviceId = localIdentity?.deviceId
+        val outbound = body.copy(sourceDeviceId = sourceDeviceId)
+        EdgeLinkLog.info("notification.android.local_post id=${body.id} app=${body.app} hasSession=${session != null}")
+        sendEnvelope(EnvelopeTypes.NOTIFICATION_POST, outbound)
+    }
+
+    fun onLocalNotificationRemoved(body: NotificationRemoveBody) {
+        if (!stateFlow.value.notificationSyncEnabled) {
+            return
+        }
+        val outbound = body.copy(sourceDeviceId = localIdentity?.deviceId)
+        EdgeLinkLog.info("notification.android.local_remove id=${body.id} hasSession=${session != null}")
+        sendEnvelope(EnvelopeTypes.NOTIFICATION_REMOVE, outbound)
     }
 
     private suspend fun run() {
@@ -434,6 +507,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     error("Handshake timed out after ${HANDSHAKE_TIMEOUT_MS}ms.")
                 }
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                lastPongElapsedMs = SystemClock.elapsedRealtime()
                 session = nextSession
                 retryDelayMs = 1_000L
                 stateFlow.update { it.copy(connectionStatus = "Connected", isConnected = true) }
@@ -497,8 +571,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     private suspend fun pingLoop(activeSession: SecureSessionClient) {
         while (coroutineContext.isActive) {
+            val pongAgeMs = SystemClock.elapsedRealtime() - lastPongElapsedMs
+            if (lastPongElapsedMs > 0 && pongAgeMs >= PONG_TIMEOUT_MS) {
+                EdgeLinkLog.warn("relay.android.pong_timeout ageMs=$pongAgeMs timeoutMs=$PONG_TIMEOUT_MS")
+                error("Pong timed out after ${pongAgeMs}ms.")
+            }
             activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.STATUS_PING, EmptyBody))
-            delay(5_000)
+            delay(PING_INTERVAL_MS)
         }
     }
 
@@ -533,6 +612,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
 private class AndroidCommandDispatcher(
     private val clipboardSync: AndroidClipboardSync,
+    private val notificationPresenter: AndroidNotificationPresenter,
     private val onPong: () -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
@@ -545,6 +625,16 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.CLIPBOARD_SET -> {
                 val envelope = EnvelopeCodec.decode<ClipboardSetBody>(plaintext)
                 clipboardSync.applyRemoteText(envelope.b.text, envelope.b.hash)
+                null
+            }
+            EnvelopeTypes.NOTIFICATION_POST -> {
+                val envelope = EnvelopeCodec.decode<NotificationPostBody>(plaintext)
+                notificationPresenter.show(envelope.b)
+                null
+            }
+            EnvelopeTypes.NOTIFICATION_REMOVE -> {
+                val envelope = EnvelopeCodec.decode<NotificationRemoveBody>(plaintext)
+                notificationPresenter.remove(envelope.b)
                 null
             }
             else -> null

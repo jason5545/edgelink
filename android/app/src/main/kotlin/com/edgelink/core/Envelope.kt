@@ -20,6 +20,8 @@ object EnvelopeTypes {
     const val INPUT_KEY = "input.key"
     const val INPUT_TEXT = "input.text"
     const val CLIPBOARD_SET = "clipboard.set"
+    const val NOTIFICATION_POST = "notification.post"
+    const val NOTIFICATION_REMOVE = "notification.remove"
 }
 
 object EnvelopeCodec {
@@ -63,4 +65,23 @@ data class ClipboardSetBody(
     val text: String,
     val ts: Long,
     val hash: String
+)
+
+@Serializable
+data class NotificationPostBody(
+    val id: String,
+    val sourceDeviceId: String? = null,
+    val sourcePlatform: String? = null,
+    val app: String,
+    val bundle: String? = null,
+    val title: String,
+    val text: String,
+    val subtitle: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class NotificationRemoveBody(
+    val id: String,
+    val sourceDeviceId: String? = null
 )

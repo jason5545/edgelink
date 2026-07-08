@@ -86,6 +86,15 @@ class SharedPreferencesSettingsStore(context: Context) {
             .putBoolean("autoReconnectEnabled", enabled)
             .apply()
     }
+
+    fun notificationSyncEnabled(): Boolean =
+        prefs.getBoolean("notificationSyncEnabled", true)
+
+    fun saveNotificationSyncEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean("notificationSyncEnabled", enabled)
+            .apply()
+    }
 }
 
 private fun SharedPreferences.getBase64(key: String): ByteArray? =

@@ -15,6 +15,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var pairingStatus = ""
     @Published private(set) var isPairing = false
     @Published private(set) var canAcceptPairing = false
+    @Published private(set) var macNotificationSyncEnabled: Bool
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -22,6 +23,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let relayTransport: RelayTransport
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
+    private let macNotificationSource = MacNotificationDatabaseSource()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
     private var localIdentity: LocalIdentity?
@@ -34,6 +36,7 @@ final class EdgeLinkRuntime: ObservableObject {
         relayURL: URL = EdgeLinkConfig.relayURL,
         pairingWebSocketURL: URL = EdgeLinkConfig.pairingWebSocketURL
     ) {
+        macNotificationSyncEnabled = UserDefaults.standard.object(forKey: Self.macNotificationSyncDefaultsKey) as? Bool ?? true
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -76,6 +79,15 @@ final class EdgeLinkRuntime: ObservableObject {
                     self.isPairing = false
                 }
             }
+        }
+    }
+
+    func setMacNotificationSyncEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.macNotificationSyncDefaultsKey)
+        macNotificationSyncEnabled = enabled
+        DiagnosticsLog.info("notification.mac.sync_enabled enabled=\(enabled)")
+        if enabled {
+            Task { await macNotificationSource.resetBaseline() }
         }
     }
 
@@ -257,7 +269,11 @@ final class EdgeLinkRuntime: ObservableObject {
                 retryDelay = 1_000_000_000
 
                 let clipboardTask = Task { await clipboardLoop(session: session) }
-                defer { clipboardTask.cancel() }
+                let notificationTask = Task { await macNotificationLoop(identity: identity, session: session) }
+                defer {
+                    clipboardTask.cancel()
+                    notificationTask.cancel()
+                }
                 try await session.receiveLoop()
             } catch {
                 DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
@@ -285,6 +301,30 @@ final class EdgeLinkRuntime: ObservableObject {
             try? await Task.sleep(nanoseconds: 700_000_000)
         }
     }
+
+    private func macNotificationLoop(identity: LocalIdentity, session: SecureSessionHost) async {
+        await macNotificationSource.resetBaseline()
+        while !Task.isCancelled && currentSession === session {
+            if macNotificationSyncEnabled {
+                let bodies = await macNotificationSource.poll(sourceDeviceId: identity.deviceId)
+                for body in bodies {
+                    if let data = try? encoder.encode(Envelope(t: EnvelopeType.notificationPost, b: body)) {
+                        do {
+                            try await session.sendPlaintext(data)
+                            DiagnosticsLog.info("notification.mac.db.sent id=\(body.id) app=\(body.app)")
+                        } catch {
+                            DiagnosticsLog.error("notification.mac.db.send_failed id=\(body.id)", error)
+                        }
+                    }
+                }
+            } else {
+                await macNotificationSource.resetBaseline()
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"
 }
 
 enum EdgeLinkConfig {

@@ -22,10 +22,15 @@ actor SecureSessionHost {
 
     func connect() async throws {
         DiagnosticsLog.info("hs.mac.wait_hello hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
-        guard let hello = try await channel.receive() else {
-            throw SecureSessionHostError.closedBeforeHandshake
+        while let frame = try await channel.receive() {
+            guard isHandshakeHello(frame) else {
+                DiagnosticsLog.warn("hs.mac.stale_frame_ignored hostId=\(identity.deviceId) clientId=\(peer.deviceId) bytes=\(frame.count)")
+                continue
+            }
+            try await performHandshake(firstHello: frame, reason: "initial")
+            return
         }
-        try await performHandshake(firstHello: hello, reason: "initial")
+        throw SecureSessionHostError.closedBeforeHandshake
     }
 
     private func performHandshake(firstHello hello: Data, reason: String) async throws {
