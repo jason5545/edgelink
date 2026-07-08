@@ -17,6 +17,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var factory: RTCPeerConnectionFactory?
     private var peerConnection: RTCPeerConnection?
     private var remoteVideoTrack: RTCVideoTrack?
+    private var inputDataChannel: RTCDataChannel?
     private var didInitializeSSL = false
     private var isClosingWindow = false
     private var forwardedKeyCodes = Set<UInt16>()
@@ -120,6 +121,9 @@ final class MacScreenSession: NSObject, ObservableObject {
         if sendRemoteStop {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
+        inputDataChannel?.delegate = nil
+        inputDataChannel?.close()
+        inputDataChannel = nil
         remoteVideoTrack?.remove(videoView)
         videoView.clear()
         remoteVideoTrack = nil
@@ -144,7 +148,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func sendGlobal(_ action: String) {
-        sendEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
+        sendControlEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
 
     private func showWindow() {
@@ -252,7 +256,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         flushPendingPointerMove()
-        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
@@ -262,7 +266,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
 
         if isDown, shouldSendText(for: event), let text = event.characters, !text.isEmpty {
-            sendEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
+            sendControlEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
             return true
         }
 
@@ -281,7 +285,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func sendKey(_ key: String, down: Bool, modifiers: [String]) {
-        sendEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
+        sendControlEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
     }
 
     private func sendCoalescedPointerMove(_ body: CtrlPointerBody) {
@@ -325,7 +329,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
         lastPointerMoveSentAt = now
-        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func screenCoordinate(for event: NSEvent) -> (x: Int, y: Int)? {
@@ -417,19 +421,62 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func sendEnvelope<Body: Codable & Sendable>(type: String, body: Body) {
-        guard let sendPlaintext else {
-            DiagnosticsLog.warn("screen.mac.send_ignored no_secure_session type=\(type)")
-            return
-        }
         do {
             let data = try encoder.encode(Envelope(t: type, b: body))
-            sendPlaintext(data)
+            sendPlaintextEnvelope(type: type, data: data)
         } catch {
             DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
         }
     }
 
+    private func sendControlEnvelope<Body: Codable & Sendable>(type: String, body: Body) {
+        do {
+            let data = try encoder.encode(Envelope(t: type, b: body))
+            if sendInputDataChannel(type: type, data: data) {
+                return
+            }
+            sendPlaintextEnvelope(type: type, data: data)
+        } catch {
+            DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
+        }
+    }
+
+    private func sendPlaintextEnvelope(type: String, data: Data) {
+        guard let sendPlaintext else {
+            DiagnosticsLog.warn("screen.mac.send_ignored no_secure_session type=\(type)")
+            return
+        }
+        sendPlaintext(data)
+    }
+
+    private func sendInputDataChannel(type: String, data: Data) -> Bool {
+        guard let inputDataChannel else {
+            return false
+        }
+        guard inputDataChannel.readyState == .open else {
+            return false
+        }
+        let sent = inputDataChannel.sendData(RTCDataBuffer(data: data, isBinary: true))
+        if !sent {
+            DiagnosticsLog.warn("screen.mac.input_channel_send_failed type=\(type) buffered=\(inputDataChannel.bufferedAmount)")
+        }
+        return sent
+    }
+
+    private func attachInputDataChannel(_ dataChannel: RTCDataChannel) {
+        guard dataChannel.label == Self.inputDataChannelLabel else {
+            DiagnosticsLog.info("screen.mac.data_channel_ignored label=\(dataChannel.label)")
+            dataChannel.close()
+            return
+        }
+        inputDataChannel?.delegate = nil
+        inputDataChannel = dataChannel
+        dataChannel.delegate = self
+        DiagnosticsLog.info("screen.mac.input_channel_attached state=\(dataChannel.readyState.rawValue)")
+    }
+
     private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
+    private static let inputDataChannelLabel = "input"
 }
 
 extension MacScreenSession: NSWindowDelegate {
@@ -497,7 +544,11 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+        DispatchQueue.main.async { [weak self] in
+            self?.attachInputDataChannel(dataChannel)
+        }
+    }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didStartReceivingOn transceiver: RTCRtpTransceiver) {
         guard let track = transceiver.receiver.track as? RTCVideoTrack else {
@@ -505,6 +556,22 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
         }
         DispatchQueue.main.async { [weak self] in
             self?.attachRemoteVideoTrack(track)
+        }
+    }
+}
+
+extension MacScreenSession: RTCDataChannelDelegate {
+    func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        DiagnosticsLog.info("screen.mac.input_channel state=\(dataChannel.readyState.rawValue) buffered=\(dataChannel.bufferedAmount)")
+    }
+
+    func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        DiagnosticsLog.info("screen.mac.input_channel_message_in bytes=\(buffer.data.count)")
+    }
+
+    func dataChannel(_ dataChannel: RTCDataChannel, didChangeBufferedAmount amount: UInt64) {
+        if amount > 256_000 {
+            DiagnosticsLog.warn("screen.mac.input_channel_buffered amount=\(amount)")
         }
     }
 }
