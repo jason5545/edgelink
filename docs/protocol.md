@@ -157,6 +157,18 @@ broadcasts:
 
 所有公鑰與 nonce 都是 raw bytes；JSON 中使用標準 base64。
 
+Android 的 PairingDO WebSocket 連上後先送一個 readiness 訊息，通知 Mac 可以送 commitment。
+這個訊息不是信任資料，只是避免 Mac 在 Android WebSocket 尚未接上時送出的 commitment 被盲轉掉包：
+
+```json
+{
+  "t": "pair.ready",
+  "b": {
+    "deviceId": "137245816"
+  }
+}
+```
+
 Mac 先送 commitment：
 
 ```json

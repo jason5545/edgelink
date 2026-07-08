@@ -28,6 +28,31 @@ struct EdgeLinkMacApp: App {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Divider()
+
+                if runtime.isPairing {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(runtime.pairingStatus)
+                            .font(.subheadline)
+                        if !runtime.pairingPeerName.isEmpty {
+                            Text(runtime.pairingPeerName)
+                                .lineLimit(1)
+                        }
+                        if !runtime.pairingSAS.isEmpty {
+                            PairingView(sasDisplay: runtime.pairingSAS) {
+                                runtime.acceptPairing()
+                            }
+                            .disabled(!runtime.canAcceptPairing)
+                        }
+                    }
+                } else {
+                    Button("Pair New Device") {
+                        runtime.startPairing()
+                    }
+                    .controlSize(.large)
+                    .frame(maxWidth: .infinity)
+                }
             }
             .padding()
             .frame(width: 280)

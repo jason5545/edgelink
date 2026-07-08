@@ -11,15 +11,21 @@ import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
+import com.edgelink.core.PairConfirmRequest
+import com.edgelink.core.Pairing
+import com.edgelink.core.PairingTypes
+import com.edgelink.core.PairingWire
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.SodiumHandshakeCrypto
 import com.edgelink.core.WorkerDeviceRegistrar
+import com.edgelink.transport.PairingTransport
 import com.edgelink.transport.RelayTransport
 import com.edgelink.transport.SecureSessionClient
 import com.edgelink.ui.EdgeLinkActions
 import com.edgelink.ui.EdgeLinkUiState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -32,6 +38,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.coroutineContext
+import java.time.Instant
+import java.util.Base64
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
@@ -41,6 +49,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val pairingStore = SharedPreferencesPairingStore(appContext)
     private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
     private val relayTransport = RelayTransport(crypto = crypto)
+    private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val stateFlow = MutableStateFlow(EdgeLinkUiState())
     private val dispatcher = AndroidCommandDispatcher(clipboardSync) {
@@ -51,6 +60,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     @Volatile
     private var session: SecureSessionClient? = null
+    private var localIdentity: LocalIdentity? = null
+    private var pairingJob: Job? = null
+    private var pendingPairing: PendingPairing? = null
 
     init {
         scope.launch {
@@ -74,10 +86,56 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         sendEnvelope(EnvelopeTypes.INPUT_TEXT, body)
     }
 
+    override fun onPairDigit(digit: String) {
+        stateFlow.update {
+            if (it.pairingHostIdInput.length >= 9 || it.canConfirmPairing) {
+                it
+            } else {
+                it.copy(pairingHostIdInput = it.pairingHostIdInput + digit)
+            }
+        }
+    }
+
+    override fun onPairBackspace() {
+        stateFlow.update {
+            if (it.pairingHostIdInput.isEmpty() || it.canConfirmPairing) {
+                it
+            } else {
+                it.copy(pairingHostIdInput = it.pairingHostIdInput.dropLast(1))
+            }
+        }
+    }
+
+    override fun onStartPairing() {
+        val hostId = stateFlow.value.pairingHostIdInput
+        if (!DeviceId.isValid(hostId)) {
+            stateFlow.update { it.copy(connectionStatus = "Invalid Mac ID") }
+            return
+        }
+        pairingJob?.cancel()
+        pairingJob = scope.launch {
+            runPairing(hostId)
+        }
+    }
+
+    override fun onConfirmPairing() {
+        val pending = pendingPairing ?: return
+        scope.launch {
+            runCatching {
+                pairingTransport.confirm(EdgeLinkConfig.workerBaseUrl, pending.confirmRequest())
+            }.onSuccess {
+                stateFlow.update { it.copy(canConfirmPairing = false, connectionStatus = "Waiting for Mac") }
+            }.onFailure {
+                stateFlow.update { it.copy(connectionStatus = "Pairing failed", isPairing = false, canConfirmPairing = false) }
+            }
+        }
+    }
+
     private suspend fun run() {
         try {
             stateFlow.update { it.copy(connectionStatus = "Registering") }
             val identity = loadOrRegisterIdentity()
+            localIdentity = identity
             stateFlow.update { it.copy(localDeviceId = DeviceId.display(identity.deviceId)) }
 
             val peer = pairingStore.loadPeers().firstOrNull()
@@ -99,6 +157,112 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 it.copy(connectionStatus = "Setup failed", isConnected = false)
             }
         }
+    }
+
+    private suspend fun runPairing(hostId: String) {
+        val identity = localIdentity ?: loadOrRegisterIdentity().also { localIdentity = it }
+        val nonceC = crypto.randomBytes(32)
+        var commitment: ByteArray? = null
+        var pairedPeer: PinnedPeer? = null
+
+        stateFlow.update {
+            it.copy(
+                isPairing = true,
+                pairingSas = "",
+                pairingPeerName = "",
+                canConfirmPairing = false,
+                connectionStatus = "Opening pairing"
+            )
+        }
+
+        val channel = runCatching {
+            pairingTransport.connect(EdgeLinkConfig.pairingWebSocketUrl, hostId)
+        }.getOrElse {
+            stateFlow.update { state -> state.copy(connectionStatus = "Pairing failed", isPairing = false) }
+            return
+        }
+
+        try {
+            pairingTransport.claim(EdgeLinkConfig.workerBaseUrl, hostId, identity)
+            channel.send(PairingWire.encodeReady(identity.deviceId))
+
+            while (coroutineContext.isActive) {
+                val text = channel.receive() ?: error("Pairing socket closed.")
+                when (PairingWire.type(text)) {
+                    PairingTypes.COMMIT -> {
+                        commitment = Base64.getDecoder().decode(PairingWire.decodeCommit(text).commit)
+                        channel.send(PairingWire.encodeRevealClient(identity, nonceC))
+                    }
+                    PairingTypes.REVEAL_HOST -> {
+                        val reveal = PairingWire.decodeRevealHost(text)
+                        val hostPk = Base64.getDecoder().decode(reveal.hostPk)
+                        val nonceH = Base64.getDecoder().decode(reveal.nonceH)
+                        val expectedCommitment = Pairing.commitment(hostPk, nonceH)
+                        check(commitment?.contentEquals(expectedCommitment) == true) {
+                            "Pairing commitment mismatch."
+                        }
+                        val sas = Pairing.sas(
+                            hostPublicKey = hostPk,
+                            clientPublicKey = identity.publicKey,
+                            hostNonce = nonceH,
+                            clientNonce = nonceC
+                        )
+                        pendingPairing = PendingPairing(
+                            hostId = reveal.hostId,
+                            clientId = identity.deviceId,
+                            hostPkBase64 = reveal.hostPk,
+                            clientPkBase64 = Base64.getEncoder().encodeToString(identity.publicKey),
+                            hostName = reveal.name,
+                            clientName = identity.name,
+                            hostPublicKey = hostPk
+                        )
+                        stateFlow.update {
+                            it.copy(
+                                pairingSas = sas.display,
+                                pairingPeerName = reveal.name,
+                                canConfirmPairing = true,
+                                connectionStatus = "Compare code"
+                            )
+                        }
+                    }
+                    PairingTypes.COMPLETE -> {
+                        val complete = PairingWire.decodeComplete(text)
+                        val pending = pendingPairing
+                        if (pending != null && complete.hostId == pending.hostId && complete.clientId == pending.clientId) {
+                            val peer = PinnedPeer(
+                                deviceId = pending.hostId,
+                                name = pending.hostName,
+                                publicKey = pending.hostPublicKey,
+                                pairedAt = Instant.now()
+                            )
+                            pairedPeer = peer
+                            pairingStore.savePeer(peer)
+                            break
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            stateFlow.update { it.copy(connectionStatus = "Pairing failed", isPairing = false, canConfirmPairing = false) }
+        } finally {
+            channel.close()
+        }
+
+        val peer = pairedPeer ?: return
+        pendingPairing = null
+        stateFlow.update {
+            it.copy(
+                peerName = peer.name,
+                peerDeviceId = DeviceId.display(peer.deviceId),
+                pairingHostIdInput = "",
+                pairingSas = "",
+                pairingPeerName = "",
+                isPairing = false,
+                canConfirmPairing = false,
+                connectionStatus = "Paired"
+            )
+        }
+        connectLoop(identity, peer)
     }
 
     private suspend fun loadOrRegisterIdentity(): LocalIdentity =
@@ -227,4 +391,26 @@ private class AndroidCommandDispatcher(
 object EdgeLinkConfig {
     const val workerBaseUrl = "https://edgelink-worker.black-hill-f944.workers.dev"
     const val relayUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect"
+    const val pairingWebSocketUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/pair/ws"
+}
+
+private data class PendingPairing(
+    val hostId: String,
+    val clientId: String,
+    val hostPkBase64: String,
+    val clientPkBase64: String,
+    val hostName: String,
+    val clientName: String,
+    val hostPublicKey: ByteArray
+) {
+    fun confirmRequest(): PairConfirmRequest =
+        PairConfirmRequest(
+            role = "client",
+            hostId = hostId,
+            clientId = clientId,
+            hostPk = hostPkBase64,
+            clientPk = clientPkBase64,
+            hostName = hostName,
+            clientName = clientName
+        )
 }

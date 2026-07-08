@@ -57,18 +57,31 @@ data class EdgeLinkUiState(
     val peerName: String = "No paired Mac",
     val peerDeviceId: String = "",
     val connectionStatus: String = "Starting",
-    val isConnected: Boolean = false
+    val isConnected: Boolean = false,
+    val pairingHostIdInput: String = "",
+    val pairingSas: String = "",
+    val pairingPeerName: String = "",
+    val isPairing: Boolean = false,
+    val canConfirmPairing: Boolean = false
 )
 
 interface EdgeLinkActions {
     fun onPointer(body: InputPointerBody)
     fun onKey(body: InputKeyBody)
     fun onText(body: InputTextBody)
+    fun onPairDigit(digit: String)
+    fun onPairBackspace()
+    fun onStartPairing()
+    fun onConfirmPairing()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
         override fun onKey(body: InputKeyBody) = Unit
         override fun onText(body: InputTextBody) = Unit
+        override fun onPairDigit(digit: String) = Unit
+        override fun onPairBackspace() = Unit
+        override fun onStartPairing() = Unit
+        override fun onConfirmPairing() = Unit
     }
 }
 
@@ -89,24 +102,34 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             connected = state.isConnected
         )
 
-        Touchpad(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            onPointer = actions::onPointer
-        )
+        if (state.peerDeviceId.isEmpty()) {
+            PairingPanel(
+                state = state,
+                actions = actions,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        } else {
+            Touchpad(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                onPointer = actions::onPointer
+            )
 
-        KeyboardPanel(
-            text = text,
-            onTextChange = { value -> text = value },
-            onSendText = {
-                if (text.isNotEmpty()) {
-                    actions.onText(InputTextBody(text))
-                    text = ""
-                }
-            },
-            onKey = actions::onKey
-        )
+            KeyboardPanel(
+                text = text,
+                onTextChange = { value -> text = value },
+                onSendText = {
+                    if (text.isNotEmpty()) {
+                        actions.onText(InputTextBody(text))
+                        text = ""
+                    }
+                },
+                onKey = actions::onKey
+            )
+        }
     }
 }
 
@@ -257,7 +280,110 @@ private fun KeyboardPanel(
     }
 }
 
+@Composable
+private fun PairingPanel(
+    state: EdgeLinkUiState,
+    actions: EdgeLinkActions,
+    modifier: Modifier
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = displayDeviceIdInput(state.pairingHostIdInput),
+            style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Monospace),
+            maxLines = 1
+        )
+
+        if (state.pairingSas.isNotEmpty()) {
+            Text(
+                text = state.pairingSas,
+                fontSize = 44.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+
+        NumericPad(
+            onDigit = actions::onPairDigit,
+            onBackspace = actions::onPairBackspace,
+            enabled = !state.isPairing || state.pairingSas.isEmpty()
+        )
+
+        if (state.canConfirmPairing) {
+            Button(
+                onClick = actions::onConfirmPairing,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(72.dp)
+            ) {
+                Text("Confirm", fontSize = 22.sp)
+            }
+        } else {
+            Button(
+                onClick = actions::onStartPairing,
+                enabled = state.pairingHostIdInput.length == 9 && !state.isPairing,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(72.dp)
+            ) {
+                Text("Pair", fontSize = 22.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun NumericPad(
+    onDigit: (String) -> Unit,
+    onBackspace: () -> Unit,
+    enabled: Boolean
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(
+            listOf("1", "2", "3"),
+            listOf("4", "5", "6"),
+            listOf("7", "8", "9")
+        ).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                row.forEach { digit ->
+                    Button(
+                        onClick = { onDigit(digit) },
+                        enabled = enabled,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(64.dp)
+                    ) {
+                        Text(digit, fontSize = 24.sp)
+                    }
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Box(modifier = Modifier.weight(1f))
+            Button(
+                onClick = { onDigit("0") },
+                enabled = enabled,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(64.dp)
+            ) {
+                Text("0", fontSize = 24.sp)
+            }
+            Button(
+                onClick = onBackspace,
+                enabled = enabled,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(64.dp)
+            ) {
+                Text("⌫", fontSize = 24.sp)
+            }
+        }
+    }
+}
+
 private fun List<PointerInputChange>.averagePositionChange(): Offset {
     val total = fold(Offset.Zero) { partial, change -> partial + change.positionChange() }
     return Offset(total.x / size, total.y / size)
 }
+
+private fun displayDeviceIdInput(value: String): String =
+    value.padEnd(9, '·').chunked(3).joinToString(" ")
