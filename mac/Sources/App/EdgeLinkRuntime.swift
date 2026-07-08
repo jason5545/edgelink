@@ -24,6 +24,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
     private let macNotificationSource = MacNotificationDatabaseSource()
+    private let screenSession = MacScreenSession()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
     private var localIdentity: LocalIdentity?
@@ -47,6 +48,7 @@ final class EdgeLinkRuntime: ObservableObject {
     deinit {
         task?.cancel()
         pairingTask?.cancel()
+        screenSession.closeWindow(sendRemoteStop: false)
     }
 
     func startPairing() {
@@ -89,6 +91,14 @@ final class EdgeLinkRuntime: ObservableObject {
         if enabled {
             Task { await macNotificationSource.resetBaseline() }
         }
+    }
+
+    func viewPhoneScreen() {
+        guard isConnected else {
+            DiagnosticsLog.warn("screen.mac.start_ignored not_connected")
+            return
+        }
+        screenSession.openAndStart()
     }
 
     private func run() async {
@@ -252,7 +262,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 isConnected = false
                 connectionStatus = "Connecting relay"
                 let channel = try await relayTransport.connect(hostId: identity.deviceId, identity: identity)
-                let dispatcher = CommandDispatcher(clipboardSync: clipboardSync)
+                let dispatcher = CommandDispatcher(
+                    clipboardSync: clipboardSync,
+                    screenSession: screenSession
+                )
                 let session = SecureSessionHost(
                     channel: channel,
                     identity: identity,
@@ -264,6 +277,11 @@ final class EdgeLinkRuntime: ObservableObject {
                 try await session.connect()
                 DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
+                screenSession.setSender { [weak self] data in
+                    Task { @MainActor in
+                        await self?.sendScreenPlaintext(data)
+                    }
+                }
                 isConnected = true
                 connectionStatus = "Connected"
                 retryDelay = 1_000_000_000
@@ -273,12 +291,19 @@ final class EdgeLinkRuntime: ObservableObject {
                 defer {
                     clipboardTask.cancel()
                     notificationTask.cancel()
+                    if currentSession === session {
+                        currentSession = nil
+                        screenSession.clearSender()
+                        screenSession.stop(sendRemoteStop: false)
+                    }
                 }
                 try await session.receiveLoop()
             } catch {
                 DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
                 isConnected = false
                 currentSession = nil
+                screenSession.clearSender()
+                screenSession.stop(sendRemoteStop: false)
                 connectionStatus = "Disconnected"
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay = min(retryDelay * 2, 30_000_000_000)
@@ -299,6 +324,18 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+    }
+
+    private func sendScreenPlaintext(_ plaintext: Data) async {
+        guard let session = currentSession else {
+            DiagnosticsLog.warn("screen.mac.send_ignored no_current_session")
+            return
+        }
+        do {
+            try await session.sendPlaintext(plaintext)
+        } catch {
+            DiagnosticsLog.error("screen.mac.send_failed", error)
         }
     }
 

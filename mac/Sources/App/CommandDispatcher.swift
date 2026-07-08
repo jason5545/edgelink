@@ -5,17 +5,20 @@ final class CommandDispatcher {
     private let inputInjector: InputInjector
     private let clipboardSync: ClipboardSync
     private let notificationPresenter: MacNotificationPresenter
+    private let screenSession: MacScreenSession?
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
     init(
         inputInjector: InputInjector = InputInjector(),
         clipboardSync: ClipboardSync = ClipboardSync(),
-        notificationPresenter: MacNotificationPresenter = MacNotificationPresenter()
+        notificationPresenter: MacNotificationPresenter = MacNotificationPresenter(),
+        screenSession: MacScreenSession? = nil
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
         self.notificationPresenter = notificationPresenter
+        self.screenSession = screenSession
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -46,6 +49,30 @@ final class CommandDispatcher {
         case EnvelopeType.notificationRemove:
             let envelope = try decoder.decode(Envelope<NotificationRemoveBody>.self, from: plaintext)
             notificationPresenter.remove(envelope.b)
+            return nil
+        case EnvelopeType.screenMeta:
+            let envelope = try decoder.decode(Envelope<ScreenMetaBody>.self, from: plaintext)
+            DispatchQueue.main.async { [screenSession] in
+                screenSession?.handleMeta(envelope.b)
+            }
+            return nil
+        case EnvelopeType.rtcOffer:
+            let envelope = try decoder.decode(Envelope<RtcSdpBody>.self, from: plaintext)
+            DispatchQueue.main.async { [screenSession] in
+                screenSession?.handleOffer(envelope.b)
+            }
+            return nil
+        case EnvelopeType.rtcAnswer:
+            let envelope = try decoder.decode(Envelope<RtcSdpBody>.self, from: plaintext)
+            DispatchQueue.main.async { [screenSession] in
+                screenSession?.handleAnswer(envelope.b)
+            }
+            return nil
+        case EnvelopeType.rtcIce:
+            let envelope = try decoder.decode(Envelope<RtcIceBody>.self, from: plaintext)
+            DispatchQueue.main.async { [screenSession] in
+                screenSession?.handleIce(envelope.b)
+            }
             return nil
         default:
             return nil

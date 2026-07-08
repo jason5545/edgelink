@@ -20,6 +20,16 @@ public enum EnvelopeType {
     public static let inputPointer = "input.pointer"
     public static let inputKey = "input.key"
     public static let inputText = "input.text"
+    public static let screenStart = "screen.start"
+    public static let screenStop = "screen.stop"
+    public static let screenMeta = "screen.meta"
+    public static let ctrlPointer = "ctrl.pointer"
+    public static let ctrlKey = "ctrl.key"
+    public static let ctrlText = "ctrl.text"
+    public static let ctrlGlobal = "ctrl.global"
+    public static let rtcOffer = "rtc.offer"
+    public static let rtcAnswer = "rtc.answer"
+    public static let rtcIce = "rtc.ice"
     public static let clipboardSet = "clipboard.set"
     public static let notificationPost = "notification.post"
     public static let notificationRemove = "notification.remove"
@@ -56,6 +66,82 @@ public struct InputTextBody: Codable, Equatable, Sendable {
 
     public init(text: String) {
         self.text = text
+    }
+}
+
+public struct ScreenMetaBody: Codable, Equatable, Sendable {
+    public let w: Int
+    public let h: Int
+    public let scale: Double
+    public let dpi: Int
+
+    public init(w: Int, h: Int, scale: Double, dpi: Int) {
+        self.w = w
+        self.h = h
+        self.scale = scale
+        self.dpi = dpi
+    }
+}
+
+public struct CtrlPointerBody: Codable, Equatable, Sendable {
+    public let x: Int
+    public let y: Int
+    public let action: String
+    public let wheelDy: Int?
+
+    public init(x: Int, y: Int, action: String, wheelDy: Int? = nil) {
+        self.x = x
+        self.y = y
+        self.action = action
+        self.wheelDy = wheelDy
+    }
+}
+
+public struct CtrlKeyBody: Codable, Equatable, Sendable {
+    public let key: String
+    public let down: Bool
+    public let mods: [String]
+
+    public init(key: String, down: Bool, mods: [String] = []) {
+        self.key = key
+        self.down = down
+        self.mods = mods
+    }
+}
+
+public struct CtrlTextBody: Codable, Equatable, Sendable {
+    public let text: String
+
+    public init(text: String) {
+        self.text = text
+    }
+}
+
+public struct CtrlGlobalBody: Codable, Equatable, Sendable {
+    public let action: String
+
+    public init(action: String) {
+        self.action = action
+    }
+}
+
+public struct RtcSdpBody: Codable, Equatable, Sendable {
+    public let sdp: String
+
+    public init(sdp: String) {
+        self.sdp = sdp
+    }
+}
+
+public struct RtcIceBody: Codable, Equatable, Sendable {
+    public let mid: String
+    public let index: Int
+    public let candidate: String
+
+    public init(mid: String, index: Int, candidate: String) {
+        self.mid = mid
+        self.index = index
+        self.candidate = candidate
     }
 }
 

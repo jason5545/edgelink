@@ -345,6 +345,15 @@ AEAD：
 {"t":"input.pointer","b":{"dx":5,"dy":-2,"scrollX":null,"scrollY":null,"btn":null}}
 {"t":"input.key","b":{"key":"a","mods":["cmd"]}}
 {"t":"input.text","b":{"text":"你好"}}
+{"t":"screen.start","b":{}}
+{"t":"screen.meta","b":{"w":1080,"h":2400,"scale":1.0,"dpi":420}}
+{"t":"ctrl.pointer","b":{"x":540,"y":1200,"action":"down","wheelDy":null}}
+{"t":"ctrl.key","b":{"key":"Escape","down":true,"mods":[]}}
+{"t":"ctrl.text","b":{"text":"你好"}}
+{"t":"ctrl.global","b":{"action":"back"}}
+{"t":"rtc.offer","b":{"sdp":"v=0\r\n..."}}
+{"t":"rtc.answer","b":{"sdp":"v=0\r\n..."}}
+{"t":"rtc.ice","b":{"mid":"0","index":0,"candidate":"candidate:..."}}
 {"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"..."}}
 {"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
 {"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
@@ -358,6 +367,60 @@ AEAD：
 - MVP 使用 JSON；若之後滑鼠或檔案傳輸量太大，再新增 CBOR 或 side channel。
 - 滑鼠移動以 16ms 合併 delta，一則 envelope 是一個 batch。
 - 大檔案不要進控制通道。
+
+### Screen Session
+
+螢幕會話與既有遠端輸入是角色反轉的另一條路：
+
+- 既有 `input.*` 是 Android -> Mac，語意是 trackpad / keyboard，指標使用 delta。
+- 新增 `screen.*`、`ctrl.*` 是 Mac -> Android 螢幕控制，指標使用 Android 裝置像素空間的絕對座標。
+- 兩組 envelope 並存，不互相取代，也不要重用 `input.pointer` 來表示螢幕點擊。
+
+螢幕會話控制平面仍走現有 secure frame，也就是 E2EE envelope、64 KB frame 上限、
+relay/LAN 兩種 transport 共用。Mac 送 `screen.start` 要求 Android 開始螢幕會話；
+Mac 送 `screen.stop` 結束。Android 開始投影後回：
+
+```json
+{"t":"screen.meta","b":{"w":1080,"h":2400,"scale":1.0,"dpi":420}}
+```
+
+`screen.meta.b.w` / `h` 是 Android 回報的裝置像素尺寸；`ctrl.pointer.b.x` / `y`
+必須使用同一個座標空間。`scale` 保留給視窗顯示比例與未來密度換算，`dpi` 是 Android
+display density DPI。
+
+Mac -> Android 控制 envelope：
+
+- `screen.start` b:`{}`
+- `screen.stop` b:`{}`
+- `ctrl.pointer` b:`{"x":int,"y":int,"action":"down|move|up|rightUp|wheel","wheelDy":int?}`
+- `ctrl.key` b:`{"key":string,"down":bool,"mods":[string]}`
+- `ctrl.text` b:`{"text":string}`
+- `ctrl.global` b:`{"action":"back|home|recents|power"}`
+
+Android -> Mac metadata envelope：
+
+- `screen.meta` b:`{"w":int,"h":int,"scale":double,"dpi":int}`
+
+`ctrl.pointer.action == "wheel"` 時 `wheelDy` 表示垂直滾輪量；其他 action 可省略或設為
+`null`。`rightUp` 表示右鍵釋放語意，Android 端以長按 gesture 對應。
+
+### WebRTC Media Plane
+
+螢幕畫面與音訊不進 secure frame 的 64 KB 控制通道。媒體使用 WebRTC：
+
+- Android 螢幕是 video track。
+- Android app 播放音訊 -> Mac 是 audio track。
+- Mac 麥克風 -> Android 喇叭是另一條 audio track。
+- 媒體封包走 P2P DTLS-SRTP；NAT 穿不過時走 TURN。
+
+SDP / ICE signaling 仍是控制平面 envelope，雙向傳送：
+
+- `rtc.offer` b:`{"sdp":string}`
+- `rtc.answer` b:`{"sdp":string}`
+- `rtc.ice` b:`{"mid":string,"index":int,"candidate":string}`
+
+這裡只定義 signaling envelope；WebRTC library、MediaProjection、AudioPlaybackCapture、
+AccessibilityService 的平台實作不屬於本章協定格式。
 
 ### Notification Sync
 

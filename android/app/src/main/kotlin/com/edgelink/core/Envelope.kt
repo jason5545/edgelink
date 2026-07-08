@@ -19,6 +19,16 @@ object EnvelopeTypes {
     const val INPUT_POINTER = "input.pointer"
     const val INPUT_KEY = "input.key"
     const val INPUT_TEXT = "input.text"
+    const val SCREEN_START = "screen.start"
+    const val SCREEN_STOP = "screen.stop"
+    const val SCREEN_META = "screen.meta"
+    const val CTRL_POINTER = "ctrl.pointer"
+    const val CTRL_KEY = "ctrl.key"
+    const val CTRL_TEXT = "ctrl.text"
+    const val CTRL_GLOBAL = "ctrl.global"
+    const val RTC_OFFER = "rtc.offer"
+    const val RTC_ANSWER = "rtc.answer"
+    const val RTC_ICE = "rtc.ice"
     const val CLIPBOARD_SET = "clipboard.set"
     const val NOTIFICATION_POST = "notification.post"
     const val NOTIFICATION_REMOVE = "notification.remove"
@@ -58,6 +68,51 @@ data class InputKeyBody(
 @Serializable
 data class InputTextBody(
     val text: String
+)
+
+@Serializable
+data class ScreenMetaBody(
+    val w: Int,
+    val h: Int,
+    val scale: Double,
+    val dpi: Int
+)
+
+@Serializable
+data class CtrlPointerBody(
+    val x: Int,
+    val y: Int,
+    val action: String,
+    val wheelDy: Int? = null
+)
+
+@Serializable
+data class CtrlKeyBody(
+    val key: String,
+    val down: Boolean,
+    val mods: List<String> = emptyList()
+)
+
+@Serializable
+data class CtrlTextBody(
+    val text: String
+)
+
+@Serializable
+data class CtrlGlobalBody(
+    val action: String
+)
+
+@Serializable
+data class RtcSdpBody(
+    val sdp: String
+)
+
+@Serializable
+data class RtcIceBody(
+    val mid: String,
+    val index: Int,
+    val candidate: String
 )
 
 @Serializable

@@ -24,6 +24,8 @@ import com.edgelink.core.Pairing
 import com.edgelink.core.PairingTypes
 import com.edgelink.core.PairingWire
 import com.edgelink.core.PinnedPeer
+import com.edgelink.core.RtcIceBody
+import com.edgelink.core.RtcSdpBody
 import com.edgelink.core.SodiumHandshakeCrypto
 import com.edgelink.core.WorkerDeviceRegistrar
 import com.edgelink.transport.ByteChannel
@@ -72,6 +74,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
+    private val screenSession = AndroidScreenSession(appContext, ::sendPlaintext)
     @Volatile
     private var lastPongElapsedMs = 0L
     private val stateFlow = MutableStateFlow(
@@ -82,10 +85,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
         )
     )
-    private val dispatcher = AndroidCommandDispatcher(clipboardSync, notificationPresenter) {
-        lastPongElapsedMs = SystemClock.elapsedRealtime()
-        stateFlow.update { it.copy(connectionStatus = "Connected") }
-    }
+    private val dispatcher = AndroidCommandDispatcher(
+        clipboardSync = clipboardSync,
+        notificationPresenter = notificationPresenter,
+        screenSession = screenSession,
+        onPong = {
+            lastPongElapsedMs = SystemClock.elapsedRealtime()
+            stateFlow.update { it.copy(connectionStatus = "Connected") }
+        }
+    )
 
     val state: StateFlow<EdgeLinkUiState> = stateFlow
 
@@ -118,6 +126,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     fun close() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        screenSession.stop()
         session?.close()
         scope.cancel()
     }
@@ -261,6 +270,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         val outbound = body.copy(sourceDeviceId = localIdentity?.deviceId)
         EdgeLinkLog.info("notification.android.local_remove id=${body.id} hasSession=${session != null}")
         sendEnvelope(EnvelopeTypes.NOTIFICATION_REMOVE, outbound)
+    }
+
+    fun onScreenCapturePermissionGranted(resultCode: Int, data: Intent) {
+        screenSession.startWithPermission(resultCode, data)
+    }
+
+    fun onScreenCapturePermissionDenied() {
+        EdgeLinkLog.warn("screen.android.permission_denied")
     }
 
     private suspend fun run() {
@@ -455,6 +472,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             "relay.android.connection_start reason=$reason hostId=${peer.deviceId} clientId=${identity.deviceId} autoReconnect=${stateFlow.value.autoReconnectEnabled}"
         )
         connectionJob?.cancel()
+        screenSession.stop()
         session?.close()
         session = null
         stateFlow.update {
@@ -529,6 +547,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             } catch (error: Throwable) {
                 EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
+                screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled
                 stateFlow.update {
                     it.copy(
@@ -601,10 +620,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     private inline fun <reified T> sendEnvelope(type: String, body: T) {
+        sendPlaintext(EnvelopeCodec.encode(type, body))
+    }
+
+    private fun sendPlaintext(plaintext: ByteArray) {
         val activeSession = session ?: return
         scope.launch(Dispatchers.IO) {
             runCatching {
-                activeSession.sendPlaintext(EnvelopeCodec.encode(type, body))
+                activeSession.sendPlaintext(plaintext)
             }
         }
     }
@@ -613,6 +636,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 private class AndroidCommandDispatcher(
     private val clipboardSync: AndroidClipboardSync,
     private val notificationPresenter: AndroidNotificationPresenter,
+    private val screenSession: AndroidScreenSession,
     private val onPong: () -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
@@ -635,6 +659,24 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.NOTIFICATION_REMOVE -> {
                 val envelope = EnvelopeCodec.decode<NotificationRemoveBody>(plaintext)
                 notificationPresenter.remove(envelope.b)
+                null
+            }
+            EnvelopeTypes.SCREEN_START -> {
+                screenSession.requestStart()
+                null
+            }
+            EnvelopeTypes.SCREEN_STOP -> {
+                screenSession.stop()
+                null
+            }
+            EnvelopeTypes.RTC_ANSWER -> {
+                val envelope = EnvelopeCodec.decode<RtcSdpBody>(plaintext)
+                screenSession.handleAnswer(envelope.b)
+                null
+            }
+            EnvelopeTypes.RTC_ICE -> {
+                val envelope = EnvelopeCodec.decode<RtcIceBody>(plaintext)
+                screenSession.handleIce(envelope.b)
                 null
             }
             else -> null

@@ -2,6 +2,10 @@ name: EdgeLink
 options:
   deploymentTarget:
     macOS: "13.0"
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: "149.0.0"
 targets:
   EdgeLinkKit:
     type: framework
@@ -19,11 +23,55 @@ targets:
       - Sources/App
     dependencies:
       - target: EdgeLinkKit
+      - package: WebRTC
       - sdk: libsqlite3.tbd
+    preBuildScripts:
+      - name: Patch WebRTC macOS Headers
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          DERIVED_DATA_DIR="${BUILD_ROOT%/Build/*}"
+          ARTIFACT_ROOT="$DERIVED_DATA_DIR/SourcePackages/artifacts/webrtc/WebRTC/WebRTC.xcframework"
+          MAC_HEADERS="$BUILT_PRODUCTS_DIR/WebRTC.framework/Headers"
+          CATALYST_HEADERS="$ARTIFACT_ROOT/ios-x86_64_arm64-maccatalyst/WebRTC.framework/Versions/A/Headers"
+          if [ -d "$MAC_HEADERS" ] && [ -d "$CATALYST_HEADERS" ] && [ ! -f "$MAC_HEADERS/RTCAudioSource.h" ]; then
+            /usr/bin/ditto "$CATALYST_HEADERS" "$MAC_HEADERS"
+          fi
+          if [ -f "$MAC_HEADERS/RTCMacros.h" ] && [ ! -f "$MAC_HEADERS/sdk/objc/base/RTCMacros.h" ]; then
+            /bin/mkdir -p "$MAC_HEADERS/sdk/objc/base"
+            /bin/cp "$MAC_HEADERS/RTCMacros.h" "$MAC_HEADERS/sdk/objc/base/RTCMacros.h"
+          fi
+          if [ -d "$MAC_HEADERS" ]; then
+            /bin/cat > "$MAC_HEADERS/WebRTC.h" <<'EOF'
+          #import <WebRTC/RTCMacros.h>
+          #import <WebRTC/RTCCVPixelBuffer.h>
+          #import <WebRTC/RTCConfiguration.h>
+          #import <WebRTC/RTCDataChannel.h>
+          #import <WebRTC/RTCI420Buffer.h>
+          #import <WebRTC/RTCIceCandidate.h>
+          #import <WebRTC/RTCIceServer.h>
+          #import <WebRTC/RTCMediaConstraints.h>
+          #import <WebRTC/RTCMediaStream.h>
+          #import <WebRTC/RTCMediaStreamTrack.h>
+          #import <WebRTC/RTCPeerConnection.h>
+          #import <WebRTC/RTCPeerConnectionFactory.h>
+          #import <WebRTC/RTCRtpReceiver.h>
+          #import <WebRTC/RTCRtpTransceiver.h>
+          #import <WebRTC/RTCSSLAdapter.h>
+          #import <WebRTC/RTCSessionDescription.h>
+          #import <WebRTC/RTCYUVPlanarBuffer.h>
+          #import <WebRTC/RTCVideoFrame.h>
+          #import <WebRTC/RTCVideoFrameBuffer.h>
+          #import <WebRTC/RTCVideoRenderer.h>
+          #import <WebRTC/RTCVideoTrack.h>
+          EOF
+          fi
     settings:
       base:
         CODE_SIGN_STYLE: Automatic
+        CLANG_WARN_INCOMPLETE_UMBRELLA: NO
         DEVELOPMENT_TEAM: MW4GWYGX56
+        OTHER_SWIFT_FLAGS: "$(inherited) -Xcc -Wno-incomplete-umbrella"
         PRODUCT_BUNDLE_IDENTIFIER: com.edgelink.mac
     info:
       path: Sources/App/Info.plist

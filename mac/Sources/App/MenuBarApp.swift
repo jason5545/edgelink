@@ -40,6 +40,13 @@ struct EdgeLinkMacApp: App {
                 )
                 .toggleStyle(.switch)
 
+                Button {
+                    runtime.viewPhoneScreen()
+                } label: {
+                    Label("View Phone Screen", systemImage: "iphone")
+                }
+                .disabled(!runtime.isConnected)
+
                 Divider()
 
                 if runtime.isPairing {

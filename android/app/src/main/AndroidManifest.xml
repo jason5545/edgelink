@@ -5,6 +5,7 @@
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
 
   <application
     android:allowBackup="false"
@@ -18,10 +19,31 @@
         <category android:name="android.intent.category.LAUNCHER" />
       </intent-filter>
     </activity>
+    <activity
+      android:name=".ScreenCapturePermissionActivity"
+      android:excludeFromRecents="true"
+      android:exported="false"
+      android:theme="@style/Theme.EdgeLink.Transparent" />
     <service
       android:name=".EdgeLinkForegroundService"
       android:exported="false"
       android:foregroundServiceType="dataSync" />
+    <service
+      android:name=".ScreenProjectionForegroundService"
+      android:exported="false"
+      android:foregroundServiceType="mediaProjection" />
+    <service
+      android:name=".RemoteInputService"
+      android:exported="true"
+      android:label="@string/remote_input_service_label"
+      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+      </intent-filter>
+      <meta-data
+        android:name="android.accessibilityservice"
+        android:resource="@xml/remote_input_service" />
+    </service>
     <service
       android:name=".AndroidNotificationListenerService"
       android:exported="true"

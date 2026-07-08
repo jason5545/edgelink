@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="remote_input_service_label">EdgeLink Remote Input</string>
+  <string name="remote_input_service_description">Allow EdgeLink to control this phone from your paired Mac.</string>
+</resources>
