@@ -1,0 +1,19 @@
+name = "edgelink-worker"
+main = "src/index.ts"
+compatibility_date = "2026-07-08"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "RegistryDO"
+
+[[durable_objects.bindings]]
+name = "PAIRING"
+class_name = "PairingDO"
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RegistryDO", "PairingDO", "RelayDO"]

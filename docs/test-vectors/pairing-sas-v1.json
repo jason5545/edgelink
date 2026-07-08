@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "algorithm": "SAS = SHA256(hostPk || clientPk || nonceH || nonceC), interpreted as a big-endian integer modulo 1000000",
+  "host": {
+    "deviceId": "949758990",
+    "name": "Jason's Mac",
+    "publicKeyBase64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "nonceBase64": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+  },
+  "client": {
+    "deviceId": "137245816",
+    "name": "Pixel 9",
+    "publicKeyBase64": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+    "nonceBase64": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8="
+  },
+  "commitment": {
+    "algorithm": "SHA256(hostPk || nonceH)",
+    "base64": "GmEr3dD+3U/Bfxizfu8qM7FXrqdyXRB2xrkM7vRepm0=",
+    "hex": "1a612bddd0fedd4fc17f18b37eef2a33b157aea7725d1076c6b90ceef45ea66d"
+  },
+  "sasDigestHex": "4b4d45fb3c8efb1ce8870bbec316d8a6cbb06809d21010ec77d53ec6301fd851",
+  "sas": {
+    "numeric": "260433",
+    "display": "260 433"
+  }
+}

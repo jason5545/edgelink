@@ -1,0 +1,49 @@
+name: EdgeLink
+options:
+  deploymentTarget:
+    macOS: "13.0"
+targets:
+  EdgeLinkKit:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/EdgeLinkKit
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+  EdgeLinkMac:
+    type: application
+    platform: macOS
+    bundleId: com.edgelink.mac
+    sources:
+      - Sources/App
+    dependencies:
+      - target: EdgeLinkKit
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleDisplayName: EdgeLink
+        LSUIElement: true
+        NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
+  EdgeLinkKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/EdgeLinkKitTests
+    dependencies:
+      - target: EdgeLinkKit
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  EdgeLinkKit:
+    build:
+      targets:
+        EdgeLinkKit: all
+    test:
+      targets:
+        - EdgeLinkKitTests
+  EdgeLinkMac:
+    build:
+      targets:
+        EdgeLinkMac: all

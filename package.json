@@ -1,0 +1,9 @@
+{
+  "name": "edgelink",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vectors": "node tools/generate-test-vectors.mjs",
+    "worker:typecheck": "npm --prefix worker run typecheck"
+  }
+}
