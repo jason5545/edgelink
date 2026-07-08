@@ -330,7 +330,7 @@ AEAD：
 解密後 payload 是 UTF-8 JSON：
 
 ```json
-{"t":"input.pointer","b":{"dx":5,"dy":-2,"btn":null}}
+{"t":"input.pointer","b":{"dx":5,"dy":-2,"scrollX":null,"scrollY":null,"btn":null}}
 {"t":"input.key","b":{"key":"a","mods":["cmd"]}}
 {"t":"input.text","b":{"text":"你好"}}
 {"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"..."}}

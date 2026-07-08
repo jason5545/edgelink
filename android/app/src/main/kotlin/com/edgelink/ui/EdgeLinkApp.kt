@@ -1,12 +1,22 @@
 package com.edgelink.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -17,56 +27,222 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.edgelink.core.InputKeyBody
+import com.edgelink.core.InputPointerBody
+import com.edgelink.core.InputTextBody
 
 @Composable
-fun EdgeLinkApp() {
+fun EdgeLinkApp(actions: EdgeLinkActions = EdgeLinkActions.Noop) {
     MaterialTheme {
         Surface {
-            PairingScreen()
+            DeviceControlScreen(actions = actions)
         }
     }
 }
 
+interface EdgeLinkActions {
+    fun onPointer(body: InputPointerBody)
+    fun onKey(body: InputKeyBody)
+    fun onText(body: InputTextBody)
+
+    object Noop : EdgeLinkActions {
+        override fun onPointer(body: InputPointerBody) = Unit
+        override fun onKey(body: InputKeyBody) = Unit
+        override fun onText(body: InputTextBody) = Unit
+    }
+}
+
 @Composable
-fun PairingScreen() {
-    var hostId by remember { mutableStateOf("") }
+fun DeviceControlScreen(actions: EdgeLinkActions) {
+    var text by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("EdgeLink", style = MaterialTheme.typography.headlineMedium)
-
-        OutlinedTextField(
-            value = hostId,
-            onValueChange = { value -> hostId = value.filter(Char::isDigit).take(9) },
-            label = { Text("Mac ID") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            singleLine = true,
-            textStyle = MaterialTheme.typography.headlineSmall.copy(fontFamily = FontFamily.Monospace),
-            modifier = Modifier.fillMaxWidth()
+        DeviceCard(
+            name = "Jason's Mac",
+            deviceId = "949 758 990",
+            status = "Not connected"
         )
 
+        Touchpad(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            onPointer = actions::onPointer
+        )
+
+        KeyboardPanel(
+            text = text,
+            onTextChange = { value -> text = value },
+            onSendText = {
+                if (text.isNotEmpty()) {
+                    actions.onText(InputTextBody(text))
+                    text = ""
+                }
+            },
+            onKey = actions::onKey
+        )
+    }
+}
+
+@Composable
+private fun DeviceCard(name: String, deviceId: String, status: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .background(MaterialTheme.colorScheme.error, RoundedCornerShape(6.dp))
+            )
+            Text(
+                text = status,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         Text(
-            text = "260 433",
-            fontSize = 56.sp,
-            fontFamily = FontFamily.Monospace,
+            text = name,
+            style = MaterialTheme.typography.titleLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = deviceId,
+            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace)
+        )
+    }
+}
+
+@Composable
+private fun Touchpad(
+    modifier: Modifier,
+    onPointer: (InputPointerBody) -> Unit
+) {
+    Box(
+        modifier = modifier
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+            .pointerInput(onPointer) {
+                detectTapGestures(
+                    onTap = { onPointer(InputPointerBody(btn = "left")) },
+                    onDoubleTap = { onPointer(InputPointerBody(btn = "left")) }
+                )
+            }
+            .pointerInput(onPointer) {
+                awaitEachGesture {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.isEmpty()) break
+
+                        if (pressed.size >= 2) {
+                            val average = pressed.averagePositionChange()
+                            if (average != Offset.Zero) {
+                                onPointer(
+                                    InputPointerBody(
+                                        scrollX = (-average.x * 3f).toDouble(),
+                                        scrollY = (-average.y * 3f).toDouble()
+                                    )
+                                )
+                            }
+                        } else {
+                            val delta = pressed.first().positionChange()
+                            if (delta != Offset.Zero) {
+                                onPointer(InputPointerBody(dx = delta.x.toDouble(), dy = delta.y.toDouble()))
+                            }
+                        }
+                        pressed.forEach(PointerInputChange::consume)
+                    }
+                }
+            }
+    )
+}
+
+@Composable
+private fun KeyboardPanel(
+    text: String,
+    onTextChange: (String) -> Unit,
+    onSendText: () -> Unit,
+    onKey: (InputKeyBody) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            listOf("esc", "tab", "delete").forEach { key ->
+                FilledTonalButton(
+                    onClick = { onKey(InputKeyBody(key)) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(key.uppercase())
+                }
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            FilledTonalButton(onClick = { onKey(InputKeyBody("left")) }, modifier = Modifier.weight(1f)) {
+                Text("←")
+            }
+            FilledTonalButton(onClick = { onKey(InputKeyBody("down")) }, modifier = Modifier.weight(1f)) {
+                Text("↓")
+            }
+            FilledTonalButton(onClick = { onKey(InputKeyBody("up")) }, modifier = Modifier.weight(1f)) {
+                Text("↑")
+            }
+            FilledTonalButton(onClick = { onKey(InputKeyBody("right")) }, modifier = Modifier.weight(1f)) {
+                Text("→")
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            FilledTonalButton(onClick = { onKey(InputKeyBody("c", listOf("cmd"))) }, modifier = Modifier.weight(1f)) {
+                Text("⌘C")
+            }
+            FilledTonalButton(onClick = { onKey(InputKeyBody("v", listOf("cmd"))) }, modifier = Modifier.weight(1f)) {
+                Text("⌘V")
+            }
+            FilledTonalButton(onClick = { onKey(InputKeyBody("a", listOf("cmd"))) }, modifier = Modifier.weight(1f)) {
+                Text("⌘A")
+            }
+        }
+
+        OutlinedTextField(
+            value = text,
+            onValueChange = onTextChange,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+            singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
 
         Button(
-            onClick = { },
+            onClick = onSendText,
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
+                .height(64.dp)
         ) {
-            Text("Confirm", fontSize = 28.sp)
+            Text("Send", fontSize = 20.sp)
         }
     }
+}
+
+private fun List<PointerInputChange>.averagePositionChange(): Offset {
+    val total = fold(Offset.Zero) { partial, change -> partial + change.positionChange() }
+    return Offset(total.x / size, total.y / size)
 }
