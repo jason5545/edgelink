@@ -105,6 +105,48 @@ final class HandshakeTests: XCTestCase {
         XCTAssertEqual(decodedConfirm.t, HandshakeType.confirm)
         XCTAssertEqual(try decodedConfirm.b.signature(), signature)
     }
+
+    func testHandshakeSessionFlow() throws {
+        let clientIdentity = LocalIdentity(
+            deviceId: "137245816",
+            name: "Pixel 9",
+            signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: Data(hexString: "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"))
+        )
+        let hostIdentity = LocalIdentity(
+            deviceId: "949758990",
+            name: "Jason's Mac",
+            signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: Data(hexString: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+        )
+        let start = try HandshakeSession.startInitiator(
+            identity: clientIdentity,
+            ephemeralPrivateKey: try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(hexString: "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf")),
+            nonce: Data(base64Encoded: "4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=")!
+        )
+        let ack = try HandshakeSession.acceptHello(
+            start.hello,
+            identity: hostIdentity,
+            pinnedClientPublicKey: clientIdentity.publicKey,
+            ephemeralPrivateKey: try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(hexString: "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")),
+            nonce: Data(base64Encoded: "wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8=")!
+        )
+        let finishedInitiator = try HandshakeSession.finishInitiator(
+            state: start.state,
+            ack: ack.ack,
+            identity: clientIdentity,
+            pinnedHostPublicKey: hostIdentity.publicKey
+        )
+        var clientEstablished = finishedInitiator.established
+        var hostEstablished = try HandshakeSession.finishResponder(
+            state: ack.state,
+            confirm: finishedInitiator.confirm,
+            pinnedClientPublicKey: clientIdentity.publicKey
+        )
+
+        XCTAssertEqual(clientEstablished.keys.initiatorToResponder, hostEstablished.keys.initiatorToResponder)
+        XCTAssertEqual(clientEstablished.keys.responderToInitiator, hostEstablished.keys.responderToInitiator)
+        let ping = Data(#"{"t":"status.ping","b":{}}"#.utf8)
+        XCTAssertEqual(try hostEstablished.channel.open(try clientEstablished.channel.seal(ping)), ping)
+    }
 }
 
 private extension SharedSecret {

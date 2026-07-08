@@ -30,10 +30,13 @@ data class X25519KeyPair(
 class SodiumHandshakeCrypto(
     private val sodium: LazySodiumAndroid = LazySodiumAndroid(SodiumAndroid()),
     private val random: SecureRandom = SecureRandom()
-) {
+) : HandshakeCrypto {
     init {
         sodium.sodiumInit()
     }
+
+    override fun randomBytes(size: Int): ByteArray =
+        ByteArray(size).also(random::nextBytes)
 
     fun randomSeed(): ByteArray =
         ByteArray(Sign.ED25519_SEEDBYTES).also(random::nextBytes)
@@ -57,8 +60,15 @@ class SodiumHandshakeCrypto(
         return signature
     }
 
+    override fun signIdentity(message: ByteArray, identity: LocalIdentity): ByteArray =
+        signDetachedWithSeed(message, identity.privateKeySeed)
+
     fun signDetachedWithSeed(message: ByteArray, seed: ByteArray): ByteArray =
         signDetached(message, ed25519KeyPairFromSeed(seed).secretKey)
+
+    override fun verifyIdentity(signature: ByteArray, message: ByteArray, publicKey: ByteArray): Boolean {
+        return verifyDetached(signature, message, publicKey)
+    }
 
     fun verifyDetached(signature: ByteArray, message: ByteArray, publicKey: ByteArray): Boolean {
         require(signature.size == Sign.ED25519_BYTES) { "Ed25519 signature must be 64 bytes." }
@@ -66,7 +76,7 @@ class SodiumHandshakeCrypto(
         return sodium.cryptoSignVerifyDetached(signature, message, message.size, publicKey)
     }
 
-    fun x25519KeyPair(): X25519KeyPair {
+    override fun x25519KeyPair(): X25519KeyPair {
         val secretKey = ByteArray(DiffieHellman.SCALARMULT_SCALARBYTES).also(random::nextBytes)
         return X25519KeyPair(
             publicKey = x25519PublicKey(secretKey),
@@ -83,7 +93,7 @@ class SodiumHandshakeCrypto(
         return publicKey
     }
 
-    fun x25519SharedSecret(secretKey: ByteArray, publicKey: ByteArray): ByteArray {
+    override fun x25519SharedSecret(secretKey: ByteArray, publicKey: ByteArray): ByteArray {
         require(secretKey.size == DiffieHellman.SCALARMULT_SCALARBYTES) { "X25519 secret key must be 32 bytes." }
         require(publicKey.size == DiffieHellman.SCALARMULT_BYTES) { "X25519 public key must be 32 bytes." }
         val shared = ByteArray(DiffieHellman.SCALARMULT_BYTES)
