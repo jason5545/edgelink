@@ -1,11 +1,14 @@
 package com.edgelink.core
 
+import kotlinx.serialization.Serializable
 import java.util.Base64
 
+@Serializable
 data class RelayAuthEnvelope(
     val t: String = "relay.auth",
     val b: Body
 ) {
+    @Serializable
     data class Body(
         val hostId: String,
         val deviceId: String,

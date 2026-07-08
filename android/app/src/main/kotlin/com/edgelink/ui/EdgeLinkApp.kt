@@ -41,13 +41,24 @@ import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 
 @Composable
-fun EdgeLinkApp(actions: EdgeLinkActions = EdgeLinkActions.Noop) {
+fun EdgeLinkApp(
+    state: EdgeLinkUiState = EdgeLinkUiState(),
+    actions: EdgeLinkActions = EdgeLinkActions.Noop
+) {
     MaterialTheme {
         Surface {
-            DeviceControlScreen(actions = actions)
+            DeviceControlScreen(state = state, actions = actions)
         }
     }
 }
+
+data class EdgeLinkUiState(
+    val localDeviceId: String = "",
+    val peerName: String = "No paired Mac",
+    val peerDeviceId: String = "",
+    val connectionStatus: String = "Starting",
+    val isConnected: Boolean = false
+)
 
 interface EdgeLinkActions {
     fun onPointer(body: InputPointerBody)
@@ -62,7 +73,7 @@ interface EdgeLinkActions {
 }
 
 @Composable
-fun DeviceControlScreen(actions: EdgeLinkActions) {
+fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
     var text by remember { mutableStateOf("") }
 
     Column(
@@ -72,9 +83,10 @@ fun DeviceControlScreen(actions: EdgeLinkActions) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         DeviceCard(
-            name = "Jason's Mac",
-            deviceId = "949 758 990",
-            status = "Not connected"
+            name = state.peerName,
+            deviceId = state.peerDeviceId.ifEmpty { state.localDeviceId },
+            status = state.connectionStatus,
+            connected = state.isConnected
         )
 
         Touchpad(
@@ -99,7 +111,7 @@ fun DeviceControlScreen(actions: EdgeLinkActions) {
 }
 
 @Composable
-private fun DeviceCard(name: String, deviceId: String, status: String) {
+private fun DeviceCard(name: String, deviceId: String, status: String, connected: Boolean) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -111,7 +123,10 @@ private fun DeviceCard(name: String, deviceId: String, status: String) {
             Box(
                 modifier = Modifier
                     .size(12.dp)
-                    .background(MaterialTheme.colorScheme.error, RoundedCornerShape(6.dp))
+                    .background(
+                        if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                        RoundedCornerShape(6.dp)
+                    )
             )
             Text(
                 text = status,

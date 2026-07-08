@@ -3,21 +3,30 @@ import SwiftUI
 
 @main
 struct EdgeLinkMacApp: App {
-    @State private var pairingCode = "260 433"
+    @StateObject private var runtime = EdgeLinkRuntime()
 
     var body: some Scene {
-        MenuBarExtra("EdgeLink", systemImage: "link") {
+        MenuBarExtra("EdgeLink", systemImage: runtime.isConnected ? "link.circle.fill" : "link.circle") {
             VStack(alignment: .leading, spacing: 12) {
                 Text("EdgeLink")
                     .font(.headline)
 
-                Text("ID 949 758 990")
+                Text("ID \(runtime.localDeviceId)")
                     .monospacedDigit()
 
                 Divider()
 
-                PairingView(sasDisplay: pairingCode) {
-                    // M1 wires this to pin the peer key after both confirmations arrive.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(runtime.connectionStatus)
+                        .font(.subheadline)
+                    Text(runtime.peerName)
+                        .lineLimit(1)
+                    if !runtime.peerDeviceId.isEmpty {
+                        Text(runtime.peerDeviceId)
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .padding()

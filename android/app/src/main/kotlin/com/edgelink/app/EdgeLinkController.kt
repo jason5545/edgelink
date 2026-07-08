@@ -1,0 +1,230 @@
+package com.edgelink.app
+
+import android.content.Context
+import android.os.Build
+import com.edgelink.core.ClipboardSetBody
+import com.edgelink.core.DeviceId
+import com.edgelink.core.EmptyBody
+import com.edgelink.core.EnvelopeCodec
+import com.edgelink.core.EnvelopeTypes
+import com.edgelink.core.InputKeyBody
+import com.edgelink.core.InputPointerBody
+import com.edgelink.core.InputTextBody
+import com.edgelink.core.LocalIdentity
+import com.edgelink.core.PinnedPeer
+import com.edgelink.core.SodiumHandshakeCrypto
+import com.edgelink.core.WorkerDeviceRegistrar
+import com.edgelink.transport.RelayTransport
+import com.edgelink.transport.SecureSessionClient
+import com.edgelink.ui.EdgeLinkActions
+import com.edgelink.ui.EdgeLinkUiState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
+
+class EdgeLinkController(context: Context) : EdgeLinkActions {
+    private val appContext = context.applicationContext
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val crypto = SodiumHandshakeCrypto()
+    private val identityStore = SharedPreferencesIdentityStore(appContext)
+    private val pairingStore = SharedPreferencesPairingStore(appContext)
+    private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
+    private val relayTransport = RelayTransport(crypto = crypto)
+    private val clipboardSync = AndroidClipboardSync(appContext)
+    private val stateFlow = MutableStateFlow(EdgeLinkUiState())
+    private val dispatcher = AndroidCommandDispatcher(clipboardSync) {
+        stateFlow.update { it.copy(connectionStatus = "Connected") }
+    }
+
+    val state: StateFlow<EdgeLinkUiState> = stateFlow
+
+    @Volatile
+    private var session: SecureSessionClient? = null
+
+    init {
+        scope.launch {
+            run()
+        }
+    }
+
+    fun close() {
+        scope.cancel()
+    }
+
+    override fun onPointer(body: InputPointerBody) {
+        sendEnvelope(EnvelopeTypes.INPUT_POINTER, body)
+    }
+
+    override fun onKey(body: InputKeyBody) {
+        sendEnvelope(EnvelopeTypes.INPUT_KEY, body)
+    }
+
+    override fun onText(body: InputTextBody) {
+        sendEnvelope(EnvelopeTypes.INPUT_TEXT, body)
+    }
+
+    private suspend fun run() {
+        try {
+            stateFlow.update { it.copy(connectionStatus = "Registering") }
+            val identity = loadOrRegisterIdentity()
+            stateFlow.update { it.copy(localDeviceId = DeviceId.display(identity.deviceId)) }
+
+            val peer = pairingStore.loadPeers().firstOrNull()
+            if (peer == null) {
+                stateFlow.update { it.copy(connectionStatus = "No paired Mac") }
+                return
+            }
+
+            stateFlow.update {
+                it.copy(
+                    peerName = peer.name,
+                    peerDeviceId = DeviceId.display(peer.deviceId)
+                )
+            }
+            connectLoop(identity, peer)
+        } catch (_: Throwable) {
+            session = null
+            stateFlow.update {
+                it.copy(connectionStatus = "Setup failed", isConnected = false)
+            }
+        }
+    }
+
+    private suspend fun loadOrRegisterIdentity(): LocalIdentity =
+        withContext(Dispatchers.IO) {
+            identityStore.loadIdentity()?.let { return@withContext it }
+
+            val seed = crypto.randomSeed()
+            val keyPair = crypto.ed25519KeyPairFromSeed(seed)
+            val name = listOf(Build.MANUFACTURER, Build.MODEL)
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+                .ifBlank { "Android" }
+            val deviceId = registrar.register(
+                publicKey = keyPair.publicKey,
+                name = name,
+                platform = "android"
+            )
+            LocalIdentity(
+                deviceId = deviceId,
+                name = name,
+                publicKey = keyPair.publicKey,
+                privateKeySeed = seed
+            ).also(identityStore::saveIdentity)
+        }
+
+    private suspend fun connectLoop(identity: LocalIdentity, peer: PinnedPeer) {
+        var retryDelayMs = 1_000L
+
+        while (coroutineContext.isActive) {
+            try {
+                stateFlow.update { it.copy(connectionStatus = "Connecting relay", isConnected = false) }
+                val channel = relayTransport.connect(
+                    relayUrl = EdgeLinkConfig.relayUrl,
+                    hostId = peer.deviceId,
+                    identity = identity
+                )
+                val nextSession = SecureSessionClient(
+                    channel = channel,
+                    identity = identity,
+                    peer = peer,
+                    crypto = crypto
+                )
+
+                stateFlow.update { it.copy(connectionStatus = "Handshaking") }
+                nextSession.connect()
+                session = nextSession
+                retryDelayMs = 1_000L
+                stateFlow.update { it.copy(connectionStatus = "Connected", isConnected = true) }
+
+                coroutineScope {
+                    val pingJob = launch { pingLoop(nextSession) }
+                    val clipboardJob = launch { clipboardLoop(nextSession) }
+                    try {
+                        nextSession.receiveLoop(dispatcher::handle)
+                    } finally {
+                        pingJob.cancelAndJoin()
+                        clipboardJob.cancelAndJoin()
+                    }
+                }
+            } catch (_: Throwable) {
+                session = null
+                stateFlow.update { it.copy(connectionStatus = "Disconnected", isConnected = false) }
+                delay(retryDelayMs)
+                retryDelayMs = (retryDelayMs * 2).coerceAtMost(30_000L)
+            }
+        }
+    }
+
+    private suspend fun pingLoop(activeSession: SecureSessionClient) {
+        while (coroutineContext.isActive) {
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.STATUS_PING, EmptyBody))
+            delay(5_000)
+        }
+    }
+
+    private suspend fun clipboardLoop(activeSession: SecureSessionClient) {
+        while (coroutineContext.isActive) {
+            val snapshot = clipboardSync.pollLocalText()
+            if (snapshot != null) {
+                activeSession.sendPlaintext(
+                    EnvelopeCodec.encode(
+                        EnvelopeTypes.CLIPBOARD_SET,
+                        ClipboardSetBody(
+                            text = snapshot.text,
+                            ts = snapshot.timestampSeconds,
+                            hash = snapshot.hash
+                        )
+                    )
+                )
+            }
+            delay(700)
+        }
+    }
+
+    private inline fun <reified T> sendEnvelope(type: String, body: T) {
+        val activeSession = session ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                activeSession.sendPlaintext(EnvelopeCodec.encode(type, body))
+            }
+        }
+    }
+}
+
+private class AndroidCommandDispatcher(
+    private val clipboardSync: AndroidClipboardSync,
+    private val onPong: () -> Unit
+) {
+    suspend fun handle(plaintext: ByteArray): ByteArray? {
+        return when (EnvelopeCodec.type(plaintext)) {
+            EnvelopeTypes.STATUS_PING -> EnvelopeCodec.encode(EnvelopeTypes.STATUS_PONG, EmptyBody)
+            EnvelopeTypes.STATUS_PONG -> {
+                onPong()
+                null
+            }
+            EnvelopeTypes.CLIPBOARD_SET -> {
+                val envelope = EnvelopeCodec.decode<ClipboardSetBody>(plaintext)
+                clipboardSync.applyRemoteText(envelope.b.text, envelope.b.hash)
+                null
+            }
+            else -> null
+        }
+    }
+}
+
+object EdgeLinkConfig {
+    const val workerBaseUrl = "https://edgelink-worker.black-hill-f944.workers.dev"
+    const val relayUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect"
+}
