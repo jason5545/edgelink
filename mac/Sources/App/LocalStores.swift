@@ -4,6 +4,7 @@ import Foundation
 import Security
 
 final class KeychainIdentityStore: IdentityStore, @unchecked Sendable {
+    private static let currentStorageVersion = 2
     private let service = "com.edgelink.identity"
     private let account = "local"
     private let encoder = JSONEncoder()
@@ -27,15 +28,25 @@ final class KeychainIdentityStore: IdentityStore, @unchecked Sendable {
         guard let keyData = Data(base64Encoded: stored.signingKey) else {
             throw LocalStoreError.invalidIdentityData
         }
-        return try LocalIdentity(
+        let identity = try LocalIdentity(
             deviceId: stored.deviceId,
             name: stored.name,
             signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: keyData)
         )
+        if stored.storageVersion != Self.currentStorageVersion {
+            do {
+                try saveIdentity(identity)
+                DiagnosticsLog.info("keychain.mac.identity_migrated version=\(Self.currentStorageVersion)")
+            } catch {
+                DiagnosticsLog.error("keychain.mac.identity_migration_failed", error)
+            }
+        }
+        return identity
     }
 
     func saveIdentity(_ identity: LocalIdentity) throws {
         let stored = StoredIdentity(
+            storageVersion: Self.currentStorageVersion,
             deviceId: identity.deviceId,
             name: identity.name,
             signingKey: identity.signingKey.rawRepresentation.base64EncodedString()
@@ -45,6 +56,7 @@ final class KeychainIdentityStore: IdentityStore, @unchecked Sendable {
 
         var query = baseQuery()
         query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw LocalStoreError.keychain(status)
@@ -99,6 +111,7 @@ final class ApplicationSupportPairingStore: PairingStore, @unchecked Sendable {
 }
 
 private struct StoredIdentity: Codable {
+    let storageVersion: Int?
     let deviceId: String
     let name: String
     let signingKey: String
