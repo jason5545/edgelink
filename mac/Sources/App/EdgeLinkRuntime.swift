@@ -115,6 +115,10 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.openAndStart()
     }
 
+    func stopPhoneScreen() {
+        screenSession.closeWindow(sendRemoteStop: isConnected)
+    }
+
     func sendSms(to rawRecipient: String, text rawText: String) {
         let recipient = rawRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)

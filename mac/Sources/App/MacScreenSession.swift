@@ -41,6 +41,11 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     func openAndStart() {
         showWindow()
+        if peerConnection != nil {
+            status = hasRemoteVideo ? "Connected" : status
+            DiagnosticsLog.info("screen.mac.window_shown_existing_session")
+            return
+        }
         status = "Starting"
         sendEnvelope(type: EnvelopeType.screenStart, body: EmptyBody())
     }
@@ -375,8 +380,18 @@ final class MacScreenSession: NSObject, ObservableObject {
 }
 
 extension MacScreenSession: NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !isClosingWindow else {
+            return true
+        }
+        sender.orderOut(nil)
+        DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
+        return false
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard !isClosingWindow else {
+            window = nil
             return
         }
         stop(sendRemoteStop: true)

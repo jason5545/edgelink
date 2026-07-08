@@ -49,6 +49,13 @@ struct EdgeLinkMacApp: App {
                 }
                 .disabled(!runtime.isConnected)
 
+                Button {
+                    runtime.stopPhoneScreen()
+                } label: {
+                    Label("Stop Phone Screen", systemImage: "stop.circle")
+                }
+                .disabled(!runtime.isConnected)
+
                 Divider()
 
                 VStack(alignment: .leading, spacing: 8) {

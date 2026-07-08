@@ -21,6 +21,8 @@ import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
+import org.webrtc.RtpParameters
+import org.webrtc.RtpSender
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SdpObserver
@@ -70,10 +72,15 @@ class AndroidScreenSession(
             val localCapturer = ScreenCapturerAndroid(data, projectionCallback())
             capturer = localCapturer
 
-            val localVideoSource = localFactory.createVideoSource(false)
+            val captureSize = captureSizeFor(meta)
+            EdgeLinkLog.info(
+                "screen.android.capture_start source=${meta.w}x${meta.h} capture=${captureSize.width}x${captureSize.height} fps=$SCREEN_FPS"
+            )
+
+            val localVideoSource = localFactory.createVideoSource(true)
             videoSource = localVideoSource
             localCapturer.initialize(helper, appContext, localVideoSource.capturerObserver)
-            localCapturer.startCapture(meta.w, meta.h, SCREEN_FPS)
+            localCapturer.startCapture(captureSize.width, captureSize.height, SCREEN_FPS)
 
             val track = localFactory.createVideoTrack(SCREEN_VIDEO_TRACK_ID, localVideoSource)
             track.setEnabled(true)
@@ -81,7 +88,8 @@ class AndroidScreenSession(
 
             val pc = createPeerConnection(localFactory)
             peerConnection = pc
-            pc.addTrack(track, listOf(SCREEN_STREAM_ID))
+            val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
+            configureVideoQuality(pc, sender)
             createOffer(pc)
         } catch (error: Throwable) {
             EdgeLinkLog.error("screen.android.start_failed", error)
@@ -157,6 +165,32 @@ class AndroidScreenSession(
         }
         return localFactory.createPeerConnection(config, peerObserver())
             ?: error("Unable to create PeerConnection.")
+    }
+
+    private fun configureVideoQuality(pc: PeerConnection, sender: RtpSender?) {
+        val bitrateApplied = pc.setBitrate(
+            SCREEN_MIN_BITRATE_BPS,
+            SCREEN_START_BITRATE_BPS,
+            SCREEN_MAX_BITRATE_BPS
+        )
+        val parameters = sender?.parameters
+        if (parameters != null) {
+            parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
+            parameters.encodings.forEach { encoding ->
+                encoding.minBitrateBps = SCREEN_MIN_BITRATE_BPS
+                encoding.maxBitrateBps = SCREEN_MAX_BITRATE_BPS
+                encoding.maxFramerate = SCREEN_FPS
+                encoding.scaleResolutionDownBy = 1.0
+            }
+        }
+        val senderApplied = if (sender != null && parameters != null) {
+            sender.setParameters(parameters)
+        } else {
+            false
+        }
+        EdgeLinkLog.info(
+            "screen.android.quality bitrateApplied=$bitrateApplied senderApplied=$senderApplied min=$SCREEN_MIN_BITRATE_BPS start=$SCREEN_START_BITRATE_BPS max=$SCREEN_MAX_BITRATE_BPS"
+        )
     }
 
     private fun createOffer(pc: PeerConnection) {
@@ -260,6 +294,29 @@ class AndroidScreenSession(
         )
     }
 
+    private fun captureSizeFor(meta: ScreenMetaBody): CaptureSize {
+        val maxDimension = maxOf(meta.w, meta.h)
+        if (maxDimension <= SCREEN_MAX_CAPTURE_LONG_EDGE) {
+            return CaptureSize(meta.w.evenAtLeastTwo(), meta.h.evenAtLeastTwo())
+        }
+
+        val scale = SCREEN_MAX_CAPTURE_LONG_EDGE.toDouble() / maxDimension.toDouble()
+        return CaptureSize(
+            width = (meta.w * scale).toInt().evenAtLeastTwo(),
+            height = (meta.h * scale).toInt().evenAtLeastTwo()
+        )
+    }
+
+    private fun Int.evenAtLeastTwo(): Int {
+        val value = coerceAtLeast(2)
+        return if (value % 2 == 0) value else value - 1
+    }
+
+    private data class CaptureSize(
+        val width: Int,
+        val height: Int
+    )
+
     private class LoggingSdpObserver(private val label: String) : SdpObserver {
         override fun onCreateSuccess(description: SessionDescription) = Unit
         override fun onSetSuccess() {
@@ -277,6 +334,10 @@ class AndroidScreenSession(
 
     companion object {
         private const val SCREEN_FPS = 30
+        private const val SCREEN_MIN_BITRATE_BPS = 3_500_000
+        private const val SCREEN_START_BITRATE_BPS = 10_000_000
+        private const val SCREEN_MAX_BITRATE_BPS = 16_000_000
+        private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 2560
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
