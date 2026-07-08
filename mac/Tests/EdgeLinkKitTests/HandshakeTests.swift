@@ -87,6 +87,24 @@ final class HandshakeTests: XCTestCase {
         XCTAssertEqual(try responder.open(try initiator.seal(ping)), ping)
         XCTAssertEqual(try initiator.open(try responder.seal(pong)), pong)
     }
+
+    func testHandshakeWireRoundTrip() throws {
+        let peer = HandshakePeer(
+            deviceId: "137245816",
+            ephemeralPublicKey: Data(base64Encoded: "YFpyXSpK3+6xop4X7dYhwbdZPujNvESsbEq24vgF0jw=")!,
+            nonce: Data(base64Encoded: "4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=")!
+        )
+        let signature = Data(base64Encoded: "m/A8bxR+o8B8VqjoTHUnvYuFOP9+RDWNgDbBjthMiqbLYSWa5up+LEoRn45yaZcQOTEOr/kI+ri1EaHv0Tl3Bg==")!
+        let decodedHello = try HandshakeWire.decodeSignedPeer(try HandshakeWire.encodeHello(peer: peer, signature: signature))
+
+        XCTAssertEqual(decodedHello.t, HandshakeType.hello)
+        XCTAssertEqual(try decodedHello.b.peer(), peer)
+        XCTAssertEqual(try decodedHello.b.signature(), signature)
+
+        let decodedConfirm = try HandshakeWire.decodeConfirm(try HandshakeWire.encodeConfirm(signature: signature))
+        XCTAssertEqual(decodedConfirm.t, HandshakeType.confirm)
+        XCTAssertEqual(try decodedConfirm.b.signature(), signature)
+    }
 }
 
 private extension SharedSecret {

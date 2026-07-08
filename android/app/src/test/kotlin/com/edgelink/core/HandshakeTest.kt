@@ -82,6 +82,27 @@ class HandshakeTest {
         assertArrayEquals(pong, initiator.open(responder.seal(pong)))
     }
 
+    @Test
+    fun handshakeWireRoundTrip() {
+        val peer = HandshakePeer(
+            deviceId = "137245816",
+            ephemeralPublicKey = b64("YFpyXSpK3+6xop4X7dYhwbdZPujNvESsbEq24vgF0jw="),
+            nonce = b64("4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=")
+        )
+        val signature = b64("m/A8bxR+o8B8VqjoTHUnvYuFOP9+RDWNgDbBjthMiqbLYSWa5up+LEoRn45yaZcQOTEOr/kI+ri1EaHv0Tl3Bg==")
+        val decodedHello = HandshakeWire.decodeSignedPeer(HandshakeWire.encodeHello(peer, signature))
+
+        assertEquals(HandshakeTypes.HELLO, decodedHello.t)
+        assertEquals(peer.deviceId, decodedHello.b.peer().deviceId)
+        assertArrayEquals(peer.ephemeralPublicKey, decodedHello.b.peer().ephemeralPublicKey)
+        assertArrayEquals(peer.nonce, decodedHello.b.peer().nonce)
+        assertArrayEquals(signature, decodedHello.b.signature())
+
+        val decodedConfirm = HandshakeWire.decodeConfirm(HandshakeWire.encodeConfirm(signature))
+        assertEquals(HandshakeTypes.CONFIRM, decodedConfirm.t)
+        assertArrayEquals(signature, decodedConfirm.b.signature())
+    }
+
     private fun b64(value: String): ByteArray = Base64.getDecoder().decode(value)
 
     private fun hex(value: String): ByteArray {

@@ -53,6 +53,93 @@ public enum HandshakeEncoding {
     }
 }
 
+public enum HandshakeType {
+    public static let hello = "hs.hello"
+    public static let ack = "hs.ack"
+    public static let confirm = "hs.confirm"
+}
+
+public struct HandshakeSignedPeerBody: Codable, Equatable, Sendable {
+    public let deviceId: String
+    public let ephPk: String
+    public let nonce: String
+    public let sig: String
+
+    public init(deviceId: String, ephPk: String, nonce: String, sig: String) {
+        self.deviceId = deviceId
+        self.ephPk = ephPk
+        self.nonce = nonce
+        self.sig = sig
+    }
+
+    public init(peer: HandshakePeer, signature: Data) {
+        self.deviceId = peer.deviceId
+        self.ephPk = peer.ephemeralPublicKey.base64EncodedString()
+        self.nonce = peer.nonce.base64EncodedString()
+        self.sig = signature.base64EncodedString()
+    }
+
+    public func peer() throws -> HandshakePeer {
+        guard let ephemeralPublicKey = Data(base64Encoded: ephPk),
+              let nonceData = Data(base64Encoded: nonce) else {
+            throw HandshakeWireError.invalidBase64
+        }
+        return HandshakePeer(
+            deviceId: deviceId,
+            ephemeralPublicKey: ephemeralPublicKey,
+            nonce: nonceData
+        )
+    }
+
+    public func signature() throws -> Data {
+        guard let data = Data(base64Encoded: sig) else {
+            throw HandshakeWireError.invalidBase64
+        }
+        return data
+    }
+}
+
+public struct HandshakeConfirmBody: Codable, Equatable, Sendable {
+    public let sig: String
+
+    public init(signature: Data) {
+        self.sig = signature.base64EncodedString()
+    }
+
+    public func signature() throws -> Data {
+        guard let data = Data(base64Encoded: sig) else {
+            throw HandshakeWireError.invalidBase64
+        }
+        return data
+    }
+}
+
+public enum HandshakeWire {
+    public static func encodeHello(peer: HandshakePeer, signature: Data) throws -> Data {
+        try JSONEncoder().encode(Envelope(t: HandshakeType.hello, b: HandshakeSignedPeerBody(peer: peer, signature: signature)))
+    }
+
+    public static func encodeAck(peer: HandshakePeer, signature: Data) throws -> Data {
+        try JSONEncoder().encode(Envelope(t: HandshakeType.ack, b: HandshakeSignedPeerBody(peer: peer, signature: signature)))
+    }
+
+    public static func encodeConfirm(signature: Data) throws -> Data {
+        try JSONEncoder().encode(Envelope(t: HandshakeType.confirm, b: HandshakeConfirmBody(signature: signature)))
+    }
+
+    public static func decodeSignedPeer(_ data: Data) throws -> Envelope<HandshakeSignedPeerBody> {
+        try JSONDecoder().decode(Envelope<HandshakeSignedPeerBody>.self, from: data)
+    }
+
+    public static func decodeConfirm(_ data: Data) throws -> Envelope<HandshakeConfirmBody> {
+        try JSONDecoder().decode(Envelope<HandshakeConfirmBody>.self, from: data)
+    }
+}
+
+public enum HandshakeWireError: Error {
+    case invalidBase64
+}
+
 public struct HandshakeTranscript: Equatable, Sendable {
     public let clientPeer: HandshakePeer
     public let hostPeer: HandshakePeer

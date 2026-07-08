@@ -2,8 +2,10 @@ package com.edgelink.core
 
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
+import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import kotlinx.serialization.Serializable
 
 data class HandshakePeer(
     val deviceId: String,
@@ -58,6 +60,70 @@ object HandshakeEncoding {
 
     private fun sha256(value: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(value)
+}
+
+object HandshakeTypes {
+    const val HELLO = "hs.hello"
+    const val ACK = "hs.ack"
+    const val CONFIRM = "hs.confirm"
+}
+
+@Serializable
+data class HandshakeSignedPeerBody(
+    val deviceId: String,
+    val ephPk: String,
+    val nonce: String,
+    val sig: String
+) {
+    fun peer(): HandshakePeer =
+        HandshakePeer(
+            deviceId = deviceId,
+            ephemeralPublicKey = Base64.getDecoder().decode(ephPk),
+            nonce = Base64.getDecoder().decode(nonce)
+        )
+
+    fun signature(): ByteArray =
+        Base64.getDecoder().decode(sig)
+
+    companion object {
+        fun from(peer: HandshakePeer, signature: ByteArray): HandshakeSignedPeerBody =
+            HandshakeSignedPeerBody(
+                deviceId = peer.deviceId,
+                ephPk = Base64.getEncoder().encodeToString(peer.ephemeralPublicKey),
+                nonce = Base64.getEncoder().encodeToString(peer.nonce),
+                sig = Base64.getEncoder().encodeToString(signature)
+            )
+    }
+}
+
+@Serializable
+data class HandshakeConfirmBody(
+    val sig: String
+) {
+    fun signature(): ByteArray =
+        Base64.getDecoder().decode(sig)
+
+    companion object {
+        fun from(signature: ByteArray): HandshakeConfirmBody =
+            HandshakeConfirmBody(Base64.getEncoder().encodeToString(signature))
+    }
+}
+
+object HandshakeWire {
+    fun encodeHello(peer: HandshakePeer, signature: ByteArray): ByteArray =
+        EnvelopeCodec.encode(HandshakeTypes.HELLO, HandshakeSignedPeerBody.from(peer, signature))
+
+    fun encodeAck(peer: HandshakePeer, signature: ByteArray): ByteArray =
+        EnvelopeCodec.encode(HandshakeTypes.ACK, HandshakeSignedPeerBody.from(peer, signature))
+
+    fun encodeConfirm(signature: ByteArray): ByteArray =
+        EnvelopeCodec.encode(HandshakeTypes.CONFIRM, HandshakeConfirmBody.from(signature))
+
+    fun decodeSignedPeer(bytes: ByteArray): Envelope<HandshakeSignedPeerBody> =
+        EnvelopeCodec.decode(bytes)
+
+    fun decodeConfirm(bytes: ByteArray): Envelope<HandshakeConfirmBody> =
+        EnvelopeCodec.decode(bytes)
 }
 
 data class HandshakeTranscript(
