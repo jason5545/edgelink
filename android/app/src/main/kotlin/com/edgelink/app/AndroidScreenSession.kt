@@ -8,10 +8,6 @@ import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.EnvelopeTypes
-import com.edgelink.core.CtrlGlobalBody
-import com.edgelink.core.CtrlKeyBody
-import com.edgelink.core.CtrlPointerBody
-import com.edgelink.core.CtrlTextBody
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
 import com.edgelink.core.ScreenMetaBody
@@ -34,7 +30,6 @@ import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoCapturer
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidScreenSession(
@@ -47,7 +42,6 @@ class AndroidScreenSession(
     private var peerConnection: PeerConnection? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
     private var capturer: VideoCapturer? = null
-    private var inputDataChannel: DataChannel? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private val isStopping = AtomicBoolean(false)
@@ -94,7 +88,6 @@ class AndroidScreenSession(
 
             val pc = createPeerConnection(localFactory)
             peerConnection = pc
-            inputDataChannel = createInputDataChannel(pc)
             val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
             configureVideoQuality(pc, sender)
             createOffer(pc)
@@ -133,10 +126,6 @@ class AndroidScreenSession(
         runCatching { capturer?.stopCapture() }
         runCatching { capturer?.dispose() }
         capturer = null
-        runCatching { inputDataChannel?.unregisterObserver() }
-        runCatching { inputDataChannel?.close() }
-        runCatching { inputDataChannel?.dispose() }
-        inputDataChannel = null
         videoTrack?.dispose()
         videoTrack = null
         videoSource?.dispose()
@@ -176,65 +165,6 @@ class AndroidScreenSession(
         }
         return localFactory.createPeerConnection(config, peerObserver())
             ?: error("Unable to create PeerConnection.")
-    }
-
-    private fun createInputDataChannel(pc: PeerConnection): DataChannel {
-        val channel = pc.createDataChannel(
-            INPUT_DATA_CHANNEL_LABEL,
-            DataChannel.Init().apply {
-                ordered = true
-            }
-        )
-        registerInputDataChannel(channel)
-        return channel
-    }
-
-    private fun registerInputDataChannel(channel: DataChannel) {
-        EdgeLinkLog.info("screen.android.input_channel_created label=${channel.label()} state=${channel.state()}")
-        channel.registerObserver(
-            object : DataChannel.Observer {
-                override fun onBufferedAmountChange(previousAmount: Long) = Unit
-
-                override fun onStateChange() {
-                    EdgeLinkLog.info("screen.android.input_channel state=${channel.state()}")
-                }
-
-                override fun onMessage(buffer: DataChannel.Buffer) {
-                    handleInputDataChannelMessage(buffer)
-                }
-            }
-        )
-    }
-
-    private fun handleInputDataChannelMessage(buffer: DataChannel.Buffer) {
-        if (!buffer.binary) {
-            EdgeLinkLog.warn("screen.android.input_channel_ignored non_binary")
-            return
-        }
-        val plaintext = buffer.data.copyRemainingBytes()
-        runCatching {
-            when (EnvelopeCodec.type(plaintext)) {
-                EnvelopeTypes.CTRL_POINTER -> {
-                    val envelope = EnvelopeCodec.decode<CtrlPointerBody>(plaintext)
-                    RemoteInputService.dispatchPointer(envelope.b)
-                }
-                EnvelopeTypes.CTRL_GLOBAL -> {
-                    val envelope = EnvelopeCodec.decode<CtrlGlobalBody>(plaintext)
-                    RemoteInputService.dispatchGlobal(envelope.b)
-                }
-                EnvelopeTypes.CTRL_TEXT -> {
-                    val envelope = EnvelopeCodec.decode<CtrlTextBody>(plaintext)
-                    RemoteInputService.dispatchText(envelope.b)
-                }
-                EnvelopeTypes.CTRL_KEY -> {
-                    val envelope = EnvelopeCodec.decode<CtrlKeyBody>(plaintext)
-                    RemoteInputService.dispatchKey(envelope.b)
-                }
-                else -> EdgeLinkLog.warn("screen.android.input_channel_ignored type=${EnvelopeCodec.type(plaintext)}")
-            }
-        }.onFailure { error ->
-            EdgeLinkLog.error("screen.android.input_channel_decode_failed bytes=${plaintext.size}", error)
-        }
     }
 
     private fun configureVideoQuality(pc: PeerConnection, sender: RtpSender?) {
@@ -330,13 +260,7 @@ class AndroidScreenSession(
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
             override fun onAddStream(stream: MediaStream) = Unit
             override fun onRemoveStream(stream: MediaStream) = Unit
-            override fun onDataChannel(dataChannel: DataChannel) {
-                EdgeLinkLog.info("screen.android.remote_data_channel label=${dataChannel.label()}")
-                if (dataChannel.label() == INPUT_DATA_CHANNEL_LABEL && inputDataChannel == null) {
-                    inputDataChannel = dataChannel
-                    registerInputDataChannel(dataChannel)
-                }
-            }
+            override fun onDataChannel(dataChannel: DataChannel) = Unit
             override fun onRenegotiationNeeded() = Unit
             override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) = Unit
         }
@@ -393,13 +317,6 @@ class AndroidScreenSession(
         val height: Int
     )
 
-    private fun ByteBuffer.copyRemainingBytes(): ByteArray {
-        val duplicate = slice()
-        val bytes = ByteArray(duplicate.remaining())
-        duplicate.get(bytes)
-        return bytes
-    }
-
     private class LoggingSdpObserver(private val label: String) : SdpObserver {
         override fun onCreateSuccess(description: SessionDescription) = Unit
         override fun onSetSuccess() {
@@ -423,7 +340,6 @@ class AndroidScreenSession(
         private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 2560
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
-        private const val INPUT_DATA_CHANNEL_LABEL = "input"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
         private val initialized = AtomicBoolean(false)
 
