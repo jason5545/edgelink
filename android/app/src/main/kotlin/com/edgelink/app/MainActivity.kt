@@ -35,7 +35,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         EdgeLinkForegroundService.ensureStarted(applicationContext)
         controller = EdgeLinkRuntimeHolder.getOrCreate(applicationContext)
-        actions = EdgeLinkActivityActions(controller, ::handleNotificationSyncChange, ::handleOpenNotificationSettings)
+        actions = EdgeLinkActivityActions(
+            controller,
+            ::handleNotificationSyncChange,
+            ::handleOpenNotificationSettings,
+            ::handleOpenRemoteInputSettings
+        )
         setContent {
             val state by controller.state.collectAsState()
             EdgeLinkApp(state = state, actions = actions)
@@ -60,6 +65,10 @@ class MainActivity : ComponentActivity() {
         } else {
             openNotificationSettingsIfNeeded(force = true)
         }
+    }
+
+    private fun handleOpenRemoteInputSettings() {
+        controller.onOpenRemoteInputSettings()
     }
 
     private fun ensureNotificationPermissions() {
@@ -100,7 +109,8 @@ class MainActivity : ComponentActivity() {
 private class EdgeLinkActivityActions(
     private val delegate: EdgeLinkController,
     private val notificationSyncChangeHandler: (Boolean) -> Unit,
-    private val openNotificationSettingsHandler: () -> Unit
+    private val openNotificationSettingsHandler: () -> Unit,
+    private val openRemoteInputSettingsHandler: () -> Unit
 ) : EdgeLinkActions {
     override fun onPointer(body: InputPointerBody) = delegate.onPointer(body)
     override fun onKey(body: InputKeyBody) = delegate.onKey(body)
@@ -113,4 +123,5 @@ private class EdgeLinkActivityActions(
     override fun onAutoReconnectChange(enabled: Boolean) = delegate.onAutoReconnectChange(enabled)
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
+    override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
 }

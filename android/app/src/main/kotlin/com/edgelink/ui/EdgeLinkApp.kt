@@ -67,6 +67,7 @@ data class EdgeLinkUiState(
     val canConfirmPairing: Boolean = false,
     val autoReconnectEnabled: Boolean = true,
     val notificationSyncEnabled: Boolean = true,
+    val remoteInputAccessGranted: Boolean = false,
     val notificationAccessGranted: Boolean = false,
     val notificationPostGranted: Boolean = true
 )
@@ -83,6 +84,7 @@ interface EdgeLinkActions {
     fun onAutoReconnectChange(enabled: Boolean)
     fun onNotificationSyncChange(enabled: Boolean)
     fun onOpenNotificationSettings()
+    fun onOpenRemoteInputSettings()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -96,6 +98,7 @@ interface EdgeLinkActions {
         override fun onAutoReconnectChange(enabled: Boolean) = Unit
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onOpenNotificationSettings() = Unit
+        override fun onOpenRemoteInputSettings() = Unit
     }
 }
 
@@ -117,12 +120,14 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             hasPeer = state.peerDeviceId.isNotEmpty(),
             autoReconnectEnabled = state.autoReconnectEnabled,
             notificationSyncEnabled = state.notificationSyncEnabled,
+            remoteInputAccessGranted = state.remoteInputAccessGranted,
             notificationAccessGranted = state.notificationAccessGranted,
             notificationPostGranted = state.notificationPostGranted,
             onReconnect = actions::onReconnect,
             onAutoReconnectChange = actions::onAutoReconnectChange,
             onNotificationSyncChange = actions::onNotificationSyncChange,
-            onOpenNotificationSettings = actions::onOpenNotificationSettings
+            onOpenNotificationSettings = actions::onOpenNotificationSettings,
+            onOpenRemoteInputSettings = actions::onOpenRemoteInputSettings
         )
 
         if (state.peerDeviceId.isEmpty()) {
@@ -165,12 +170,14 @@ private fun DeviceCard(
     hasPeer: Boolean,
     autoReconnectEnabled: Boolean,
     notificationSyncEnabled: Boolean,
+    remoteInputAccessGranted: Boolean,
     notificationAccessGranted: Boolean,
     notificationPostGranted: Boolean,
     onReconnect: () -> Unit,
     onAutoReconnectChange: (Boolean) -> Unit,
     onNotificationSyncChange: (Boolean) -> Unit,
-    onOpenNotificationSettings: () -> Unit
+    onOpenNotificationSettings: () -> Unit,
+    onOpenRemoteInputSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -227,6 +234,13 @@ private fun DeviceCard(
                 postGranted = notificationPostGranted,
                 onCheckedChange = onNotificationSyncChange,
                 onOpenSettings = onOpenNotificationSettings
+            )
+
+            PermissionStatusRow(
+                label = "Remote input",
+                granted = remoteInputAccessGranted,
+                missingText = "Accessibility needed",
+                onOpenSettings = onOpenRemoteInputSettings
             )
         }
     }
@@ -287,6 +301,46 @@ private fun NotificationToggleRow(
                 ) {
                     Text("Open")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PermissionStatusRow(
+    label: String,
+    granted: Boolean,
+    missingText: String,
+    onOpenSettings: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+        if (granted) {
+            Text(
+                text = "Ready",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+        } else {
+            Text(
+                text = missingText,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            FilledTonalButton(
+                onClick = onOpenSettings,
+                modifier = Modifier.height(48.dp)
+            ) {
+                Text("Open")
             }
         }
     }

@@ -19,9 +19,16 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var remoteVideoTrack: RTCVideoTrack?
     private var didInitializeSSL = false
     private var isClosingWindow = false
+    private var forwardedKeyCodes = Set<UInt16>()
 
     override init() {
         super.init()
+        videoView.pointerHandler = { [weak self] action, event, wheelDy in
+            self?.sendPointer(action: action, event: event, wheelDy: wheelDy)
+        }
+        videoView.keyHandler = { [weak self] event, isDown in
+            self?.handleKey(event, isDown: isDown) ?? false
+        }
     }
 
     func setSender(_ sender: @escaping (Data) -> Void) {
@@ -127,9 +134,14 @@ final class MacScreenSession: NSObject, ObservableObject {
         self.window = nil
     }
 
+    func sendGlobal(_ action: String) {
+        sendEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
+    }
+
     private func showWindow() {
         if let window {
             window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(videoView)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
@@ -147,6 +159,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.center()
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
     }
@@ -217,6 +230,134 @@ final class MacScreenSession: NSObject, ObservableObject {
         hasRemoteVideo = true
         status = "Connected"
         DiagnosticsLog.info("screen.mac.remote_video_attached")
+    }
+
+    private func sendPointer(action: String, event: NSEvent, wheelDy: Int? = nil) {
+        guard let coordinate = screenCoordinate(for: event) else {
+            DiagnosticsLog.warn("screen.mac.pointer_ignored no_screen_meta action=\(action)")
+            return
+        }
+        sendEnvelope(
+            type: EnvelopeType.ctrlPointer,
+            body: CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: action, wheelDy: wheelDy)
+        )
+    }
+
+    private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
+        if let specialKey = specialKeyName(for: event) {
+            sendKey(specialKey, down: isDown, modifiers: modifiers(from: event))
+            return true
+        }
+
+        if isDown, shouldSendText(for: event), let text = event.characters, !text.isEmpty {
+            sendEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
+            return true
+        }
+
+        if isDown, let key = printableKeyName(for: event) {
+            forwardedKeyCodes.insert(event.keyCode)
+            sendKey(key, down: true, modifiers: modifiers(from: event))
+            return true
+        }
+
+        if !isDown, forwardedKeyCodes.remove(event.keyCode) != nil, let key = printableKeyName(for: event) {
+            sendKey(key, down: false, modifiers: modifiers(from: event))
+            return true
+        }
+
+        return false
+    }
+
+    private func sendKey(_ key: String, down: Bool, modifiers: [String]) {
+        sendEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
+    }
+
+    private func screenCoordinate(for event: NSEvent) -> (x: Int, y: Int)? {
+        guard let meta = screenMeta else {
+            return nil
+        }
+        let bounds = videoView.bounds
+        guard bounds.width > 0, bounds.height > 0, meta.w > 0, meta.h > 0 else {
+            return nil
+        }
+        let point = videoView.convert(event.locationInWindow, from: nil)
+        let x = clamped(point.x, lower: 0, upper: bounds.width)
+        let y = clamped(bounds.height - point.y, lower: 0, upper: bounds.height)
+        let deviceX = clampedInt((x / bounds.width * CGFloat(meta.w)).rounded(), lower: 0, upper: meta.w - 1)
+        let deviceY = clampedInt((y / bounds.height * CGFloat(meta.h)).rounded(), lower: 0, upper: meta.h - 1)
+        return (deviceX, deviceY)
+    }
+
+    private func shouldSendText(for event: NSEvent) -> Bool {
+        let commandLikeFlags: NSEvent.ModifierFlags = [.command, .control, .option]
+        guard event.modifierFlags.intersection(commandLikeFlags).isEmpty else {
+            return false
+        }
+        guard let characters = event.characters, !characters.isEmpty else {
+            return false
+        }
+        return characters.unicodeScalars.allSatisfy { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+        }
+    }
+
+    private func printableKeyName(for event: NSEvent) -> String? {
+        guard let characters = event.charactersIgnoringModifiers?.lowercased(), characters.count == 1 else {
+            return nil
+        }
+        return characters
+    }
+
+    private func specialKeyName(for event: NSEvent) -> String? {
+        switch event.keyCode {
+        case 36, 76:
+            return "return"
+        case 48:
+            return "tab"
+        case 49:
+            return "space"
+        case 51:
+            return "delete"
+        case 53:
+            return "escape"
+        case 117:
+            return "forwardDelete"
+        case 123:
+            return "left"
+        case 124:
+            return "right"
+        case 125:
+            return "down"
+        case 126:
+            return "up"
+        default:
+            return nil
+        }
+    }
+
+    private func modifiers(from event: NSEvent) -> [String] {
+        var mods: [String] = []
+        if event.modifierFlags.contains(.shift) {
+            mods.append("shift")
+        }
+        if event.modifierFlags.contains(.control) {
+            mods.append("ctrl")
+        }
+        if event.modifierFlags.contains(.option) {
+            mods.append("alt")
+        }
+        if event.modifierFlags.contains(.command) {
+            mods.append("cmd")
+        }
+        return mods
+    }
+
+    private func clamped(_ value: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
+        min(max(value, lower), upper)
+    }
+
+    private func clampedInt(_ value: CGFloat, lower: Int, upper: Int) -> Int {
+        min(max(Int(value), lower), upper)
     }
 
     private func sendEnvelope<Body: Codable & Sendable>(type: String, body: Body) {
@@ -308,6 +449,18 @@ struct PhoneScreenView: View {
             Color.black
             PhoneVideoView(videoView: session.videoView)
                 .aspectRatio(aspectRatio, contentMode: .fit)
+            VStack {
+                Spacer()
+                HStack(spacing: 12) {
+                    globalButton(systemName: "chevron.backward", action: "back", help: "Back")
+                    globalButton(systemName: "circle", action: "home", help: "Home")
+                    globalButton(systemName: "rectangle.stack", action: "recents", help: "Recents")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.bottom, 14)
+            }
             if !session.hasRemoteVideo {
                 Text(session.status)
                     .foregroundStyle(.secondary)
@@ -323,6 +476,17 @@ struct PhoneScreenView: View {
         }
         return CGFloat(meta.w) / CGFloat(meta.h)
     }
+
+    private func globalButton(systemName: String, action: String, help: String) -> some View {
+        Button {
+            session.sendGlobal(action)
+        } label: {
+            Image(systemName: systemName)
+                .frame(width: 28, height: 28)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+    }
 }
 
 struct PhoneVideoView: NSViewRepresentable {
@@ -336,9 +500,14 @@ struct PhoneVideoView: NSViewRepresentable {
 }
 
 final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
+    var pointerHandler: ((String, NSEvent, Int?) -> Void)?
+    var keyHandler: ((NSEvent, Bool) -> Bool)?
+
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private var lastSize: CGSize = .zero
     private var didLogUnsupportedFrameBuffer = false
+
+    override var acceptsFirstResponder: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -348,6 +517,47 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         configureLayer()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.makeFirstResponder(self)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        pointerHandler?("down", event, nil)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        pointerHandler?("move", event, nil)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        pointerHandler?("up", event, nil)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        pointerHandler?("rightUp", event, nil)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let wheelDy = Int(event.scrollingDeltaY.rounded())
+        pointerHandler?("wheel", event, wheelDy == 0 ? nil : wheelDy)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if keyHandler?(event, true) != true {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if keyHandler?(event, false) != true {
+            super.keyUp(with: event)
+        }
     }
 
     func setSize(_ size: CGSize) {

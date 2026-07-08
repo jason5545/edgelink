@@ -9,6 +9,10 @@ import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import com.edgelink.core.ClipboardSetBody
+import com.edgelink.core.CtrlGlobalBody
+import com.edgelink.core.CtrlKeyBody
+import com.edgelink.core.CtrlPointerBody
+import com.edgelink.core.CtrlTextBody
 import com.edgelink.core.DeviceId
 import com.edgelink.core.EmptyBody
 import com.edgelink.core.EnvelopeCodec
@@ -81,6 +85,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkUiState(
             autoReconnectEnabled = settingsStore.autoReconnectEnabled(),
             notificationSyncEnabled = settingsStore.notificationSyncEnabled(),
+            remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
         )
@@ -235,9 +240,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         appContext.startActivity(intent)
     }
 
+    override fun onOpenRemoteInputSettings() {
+        EdgeLinkLog.info("remote_input.android.open_settings")
+        RemoteInputService.openSettings(appContext)
+    }
+
     fun refreshNotificationAccess() {
         stateFlow.update {
             it.copy(
+                remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
             )
@@ -677,6 +688,26 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.RTC_ICE -> {
                 val envelope = EnvelopeCodec.decode<RtcIceBody>(plaintext)
                 screenSession.handleIce(envelope.b)
+                null
+            }
+            EnvelopeTypes.CTRL_POINTER -> {
+                val envelope = EnvelopeCodec.decode<CtrlPointerBody>(plaintext)
+                RemoteInputService.dispatchPointer(envelope.b)
+                null
+            }
+            EnvelopeTypes.CTRL_GLOBAL -> {
+                val envelope = EnvelopeCodec.decode<CtrlGlobalBody>(plaintext)
+                RemoteInputService.dispatchGlobal(envelope.b)
+                null
+            }
+            EnvelopeTypes.CTRL_TEXT -> {
+                val envelope = EnvelopeCodec.decode<CtrlTextBody>(plaintext)
+                RemoteInputService.dispatchText(envelope.b)
+                null
+            }
+            EnvelopeTypes.CTRL_KEY -> {
+                val envelope = EnvelopeCodec.decode<CtrlKeyBody>(plaintext)
+                RemoteInputService.dispatchKey(envelope.b)
                 null
             }
             else -> null

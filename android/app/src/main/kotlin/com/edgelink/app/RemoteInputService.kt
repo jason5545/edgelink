@@ -102,8 +102,10 @@ class RemoteInputService : AccessibilityService() {
     }
 
     private fun handleKey(body: CtrlKeyBody) {
-        if (body.key.equals("escape", ignoreCase = true) && body.down) {
-            performGlobalAction(GLOBAL_ACTION_BACK)
+        if (body.key.equals("escape", ignoreCase = true)) {
+            if (body.down) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+            }
             return
         }
         if (Build.VERSION.SDK_INT < 33) {
@@ -127,7 +129,6 @@ class RemoteInputService : AccessibilityService() {
     private fun beginStroke(x: Float, y: Float) {
         activeStroke = null
         pendingStrokes.clear()
-        gestureInFlight = false
         lastX = cleanCoordinate(x)
         lastY = cleanCoordinate(y)
         val path = Path().apply { moveTo(lastX, lastY) }
