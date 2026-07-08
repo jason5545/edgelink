@@ -69,7 +69,8 @@ data class EdgeLinkUiState(
     val notificationSyncEnabled: Boolean = true,
     val remoteInputAccessGranted: Boolean = false,
     val notificationAccessGranted: Boolean = false,
-    val notificationPostGranted: Boolean = true
+    val notificationPostGranted: Boolean = true,
+    val smsAccessGranted: Boolean = false
 )
 
 interface EdgeLinkActions {
@@ -85,6 +86,7 @@ interface EdgeLinkActions {
     fun onNotificationSyncChange(enabled: Boolean)
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
+    fun onOpenSmsSettings()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -99,6 +101,7 @@ interface EdgeLinkActions {
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
+        override fun onOpenSmsSettings() = Unit
     }
 }
 
@@ -123,11 +126,13 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             remoteInputAccessGranted = state.remoteInputAccessGranted,
             notificationAccessGranted = state.notificationAccessGranted,
             notificationPostGranted = state.notificationPostGranted,
+            smsAccessGranted = state.smsAccessGranted,
             onReconnect = actions::onReconnect,
             onAutoReconnectChange = actions::onAutoReconnectChange,
             onNotificationSyncChange = actions::onNotificationSyncChange,
             onOpenNotificationSettings = actions::onOpenNotificationSettings,
-            onOpenRemoteInputSettings = actions::onOpenRemoteInputSettings
+            onOpenRemoteInputSettings = actions::onOpenRemoteInputSettings,
+            onOpenSmsSettings = actions::onOpenSmsSettings
         )
 
         if (state.peerDeviceId.isEmpty()) {
@@ -173,11 +178,13 @@ private fun DeviceCard(
     remoteInputAccessGranted: Boolean,
     notificationAccessGranted: Boolean,
     notificationPostGranted: Boolean,
+    smsAccessGranted: Boolean,
     onReconnect: () -> Unit,
     onAutoReconnectChange: (Boolean) -> Unit,
     onNotificationSyncChange: (Boolean) -> Unit,
     onOpenNotificationSettings: () -> Unit,
-    onOpenRemoteInputSettings: () -> Unit
+    onOpenRemoteInputSettings: () -> Unit,
+    onOpenSmsSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -241,6 +248,13 @@ private fun DeviceCard(
                 granted = remoteInputAccessGranted,
                 missingText = "Accessibility needed",
                 onOpenSettings = onOpenRemoteInputSettings
+            )
+
+            PermissionStatusRow(
+                label = "SMS",
+                granted = smsAccessGranted,
+                missingText = "SMS permissions needed",
+                onOpenSettings = onOpenSmsSettings
             )
         }
     }

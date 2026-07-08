@@ -31,6 +31,9 @@ import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
 import com.edgelink.core.SodiumHandshakeCrypto
+import com.edgelink.core.SmsMessageBody
+import com.edgelink.core.SmsSendBody
+import com.edgelink.core.SmsSendResultBody
 import com.edgelink.core.WorkerDeviceRegistrar
 import com.edgelink.transport.ByteChannel
 import com.edgelink.transport.PairingTransport
@@ -64,6 +67,7 @@ private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
+private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
@@ -78,6 +82,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
+    private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val screenSession = AndroidScreenSession(appContext, ::sendPlaintext)
     @Volatile
     private var lastPongElapsedMs = 0L
@@ -87,16 +92,21 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             notificationSyncEnabled = settingsStore.notificationSyncEnabled(),
             remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
-            notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+            notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
+            smsAccessGranted = smsSync.smsAccessGranted()
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
         clipboardSync = clipboardSync,
         notificationPresenter = notificationPresenter,
         screenSession = screenSession,
+        smsSync = smsSync,
         onPong = {
             lastPongElapsedMs = SystemClock.elapsedRealtime()
             stateFlow.update { it.copy(connectionStatus = "Connected") }
+        },
+        onSmsSendResult = { result ->
+            sendEnvelope(EnvelopeTypes.SMS_SEND_RESULT, result)
         }
     )
 
@@ -108,6 +118,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var currentPeer: PinnedPeer? = null
     private var connectionJob: Job? = null
     private var pairingJob: Job? = null
+    private var smsPendingDrainJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private val autoReconnectWakeups = Channel<Unit>(Channel.CONFLATED)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -228,7 +239,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             it.copy(
                 notificationSyncEnabled = enabled,
                 notificationAccessGranted = isNotificationListenerEnabled(),
-                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
+                smsAccessGranted = smsSync.smsAccessGranted()
             )
         }
     }
@@ -245,12 +257,17 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         RemoteInputService.openSettings(appContext)
     }
 
+    override fun onOpenSmsSettings() {
+        EdgeLinkLog.info("sms.android.permission_request")
+    }
+
     fun refreshNotificationAccess() {
         stateFlow.update {
             it.copy(
                 remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
-                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext)
+                notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
+                smsAccessGranted = smsSync.smsAccessGranted()
             )
         }
     }
@@ -281,6 +298,94 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         val outbound = body.copy(sourceDeviceId = localIdentity?.deviceId)
         EdgeLinkLog.info("notification.android.local_remove id=${body.id} hasSession=${session != null}")
         sendEnvelope(EnvelopeTypes.NOTIFICATION_REMOVE, outbound)
+    }
+
+    fun onSmsReceivedFromBroadcast(address: String, text: String, timestampMs: Long) {
+        onSmsInbound(
+            address = address,
+            text = text,
+            timestampMs = timestampMs,
+            markSeen = true,
+            logName = "sms.android.received"
+        )
+    }
+
+    fun onDebugSmsInjected(address: String, text: String, timestampMs: Long) {
+        onSmsInbound(
+            address = address,
+            text = text,
+            timestampMs = timestampMs,
+            markSeen = false,
+            logName = "sms.android.debug_injected"
+        )
+    }
+
+    fun onSmsPendingAvailable(reason: String) {
+        launchSmsPendingDrain(reason)
+    }
+
+    private fun onSmsInbound(
+        address: String,
+        text: String,
+        timestampMs: Long,
+        markSeen: Boolean,
+        logName: String
+    ) {
+        val body = smsSync.messageFromBroadcast(
+            sourceDeviceId = localIdentity?.deviceId,
+            address = address,
+            text = text,
+            timestampMs = timestampMs
+        )
+        val activeSession = session
+        if (activeSession == null) {
+            EdgeLinkLog.info("${logName}_deferred id=${body.id} addressFp=${AndroidSmsSync.fingerprint(address)}")
+            if (!markSeen) {
+                scope.launch(Dispatchers.IO) {
+                    val lateSession = waitForSession(DEBUG_SMS_SEND_TIMEOUT_MS)
+                    if (lateSession == null) {
+                        EdgeLinkLog.warn("${logName}_dropped_no_session id=${body.id}")
+                        return@launch
+                    }
+                    EdgeLinkLog.info("${logName}_retry id=${body.id}")
+                    sendSmsMessage(lateSession, body, logName, markSeenTimestampMs = null)
+                }
+            }
+            return
+        }
+        EdgeLinkLog.info("$logName id=${body.id} addressFp=${AndroidSmsSync.fingerprint(address)}")
+        scope.launch(Dispatchers.IO) {
+            sendSmsMessage(
+                activeSession = activeSession,
+                body = body,
+                logName = logName,
+                markSeenTimestampMs = timestampMs.takeIf { markSeen }
+            )
+        }
+    }
+
+    private suspend fun waitForSession(timeoutMs: Long): SecureSessionClient? {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline && coroutineContext.isActive) {
+            session?.let { return it }
+            delay(250)
+        }
+        return session
+    }
+
+    private suspend fun sendSmsMessage(
+        activeSession: SecureSessionClient,
+        body: SmsMessageBody,
+        logName: String,
+        markSeenTimestampMs: Long?
+    ) {
+        runCatching {
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SMS_MESSAGE, body))
+        }.onSuccess {
+            markSeenTimestampMs?.let(smsSync::markBroadcastSeen)
+        }.onFailure { error ->
+            EdgeLinkLog.error("${logName}_send_failed id=${body.id}", error)
+        }
     }
 
     fun onScreenCapturePermissionGranted(resultCode: Int, data: Intent) {
@@ -544,11 +649,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 coroutineScope {
                     val pingJob = launch { pingLoop(nextSession) }
                     val clipboardJob = launch { clipboardLoop(nextSession) }
+                    val smsPendingJob = launch { drainPendingSms(nextSession, identity, reason = "connected") }
                     try {
                         nextSession.receiveLoop(dispatcher::handle)
                     } finally {
                         pingJob.cancelAndJoin()
                         clipboardJob.cancelAndJoin()
+                        smsPendingJob.cancelAndJoin()
                     }
                 }
                 throw IllegalStateException("Relay receive loop ended.")
@@ -630,6 +737,46 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    private fun launchSmsPendingDrain(reason: String) {
+        val activeSession = session
+        val identity = localIdentity
+        if (activeSession == null || identity == null) {
+            EdgeLinkLog.info(
+                "sms.android.pending_deferred reason=$reason hasSession=${activeSession != null} hasIdentity=${identity != null}"
+            )
+            return
+        }
+        if (smsPendingDrainJob?.isActive == true) {
+            EdgeLinkLog.info("sms.android.pending_drain_already_running reason=$reason")
+            return
+        }
+        smsPendingDrainJob = scope.launch(Dispatchers.IO) {
+            drainPendingSms(activeSession, identity, reason)
+        }
+    }
+
+    private suspend fun drainPendingSms(
+        activeSession: SecureSessionClient,
+        identity: LocalIdentity,
+        reason: String
+    ) {
+        runCatching {
+            val pending = smsSync.pendingBroadcastMessages(sourceDeviceId = identity.deviceId)
+            if (pending.isEmpty()) {
+                return@runCatching
+            }
+            var sent = 0
+            for (body in pending) {
+                activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SMS_MESSAGE, body))
+                smsSync.acknowledgePendingBroadcasts(listOf(body.id))
+                sent += 1
+            }
+            EdgeLinkLog.info("sms.android.pending_sent count=$sent reason=$reason")
+        }.onFailure { error ->
+            EdgeLinkLog.error("sms.android.pending_send_failed reason=$reason", error)
+        }
+    }
+
     private inline fun <reified T> sendEnvelope(type: String, body: T) {
         sendPlaintext(EnvelopeCodec.encode(type, body))
     }
@@ -648,7 +795,9 @@ private class AndroidCommandDispatcher(
     private val clipboardSync: AndroidClipboardSync,
     private val notificationPresenter: AndroidNotificationPresenter,
     private val screenSession: AndroidScreenSession,
-    private val onPong: () -> Unit
+    private val smsSync: AndroidSmsSync,
+    private val onPong: () -> Unit,
+    private val onSmsSendResult: (SmsSendResultBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -670,6 +819,11 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.NOTIFICATION_REMOVE -> {
                 val envelope = EnvelopeCodec.decode<NotificationRemoveBody>(plaintext)
                 notificationPresenter.remove(envelope.b)
+                null
+            }
+            EnvelopeTypes.SMS_SEND -> {
+                val envelope = EnvelopeCodec.decode<SmsSendBody>(plaintext)
+                onSmsSendResult(smsSync.sendSms(envelope.b))
                 null
             }
             EnvelopeTypes.SCREEN_START -> {

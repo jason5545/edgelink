@@ -6,6 +6,8 @@ final class CommandDispatcher {
     private let clipboardSync: ClipboardSync
     private let notificationPresenter: MacNotificationPresenter
     private let screenSession: MacScreenSession?
+    private let onSmsMessage: @Sendable (SmsMessageBody) -> Void
+    private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -13,12 +15,16 @@ final class CommandDispatcher {
         inputInjector: InputInjector = InputInjector(),
         clipboardSync: ClipboardSync = ClipboardSync(),
         notificationPresenter: MacNotificationPresenter = MacNotificationPresenter(),
-        screenSession: MacScreenSession? = nil
+        screenSession: MacScreenSession? = nil,
+        onSmsMessage: @escaping @Sendable (SmsMessageBody) -> Void = { _ in },
+        onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in }
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
         self.notificationPresenter = notificationPresenter
         self.screenSession = screenSession
+        self.onSmsMessage = onSmsMessage
+        self.onSmsSendResult = onSmsSendResult
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -49,6 +55,14 @@ final class CommandDispatcher {
         case EnvelopeType.notificationRemove:
             let envelope = try decoder.decode(Envelope<NotificationRemoveBody>.self, from: plaintext)
             notificationPresenter.remove(envelope.b)
+            return nil
+        case EnvelopeType.smsMessage:
+            let envelope = try decoder.decode(Envelope<SmsMessageBody>.self, from: plaintext)
+            onSmsMessage(envelope.b)
+            return nil
+        case EnvelopeType.smsSendResult:
+            let envelope = try decoder.decode(Envelope<SmsSendResultBody>.self, from: plaintext)
+            onSmsSendResult(envelope.b)
             return nil
         case EnvelopeType.screenMeta:
             let envelope = try decoder.decode(Envelope<ScreenMetaBody>.self, from: plaintext)

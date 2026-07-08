@@ -33,6 +33,9 @@ public enum EnvelopeType {
     public static let clipboardSet = "clipboard.set"
     public static let notificationPost = "notification.post"
     public static let notificationRemove = "notification.remove"
+    public static let smsMessage = "sms.message"
+    public static let smsSend = "sms.send"
+    public static let smsSendResult = "sms.send.result"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -198,5 +201,64 @@ public struct NotificationRemoveBody: Codable, Equatable, Sendable {
     public init(id: String, sourceDeviceId: String? = nil) {
         self.id = id
         self.sourceDeviceId = sourceDeviceId
+    }
+}
+
+public struct SmsMessageBody: Codable, Equatable, Sendable, Identifiable {
+    public let id: String
+    public let sourceDeviceId: String?
+    public let sourcePlatform: String?
+    public let address: String
+    public let text: String
+    public let direction: String
+    public let isBackfill: Bool
+    public let ts: Int64
+
+    public init(
+        id: String,
+        sourceDeviceId: String? = nil,
+        sourcePlatform: String? = nil,
+        address: String,
+        text: String,
+        direction: String,
+        isBackfill: Bool = false,
+        ts: Int64
+    ) {
+        self.id = id
+        self.sourceDeviceId = sourceDeviceId
+        self.sourcePlatform = sourcePlatform
+        self.address = address
+        self.text = text
+        self.direction = direction
+        self.isBackfill = isBackfill
+        self.ts = ts
+    }
+}
+
+public struct SmsSendBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let to: String
+    public let text: String
+
+    public init(requestId: String, to: String, text: String) {
+        self.requestId = requestId
+        self.to = to
+        self.text = text
+    }
+}
+
+public struct SmsSendResultBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let to: String
+    public let success: Bool
+    public let error: String?
+    public let ts: Int64
+
+    public init(requestId: String, to: String, success: Bool, error: String? = nil, ts: Int64) {
+        self.requestId = requestId
+        self.to = to
+        self.success = success
+        self.error = error
+        self.ts = ts
     }
 }

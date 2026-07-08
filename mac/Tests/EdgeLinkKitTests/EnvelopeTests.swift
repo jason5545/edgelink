@@ -48,4 +48,43 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(ice.t, "rtc.ice")
         XCTAssertEqual(ice.b, RtcIceBody(mid: "0", index: 0, candidate: "candidate:..."))
     }
+
+    func testSmsBodiesRoundTrip() throws {
+        let messageData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.smsMessage,
+                b: SmsMessageBody(
+                    id: "sms:inbox:42",
+                    sourceDeviceId: "123456789",
+                    sourcePlatform: "android",
+                    address: "123720",
+                    text: "hello",
+                    direction: "inbound",
+                    isBackfill: true,
+                    ts: 1_783_510_253
+                )
+            )
+        )
+        let message = try decoder.decode(Envelope<SmsMessageBody>.self, from: messageData)
+        XCTAssertEqual(message.t, "sms.message")
+        XCTAssertEqual(message.b.address, "123720")
+        XCTAssertTrue(message.b.isBackfill)
+
+        let sendData = try encoder.encode(
+            Envelope(t: EnvelopeType.smsSend, b: SmsSendBody(requestId: "req-1", to: "0912345678", text: "ping"))
+        )
+        let send = try decoder.decode(Envelope<SmsSendBody>.self, from: sendData)
+        XCTAssertEqual(send.t, "sms.send")
+        XCTAssertEqual(send.b.to, "0912345678")
+
+        let resultData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.smsSendResult,
+                b: SmsSendResultBody(requestId: "req-1", to: "0912345678", success: true, ts: 1_783_510_254)
+            )
+        )
+        let result = try decoder.decode(Envelope<SmsSendResultBody>.self, from: resultData)
+        XCTAssertEqual(result.t, "sms.send.result")
+        XCTAssertTrue(result.b.success)
+    }
 }

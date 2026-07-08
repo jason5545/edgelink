@@ -32,6 +32,9 @@ object EnvelopeTypes {
     const val CLIPBOARD_SET = "clipboard.set"
     const val NOTIFICATION_POST = "notification.post"
     const val NOTIFICATION_REMOVE = "notification.remove"
+    const val SMS_MESSAGE = "sms.message"
+    const val SMS_SEND = "sms.send"
+    const val SMS_SEND_RESULT = "sms.send.result"
 }
 
 object EnvelopeCodec {
@@ -139,4 +142,32 @@ data class NotificationPostBody(
 data class NotificationRemoveBody(
     val id: String,
     val sourceDeviceId: String? = null
+)
+
+@Serializable
+data class SmsMessageBody(
+    val id: String,
+    val sourceDeviceId: String? = null,
+    val sourcePlatform: String? = null,
+    val address: String,
+    val text: String,
+    val direction: String,
+    val isBackfill: Boolean = false,
+    val ts: Long
+)
+
+@Serializable
+data class SmsSendBody(
+    val requestId: String,
+    val to: String,
+    val text: String
+)
+
+@Serializable
+data class SmsSendResultBody(
+    val requestId: String,
+    val to: String,
+    val success: Boolean,
+    val error: String? = null,
+    val ts: Long
 )

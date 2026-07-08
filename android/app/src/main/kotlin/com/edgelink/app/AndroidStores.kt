@@ -95,6 +95,19 @@ class SharedPreferencesSettingsStore(context: Context) {
             .putBoolean("notificationSyncEnabled", enabled)
             .apply()
     }
+
+    fun smsLastSeenDateMs(): Long =
+        prefs.getLong("smsLastSeenDateMs", 0L)
+
+    fun smsLastSeenRowId(): Long =
+        prefs.getLong("smsLastSeenRowId", 0L)
+
+    fun saveSmsLastSeen(dateMs: Long, rowId: Long) {
+        prefs.edit()
+            .putLong("smsLastSeenDateMs", dateMs)
+            .putLong("smsLastSeenRowId", rowId)
+            .apply()
+    }
 }
 
 private fun SharedPreferences.getBase64(key: String): ByteArray? =

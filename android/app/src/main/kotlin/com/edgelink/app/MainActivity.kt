@@ -31,6 +31,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+    private val smsPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            controller.refreshNotificationAccess()
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         EdgeLinkForegroundService.ensureStarted(applicationContext)
@@ -39,7 +44,8 @@ class MainActivity : ComponentActivity() {
             controller,
             ::handleNotificationSyncChange,
             ::handleOpenNotificationSettings,
-            ::handleOpenRemoteInputSettings
+            ::handleOpenRemoteInputSettings,
+            ::handleOpenSmsSettings
         )
         setContent {
             val state by controller.state.collectAsState()
@@ -69,6 +75,11 @@ class MainActivity : ComponentActivity() {
 
     private fun handleOpenRemoteInputSettings() {
         controller.onOpenRemoteInputSettings()
+    }
+
+    private fun handleOpenSmsSettings() {
+        controller.onOpenSmsSettings()
+        smsPermissionLauncher.launch(AndroidSmsSync.requiredPermissions)
     }
 
     private fun ensureNotificationPermissions() {
@@ -110,7 +121,8 @@ private class EdgeLinkActivityActions(
     private val delegate: EdgeLinkController,
     private val notificationSyncChangeHandler: (Boolean) -> Unit,
     private val openNotificationSettingsHandler: () -> Unit,
-    private val openRemoteInputSettingsHandler: () -> Unit
+    private val openRemoteInputSettingsHandler: () -> Unit,
+    private val openSmsSettingsHandler: () -> Unit
 ) : EdgeLinkActions {
     override fun onPointer(body: InputPointerBody) = delegate.onPointer(body)
     override fun onKey(body: InputKeyBody) = delegate.onKey(body)
@@ -124,4 +136,5 @@ private class EdgeLinkActivityActions(
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
+    override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
 }

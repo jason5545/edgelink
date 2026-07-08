@@ -17,6 +17,8 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var isPairing = false
     @Published private(set) var canAcceptPairing = false
     @Published private(set) var macNotificationSyncEnabled: Bool
+    @Published private(set) var smsMessages: [SmsMessageBody] = []
+    @Published private(set) var smsSendStatus = ""
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -24,6 +26,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let relayTransport: RelayTransport
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
+    private let notificationPresenter = MacNotificationPresenter()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
     private let encoder = JSONEncoder()
@@ -35,6 +38,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
+    private var pendingSmsSends: [String: SmsSendBody] = [:]
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -105,6 +109,39 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         screenSession.openAndStart()
+    }
+
+    func sendSms(to rawRecipient: String, text rawText: String) {
+        let recipient = rawRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !recipient.isEmpty, !text.isEmpty else {
+            smsSendStatus = "SMS needs recipient and text"
+            return
+        }
+        guard let session = currentSession, isConnected else {
+            smsSendStatus = "SMS unavailable"
+            DiagnosticsLog.warn("sms.mac.send_ignored not_connected")
+            return
+        }
+
+        let requestId = UUID().uuidString
+        let body = SmsSendBody(requestId: requestId, to: recipient, text: text)
+        pendingSmsSends[requestId] = body
+        smsSendStatus = "Sending SMS"
+
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.smsSend, b: body))
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info("sms.mac.send_requested requestId=\(requestId) toFp=\(Self.fingerprint(recipient))")
+            } catch {
+                await MainActor.run {
+                    self.pendingSmsSends.removeValue(forKey: requestId)
+                    self.smsSendStatus = "SMS send failed"
+                }
+                DiagnosticsLog.error("sms.mac.send_request_failed requestId=\(requestId)", error)
+            }
+        }
     }
 
     private func run() async {
@@ -285,7 +322,18 @@ final class EdgeLinkRuntime: ObservableObject {
 
                 let dispatcher = CommandDispatcher(
                     clipboardSync: clipboardSync,
-                    screenSession: screenSession
+                    notificationPresenter: notificationPresenter,
+                    screenSession: screenSession,
+                    onSmsMessage: { [weak self] message in
+                        Task { @MainActor in
+                            self?.handleSmsMessage(message)
+                        }
+                    },
+                    onSmsSendResult: { [weak self] result in
+                        Task { @MainActor in
+                            self?.handleSmsSendResult(result)
+                        }
+                    }
                 )
                 let session = SecureSessionHost(
                     channel: connectedChannel,
@@ -410,6 +458,59 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
+    }
+
+    private func handleSmsMessage(_ message: SmsMessageBody) {
+        smsMessages.removeAll { $0.id == message.id }
+        smsMessages.insert(message, at: 0)
+        if smsMessages.count > 30 {
+            smsMessages.removeLast(smsMessages.count - 30)
+        }
+
+        DiagnosticsLog.info("sms.mac.message_received id=\(message.id) addressFp=\(Self.fingerprint(message.address)) backfill=\(message.isBackfill)")
+        if !message.isBackfill && message.direction == "inbound" {
+            notificationPresenter.show(
+                NotificationPostBody(
+                    id: message.id,
+                    sourceDeviceId: message.sourceDeviceId,
+                    sourcePlatform: message.sourcePlatform,
+                    app: "SMS",
+                    bundle: "sms",
+                    title: message.address,
+                    text: message.text,
+                    ts: message.ts
+                )
+            )
+        }
+    }
+
+    private func handleSmsSendResult(_ result: SmsSendResultBody) {
+        let pending = pendingSmsSends.removeValue(forKey: result.requestId)
+        if result.success {
+            smsSendStatus = "SMS queued"
+            if let pending {
+                handleSmsMessage(
+                    SmsMessageBody(
+                        id: "sms:local:\(result.requestId)",
+                        sourceDeviceId: localIdentity?.deviceId,
+                        sourcePlatform: "macos",
+                        address: result.to,
+                        text: pending.text,
+                        direction: "outbound",
+                        isBackfill: false,
+                        ts: result.ts
+                    )
+                )
+            }
+            DiagnosticsLog.info("sms.mac.send_result requestId=\(result.requestId) success=true toFp=\(Self.fingerprint(result.to))")
+        } else {
+            smsSendStatus = "SMS failed: \(result.error ?? "unknown")"
+            DiagnosticsLog.warn("sms.mac.send_result requestId=\(result.requestId) success=false error=\(result.error ?? "unknown")")
+        }
+    }
+
+    private static func fingerprint(_ value: String) -> String {
+        DiagnosticsLog.fingerprint(Data(value.utf8))
     }
 
     private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"

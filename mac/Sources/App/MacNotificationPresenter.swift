@@ -5,6 +5,7 @@ import UserNotifications
 
 final class MacNotificationPresenter: @unchecked Sendable {
     private let center: UNUserNotificationCenter?
+    private let delegate = MacNotificationCenterDelegate()
 
     init() {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier, !bundleIdentifier.isEmpty else {
@@ -12,7 +13,9 @@ final class MacNotificationPresenter: @unchecked Sendable {
             center = nil
             return
         }
-        center = UNUserNotificationCenter.current()
+        let notificationCenter = UNUserNotificationCenter.current()
+        notificationCenter.delegate = delegate
+        center = notificationCenter
     }
 
     func show(_ body: NotificationPostBody) {
@@ -78,5 +81,14 @@ final class MacNotificationPresenter: @unchecked Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
         return "edgelink.remote.\(digest)"
+    }
+}
+
+private final class MacNotificationCenterDelegate: NSObject, UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
     }
 }

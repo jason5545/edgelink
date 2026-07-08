@@ -51,4 +51,41 @@ class EnvelopeTest {
         assertEquals(EnvelopeTypes.RTC_ICE, ice.t)
         assertEquals(RtcIceBody(mid = "0", index = 0, candidate = "candidate:..."), ice.b)
     }
+
+    @Test
+    fun smsBodiesRoundTrip() {
+        val messageBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.SMS_MESSAGE,
+            SmsMessageBody(
+                id = "sms:inbox:42",
+                sourceDeviceId = "123456789",
+                sourcePlatform = "android",
+                address = "123720",
+                text = "hello",
+                direction = "inbound",
+                isBackfill = true,
+                ts = 1783510253
+            )
+        )
+        val message = EnvelopeCodec.decode<SmsMessageBody>(messageBytes)
+        assertEquals(EnvelopeTypes.SMS_MESSAGE, message.t)
+        assertEquals("123720", message.b.address)
+        assertEquals(true, message.b.isBackfill)
+
+        val sendBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.SMS_SEND,
+            SmsSendBody(requestId = "req-1", to = "0912345678", text = "ping")
+        )
+        val send = EnvelopeCodec.decode<SmsSendBody>(sendBytes)
+        assertEquals(EnvelopeTypes.SMS_SEND, send.t)
+        assertEquals("0912345678", send.b.to)
+
+        val resultBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.SMS_SEND_RESULT,
+            SmsSendResultBody(requestId = "req-1", to = "0912345678", success = true, ts = 1783510254)
+        )
+        val result = EnvelopeCodec.decode<SmsSendResultBody>(resultBytes)
+        assertEquals(EnvelopeTypes.SMS_SEND_RESULT, result.t)
+        assertEquals(true, result.b.success)
+    }
 }
