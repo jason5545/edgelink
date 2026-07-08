@@ -28,6 +28,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("com.goterl:lazysodium-android:5.2.0@aar")
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")

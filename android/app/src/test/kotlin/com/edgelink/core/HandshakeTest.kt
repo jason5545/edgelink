@@ -1,0 +1,93 @@
+package com.edgelink.core
+
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Test
+import java.util.Base64
+
+class HandshakeTest {
+    @Test
+    fun handshakeVectorV1() {
+        val clientPeer = HandshakePeer(
+            deviceId = "137245816",
+            ephemeralPublicKey = b64("YFpyXSpK3+6xop4X7dYhwbdZPujNvESsbEq24vgF0jw="),
+            nonce = b64("4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=")
+        )
+        val hostPeer = HandshakePeer(
+            deviceId = "949758990",
+            ephemeralPublicKey = b64("ST6C/HRGSlkmiBdiPSBTxeuOLMSpiLT+4XnsawENUx0="),
+            nonce = b64("wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8=")
+        )
+
+        assertEquals(
+            "00093133373234353831360020605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23c0020e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+            HandshakeEncoding.peerRecord(clientPeer).hex()
+        )
+        assertEquals(
+            "00093934393735383939300020493e82fc74464a59268817623d2053c5eb8e2cc4a988b4fee179ec6b010d531d0020c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+            HandshakeEncoding.peerRecord(hostPeer).hex()
+        )
+
+        val helloSignature = b64("m/A8bxR+o8B8VqjoTHUnvYuFOP9+RDWNgDbBjthMiqbLYSWa5up+LEoRn45yaZcQOTEOr/kI+ri1EaHv0Tl3Bg==")
+        val ackSignature = b64("3LH5/RUiKuMfwkfWVC7L/xHTSsuN/AbSrmr+hycD+1slWwdo5+y7I2t4whL8dynqImE2c6LfD37ibuD/gogVAw==")
+        val confirmSignature = b64("1zz4Id0wNY0Du6sQ7RTlfcrNuycMB8Z+VS4HIcWaIVED4MNiI/OKebsQkH9+XPJcTr+x5m2ZW5Gt7AdRCG15Cg==")
+        val transcript = HandshakeTranscript(clientPeer, hostPeer, helloSignature, ackSignature, confirmSignature)
+
+        assertEquals(
+            "d3e644a6176792c74704762e7afb801ca60b2780836a147c4378ee511daffc40",
+            transcript.transcriptHash.hex()
+        )
+
+        val keys = HandshakeKeySchedule.deriveKeys(
+            sharedSecret = hex("c6dea8dd115ef27b7e0953539b2b19e59b7abf3ffd57985ec76de86ec31d1b42"),
+            transcriptHash = transcript.transcriptHash
+        )
+        assertEquals("84f1d1b229d59758326024a9124c2ad39e5d9ae2adf0a0a66be0808b028e73b7", keys.initiatorToResponder.hex())
+        assertEquals("b3101fc48f69c8c67deee3492347da54870971942b1bf5cb65753ff5d93f6fb2", keys.responderToInitiator.hex())
+    }
+
+    @Test
+    fun secureFrameVectorV1() {
+        val key = hex("84f1d1b229d59758326024a9124c2ad39e5d9ae2adf0a0a66be0808b028e73b7")
+        val plaintext = """{"t":"status.ping","b":{}}""".encodeToByteArray()
+        val frame = SecureFrame.seal(
+            plaintext = plaintext,
+            key = key,
+            direction = SecureChannelDirection.INITIATOR_TO_RESPONDER,
+            counter = 0
+        )
+
+        assertEquals(
+            "0000002a7f9dbb3859fc024e439d8e3c8e2d56f8b4670ae4066ac1b84db0887b466a60f2de30a3895e3b7b31b90d",
+            frame.hex()
+        )
+        assertArrayEquals(
+            plaintext,
+            SecureFrame.open(frame, key, SecureChannelDirection.INITIATOR_TO_RESPONDER, 0)
+        )
+    }
+
+    @Test
+    fun secureChannelCountersAndDirections() {
+        val keys = SecureChannelKeys(
+            initiatorToResponder = hex("84f1d1b229d59758326024a9124c2ad39e5d9ae2adf0a0a66be0808b028e73b7"),
+            responderToInitiator = hex("b3101fc48f69c8c67deee3492347da54870971942b1bf5cb65753ff5d93f6fb2")
+        )
+        val initiator = SecureChannel(keys, SecureChannelRole.INITIATOR)
+        val responder = SecureChannel(keys, SecureChannelRole.RESPONDER)
+        val ping = """{"t":"status.ping","b":{}}""".encodeToByteArray()
+        val pong = """{"t":"status.pong","b":{}}""".encodeToByteArray()
+
+        assertArrayEquals(ping, responder.open(initiator.seal(ping)))
+        assertArrayEquals(pong, initiator.open(responder.seal(pong)))
+    }
+
+    private fun b64(value: String): ByteArray = Base64.getDecoder().decode(value)
+
+    private fun hex(value: String): ByteArray {
+        require(value.length % 2 == 0)
+        return value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
+    private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}

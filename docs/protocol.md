@@ -277,6 +277,10 @@ confirmSigInput = utf8("EdgeLink hs.v1 confirm\n") || clientPeerRecord || hostPe
 
 `clientPeerRecord` 是 initiator；`hostPeerRecord` 是 responder。
 
+測試向量中的 signature bytes 是一組固定 transcript 範例。平台測試必須驗證這些 signature
+能由對應 public key 驗過，並用這些 bytes 計算 transcript hash；但不要求每個 Ed25519
+implementation 對同一訊息產生逐 byte 相同的 signature。
+
 ### Key Schedule
 
 ```text
