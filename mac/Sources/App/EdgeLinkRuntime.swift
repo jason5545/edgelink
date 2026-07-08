@@ -360,9 +360,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
                 lastSecurePongAt = Date()
-                screenSession.setSender { [weak self] data in
-                    Task { @MainActor in
-                        await self?.sendScreenPlaintext(data)
+                screenSession.setSender { data in
+                    Task {
+                        do {
+                            try await session.sendPlaintext(data)
+                        } catch {
+                            DiagnosticsLog.error("screen.mac.send_failed", error)
+                        }
                     }
                 }
                 isConnected = true

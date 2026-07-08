@@ -33,6 +33,8 @@ class RemoteInputService : AccessibilityService() {
     private val pendingStrokes = ArrayDeque<GestureDescription.StrokeDescription>()
     private var gestureInFlight = false
     private var activeStroke: GestureDescription.StrokeDescription? = null
+    private var pendingDragPoint: DragPoint? = null
+    private var pendingStartStroke = false
     private var lastX = 0f
     private var lastY = 0f
 
@@ -129,30 +131,45 @@ class RemoteInputService : AccessibilityService() {
     private fun beginStroke(x: Float, y: Float) {
         activeStroke = null
         pendingStrokes.clear()
+        pendingDragPoint = null
         lastX = cleanCoordinate(x)
         lastY = cleanCoordinate(y)
         val path = Path().apply { moveTo(lastX, lastY) }
         val stroke = GestureDescription.StrokeDescription(path, 0, TAP_SEGMENT_MS, true)
         activeStroke = stroke
+        pendingStartStroke = true
         enqueueStroke(stroke)
     }
 
     private fun continueStroke(x: Float, y: Float, willContinue: Boolean) {
         val cleanX = cleanCoordinate(x)
         val cleanY = cleanCoordinate(y)
-        val current = activeStroke ?: run {
+        if (activeStroke == null) {
             beginStroke(cleanX, cleanY)
-            activeStroke ?: return
+            if (!willContinue) {
+                pendingDragPoint = DragPoint(cleanX, cleanY, willContinue = false)
+                dispatchNextStroke()
+            }
+            return
         }
+        pendingDragPoint = DragPoint(cleanX, cleanY, willContinue)
+        dispatchNextStroke()
+    }
+
+    private fun dispatchPendingDragPoint(): Boolean {
+        val current = activeStroke ?: return false
+        val point = pendingDragPoint ?: return false
+        pendingDragPoint = null
         val path = Path().apply {
             moveTo(lastX, lastY)
-            lineTo(cleanX, cleanY)
+            lineTo(point.x, point.y)
         }
-        val stroke = current.continueStroke(path, 0, TOUCH_SEGMENT_MS, willContinue)
-        activeStroke = if (willContinue) stroke else null
-        lastX = cleanX
-        lastY = cleanY
-        enqueueStroke(stroke)
+        val stroke = current.continueStroke(path, 0, TOUCH_SEGMENT_MS, point.willContinue)
+        activeStroke = if (point.willContinue) stroke else null
+        lastX = point.x
+        lastY = point.y
+        dispatchStroke(stroke)
+        return true
     }
 
     private fun longPress(x: Float, y: Float) {
@@ -193,7 +210,23 @@ class RemoteInputService : AccessibilityService() {
         if (gestureInFlight) {
             return
         }
+        if (pendingStartStroke) {
+            val stroke = pendingStrokes.poll()
+            if (stroke != null) {
+                pendingStartStroke = false
+                dispatchStroke(stroke)
+                return
+            }
+            pendingStartStroke = false
+        }
+        if (dispatchPendingDragPoint()) {
+            return
+        }
         val stroke = pendingStrokes.poll() ?: return
+        dispatchStroke(stroke)
+    }
+
+    private fun dispatchStroke(stroke: GestureDescription.StrokeDescription) {
         gestureInFlight = true
         val dispatched = dispatchGesture(
             GestureDescription.Builder().addStroke(stroke).build(),
@@ -219,6 +252,12 @@ class RemoteInputService : AccessibilityService() {
     }
 
     private fun cleanCoordinate(value: Float): Float = max(0f, value)
+
+    private data class DragPoint(
+        val x: Float,
+        val y: Float,
+        val willContinue: Boolean
+    )
 
     companion object {
         @Volatile
