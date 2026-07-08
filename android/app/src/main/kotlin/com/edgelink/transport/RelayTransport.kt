@@ -35,8 +35,13 @@ class RelayTransport(
         EdgeLinkLog.info("relay.transport.open_start hostId=$hostId deviceId=${identity.deviceId}")
         val channel = OkHttpRelayByteChannel(hostId, identity.deviceId, auth)
         channel.attach(client.newWebSocket(request, channel))
-        channel.awaitReady()
-        return channel
+        try {
+            channel.awaitReady()
+            return channel
+        } catch (error: Throwable) {
+            channel.close()
+            throw error
+        }
     }
 
     fun request(relayUrl: String, hostId: String): Request =
@@ -128,4 +133,10 @@ private class OkHttpRelayByteChannel(
 
     override suspend fun receive(): ByteArray? =
         incoming.receiveCatching().getOrNull()
+
+    override fun close() {
+        EdgeLinkLog.info("relay.transport.close hostId=$hostId deviceId=$deviceId")
+        incoming.close()
+        webSocket?.close(1000, "Client closing")
+    }
 }

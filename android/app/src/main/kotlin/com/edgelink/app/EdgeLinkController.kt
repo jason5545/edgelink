@@ -18,11 +18,13 @@ import com.edgelink.core.PairingWire
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.SodiumHandshakeCrypto
 import com.edgelink.core.WorkerDeviceRegistrar
+import com.edgelink.transport.ByteChannel
 import com.edgelink.transport.PairingTransport
 import com.edgelink.transport.RelayTransport
 import com.edgelink.transport.SecureSessionClient
 import com.edgelink.ui.EdgeLinkActions
 import com.edgelink.ui.EdgeLinkUiState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -37,9 +39,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import java.time.Instant
 import java.util.Base64
+
+private const val HANDSHAKE_TIMEOUT_MS = 4_000L
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
@@ -47,11 +52,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val crypto = SodiumHandshakeCrypto()
     private val identityStore = SharedPreferencesIdentityStore(appContext)
     private val pairingStore = SharedPreferencesPairingStore(appContext)
+    private val settingsStore = SharedPreferencesSettingsStore(appContext)
     private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
     private val relayTransport = RelayTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
-    private val stateFlow = MutableStateFlow(EdgeLinkUiState())
+    private val stateFlow = MutableStateFlow(
+        EdgeLinkUiState(autoReconnectEnabled = settingsStore.autoReconnectEnabled())
+    )
     private val dispatcher = AndroidCommandDispatcher(clipboardSync) {
         stateFlow.update { it.copy(connectionStatus = "Connected") }
     }
@@ -61,6 +69,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     @Volatile
     private var session: SecureSessionClient? = null
     private var localIdentity: LocalIdentity? = null
+    private var currentPeer: PinnedPeer? = null
+    private var connectionJob: Job? = null
     private var pairingJob: Job? = null
     private var pendingPairing: PendingPairing? = null
 
@@ -72,6 +82,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     fun close() {
+        session?.close()
         scope.cancel()
     }
 
@@ -137,6 +148,28 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    override fun onReconnect() {
+        val identity = localIdentity
+        val peer = currentPeer
+        EdgeLinkLog.info(
+            "relay.android.reconnect_requested hasIdentity=${identity != null} hasPeer=${peer != null}"
+        )
+        if (identity == null || peer == null) {
+            stateFlow.update { it.copy(connectionStatus = "No paired Mac", isConnected = false) }
+            return
+        }
+        startConnection(identity, peer, reason = "manual")
+    }
+
+    override fun onAutoReconnectChange(enabled: Boolean) {
+        settingsStore.saveAutoReconnectEnabled(enabled)
+        EdgeLinkLog.info("relay.android.auto_reconnect enabled=$enabled")
+        stateFlow.update { it.copy(autoReconnectEnabled = enabled) }
+        if (enabled && !stateFlow.value.isConnected) {
+            onReconnect()
+        }
+    }
+
     private suspend fun run() {
         try {
             stateFlow.update { it.copy(connectionStatus = "Registering") }
@@ -159,7 +192,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     peerDeviceId = DeviceId.display(peer.deviceId)
                 )
             }
-            connectLoop(identity, peer)
+            startConnection(identity, peer, reason = "startup")
         } catch (error: Throwable) {
             EdgeLinkLog.error("runtime.android.setup_failed", error)
             session = null
@@ -293,7 +326,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             )
         }
         EdgeLinkLog.info("pair.android.done hostId=${peer.deviceId} clientId=${identity.deviceId}")
-        connectLoop(identity, peer)
+        startConnection(identity, peer, reason = "pairing")
     }
 
     private suspend fun loadOrRegisterIdentity(): LocalIdentity =
@@ -323,14 +356,34 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             ).also(identityStore::saveIdentity)
         }
 
+    private fun startConnection(identity: LocalIdentity, peer: PinnedPeer, reason: String) {
+        currentPeer = peer
+        EdgeLinkLog.info(
+            "relay.android.connection_start reason=$reason hostId=${peer.deviceId} clientId=${identity.deviceId} autoReconnect=${stateFlow.value.autoReconnectEnabled}"
+        )
+        connectionJob?.cancel()
+        session?.close()
+        session = null
+        stateFlow.update {
+            it.copy(
+                connectionStatus = if (reason == "manual") "Reconnecting" else it.connectionStatus,
+                isConnected = false
+            )
+        }
+        connectionJob = scope.launch {
+            connectLoop(identity, peer)
+        }
+    }
+
     private suspend fun connectLoop(identity: LocalIdentity, peer: PinnedPeer) {
         var retryDelayMs = 1_000L
 
         while (coroutineContext.isActive) {
+            var channel: ByteChannel? = null
             try {
                 EdgeLinkLog.info("relay.android.connect_start hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 stateFlow.update { it.copy(connectionStatus = "Connecting relay", isConnected = false) }
-                val channel = relayTransport.connect(
+                channel = relayTransport.connect(
                     relayUrl = EdgeLinkConfig.relayUrl,
                     hostId = peer.deviceId,
                     identity = identity
@@ -343,7 +396,16 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 )
 
                 stateFlow.update { it.copy(connectionStatus = "Handshaking") }
-                nextSession.connect()
+                val handshakeEstablished = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                    nextSession.connect()
+                    true
+                } == true
+                if (!handshakeEstablished) {
+                    EdgeLinkLog.warn(
+                        "relay.android.handshake_timeout hostId=${peer.deviceId} clientId=${identity.deviceId} timeoutMs=$HANDSHAKE_TIMEOUT_MS"
+                    )
+                    error("Handshake timed out after ${HANDSHAKE_TIMEOUT_MS}ms.")
+                }
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 session = nextSession
                 retryDelayMs = 1_000L
@@ -359,14 +421,47 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         clipboardJob.cancelAndJoin()
                     }
                 }
+                throw IllegalStateException("Relay receive loop ended.")
+            } catch (error: CancellationException) {
+                EdgeLinkLog.info("relay.android.connect_cancelled hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                throw error
             } catch (error: Throwable) {
                 EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
-                stateFlow.update { it.copy(connectionStatus = "Disconnected", isConnected = false) }
-                delay(retryDelayMs)
+                val autoReconnect = stateFlow.value.autoReconnectEnabled
+                stateFlow.update {
+                    it.copy(
+                        connectionStatus = if (autoReconnect) "Reconnecting" else "Disconnected",
+                        isConnected = false
+                    )
+                }
+                if (!autoReconnect) {
+                    EdgeLinkLog.info("relay.android.auto_reconnect_disabled hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                    return
+                }
+                if (!waitForAutoReconnect(retryDelayMs)) {
+                    EdgeLinkLog.info("relay.android.auto_reconnect_stopped hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                    stateFlow.update { it.copy(connectionStatus = "Disconnected", isConnected = false) }
+                    return
+                }
                 retryDelayMs = (retryDelayMs * 2).coerceAtMost(30_000L)
+            } finally {
+                channel?.close()
             }
         }
+    }
+
+    private suspend fun waitForAutoReconnect(delayMs: Long): Boolean {
+        var remainingMs = delayMs
+        while (remainingMs > 0 && coroutineContext.isActive) {
+            if (!stateFlow.value.autoReconnectEnabled) {
+                return false
+            }
+            val stepMs = minOf(remainingMs, 500L)
+            delay(stepMs)
+            remainingMs -= stepMs
+        }
+        return stateFlow.value.autoReconnectEnabled
     }
 
     private suspend fun pingLoop(activeSession: SecureSessionClient) {

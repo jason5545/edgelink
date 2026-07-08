@@ -62,4 +62,8 @@ class SecureSessionClient(
             }
         }
     }
+
+    fun close() {
+        channel.close()
+    }
 }

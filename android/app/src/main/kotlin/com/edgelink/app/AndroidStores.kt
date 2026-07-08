@@ -75,6 +75,19 @@ class SharedPreferencesPairingStore(context: Context) : PairingStore {
     }
 }
 
+class SharedPreferencesSettingsStore(context: Context) {
+    private val prefs = context.getSharedPreferences("edgelink_settings", Context.MODE_PRIVATE)
+
+    fun autoReconnectEnabled(): Boolean =
+        prefs.getBoolean("autoReconnectEnabled", true)
+
+    fun saveAutoReconnectEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean("autoReconnectEnabled", enabled)
+            .apply()
+    }
+}
+
 private fun SharedPreferences.getBase64(key: String): ByteArray? =
     getString(key, null)?.let(Base64.getDecoder()::decode)
 

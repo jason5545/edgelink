@@ -20,12 +20,14 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -62,7 +64,8 @@ data class EdgeLinkUiState(
     val pairingSas: String = "",
     val pairingPeerName: String = "",
     val isPairing: Boolean = false,
-    val canConfirmPairing: Boolean = false
+    val canConfirmPairing: Boolean = false,
+    val autoReconnectEnabled: Boolean = true
 )
 
 interface EdgeLinkActions {
@@ -73,6 +76,8 @@ interface EdgeLinkActions {
     fun onPairBackspace()
     fun onStartPairing()
     fun onConfirmPairing()
+    fun onReconnect()
+    fun onAutoReconnectChange(enabled: Boolean)
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -82,6 +87,8 @@ interface EdgeLinkActions {
         override fun onPairBackspace() = Unit
         override fun onStartPairing() = Unit
         override fun onConfirmPairing() = Unit
+        override fun onReconnect() = Unit
+        override fun onAutoReconnectChange(enabled: Boolean) = Unit
     }
 }
 
@@ -99,7 +106,11 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             name = state.peerName,
             deviceId = state.peerDeviceId.ifEmpty { state.localDeviceId },
             status = state.connectionStatus,
-            connected = state.isConnected
+            connected = state.isConnected,
+            hasPeer = state.peerDeviceId.isNotEmpty(),
+            autoReconnectEnabled = state.autoReconnectEnabled,
+            onReconnect = actions::onReconnect,
+            onAutoReconnectChange = actions::onAutoReconnectChange
         )
 
         if (state.peerDeviceId.isEmpty()) {
@@ -134,7 +145,16 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
 }
 
 @Composable
-private fun DeviceCard(name: String, deviceId: String, status: String, connected: Boolean) {
+private fun DeviceCard(
+    name: String,
+    deviceId: String,
+    status: String,
+    connected: Boolean,
+    hasPeer: Boolean,
+    autoReconnectEnabled: Boolean,
+    onReconnect: () -> Unit,
+    onAutoReconnectChange: (Boolean) -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -167,6 +187,37 @@ private fun DeviceCard(name: String, deviceId: String, status: String, connected
             text = deviceId,
             style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace)
         )
+
+        if (hasPeer) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onReconnect,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp)
+                ) {
+                    Text("Reconnect")
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Auto reconnect",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Switch(
+                        checked = autoReconnectEnabled,
+                        onCheckedChange = onAutoReconnectChange
+                    )
+                }
+            }
+        }
     }
 }
 
