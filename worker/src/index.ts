@@ -17,12 +17,12 @@ export default {
       });
     }
 
-    if (url.pathname === "/v1/device/register") {
+    if (url.pathname === "/v1/device/register" || url.pathname.startsWith("/v1/device/")) {
       const id = env.REGISTRY.idFromName("global");
       return env.REGISTRY.get(id).fetch(request);
     }
 
-    if (url.pathname === "/v1/pair/start" || url.pathname === "/v1/pair/claim" || url.pathname === "/v1/pair/ws") {
+    if (url.pathname === "/v1/pair/start" || url.pathname === "/v1/pair/claim" || url.pathname === "/v1/pair/confirm" || url.pathname === "/v1/pair/ws") {
       const body = request.headers.get("upgrade") === "websocket"
         ? null
         : await request.clone().json().catch(() => null) as { hostId?: string } | null;

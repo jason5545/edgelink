@@ -86,7 +86,9 @@ POST /v1/pair/start
 
 ```json
 {
-  "hostId": "949758990"
+  "hostId": "949758990",
+  "hostPk": "<base64 Ed25519 public key>",
+  "name": "Jason's Mac"
 }
 ```
 
@@ -102,7 +104,9 @@ POST /v1/pair/claim
 ```json
 {
   "hostId": "949758990",
-  "clientId": "137245816"
+  "clientId": "137245816",
+  "clientPk": "<base64 Ed25519 public key>",
+  "name": "Pixel 9"
 }
 ```
 
@@ -116,6 +120,38 @@ Upgrade: websocket
 ```
 
 WebSocket 只在 pairing window 尚未過期時接受。
+
+### Confirmation
+
+SAS 相同時，Android 與 Mac 都要各自呼叫：
+
+```http
+POST /v1/pair/confirm
+```
+
+Host confirmation:
+
+```json
+{
+  "role": "host",
+  "hostId": "949758990",
+  "clientId": "137245816",
+  "hostPk": "<base64 Ed25519 public key>",
+  "clientPk": "<base64 Ed25519 public key>",
+  "hostName": "Jason's Mac",
+  "clientName": "Pixel 9"
+}
+```
+
+Client confirmation has the same fields with `"role": "client"`。
+
+PairingDO stores each side's confirmation. Pairing is complete only when both confirmations refer to
+the same `hostId/clientId/hostPk/clientPk`. On completion, PairingDO stores the pair in RelayDO and
+broadcasts:
+
+```json
+{"t":"pair.complete","b":{"hostId":"949758990","clientId":"137245816"}}
+```
 
 ### Commitment
 
@@ -309,18 +345,38 @@ AEAD：
 
 ### Relay
 
-Mac 對 `/v1/connect?hostId=<hostId>` 維持 WebSocket。M1 會加入 Ed25519 授權：
+Mac 對 `/v1/connect?hostId=<hostId>` 維持 WebSocket。連上後第一包 text message 必須是
+Ed25519 授權：
 
 ```json
 {
-  "deviceId": "949758990",
-  "ts": 1751941000,
-  "sig": "<base64 Ed25519 over deviceId || ts>"
+  "t": "relay.auth",
+  "b": {
+    "hostId": "949758990",
+    "deviceId": "949758990",
+    "ts": 1751941000,
+    "sig": "<base64 Ed25519 signature>"
+  }
 }
 ```
 
-`RelayDO(idFromName(hostDeviceId))` 只在兩端已配對時橋接。RelayDO 必須使用
-Hibernatable WebSockets API：`state.acceptWebSocket()` 與 `webSocketMessage()`。
+`ts` 是 Unix seconds。Signature input 不簽 JSON，而是：
+
+```text
+utf8("EdgeLink relay auth v1\n" || deviceId || "\n" || ts)
+```
+
+RegistryDO 用 register 時綁定的 Ed25519 public key 驗簽，允許 5 分鐘 clock skew。
+`RelayDO(idFromName(hostDeviceId))` 允許 host 自己連線；client 必須已完成配對才可連線。
+RelayDO 通過驗證後回：
+
+```json
+{"t":"relay.ready","b":{"role":"host"}}
+```
+
+之後只轉送 binary frame。未驗證 socket 傳 binary frame 會被關閉。RelayDO 必須使用
+Hibernatable WebSockets API：`state.acceptWebSocket()`、`serializeAttachment()` 與
+`webSocketMessage()`。
 
 ### LAN
 
