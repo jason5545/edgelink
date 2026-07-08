@@ -1,5 +1,6 @@
 package com.edgelink.transport
 
+import com.edgelink.app.EdgeLinkLog
 import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.LocalIdentity
 import com.edgelink.core.RelayAuth
@@ -15,7 +16,6 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.time.Instant
@@ -32,7 +32,8 @@ class RelayTransport(
             RelayAuth.envelope(hostId, identity, timestamp, signature)
         )
         val request = request(relayUrl, hostId)
-        val channel = OkHttpRelayByteChannel(auth)
+        EdgeLinkLog.info("relay.transport.open_start hostId=$hostId deviceId=${identity.deviceId}")
+        val channel = OkHttpRelayByteChannel(hostId, identity.deviceId, auth)
         channel.attach(client.newWebSocket(request, channel))
         channel.awaitReady()
         return channel
@@ -40,8 +41,13 @@ class RelayTransport(
 
     fun request(relayUrl: String, hostId: String): Request =
         Request.Builder()
-            .url(relayUrl.toHttpUrl().newBuilder().addQueryParameter("hostId", hostId).build())
+            .url(withHostId(relayUrl, hostId))
             .build()
+
+    private fun withHostId(url: String, hostId: String): String {
+        val separator = if ('?' in url) "&" else "?"
+        return "$url${separator}hostId=$hostId"
+    }
 }
 
 @Serializable
@@ -54,6 +60,8 @@ private data class RelayReadyEnvelope(
 }
 
 private class OkHttpRelayByteChannel(
+    private val hostId: String,
+    private val deviceId: String,
     private val authText: String
 ) : WebSocketListener(), ByteChannel {
     private val ready = CompletableDeferred<Unit>()
@@ -69,6 +77,7 @@ private class OkHttpRelayByteChannel(
     }
 
     override fun onOpen(webSocket: WebSocket, response: Response) {
+        EdgeLinkLog.info("relay.transport.open hostId=$hostId deviceId=$deviceId status=${response.code}")
         if (!webSocket.send(authText)) {
             ready.completeExceptionally(IllegalStateException("Relay WebSocket rejected auth frame."))
         }
@@ -79,20 +88,26 @@ private class OkHttpRelayByteChannel(
             EnvelopeCodec.json.decodeFromString(RelayReadyEnvelope.serializer(), text)
         }.getOrNull()
         if (envelope?.t == "relay.ready") {
+            EdgeLinkLog.info("relay.transport.ready hostId=$hostId deviceId=$deviceId role=${envelope.b.role}")
             ready.complete(Unit)
+        } else {
+            EdgeLinkLog.warn("relay.transport.text_unexpected hostId=$hostId deviceId=$deviceId text=$text")
         }
     }
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+        EdgeLinkLog.info("relay.transport.binary_in hostId=$hostId deviceId=$deviceId bytes=${bytes.size}")
         incoming.trySend(bytes.toByteArray())
     }
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        EdgeLinkLog.error("relay.transport.failure hostId=$hostId deviceId=$deviceId status=${response?.code}", t)
         ready.completeExceptionally(t)
         incoming.close(t)
     }
 
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        EdgeLinkLog.info("relay.transport.closed hostId=$hostId deviceId=$deviceId code=$code reason=$reason")
         if (!ready.isCompleted) {
             ready.completeExceptionally(IllegalStateException("Relay WebSocket closed before ready: $code $reason"))
         }
@@ -102,6 +117,7 @@ private class OkHttpRelayByteChannel(
     override suspend fun send(bytes: ByteArray) {
         ready.await()
         val socket = webSocket ?: error("Relay WebSocket is not attached.")
+        EdgeLinkLog.info("relay.transport.binary_out hostId=$hostId deviceId=$deviceId bytes=${bytes.size}")
         val accepted = withContext(Dispatchers.IO) {
             socket.send(bytes.toByteString())
         }

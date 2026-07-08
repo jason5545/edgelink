@@ -21,30 +21,36 @@ actor SecureSessionHost {
     }
 
     func connect() async throws {
+        DiagnosticsLog.info("hs.mac.wait_hello hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
         guard let hello = try await channel.receive() else {
             throw SecureSessionHostError.closedBeforeHandshake
         }
+        DiagnosticsLog.info("hs.mac.hello_in bytes=\(hello.count)")
         let ack = try HandshakeSession.acceptHello(
             hello,
             identity: identity,
             pinnedClientPublicKey: peer.publicKey
         )
+        DiagnosticsLog.info("hs.mac.ack_out bytes=\(ack.ack.count)")
         try await channel.send(ack.ack)
 
         guard let confirm = try await channel.receive() else {
             throw SecureSessionHostError.closedBeforeHandshake
         }
+        DiagnosticsLog.info("hs.mac.confirm_in bytes=\(confirm.count)")
         established = try HandshakeSession.finishResponder(
             state: ack.state,
             confirm: confirm,
             pinnedClientPublicKey: peer.publicKey
         )
+        DiagnosticsLog.info("hs.mac.established hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
     }
 
     func sendPlaintext(_ plaintext: Data) async throws {
         var session = try requireEstablished()
         let frame = try session.channel.seal(plaintext)
         established = session
+        DiagnosticsLog.info("secure.mac.frame_out plaintext=\(plaintext.count) frame=\(frame.count)")
         try await channel.send(frame)
     }
 
@@ -53,6 +59,7 @@ actor SecureSessionHost {
             var session = try requireEstablished()
             let plaintext = try session.channel.open(frame)
             established = session
+            DiagnosticsLog.info("secure.mac.frame_in frame=\(frame.count) plaintext=\(plaintext.count)")
 
             if let response = try dispatcher.handle(plaintext) {
                 try await sendPlaintext(response)

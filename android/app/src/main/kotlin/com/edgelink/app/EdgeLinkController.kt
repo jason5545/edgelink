@@ -65,6 +65,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var pendingPairing: PendingPairing? = null
 
     init {
+        EdgeLinkLog.configure(appContext)
         scope.launch {
             run()
         }
@@ -108,7 +109,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     override fun onStartPairing() {
         val hostId = stateFlow.value.pairingHostIdInput
+        EdgeLinkLog.info("pair.android.start requested hostId=$hostId")
         if (!DeviceId.isValid(hostId)) {
+            EdgeLinkLog.warn("pair.android.start invalid_host_id hostId=$hostId")
             stateFlow.update { it.copy(connectionStatus = "Invalid Mac ID") }
             return
         }
@@ -120,12 +123,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     override fun onConfirmPairing() {
         val pending = pendingPairing ?: return
+        EdgeLinkLog.info("pair.android.confirm click hostId=${pending.hostId} clientId=${pending.clientId}")
         scope.launch {
             runCatching {
                 pairingTransport.confirm(EdgeLinkConfig.workerBaseUrl, pending.confirmRequest())
             }.onSuccess {
+                EdgeLinkLog.info("pair.android.confirm sent hostId=${pending.hostId} clientId=${pending.clientId}")
                 stateFlow.update { it.copy(canConfirmPairing = false, connectionStatus = "Waiting for Mac") }
-            }.onFailure {
+            }.onFailure { error ->
+                EdgeLinkLog.error("pair.android.confirm failed hostId=${pending.hostId} clientId=${pending.clientId}", error)
                 stateFlow.update { it.copy(connectionStatus = "Pairing failed", isPairing = false, canConfirmPairing = false) }
             }
         }
@@ -137,12 +143,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             val identity = loadOrRegisterIdentity()
             localIdentity = identity
             stateFlow.update { it.copy(localDeviceId = DeviceId.display(identity.deviceId)) }
+            EdgeLinkLog.info("runtime.android.identity deviceId=${identity.deviceId} pkfp=${EdgeLinkLog.fingerprint(identity.publicKey)}")
 
             val peer = pairingStore.loadPeers().firstOrNull()
             if (peer == null) {
+                EdgeLinkLog.info("runtime.android.no_paired_peer")
                 stateFlow.update { it.copy(connectionStatus = "No paired Mac") }
                 return
             }
+            EdgeLinkLog.info("runtime.android.loaded_peer hostId=${peer.deviceId} pkfp=${EdgeLinkLog.fingerprint(peer.publicKey)}")
 
             stateFlow.update {
                 it.copy(
@@ -151,7 +160,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 )
             }
             connectLoop(identity, peer)
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            EdgeLinkLog.error("runtime.android.setup_failed", error)
             session = null
             stateFlow.update {
                 it.copy(connectionStatus = "Setup failed", isConnected = false)
@@ -164,6 +174,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         val nonceC = crypto.randomBytes(32)
         var commitment: ByteArray? = null
         var pairedPeer: PinnedPeer? = null
+        EdgeLinkLog.info("pair.android.open hostId=$hostId clientId=${identity.deviceId} clientPkFp=${EdgeLinkLog.fingerprint(identity.publicKey)}")
 
         stateFlow.update {
             it.copy(
@@ -177,21 +188,29 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
         val channel = runCatching {
             pairingTransport.connect(EdgeLinkConfig.pairingWebSocketUrl, hostId)
-        }.getOrElse {
+        }.getOrElse { error ->
+            EdgeLinkLog.error("pair.android.ws_connect_failed hostId=$hostId", error)
             stateFlow.update { state -> state.copy(connectionStatus = "Pairing failed", isPairing = false) }
             return
         }
 
         try {
+            EdgeLinkLog.info("pair.android.ws_connected hostId=$hostId")
             pairingTransport.claim(EdgeLinkConfig.workerBaseUrl, hostId, identity)
+            EdgeLinkLog.info("pair.android.claim_ok hostId=$hostId clientId=${identity.deviceId}")
             channel.send(PairingWire.encodeReady(identity.deviceId))
+            EdgeLinkLog.info("pair.android.ready_sent hostId=$hostId clientId=${identity.deviceId}")
 
             while (coroutineContext.isActive) {
                 val text = channel.receive() ?: error("Pairing socket closed.")
-                when (PairingWire.type(text)) {
+                val type = PairingWire.type(text)
+                EdgeLinkLog.info("pair.android.message type=$type hostId=$hostId")
+                when (type) {
                     PairingTypes.COMMIT -> {
                         commitment = Base64.getDecoder().decode(PairingWire.decodeCommit(text).commit)
+                        EdgeLinkLog.info("pair.android.commit_received hostId=$hostId commitFp=${EdgeLinkLog.fingerprint(commitment!!)}")
                         channel.send(PairingWire.encodeRevealClient(identity, nonceC))
+                        EdgeLinkLog.info("pair.android.reveal_client_sent hostId=$hostId clientId=${identity.deviceId}")
                     }
                     PairingTypes.REVEAL_HOST -> {
                         val reveal = PairingWire.decodeRevealHost(text)
@@ -201,12 +220,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         check(commitment?.contentEquals(expectedCommitment) == true) {
                             "Pairing commitment mismatch."
                         }
+                        EdgeLinkLog.info("pair.android.commit_verified hostId=${reveal.hostId} hostPkFp=${EdgeLinkLog.fingerprint(hostPk)}")
                         val sas = Pairing.sas(
                             hostPublicKey = hostPk,
                             clientPublicKey = identity.publicKey,
                             hostNonce = nonceH,
                             clientNonce = nonceC
                         )
+                        EdgeLinkLog.info("pair.android.sas hostId=${reveal.hostId} clientId=${identity.deviceId} sas=${sas.display}")
                         pendingPairing = PendingPairing(
                             hostId = reveal.hostId,
                             clientId = identity.deviceId,
@@ -227,6 +248,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     }
                     PairingTypes.COMPLETE -> {
                         val complete = PairingWire.decodeComplete(text)
+                        EdgeLinkLog.info("pair.android.complete_received hostId=${complete.hostId} clientId=${complete.clientId}")
                         val pending = pendingPairing
                         if (pending != null && complete.hostId == pending.hostId && complete.clientId == pending.clientId) {
                             val peer = PinnedPeer(
@@ -237,18 +259,26 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                             )
                             pairedPeer = peer
                             pairingStore.savePeer(peer)
+                            EdgeLinkLog.info("pair.android.peer_saved hostId=${peer.deviceId} pkfp=${EdgeLinkLog.fingerprint(peer.publicKey)}")
                             break
+                        } else {
+                            EdgeLinkLog.warn("pair.android.complete_mismatch expected=${pending?.hostId}/${pending?.clientId} got=${complete.hostId}/${complete.clientId}")
                         }
                     }
                 }
             }
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            EdgeLinkLog.error("pair.android.failed hostId=$hostId", error)
             stateFlow.update { it.copy(connectionStatus = "Pairing failed", isPairing = false, canConfirmPairing = false) }
         } finally {
+            EdgeLinkLog.info("pair.android.ws_close hostId=$hostId")
             channel.close()
         }
 
-        val peer = pairedPeer ?: return
+        val peer = pairedPeer ?: run {
+            EdgeLinkLog.warn("pair.android.no_paired_peer_after_loop hostId=$hostId")
+            return
+        }
         pendingPairing = null
         stateFlow.update {
             it.copy(
@@ -262,12 +292,16 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 connectionStatus = "Paired"
             )
         }
+        EdgeLinkLog.info("pair.android.done hostId=${peer.deviceId} clientId=${identity.deviceId}")
         connectLoop(identity, peer)
     }
 
     private suspend fun loadOrRegisterIdentity(): LocalIdentity =
         withContext(Dispatchers.IO) {
-            identityStore.loadIdentity()?.let { return@withContext it }
+            identityStore.loadIdentity()?.let {
+                EdgeLinkLog.info("runtime.android.identity_loaded deviceId=${it.deviceId}")
+                return@withContext it
+            }
 
             val seed = crypto.randomSeed()
             val keyPair = crypto.ed25519KeyPairFromSeed(seed)
@@ -280,6 +314,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 name = name,
                 platform = "android"
             )
+            EdgeLinkLog.info("runtime.android.identity_registered deviceId=$deviceId name=$name pkfp=${EdgeLinkLog.fingerprint(keyPair.publicKey)}")
             LocalIdentity(
                 deviceId = deviceId,
                 name = name,
@@ -293,6 +328,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
         while (coroutineContext.isActive) {
             try {
+                EdgeLinkLog.info("relay.android.connect_start hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 stateFlow.update { it.copy(connectionStatus = "Connecting relay", isConnected = false) }
                 val channel = relayTransport.connect(
                     relayUrl = EdgeLinkConfig.relayUrl,
@@ -308,6 +344,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
                 stateFlow.update { it.copy(connectionStatus = "Handshaking") }
                 nextSession.connect()
+                EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 session = nextSession
                 retryDelayMs = 1_000L
                 stateFlow.update { it.copy(connectionStatus = "Connected", isConnected = true) }
@@ -322,7 +359,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         clipboardJob.cancelAndJoin()
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
+                EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
                 stateFlow.update { it.copy(connectionStatus = "Disconnected", isConnected = false) }
                 delay(retryDelayMs)

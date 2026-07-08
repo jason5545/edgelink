@@ -14,6 +14,7 @@ final class PairingTransport {
     }
 
     func start(identity: LocalIdentity) async throws {
+        DiagnosticsLog.info("pair.transport.mac.start_http hostId=\(identity.deviceId)")
         let request = PairStartRequest(
             hostId: identity.deviceId,
             hostPk: identity.publicKey.base64EncodedString(),
@@ -23,12 +24,14 @@ final class PairingTransport {
     }
 
     func confirm(_ confirmation: PairConfirmRequest) async throws {
+        DiagnosticsLog.info("pair.transport.mac.confirm_http hostId=\(confirmation.hostId) clientId=\(confirmation.clientId) role=\(confirmation.role)")
         try await post(path: "/v1/pair/confirm", body: confirmation)
     }
 
     func connect(hostId: String) async throws -> PairingTextChannel {
+        DiagnosticsLog.info("pair.transport.mac.ws_open_start hostId=\(hostId)")
         let task = session.webSocketTask(with: try pairURL(hostId: hostId))
-        let channel = PairingTextChannel(task: task)
+        let channel = PairingTextChannel(hostId: hostId, task: task)
         task.resume()
         return channel
     }
@@ -39,10 +42,14 @@ final class PairingTransport {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try encoder.encode(body)
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        let responseBody = String(data: data, encoding: .utf8) ?? ""
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            DiagnosticsLog.error("pair.transport.mac.http_failed path=\(path) status=\(status) body=\(responseBody)")
             throw PairingTransportError.requestFailed
         }
+        DiagnosticsLog.info("pair.transport.mac.http_ok path=\(path) status=\(http.statusCode) body=\(responseBody)")
     }
 
     private func pairURL(hostId: String) throws -> URL {
@@ -60,13 +67,16 @@ final class PairingTransport {
 }
 
 final class PairingTextChannel: @unchecked Sendable {
+    private let hostId: String
     private let task: URLSessionWebSocketTask
 
-    init(task: URLSessionWebSocketTask) {
+    init(hostId: String, task: URLSessionWebSocketTask) {
+        self.hostId = hostId
         self.task = task
     }
 
     func send(_ text: String) async throws {
+        DiagnosticsLog.info("pair.transport.mac.ws_send hostId=\(hostId) bytes=\(Data(text.utf8).count)")
         try await task.send(.string(text))
     }
 
@@ -75,16 +85,20 @@ final class PairingTextChannel: @unchecked Sendable {
             let message = try await task.receive()
             switch message {
             case .string(let text):
+                DiagnosticsLog.info("pair.transport.mac.ws_text hostId=\(hostId) bytes=\(Data(text.utf8).count)")
                 return text
             case .data:
+                DiagnosticsLog.warn("pair.transport.mac.ws_binary_ignored hostId=\(hostId)")
                 continue
             @unknown default:
+                DiagnosticsLog.warn("pair.transport.mac.ws_unknown_message hostId=\(hostId)")
                 continue
             }
         }
     }
 
     func close() {
+        DiagnosticsLog.info("pair.transport.mac.ws_close hostId=\(hostId)")
         task.cancel(with: .normalClosure, reason: nil)
     }
 }
