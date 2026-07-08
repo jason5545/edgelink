@@ -1,6 +1,8 @@
 package com.edgelink.app
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.DeviceId
@@ -31,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,11 +48,14 @@ import java.time.Instant
 import java.util.Base64
 
 private const val HANDSHAKE_TIMEOUT_MS = 4_000L
+private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
+private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val crypto = SodiumHandshakeCrypto()
+    private val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java)
     private val identityStore = SharedPreferencesIdentityStore(appContext)
     private val pairingStore = SharedPreferencesPairingStore(appContext)
     private val settingsStore = SharedPreferencesSettingsStore(appContext)
@@ -73,15 +79,28 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var connectionJob: Job? = null
     private var pairingJob: Job? = null
     private var pendingPairing: PendingPairing? = null
+    private val autoReconnectWakeups = Channel<Unit>(Channel.CONFLATED)
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            EdgeLinkLog.info("relay.android.network_available")
+            signalAutoReconnect("network_available")
+        }
+    }
 
     init {
         EdgeLinkLog.configure(appContext)
+        runCatching {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        }.onFailure { error ->
+            EdgeLinkLog.error("relay.android.network_callback_failed", error)
+        }
         scope.launch {
             run()
         }
     }
 
     fun close() {
+        runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         session?.close()
         scope.cancel()
     }
@@ -166,6 +185,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkLog.info("relay.android.auto_reconnect enabled=$enabled")
         stateFlow.update { it.copy(autoReconnectEnabled = enabled) }
         if (enabled && !stateFlow.value.isConnected) {
+            signalAutoReconnect("auto_reconnect_enabled")
             onReconnect()
         }
     }
@@ -383,11 +403,18 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             try {
                 EdgeLinkLog.info("relay.android.connect_start hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 stateFlow.update { it.copy(connectionStatus = "Connecting relay", isConnected = false) }
-                channel = relayTransport.connect(
-                    relayUrl = EdgeLinkConfig.relayUrl,
-                    hostId = peer.deviceId,
-                    identity = identity
-                )
+                channel = withTimeoutOrNull(RELAY_CONNECT_TIMEOUT_MS) {
+                    relayTransport.connect(
+                        relayUrl = EdgeLinkConfig.relayUrl,
+                        hostId = peer.deviceId,
+                        identity = identity
+                    )
+                } ?: run {
+                    EdgeLinkLog.warn(
+                        "relay.android.connect_timeout hostId=${peer.deviceId} clientId=${identity.deviceId} timeoutMs=$RELAY_CONNECT_TIMEOUT_MS"
+                    )
+                    error("Relay connect timed out after ${RELAY_CONNECT_TIMEOUT_MS}ms.")
+                }
                 val nextSession = SecureSessionClient(
                     channel = channel,
                     identity = identity,
@@ -444,7 +471,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     stateFlow.update { it.copy(connectionStatus = "Disconnected", isConnected = false) }
                     return
                 }
-                retryDelayMs = (retryDelayMs * 2).coerceAtMost(30_000L)
+                retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_AUTO_RECONNECT_DELAY_MS)
             } finally {
                 channel?.close()
             }
@@ -452,16 +479,20 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     private suspend fun waitForAutoReconnect(delayMs: Long): Boolean {
-        var remainingMs = delayMs
-        while (remainingMs > 0 && coroutineContext.isActive) {
-            if (!stateFlow.value.autoReconnectEnabled) {
-                return false
-            }
-            val stepMs = minOf(remainingMs, 500L)
-            delay(stepMs)
-            remainingMs -= stepMs
+        if (!stateFlow.value.autoReconnectEnabled) {
+            return false
         }
+        val woke = withTimeoutOrNull(delayMs) {
+            autoReconnectWakeups.receive()
+            true
+        } == true
+        EdgeLinkLog.info("relay.android.auto_reconnect_wait_done delayMs=$delayMs woke=$woke")
         return stateFlow.value.autoReconnectEnabled
+    }
+
+    private fun signalAutoReconnect(reason: String) {
+        EdgeLinkLog.info("relay.android.auto_reconnect_wakeup reason=$reason")
+        autoReconnectWakeups.trySend(Unit)
     }
 
     private suspend fun pingLoop(activeSession: SecureSessionClient) {
