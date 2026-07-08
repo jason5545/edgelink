@@ -6,6 +6,9 @@ import Foundation
 
 @MainActor
 final class EdgeLinkRuntime: ObservableObject {
+    private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
+    private static let securePongTimeoutSeconds: TimeInterval = 15
+
     @Published private(set) var localDeviceId = "Registering..."
     @Published private(set) var peerName = "No paired Android"
     @Published private(set) var peerDeviceId = ""
@@ -37,6 +40,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var task: Task<Void, Never>?
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
+    private var lastSecurePongAt = Date.distantPast
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
 
@@ -324,6 +328,11 @@ final class EdgeLinkRuntime: ObservableObject {
                     clipboardSync: clipboardSync,
                     notificationPresenter: notificationPresenter,
                     screenSession: screenSession,
+                    onStatusPong: { [weak self] in
+                        Task { @MainActor in
+                            self?.recordSecurePong(generation: channelGeneration)
+                        }
+                    },
                     onSmsMessage: { [weak self] message in
                         Task { @MainActor in
                             self?.handleSmsMessage(message)
@@ -346,6 +355,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 try await session.connect()
                 DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
+                lastSecurePongAt = Date()
                 screenSession.setSender { [weak self] data in
                     Task { @MainActor in
                         await self?.sendScreenPlaintext(data)
@@ -366,7 +376,25 @@ final class EdgeLinkRuntime: ObservableObject {
                         screenSession.stop(sendRemoteStop: false)
                     }
                 }
-                try await session.receiveLoop()
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        try await session.receiveLoop()
+                    }
+                    group.addTask { [weak self] in
+                        guard let self else {
+                            return
+                        }
+                        try await self.secureKeepaliveLoop(
+                            session: session,
+                            generation: channelGeneration,
+                            hostId: identity.deviceId,
+                            clientId: peer.deviceId
+                        )
+                    }
+                    _ = try await group.next()
+                    group.cancelAll()
+                }
+                throw SecureKeepaliveError.receiveLoopEnded
             } catch {
                 DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
                 isConnected = false
@@ -377,6 +405,44 @@ final class EdgeLinkRuntime: ObservableObject {
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay = min(retryDelay * 2, 30_000_000_000)
             }
+        }
+    }
+
+    private func recordSecurePong(generation: UUID) {
+        guard currentChannelGeneration == generation else {
+            return
+        }
+        lastSecurePongAt = Date()
+        if isConnected {
+            connectionStatus = "Connected"
+        }
+    }
+
+    private func secureKeepaliveLoop(
+        session: SecureSessionHost,
+        generation: UUID,
+        hostId: String,
+        clientId: String
+    ) async throws {
+        while !Task.isCancelled {
+            try await Task.sleep(nanoseconds: Self.secureKeepaliveIntervalNanoseconds)
+            try Task.checkCancellation()
+
+            guard currentChannelGeneration == generation, currentSession === session else {
+                return
+            }
+
+            let pongAgeSeconds = Date().timeIntervalSince(lastSecurePongAt)
+            if pongAgeSeconds >= Self.securePongTimeoutSeconds {
+                DiagnosticsLog.warn(
+                    "relay.mac.pong_timeout hostId=\(hostId) clientId=\(clientId) ageMs=\(Int(pongAgeSeconds * 1000)) timeoutMs=\(Int(Self.securePongTimeoutSeconds * 1000))"
+                )
+                currentChannel?.close()
+                throw SecureKeepaliveError.pongTimedOut
+            }
+
+            let data = try encoder.encode(Envelope(t: EnvelopeType.statusPing, b: EmptyBody()))
+            try await session.sendPlaintext(data)
         }
     }
 
@@ -546,4 +612,9 @@ private struct MacPendingPairing {
 
 private enum PairingRuntimeError: Error {
     case invalidPeerMessage
+}
+
+private enum SecureKeepaliveError: Error {
+    case receiveLoopEnded
+    case pongTimedOut
 }

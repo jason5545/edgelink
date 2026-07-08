@@ -541,6 +541,11 @@ RelayDO 通過驗證後回：
 Hibernatable WebSockets API：`state.acceptWebSocket()`、`serializeAttachment()` 與
 `webSocketMessage()`。
 
+兩端要同時維持 relay transport 與 secure channel 活性。WebSocket ping/pong 用來避免
+裝置到 Worker 的連線被閒置中斷；握手後的 secure channel 另外用
+`status.ping` / `status.pong` 做端到端 keepalive。任一端超過 15 秒沒有收到
+secure pong，應主動關閉目前 channel，交由 reconnect loop 建新連線與新 handshake。
+
 ### LAN
 
 M5 再做。Mac 使用 `_edgelink._tcp` Bonjour；Android 使用 `NsdManager`，並提供手動 IP

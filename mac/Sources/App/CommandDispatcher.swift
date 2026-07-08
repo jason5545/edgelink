@@ -6,6 +6,7 @@ final class CommandDispatcher {
     private let clipboardSync: ClipboardSync
     private let notificationPresenter: MacNotificationPresenter
     private let screenSession: MacScreenSession?
+    private let onStatusPong: @Sendable () -> Void
     private let onSmsMessage: @Sendable (SmsMessageBody) -> Void
     private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
     private let decoder = JSONDecoder()
@@ -16,6 +17,7 @@ final class CommandDispatcher {
         clipboardSync: ClipboardSync = ClipboardSync(),
         notificationPresenter: MacNotificationPresenter = MacNotificationPresenter(),
         screenSession: MacScreenSession? = nil,
+        onStatusPong: @escaping @Sendable () -> Void = {},
         onSmsMessage: @escaping @Sendable (SmsMessageBody) -> Void = { _ in },
         onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in }
     ) {
@@ -23,6 +25,7 @@ final class CommandDispatcher {
         self.clipboardSync = clipboardSync
         self.notificationPresenter = notificationPresenter
         self.screenSession = screenSession
+        self.onStatusPong = onStatusPong
         self.onSmsMessage = onSmsMessage
         self.onSmsSendResult = onSmsSendResult
     }
@@ -32,6 +35,9 @@ final class CommandDispatcher {
         switch header.t {
         case EnvelopeType.statusPing:
             return try encoder.encode(Envelope(t: EnvelopeType.statusPong, b: EmptyBody()))
+        case EnvelopeType.statusPong:
+            onStatusPong()
+            return nil
         case EnvelopeType.inputPointer:
             let envelope = try decoder.decode(Envelope<InputPointerBody>.self, from: plaintext)
             handlePointer(envelope.b)

@@ -19,9 +19,14 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.time.Instant
+import java.util.concurrent.TimeUnit
+
+private const val RELAY_WEBSOCKET_PING_INTERVAL_SECONDS = 15L
 
 class RelayTransport(
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .pingInterval(RELAY_WEBSOCKET_PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
+        .build(),
     private val crypto: SodiumHandshakeCrypto = SodiumHandshakeCrypto()
 ) {
     suspend fun connect(relayUrl: String, hostId: String, identity: LocalIdentity): ByteChannel {
