@@ -382,9 +382,10 @@ AEAD：
 MediaProjection service 與既有 virtual display，讓下一次 `screen.start` 不必重新消耗一次性
 permission token。Android 開始投影後回：
 
-Android 端在活躍螢幕串流開始後可持有 wake lock 防止螢幕鎖定，並在約 5 秒後暫時把系統亮度降到
-最低；收到 `screen.stop`、relay 斷線、或 projection 結束時必須恢復原本亮度設定。亮度寫入需要
-Android `WRITE_SETTINGS` special app access，未授權時不應阻擋螢幕串流。
+Android 端在活躍螢幕串流開始後可持有 wake lock 防止螢幕鎖定、暫時停用 screensaver/daydream
+避免進入 wall clock，並在約 5 秒後暫時把系統亮度降到最低；收到 `screen.stop`、relay 斷線、或
+projection 結束時必須恢復原本亮度與 screensaver 設定。亮度寫入需要 Android `WRITE_SETTINGS`
+special app access；screensaver 寫入需要 `WRITE_SECURE_SETTINGS`。未授權時不應阻擋螢幕串流。
 
 部分 Android / OEM build 會在整螢幕 MediaProjection 期間隱藏通知或受保護內容。EdgeLink 不依賴
 per-app notification privacy API，因為 Android 沒有提供「整螢幕分享但只調整某一個 app 通知」的公開
