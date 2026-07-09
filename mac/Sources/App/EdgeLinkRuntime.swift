@@ -381,7 +381,6 @@ final class EdgeLinkRuntime: ObservableObject {
                     if currentSession === session {
                         currentSession = nil
                         screenSession.clearSender()
-                        screenSession.stop(sendRemoteStop: false)
                     }
                 }
                 try await withThrowingTaskGroup(of: Void.self) { group in
@@ -408,7 +407,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 isConnected = false
                 currentSession = nil
                 screenSession.clearSender()
-                screenSession.stop(sendRemoteStop: false)
+                screenSession.handleTransportInterrupted()
                 connectionStatus = "Disconnected"
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay = min(retryDelay * 2, 30_000_000_000)

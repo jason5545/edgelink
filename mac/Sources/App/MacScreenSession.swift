@@ -46,6 +46,11 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     func setSender(_ sender: @escaping (Data) -> Void) {
         sendPlaintext = sender
+        if isScreenSessionActive && peerConnection == nil {
+            status = "Starting"
+            DiagnosticsLog.info("screen.mac.resume_start_after_reconnect")
+            sendEnvelope(type: EnvelopeType.screenStart, body: EmptyBody())
+        }
     }
 
     func clearSender() {
@@ -197,6 +202,57 @@ final class MacScreenSession: NSObject, ObservableObject {
         factory = nil
         DiagnosticsLog.info(
             "screen.mac.stop_done pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack)"
+        )
+    }
+
+    func handleTransportInterrupted() {
+        guard !isStopping else {
+            DiagnosticsLog.warn("screen.mac.transport_interrupted_ignored already_stopping")
+            return
+        }
+
+        let hadPeerConnection = peerConnection != nil
+        let hadControlDataChannel = controlDataChannel != nil
+        let hadRemoteVideoTrack = remoteVideoTrack != nil
+        let shouldResume = isScreenSessionActive
+        let hadSessionState = shouldResume || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || screenMeta != nil
+        guard hadSessionState else {
+            return
+        }
+
+        isStopping = true
+        defer { isStopping = false }
+        DiagnosticsLog.info(
+            "screen.mac.transport_interrupted resume=\(shouldResume) active=\(isScreenSessionActive) pc=\(hadPeerConnection) dc=\(hadControlDataChannel)"
+        )
+
+        status = shouldResume ? "Reconnecting" : "Stopped"
+        hasRemoteVideo = false
+        cancelPendingPointerMove()
+        cancelPendingWheel()
+
+        let track = remoteVideoTrack
+        remoteVideoTrack = nil
+        track?.remove(videoView)
+        stopStatsLogging()
+        videoView.clear()
+
+        let dataChannel = controlDataChannel
+        controlDataChannel = nil
+        dataChannel?.delegate = nil
+
+        let peerConnectionToClose = peerConnection
+        peerConnection = nil
+        peerConnectionToClose?.close()
+        factory = nil
+
+        if !shouldResume {
+            isScreenSessionActive = false
+            screenMeta = nil
+        }
+
+        DiagnosticsLog.info(
+            "screen.mac.transport_interrupted_done resume=\(shouldResume) pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack)"
         )
     }
 
