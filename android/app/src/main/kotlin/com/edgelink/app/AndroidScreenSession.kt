@@ -41,6 +41,11 @@ import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -74,6 +79,7 @@ class AndroidScreenSession(
     private var viewerVisible = true
     private var statsHandlerThread: HandlerThread? = null
     private var statsHandler: Handler? = null
+    private val shizukuScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val statsLogger = ScreenStatsLogger()
     private val isStopping = AtomicBoolean(false)
     private val boostHandler = Handler(appContext.mainLooper)
@@ -89,7 +95,10 @@ class AndroidScreenSession(
             startWithActiveProjection()
             return
         }
-        ScreenCapturePermissionActivity.start(appContext)
+        shizukuScope.launch {
+            prepareScreenAccessWithShizuku()
+            ScreenCapturePermissionActivity.start(appContext)
+        }
     }
 
     fun setControlDataChannelHandler(handler: ((ByteArray) -> Unit)?) {
@@ -234,7 +243,24 @@ class AndroidScreenSession(
     }
 
     fun shutdown() {
+        shizukuScope.cancel()
         releaseProjection(stopService = true)
+    }
+
+    private suspend fun prepareScreenAccessWithShizuku() {
+        if (!AndroidShizukuSupport.hasPermission()) {
+            return
+        }
+        val result = runCatching {
+            AndroidShizukuSupport.prepareScreenAccess(appContext)
+        }.getOrElse { error ->
+            ShizukuOperationResult(success = false, message = error.message.orEmpty())
+        }
+        if (result.success) {
+            EdgeLinkLog.info("screen.android.shizuku_prepare_ok message=${result.message}")
+        } else {
+            EdgeLinkLog.warn("screen.android.shizuku_prepare_failed message=${result.message}")
+        }
     }
 
     private fun stopStreaming() {

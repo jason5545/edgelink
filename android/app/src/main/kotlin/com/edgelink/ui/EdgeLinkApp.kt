@@ -198,7 +198,12 @@ data class EdgeLinkUiState(
     val notificationAccessGranted: Boolean = false,
     val notificationPostGranted: Boolean = true,
     val screenDimmingAccessGranted: Boolean = false,
-    val smsAccessGranted: Boolean = false
+    val smsAccessGranted: Boolean = false,
+    val shizukuAvailable: Boolean = false,
+    val shizukuSupported: Boolean = false,
+    val shizukuPermissionGranted: Boolean = false,
+    val shizukuPermissionRequestBlocked: Boolean = false,
+    val shizukuUid: Int? = null
 )
 
 interface EdgeLinkActions {
@@ -218,6 +223,7 @@ interface EdgeLinkActions {
     fun onOpenRemoteInputSettings()
     fun onOpenScreenDimmingSettings()
     fun onOpenSmsSettings()
+    fun onRequestShizukuPermission()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -236,6 +242,7 @@ interface EdgeLinkActions {
         override fun onOpenRemoteInputSettings() = Unit
         override fun onOpenScreenDimmingSettings() = Unit
         override fun onOpenSmsSettings() = Unit
+        override fun onRequestShizukuPermission() = Unit
     }
 }
 
@@ -451,7 +458,7 @@ private fun MissingPermissionRow(permission: MissingPermission) {
             Text(permission.detail, style = MaterialTheme.typography.bodySmall)
         }
         FilledTonalButton(onClick = permission.onOpen) {
-            Text("開啟設定")
+            Text(permission.actionLabel)
         }
     }
 }
@@ -601,6 +608,12 @@ private fun SettingsScreen(
             }
 
             item {
+                SettingsSection(title = "Shizuku") {
+                    ShizukuStatusRow(state = state, actions = actions)
+                }
+            }
+
+            item {
                 SettingsSection(title = "同步") {
                     SettingsToggleRow(
                         label = "自動重新連線",
@@ -612,6 +625,7 @@ private fun SettingsScreen(
                         enabled = state.notificationSyncEnabled,
                         accessGranted = state.notificationAccessGranted,
                         postGranted = state.notificationPostGranted,
+                        actionLabel = permissionActionLabel(state),
                         onCheckedChange = actions::onNotificationSyncChange,
                         onOpenSettings = actions::onOpenNotificationSettings
                     )
@@ -624,18 +638,21 @@ private fun SettingsScreen(
                         label = "遠端輸入",
                         granted = state.remoteInputAccessGranted,
                         missingText = "需要啟用輔助使用服務",
+                        actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenRemoteInputSettings
                     )
                     PermissionStatusRow(
                         label = "螢幕保持喚醒",
                         granted = state.screenDimmingAccessGranted,
                         missingText = "需要修改系統設定或顯示在其他應用程式上層",
+                        actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenScreenDimmingSettings
                     )
                     PermissionStatusRow(
                         label = "SMS",
                         granted = state.smsAccessGranted,
                         missingText = "需要簡訊權限",
+                        actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenSmsSettings
                     )
                 }
@@ -706,6 +723,22 @@ private fun MonoTextRow(label: String, value: String) {
 }
 
 @Composable
+private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
+    ListItem(
+        headlineContent = { Text("狀態") },
+        supportingContent = { Text(shizukuStatusText(state)) },
+        trailingContent = {
+            if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionGranted && !state.shizukuPermissionRequestBlocked) {
+                FilledTonalButton(onClick = actions::onRequestShizukuPermission) {
+                    Text("授權")
+                }
+            }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
+}
+
+@Composable
 private fun SettingsToggleRow(
     label: String,
     checked: Boolean,
@@ -728,6 +761,7 @@ private fun NotificationToggleRow(
     enabled: Boolean,
     accessGranted: Boolean,
     postGranted: Boolean,
+    actionLabel: String,
     onCheckedChange: (Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -750,7 +784,7 @@ private fun NotificationToggleRow(
                     modifier = Modifier.weight(1f)
                 )
                 FilledTonalButton(onClick = onOpenSettings) {
-                    Text("開啟設定")
+                    Text(actionLabel)
                 }
             }
         }
@@ -762,6 +796,7 @@ private fun PermissionStatusRow(
     label: String,
     granted: Boolean,
     missingText: String,
+    actionLabel: String = "開啟設定",
     onOpenSettings: () -> Unit
 ) {
     ListItem(
@@ -772,7 +807,7 @@ private fun PermissionStatusRow(
         trailingContent = {
             if (!granted) {
                 FilledTonalButton(onClick = onOpenSettings) {
-                    Text("開啟設定")
+                    Text(actionLabel)
                 }
             }
         },
@@ -1046,6 +1081,7 @@ private fun NumericPad(
 private data class MissingPermission(
     val title: String,
     val detail: String,
+    val actionLabel: String,
     val onOpen: () -> Unit
 )
 
@@ -1056,6 +1092,7 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
                 MissingPermission(
                     title = "通知同步",
                     detail = if (!state.notificationAccessGranted) "需要通知存取權" else "需要允許通知提醒",
+                    actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenNotificationSettings
                 )
             )
@@ -1065,6 +1102,7 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
                 MissingPermission(
                     title = "遠端輸入",
                     detail = "需要啟用輔助使用服務",
+                    actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenRemoteInputSettings
                 )
             )
@@ -1074,6 +1112,7 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
                 MissingPermission(
                     title = "螢幕保持喚醒",
                     detail = "需要修改系統設定或顯示在其他應用程式上層",
+                    actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenScreenDimmingSettings
                 )
             )
@@ -1083,10 +1122,32 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
                 MissingPermission(
                     title = "SMS",
                     detail = "需要簡訊權限",
+                    actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenSmsSettings
                 )
             )
         }
+    }
+
+private fun permissionActionLabel(state: EdgeLinkUiState): String =
+    if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionRequestBlocked) {
+        "修復"
+    } else {
+        "開啟設定"
+    }
+
+private fun shizukuStatusText(state: EdgeLinkUiState): String =
+    when {
+        !state.shizukuAvailable -> "未連線"
+        !state.shizukuSupported -> "版本不支援"
+        state.shizukuPermissionGranted -> when (state.shizukuUid) {
+            0 -> "已授權：root"
+            2000 -> "已授權：shell"
+            null -> "已授權"
+            else -> "已授權：uid ${state.shizukuUid}"
+        }
+        state.shizukuPermissionRequestBlocked -> "已拒絕"
+        else -> "可授權"
     }
 
 private val EdgeLinkUiState.canDisconnect: Boolean

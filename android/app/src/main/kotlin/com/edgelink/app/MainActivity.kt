@@ -68,6 +68,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleOpenNotificationSettings() {
+        if (controller.tryHandleNotificationAccessWithShizuku()) {
+            return
+        }
         if (!AndroidNotificationPresenter.canPostNotifications(this)) {
             requestPostNotificationsPermission(openAccessAfterPermission = false)
         } else {
@@ -84,8 +87,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleOpenSmsSettings() {
-        controller.onOpenSmsSettings()
-        smsPermissionLauncher.launch(AndroidSmsSync.requiredPermissions)
+        if (!controller.tryHandleSmsAccessWithShizuku()) {
+            controller.onOpenSmsSettings()
+            smsPermissionLauncher.launch(AndroidSmsSync.requiredPermissions)
+        }
     }
 
     private fun handleQuit() {
@@ -153,4 +158,5 @@ private class EdgeLinkActivityActions(
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
     override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
+    override fun onRequestShizukuPermission() = delegate.onRequestShizukuPermission()
 }

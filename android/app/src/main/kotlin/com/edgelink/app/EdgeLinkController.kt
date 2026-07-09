@@ -3,6 +3,7 @@ package com.edgelink.app
 import android.content.Context
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
@@ -61,6 +62,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import rikka.shizuku.Shizuku
 import kotlin.coroutines.coroutineContext
 import java.time.Instant
 import java.util.Base64
@@ -75,6 +77,13 @@ private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 
 private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
     (endedAtNanos - startedAtNanos) / 1_000_000L
+
+private enum class PendingShizukuAction {
+    Notification,
+    RemoteInput,
+    Screen,
+    Sms
+}
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
@@ -91,6 +100,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val screenSession = AndroidScreenSession(appContext, ::sendPlaintext)
+    private val initialShizukuState = AndroidShizukuSupport.currentState()
     @Volatile
     private var lastPongElapsedMs = 0L
     private val stateFlow = MutableStateFlow(
@@ -101,7 +111,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
             screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
-            smsAccessGranted = smsSync.smsAccessGranted()
+            smsAccessGranted = smsSync.smsAccessGranted(),
+            shizukuAvailable = initialShizukuState.available,
+            shizukuSupported = initialShizukuState.supported,
+            shizukuPermissionGranted = initialShizukuState.permissionGranted,
+            shizukuPermissionRequestBlocked = initialShizukuState.permissionRequestBlocked,
+            shizukuUid = initialShizukuState.uid
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
@@ -133,6 +148,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var pairingJob: Job? = null
     private var smsPendingDrainJob: Job? = null
     private var pendingPairing: PendingPairing? = null
+    private var pendingShizukuAction: PendingShizukuAction? = null
     @Volatile
     private var manuallyDisconnected = false
     private val connectionGeneration = AtomicInteger(0)
@@ -143,9 +159,31 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             signalAutoReconnect("network_available")
         }
     }
+    private val shizukuBinderReceivedListener = Shizuku.OnBinderReceivedListener {
+        onShizukuStateChanged("binder_received")
+    }
+    private val shizukuBinderDeadListener = Shizuku.OnBinderDeadListener {
+        onShizukuStateChanged("binder_dead")
+    }
+    private val shizukuPermissionResultListener =
+        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode != AndroidShizukuSupport.requestCode) {
+                return@OnRequestPermissionResultListener
+            }
+            EdgeLinkLog.info("shizuku.android.permission_result granted=${grantResult == PackageManager.PERMISSION_GRANTED}")
+            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                runPendingShizukuAction()
+            } else {
+                pendingShizukuAction = null
+                refreshNotificationAccess()
+            }
+        }
 
     init {
         EdgeLinkLog.configure(appContext)
+        Shizuku.addBinderReceivedListenerSticky(shizukuBinderReceivedListener)
+        Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(::handleScreenControlDataChannel)
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -159,6 +197,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     fun close() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        Shizuku.removeBinderReceivedListener(shizukuBinderReceivedListener)
+        Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(null)
         screenSession.shutdown()
         session?.close()
@@ -312,18 +353,45 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     override fun onOpenNotificationSettings() {
+        if (tryHandleNotificationAccessWithShizuku()) {
+            return
+        }
+        openNotificationSettingsDirect()
+    }
+
+    private fun openNotificationSettingsDirect() {
         EdgeLinkLog.info("notification.android.open_settings")
-        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        val intent = if (!AndroidNotificationPresenter.canPostNotifications(appContext)) {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, appContext.packageName)
+        } else {
+            Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        }
+        intent
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         appContext.startActivity(intent)
     }
 
     override fun onOpenRemoteInputSettings() {
+        if (tryRunOrRequestShizuku(PendingShizukuAction.RemoteInput)) {
+            return
+        }
+        openRemoteInputSettingsDirect()
+    }
+
+    private fun openRemoteInputSettingsDirect() {
         EdgeLinkLog.info("remote_input.android.open_settings")
         RemoteInputService.openSettings(appContext)
     }
 
     override fun onOpenScreenDimmingSettings() {
+        if (tryRunOrRequestShizuku(PendingShizukuAction.Screen)) {
+            return
+        }
+        openScreenDimmingSettingsDirect()
+    }
+
+    private fun openScreenDimmingSettingsDirect() {
         EdgeLinkLog.info("screen.android.dimming_open_settings")
         val action = if (!AndroidScreenPowerGuard.canWriteSettings(appContext)) {
             Settings.ACTION_MANAGE_WRITE_SETTINGS
@@ -338,16 +406,118 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     override fun onOpenSmsSettings() {
         EdgeLinkLog.info("sms.android.permission_request")
+        tryHandleSmsAccessWithShizuku()
+    }
+
+    override fun onRequestShizukuPermission() {
+        pendingShizukuAction = null
+        if (!AndroidShizukuSupport.requestPermission()) {
+            EdgeLinkLog.warn("shizuku.android.permission_request_skipped")
+        }
+        refreshNotificationAccess()
+    }
+
+    fun tryHandleNotificationAccessWithShizuku(): Boolean =
+        tryRunOrRequestShizuku(PendingShizukuAction.Notification)
+
+    fun tryHandleSmsAccessWithShizuku(): Boolean =
+        tryRunOrRequestShizuku(PendingShizukuAction.Sms)
+
+    private fun tryRunOrRequestShizuku(action: PendingShizukuAction): Boolean {
+        val state = AndroidShizukuSupport.currentState()
+        return when {
+            state.canUse -> {
+                runShizukuAction(action)
+                true
+            }
+            state.canRequestPermission -> {
+                pendingShizukuAction = action
+                val requested = AndroidShizukuSupport.requestPermission()
+                if (!requested) {
+                    pendingShizukuAction = null
+                }
+                requested
+            }
+            else -> false
+        }
+    }
+
+    private fun runPendingShizukuAction() {
+        val action = pendingShizukuAction ?: run {
+            refreshNotificationAccess()
+            return
+        }
+        pendingShizukuAction = null
+        runShizukuAction(action)
+    }
+
+    private fun runShizukuAction(action: PendingShizukuAction) {
+        scope.launch {
+            val result = runCatching {
+                when (action) {
+                    PendingShizukuAction.Notification -> AndroidShizukuSupport.enableNotificationAccess(appContext)
+                    PendingShizukuAction.RemoteInput -> AndroidShizukuSupport.enableRemoteInput(appContext)
+                    PendingShizukuAction.Screen -> AndroidShizukuSupport.prepareScreenAccess(appContext)
+                    PendingShizukuAction.Sms -> AndroidShizukuSupport.grantSmsPermissions(appContext)
+                }
+            }.getOrElse { error ->
+                ShizukuOperationResult(success = false, message = error.message.orEmpty())
+            }
+
+            if (result.success) {
+                EdgeLinkLog.info("shizuku.android.action_ok action=$action message=${result.message}")
+            } else {
+                EdgeLinkLog.warn("shizuku.android.action_failed action=$action message=${result.message}")
+            }
+            refreshNotificationAccess()
+            fallbackAfterShizukuAction(action)
+        }
+    }
+
+    private fun fallbackAfterShizukuAction(action: PendingShizukuAction) {
+        val state = stateFlow.value
+        when (action) {
+            PendingShizukuAction.Notification -> {
+                if (state.notificationSyncEnabled && (!state.notificationAccessGranted || !state.notificationPostGranted)) {
+                    openNotificationSettingsDirect()
+                }
+            }
+            PendingShizukuAction.RemoteInput -> {
+                if (!state.remoteInputAccessGranted) {
+                    openRemoteInputSettingsDirect()
+                }
+            }
+            PendingShizukuAction.Screen -> {
+                if (!state.screenDimmingAccessGranted) {
+                    openScreenDimmingSettingsDirect()
+                }
+            }
+            PendingShizukuAction.Sms -> Unit
+        }
+    }
+
+    private fun onShizukuStateChanged(reason: String) {
+        EdgeLinkLog.info("shizuku.android.state_changed reason=$reason available=${AndroidShizukuSupport.currentState().available}")
+        refreshNotificationAccess()
+        if (AndroidShizukuSupport.hasPermission()) {
+            runPendingShizukuAction()
+        }
     }
 
     fun refreshNotificationAccess() {
+        val shizukuState = AndroidShizukuSupport.currentState()
         stateFlow.update {
             it.copy(
                 remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
                 screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
-                smsAccessGranted = smsSync.smsAccessGranted()
+                smsAccessGranted = smsSync.smsAccessGranted(),
+                shizukuAvailable = shizukuState.available,
+                shizukuSupported = shizukuState.supported,
+                shizukuPermissionGranted = shizukuState.permissionGranted,
+                shizukuPermissionRequestBlocked = shizukuState.permissionRequestBlocked,
+                shizukuUid = shizukuState.uid
             )
         }
     }

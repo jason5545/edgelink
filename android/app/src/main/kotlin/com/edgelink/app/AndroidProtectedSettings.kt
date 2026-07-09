@@ -6,6 +6,9 @@ import android.content.pm.PackageManager
 
 object AndroidProtectedSettings {
     fun canWriteSecureSettings(context: Context): Boolean =
+        canWriteSecureSettingsDirectly(context) || AndroidShizukuSupport.hasPermission()
+
+    fun canWriteSecureSettingsDirectly(context: Context): Boolean =
         context.applicationContext.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
             PackageManager.PERMISSION_GRANTED
 }

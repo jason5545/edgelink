@@ -8,6 +8,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 private const val SCREEN_DIM_DELAY_MS = 5_000L
 private const val SCREEN_POWER_PREFS = "edgelink_screen_power"
@@ -26,6 +30,7 @@ class AndroidScreenPowerGuard(context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val powerManager = appContext.getSystemService(PowerManager::class.java)
     private var wakeLock: PowerManager.WakeLock? = null
+    private val secureSettingsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var originalBrightnessSettings: BrightnessSnapshot? = null
     private var originalScreensaverSettings: ScreensaverSnapshot? = null
     private val keepScreenOnWindow = AndroidKeepScreenOnWindow(appContext)
@@ -115,6 +120,11 @@ class AndroidScreenPowerGuard(context: Context) {
             ?: readCurrentScreensaverSnapshot().also(::saveScreensaverSnapshot)
         originalScreensaverSettings = snapshot
 
+        if (!AndroidProtectedSettings.canWriteSecureSettingsDirectly(appContext)) {
+            putScreensaverWithShizuku(value = 0, reason = "disable")
+            return
+        }
+
         runCatching {
             Settings.Secure.putInt(resolver, SECURE_SCREENSAVER_ENABLED, 0)
         }.onSuccess {
@@ -131,6 +141,14 @@ class AndroidScreenPowerGuard(context: Context) {
             return
         }
 
+        if (!AndroidProtectedSettings.canWriteSecureSettingsDirectly(appContext)) {
+            putScreensaverWithShizuku(value = snapshot.enabled, reason = "restore:$reason") {
+                originalScreensaverSettings = null
+                clearScreensaverSnapshot()
+            }
+            return
+        }
+
         runCatching {
             Settings.Secure.putInt(resolver, SECURE_SCREENSAVER_ENABLED, snapshot.enabled)
         }.onSuccess {
@@ -139,6 +157,26 @@ class AndroidScreenPowerGuard(context: Context) {
             EdgeLinkLog.info("screen.android.screensaver_restored reason=$reason enabled=${snapshot.enabled}")
         }.onFailure { error ->
             EdgeLinkLog.warn("screen.android.screensaver_restore_failed reason=$reason", error)
+        }
+    }
+
+    private fun putScreensaverWithShizuku(
+        value: Int,
+        reason: String,
+        onSuccess: () -> Unit = {}
+    ) {
+        secureSettingsScope.launch {
+            val result = runCatching {
+                AndroidShizukuSupport.putSecureInt(appContext, SECURE_SCREENSAVER_ENABLED, value)
+            }.getOrElse { error ->
+                ShizukuOperationResult(success = false, message = error.message.orEmpty())
+            }
+            if (result.success) {
+                EdgeLinkLog.info("screen.android.screensaver_shizuku_written reason=$reason value=$value")
+                onSuccess()
+            } else {
+                EdgeLinkLog.warn("screen.android.screensaver_shizuku_failed reason=$reason message=${result.message}")
+            }
         }
     }
 
