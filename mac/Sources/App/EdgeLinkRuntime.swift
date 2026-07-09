@@ -638,6 +638,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
                 if let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardSet, b: body)) {
                     try? await session.sendPlaintext(data)
+                    DiagnosticsLog.info("clipboard.mac.sent hashFp=\(Self.fingerprint(snapshot.hash))")
                 }
             }
             try? await Task.sleep(nanoseconds: 700_000_000)

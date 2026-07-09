@@ -66,6 +66,7 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 content.sound = .default
                 content.threadIdentifier = "edgelink.remote.\(body.sourceDeviceId ?? "unknown")"
                 content.userInfo = [
+                    "edgelinkDoNotForward": true,
                     "edgelinkNotificationId": body.id,
                     "sourceDeviceId": body.sourceDeviceId ?? "",
                     "sourcePlatform": body.sourcePlatform ?? ""
@@ -118,6 +119,7 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 content.categoryIdentifier = Self.verificationCodeCategoryIdentifier
                 content.threadIdentifier = "edgelink.verification.\(message.sourceDeviceId ?? "unknown")"
                 content.userInfo = [
+                    "edgelinkDoNotForward": true,
                     "edgelinkVerificationCode": candidate.code,
                     "edgelinkVerificationId": candidate.id,
                     "sourceDeviceId": message.sourceDeviceId ?? "",

@@ -9,8 +9,11 @@ struct ClipboardSnapshot: Equatable {
 }
 
 final class ClipboardSync {
+    private static let protectedOutboundInterval: TimeInterval = 10 * 60
+
     private var lastChangeCount = NSPasteboard.general.changeCount
     private var suppressedHash: String?
+    private var protectedOutboundHashes: [String: Date] = [:]
 
     func pollLocalText() -> ClipboardSnapshot? {
         let pasteboard = NSPasteboard.general
@@ -22,6 +25,11 @@ final class ClipboardSync {
             return nil
         }
         let hash = Self.hash(text)
+        pruneProtectedOutboundHashes()
+        if protectedOutboundHashes[hash] != nil {
+            DiagnosticsLog.info("clipboard.mac.local_blocked hashFp=\(Self.fingerprint(hash))")
+            return nil
+        }
         if hash == suppressedHash {
             suppressedHash = nil
             return nil
@@ -48,8 +56,10 @@ final class ClipboardSync {
 
     func setLocalTextWithoutPublishing(_ text: String) {
         let hash = Self.hash(text)
+        protectOutbound(hash)
         guard hash != Self.hash(NSPasteboard.general.string(forType: .string) ?? "") else {
             suppressedHash = hash
+            lastChangeCount = NSPasteboard.general.changeCount
             return
         }
         let pasteboard = NSPasteboard.general
@@ -59,9 +69,23 @@ final class ClipboardSync {
         lastChangeCount = pasteboard.changeCount
     }
 
+    private func protectOutbound(_ hash: String) {
+        protectedOutboundHashes[hash] = Date().addingTimeInterval(Self.protectedOutboundInterval)
+    }
+
+    private func pruneProtectedOutboundHashes(now: Date = Date()) {
+        protectedOutboundHashes = protectedOutboundHashes.filter { _, expiresAt in
+            expiresAt > now
+        }
+    }
+
     static func hash(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private static func fingerprint(_ value: String) -> String {
+        String(value.prefix(12))
     }
 }

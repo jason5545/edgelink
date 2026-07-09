@@ -72,6 +72,10 @@ actor MacNotificationDatabaseSource {
         }
 
         let bundleIdentifier = row.bundleIdentifier ?? stringValue(root["app"]).ifEmpty(nil)
+        if bundleIdentifier == Bundle.main.bundleIdentifier || containsEdgeLinkForwardingMarker(root) {
+            DiagnosticsLog.info("notification.mac.db.skip_self id=\(row.id)")
+            return nil
+        }
         return NotificationPostBody(
             id: "mac:\(row.id)",
             sourceDeviceId: sourceDeviceId,
@@ -169,6 +173,25 @@ actor MacNotificationDatabaseSource {
 
     private func stringValue(_ value: Any?) -> String {
         (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func containsEdgeLinkForwardingMarker(_ value: Any) -> Bool {
+        if let dictionary = value as? [String: Any] {
+            for (key, nestedValue) in dictionary {
+                if key == "edgelinkDoNotForward" ||
+                    key == "edgelinkNotificationId" ||
+                    key == "edgelinkVerificationCode" ||
+                    key == "edgelinkVerificationId" {
+                    return true
+                }
+                if containsEdgeLinkForwardingMarker(nestedValue) {
+                    return true
+                }
+            }
+        } else if let array = value as? [Any] {
+            return array.contains { containsEdgeLinkForwardingMarker($0) }
+        }
+        return false
     }
 }
 
