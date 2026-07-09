@@ -64,6 +64,7 @@ class AndroidScreenSession(
     private var capturerObserver: GapLoggingCapturerObserver? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
+    private var videoSender: RtpSender? = null
     private var controlDataChannel: DataChannel? = null
     private var controlDataChannelObserver: DataChannel.Observer? = null
     private val screenPowerGuard = AndroidScreenPowerGuard(appContext)
@@ -156,6 +157,7 @@ class AndroidScreenSession(
             val pc = createPeerConnection(localFactory)
             peerConnection = pc
             val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
+            videoSender = sender
             configureVideoQuality(pc, sender)
             setupControlDataChannel(pc)
             createOffer(pc)
@@ -213,13 +215,16 @@ class AndroidScreenSession(
         if (viewerVisible) {
             return
         }
-        val applied = pc.setBitrate(
-            SCREEN_BOOST_MIN_BITRATE_BPS,
-            SCREEN_BOOST_START_BITRATE_BPS,
-            SCREEN_MAX_BITRATE_BPS
+        val profile = BitrateProfile(
+            minBps = SCREEN_VISIBLE_MIN_BITRATE_BPS,
+            startBps = SCREEN_VISIBLE_START_BITRATE_BPS,
+            maxBps = SCREEN_VISIBLE_MAX_BITRATE_BPS,
+            scaleResolutionDownBy = SCREEN_VISIBLE_SCALE_RESOLUTION_DOWN_BY,
+            degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
         )
+        val result = applyBitrateProfile(pc, videoSender, profile)
         EdgeLinkLog.info(
-            "screen.android.bitrate_boost applied=$applied min=$SCREEN_BOOST_MIN_BITRATE_BPS start=$SCREEN_BOOST_START_BITRATE_BPS max=$SCREEN_MAX_BITRATE_BPS durationMs=$SCREEN_BOOST_DURATION_MS"
+            "screen.android.bitrate_boost bitrateApplied=${result.bitrateApplied} senderApplied=${result.senderApplied} min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps} scale=${profile.scaleResolutionDownBy} durationMs=$SCREEN_BOOST_DURATION_MS"
         )
         boostHandler.removeCallbacks(restoreBitrateRunnable)
         boostHandler.postDelayed(restoreBitrateRunnable, SCREEN_BOOST_DURATION_MS)
@@ -246,6 +251,7 @@ class AndroidScreenSession(
             stopStatsLogging()
             closeControlDataChannel()
             detachProjectionFrames()
+            videoSender = null
             videoTrack?.dispose()
             videoTrack = null
             videoSource?.dispose()
@@ -460,6 +466,27 @@ class AndroidScreenSession(
 
     private fun configureVideoQuality(pc: PeerConnection, sender: RtpSender?) {
         val profile = currentViewerBitrateProfile()
+        val result = applyBitrateProfile(pc, sender, profile)
+        EdgeLinkLog.info(
+            "screen.android.quality bitrateApplied=${result.bitrateApplied} senderApplied=${result.senderApplied} visible=$viewerVisible min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps} scale=${profile.scaleResolutionDownBy} degradation=${profile.degradationPreference}"
+        )
+    }
+
+    private fun applyViewerBitrate(reason: String): Boolean {
+        val pc = peerConnection ?: return false
+        val profile = currentViewerBitrateProfile()
+        val result = applyBitrateProfile(pc, videoSender, profile)
+        EdgeLinkLog.info(
+            "screen.android.bitrate_viewer reason=$reason visible=$viewerVisible bitrateApplied=${result.bitrateApplied} senderApplied=${result.senderApplied} min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps} scale=${profile.scaleResolutionDownBy} degradation=${profile.degradationPreference}"
+        )
+        return result.bitrateApplied || result.senderApplied
+    }
+
+    private fun applyBitrateProfile(
+        pc: PeerConnection,
+        sender: RtpSender?,
+        profile: BitrateProfile
+    ): BitrateApplyResult {
         val bitrateApplied = pc.setBitrate(
             profile.minBps,
             profile.startBps,
@@ -467,12 +494,12 @@ class AndroidScreenSession(
         )
         val parameters = sender?.parameters
         if (parameters != null) {
-            parameters.degradationPreference = RtpParameters.DegradationPreference.BALANCED
+            parameters.degradationPreference = profile.degradationPreference
             parameters.encodings.forEach { encoding ->
                 encoding.minBitrateBps = profile.minBps
                 encoding.maxBitrateBps = profile.maxBps
                 encoding.maxFramerate = SCREEN_FPS
-                encoding.scaleResolutionDownBy = 1.0
+                encoding.scaleResolutionDownBy = profile.scaleResolutionDownBy
             }
         }
         val senderApplied = if (sender != null && parameters != null) {
@@ -480,19 +507,10 @@ class AndroidScreenSession(
         } else {
             false
         }
-        EdgeLinkLog.info(
-            "screen.android.quality bitrateApplied=$bitrateApplied senderApplied=$senderApplied visible=$viewerVisible min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps}"
+        return BitrateApplyResult(
+            bitrateApplied = bitrateApplied,
+            senderApplied = senderApplied
         )
-    }
-
-    private fun applyViewerBitrate(reason: String): Boolean {
-        val pc = peerConnection ?: return false
-        val profile = currentViewerBitrateProfile()
-        val applied = pc.setBitrate(profile.minBps, profile.startBps, profile.maxBps)
-        EdgeLinkLog.info(
-            "screen.android.bitrate_viewer reason=$reason visible=$viewerVisible applied=$applied min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps}"
-        )
-        return applied
     }
 
     private fun currentViewerBitrateProfile(): BitrateProfile =
@@ -500,13 +518,17 @@ class AndroidScreenSession(
             BitrateProfile(
                 minBps = SCREEN_VISIBLE_MIN_BITRATE_BPS,
                 startBps = SCREEN_VISIBLE_START_BITRATE_BPS,
-                maxBps = SCREEN_MAX_BITRATE_BPS
+                maxBps = SCREEN_VISIBLE_MAX_BITRATE_BPS,
+                scaleResolutionDownBy = SCREEN_VISIBLE_SCALE_RESOLUTION_DOWN_BY,
+                degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
             )
         } else {
             BitrateProfile(
                 minBps = SCREEN_HIDDEN_MIN_BITRATE_BPS,
                 startBps = SCREEN_HIDDEN_START_BITRATE_BPS,
-                maxBps = SCREEN_MAX_BITRATE_BPS
+                maxBps = SCREEN_HIDDEN_MAX_BITRATE_BPS,
+                scaleResolutionDownBy = SCREEN_HIDDEN_SCALE_RESOLUTION_DOWN_BY,
+                degradationPreference = RtpParameters.DegradationPreference.BALANCED
             )
         }
 
@@ -978,20 +1000,28 @@ class AndroidScreenSession(
     private data class BitrateProfile(
         val minBps: Int,
         val startBps: Int,
-        val maxBps: Int
+        val maxBps: Int,
+        val scaleResolutionDownBy: Double,
+        val degradationPreference: RtpParameters.DegradationPreference
+    )
+
+    private data class BitrateApplyResult(
+        val bitrateApplied: Boolean,
+        val senderApplied: Boolean
     )
 
     companion object {
         private const val SCREEN_FPS = 30
-        private const val SCREEN_VISIBLE_MIN_BITRATE_BPS = 2_500_000
-        private const val SCREEN_VISIBLE_START_BITRATE_BPS = 2_500_000
+        private const val SCREEN_VISIBLE_MIN_BITRATE_BPS = 3_500_000
+        private const val SCREEN_VISIBLE_START_BITRATE_BPS = 10_000_000
+        private const val SCREEN_VISIBLE_MAX_BITRATE_BPS = 16_000_000
+        private const val SCREEN_VISIBLE_SCALE_RESOLUTION_DOWN_BY = 1.0
         private const val SCREEN_HIDDEN_MIN_BITRATE_BPS = 300_000
         private const val SCREEN_HIDDEN_START_BITRATE_BPS = 1_000_000
-        private const val SCREEN_BOOST_MIN_BITRATE_BPS = 2_500_000
-        private const val SCREEN_BOOST_START_BITRATE_BPS = 2_500_000
-        private const val SCREEN_MAX_BITRATE_BPS = 8_000_000
+        private const val SCREEN_HIDDEN_MAX_BITRATE_BPS = 1_500_000
+        private const val SCREEN_HIDDEN_SCALE_RESOLUTION_DOWN_BY = 2.0
         private const val SCREEN_BOOST_DURATION_MS = 3_000L
-        private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 1280
+        private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 2560
         private const val VIRTUAL_DISPLAY_DPI = 400
         private val DISPLAY_FLAGS =
             DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
