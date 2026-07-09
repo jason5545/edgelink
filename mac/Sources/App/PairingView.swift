@@ -11,7 +11,7 @@ struct PairingView: View {
                 .monospacedDigit()
                 .frame(maxWidth: .infinity)
 
-            Button("Accept") {
+            Button("確認配對") {
                 onAccept()
             }
             .keyboardShortcut(.defaultAction)

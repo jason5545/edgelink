@@ -1,38 +1,73 @@
 package com.edgelink.ui
 
+import android.os.Build
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,18 +82,110 @@ fun EdgeLinkApp(
     state: EdgeLinkUiState = EdgeLinkUiState(),
     actions: EdgeLinkActions = EdgeLinkActions.Noop
 ) {
-    MaterialTheme {
-        Surface {
+    EdgeLinkTheme {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
+        ) {
             DeviceControlScreen(state = state, actions = actions)
         }
     }
 }
 
+@Composable
+private fun EdgeLinkTheme(content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    val dark = isSystemInDarkTheme()
+    val colorScheme = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && dark -> dynamicDarkColorScheme(context).amoled()
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicLightColorScheme(context)
+        dark -> edgeLinkAmoledDarkScheme()
+        else -> edgeLinkLightScheme()
+    }
+
+    MaterialTheme(
+        colorScheme = colorScheme,
+        content = content
+    )
+}
+
+private fun ColorScheme.amoled(): ColorScheme =
+    copy(
+        background = Color.Black,
+        onBackground = Color(0xFFECECEC),
+        surface = Color.Black,
+        onSurface = Color(0xFFECECEC),
+        surfaceVariant = Color(0xFF202124),
+        onSurfaceVariant = Color(0xFFD7D7D7),
+        surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF070707),
+        surfaceContainer = Color(0xFF0D0D0D),
+        surfaceContainerHigh = Color(0xFF151515),
+        surfaceContainerHighest = Color(0xFF1E1E1E)
+    )
+
+private fun edgeLinkLightScheme(): ColorScheme =
+    lightColorScheme(
+        primary = Color(0xFF285EA8),
+        onPrimary = Color.White,
+        primaryContainer = Color(0xFFD6E3FF),
+        onPrimaryContainer = Color(0xFF001B3F),
+        tertiary = Color(0xFF51643F),
+        onTertiary = Color.White,
+        tertiaryContainer = Color(0xFFD4EABB),
+        onTertiaryContainer = Color(0xFF102004),
+        error = Color(0xFFBA1A1A),
+        errorContainer = Color(0xFFFFDAD6),
+        onErrorContainer = Color(0xFF410002),
+        background = Color(0xFFFBFCFF),
+        surface = Color(0xFFFBFCFF),
+        surfaceVariant = Color(0xFFE0E2EC),
+        outlineVariant = Color(0xFFC3C6D0)
+    )
+
+private fun edgeLinkAmoledDarkScheme(): ColorScheme =
+    darkColorScheme(
+        primary = Color(0xFFA8C7FA),
+        onPrimary = Color(0xFF00315F),
+        primaryContainer = Color(0xFF004786),
+        onPrimaryContainer = Color(0xFFD6E3FF),
+        tertiary = Color(0xFFB8CEA0),
+        onTertiary = Color(0xFF243514),
+        tertiaryContainer = Color(0xFF3A4C29),
+        onTertiaryContainer = Color(0xFFD4EABB),
+        error = Color(0xFFFFB4AB),
+        onError = Color(0xFF690005),
+        errorContainer = Color(0xFF93000A),
+        onErrorContainer = Color(0xFFFFDAD6),
+        background = Color.Black,
+        onBackground = Color(0xFFECECEC),
+        surface = Color.Black,
+        onSurface = Color(0xFFECECEC),
+        surfaceVariant = Color(0xFF202124),
+        onSurfaceVariant = Color(0xFFD7D7D7),
+        outlineVariant = Color(0xFF44474F),
+        surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF070707),
+        surfaceContainer = Color(0xFF0D0D0D),
+        surfaceContainerHigh = Color(0xFF151515),
+        surfaceContainerHighest = Color(0xFF1E1E1E)
+    )
+
+enum class ConnectionPhase {
+    Idle,
+    Connecting,
+    Handshaking,
+    Connected,
+    Reconnecting,
+    Disconnected
+}
+
 data class EdgeLinkUiState(
     val localDeviceId: String = "",
-    val peerName: String = "No paired Mac",
+    val peerName: String = "尚未配對 Mac",
     val peerDeviceId: String = "",
     val connectionStatus: String = "Starting",
+    val connectionPhase: ConnectionPhase = ConnectionPhase.Idle,
     val isConnected: Boolean = false,
     val pairingHostIdInput: String = "",
     val pairingSas: String = "",
@@ -112,200 +239,470 @@ interface EdgeLinkActions {
     }
 }
 
+private enum class EdgeLinkScreen {
+    Dashboard,
+    RemoteControl,
+    Settings
+}
+
 @Composable
 fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
-    var text by remember { mutableStateOf("") }
+    var screenName by rememberSaveable { mutableStateOf(EdgeLinkScreen.Dashboard.name) }
+    val currentScreen = remember(screenName) { EdgeLinkScreen.valueOf(screenName) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        DeviceCard(
-            name = state.peerName,
-            deviceId = state.peerDeviceId.ifEmpty { state.localDeviceId },
-            status = state.connectionStatus,
-            connected = state.isConnected,
-            hasPeer = state.peerDeviceId.isNotEmpty(),
-            autoReconnectEnabled = state.autoReconnectEnabled,
-            notificationSyncEnabled = state.notificationSyncEnabled,
-            remoteInputAccessGranted = state.remoteInputAccessGranted,
-            notificationAccessGranted = state.notificationAccessGranted,
-            notificationPostGranted = state.notificationPostGranted,
-            screenDimmingAccessGranted = state.screenDimmingAccessGranted,
-            smsAccessGranted = state.smsAccessGranted,
-            onReconnect = actions::onReconnect,
-            onDisconnect = actions::onDisconnect,
-            onQuit = actions::onQuit,
-            onAutoReconnectChange = actions::onAutoReconnectChange,
-            onNotificationSyncChange = actions::onNotificationSyncChange,
-            onOpenNotificationSettings = actions::onOpenNotificationSettings,
-            onOpenRemoteInputSettings = actions::onOpenRemoteInputSettings,
-            onOpenScreenDimmingSettings = actions::onOpenScreenDimmingSettings,
-            onOpenSmsSettings = actions::onOpenSmsSettings
+    BackHandler(enabled = state.peerDeviceId.isNotEmpty() && currentScreen != EdgeLinkScreen.Dashboard) {
+        screenName = EdgeLinkScreen.Dashboard.name
+    }
+
+    if (state.peerDeviceId.isEmpty()) {
+        PairingScreen(state = state, actions = actions)
+        return
+    }
+
+    when (currentScreen) {
+        EdgeLinkScreen.Dashboard -> DashboardScreen(
+            state = state,
+            actions = actions,
+            onOpenRemoteControl = { screenName = EdgeLinkScreen.RemoteControl.name },
+            onOpenSettings = { screenName = EdgeLinkScreen.Settings.name }
         )
+        EdgeLinkScreen.RemoteControl -> RemoteControlScreen(
+            state = state,
+            actions = actions,
+            onBack = { screenName = EdgeLinkScreen.Dashboard.name }
+        )
+        EdgeLinkScreen.Settings -> SettingsScreen(
+            state = state,
+            actions = actions,
+            onBack = { screenName = EdgeLinkScreen.Dashboard.name }
+        )
+    }
+}
 
-        if (state.peerDeviceId.isEmpty()) {
-            PairingPanel(
-                state = state,
-                actions = actions,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            )
-        } else {
-            Touchpad(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                onPointer = actions::onPointer
-            )
-
-            KeyboardPanel(
-                text = text,
-                onTextChange = { value -> text = value },
-                onSendText = {
-                    if (text.isNotEmpty()) {
-                        actions.onText(InputTextBody(text))
-                        text = ""
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DashboardScreen(
+    state: EdgeLinkUiState,
+    actions: EdgeLinkActions,
+    onOpenRemoteControl: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("EdgeLink") },
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Text("⚙", style = MaterialTheme.typography.titleLarge)
                     }
-                },
-                onKey = actions::onKey
+                }
             )
+        }
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item { ConnectionStatusCard(state = state, actions = actions) }
+            item { PermissionHealthCard(state = state, actions = actions) }
+            item { RemoteControlEntry(onOpenRemoteControl = onOpenRemoteControl) }
         }
     }
 }
 
 @Composable
-private fun DeviceCard(
-    name: String,
-    deviceId: String,
-    status: String,
-    connected: Boolean,
-    hasPeer: Boolean,
-    autoReconnectEnabled: Boolean,
-    notificationSyncEnabled: Boolean,
-    remoteInputAccessGranted: Boolean,
-    notificationAccessGranted: Boolean,
-    notificationPostGranted: Boolean,
-    screenDimmingAccessGranted: Boolean,
-    smsAccessGranted: Boolean,
-    onReconnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    onQuit: () -> Unit,
-    onAutoReconnectChange: (Boolean) -> Unit,
-    onNotificationSyncChange: (Boolean) -> Unit,
-    onOpenNotificationSettings: () -> Unit,
-    onOpenRemoteInputSettings: () -> Unit,
-    onOpenScreenDimmingSettings: () -> Unit,
-    onOpenSmsSettings: () -> Unit
-) {
-    Column(
+private fun ConnectionStatusCard(state: EdgeLinkUiState, actions: EdgeLinkActions) {
+    val colors = MaterialTheme.colorScheme
+    val containerColor = when (state.connectionPhase) {
+        ConnectionPhase.Connected -> colors.primaryContainer
+        ConnectionPhase.Connecting,
+        ConnectionPhase.Handshaking,
+        ConnectionPhase.Reconnecting -> colors.tertiaryContainer
+        ConnectionPhase.Disconnected -> colors.errorContainer
+        ConnectionPhase.Idle -> colors.surfaceContainerHigh
+    }
+    val contentColor = when (state.connectionPhase) {
+        ConnectionPhase.Connected -> colors.onPrimaryContainer
+        ConnectionPhase.Connecting,
+        ConnectionPhase.Handshaking,
+        ConnectionPhase.Reconnecting -> colors.onTertiaryContainer
+        ConnectionPhase.Disconnected -> colors.onErrorContainer
+        ConnectionPhase.Idle -> colors.onSurface
+    }
+
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = containerColor,
+            contentColor = contentColor
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(12.dp)
+                        .background(contentColor, CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = localizedStatus(state.connectionStatus),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = state.peerName,
+                    style = MaterialTheme.typography.headlineSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = state.peerDeviceId,
+                    style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (state.connectionPhase == ConnectionPhase.Connected) {
+                OutlinedButton(
+                    onClick = actions::onReconnect,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("重新連線")
+                }
+            } else {
+                Button(
+                    onClick = actions::onReconnect,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("重新連線")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PermissionHealthCard(state: EdgeLinkUiState, actions: EdgeLinkActions) {
+    val missing = missingPermissions(state = state, actions = actions)
+    if (missing.isEmpty()) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "權限已就緒",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        return
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text("需要補齊權限", style = MaterialTheme.typography.titleMedium)
+            missing.forEach { permission ->
+                MissingPermissionRow(permission = permission)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MissingPermissionRow(permission: MissingPermission) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(permission.title, style = MaterialTheme.typography.labelLarge)
+            Text(permission.detail, style = MaterialTheme.typography.bodySmall)
+        }
+        FilledTonalButton(onClick = permission.onOpen) {
+            Text("開啟設定")
+        }
+    }
+}
+
+@Composable
+private fun RemoteControlEntry(onOpenRemoteControl: () -> Unit) {
+    FilledTonalButton(
+        onClick = onOpenRemoteControl,
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .height(64.dp)
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Box(
+        Text("遠端控制")
+    }
+}
+
+@Composable
+private fun RemoteControlScreen(
+    state: EdgeLinkUiState,
+    actions: EdgeLinkActions,
+    onBack: () -> Unit
+) {
+    var text by rememberSaveable { mutableStateOf("") }
+    var keyboardExpanded by rememberSaveable { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        if (state.isConnected) {
+            Touchpad(
+                modifier = Modifier.fillMaxSize(),
+                onPointer = actions::onPointer
+            )
+            RemoteBackButton(onBack = onBack)
+
+            Column(
                 modifier = Modifier
-                    .size(12.dp)
-                    .background(
-                        if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                        RoundedCornerShape(6.dp)
-                    )
-            )
-            Text(
-                text = status,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Text(
-            text = name,
-            style = MaterialTheme.typography.titleLarge,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = deviceId,
-            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace)
-        )
-
-        if (hasPeer) {
-            val canDisconnect = connected ||
-                status == "Connecting relay" ||
-                status == "Handshaking" ||
-                status == "Reconnecting"
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                Button(
-                    onClick = onReconnect,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(56.dp)
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                FilledTonalButton(
+                    onClick = { keyboardExpanded = !keyboardExpanded },
+                    modifier = Modifier.padding(16.dp)
                 ) {
-                    Text("Reconnect")
+                    Text(if (keyboardExpanded) "收合鍵盤" else "開啟鍵盤")
                 }
 
-                FilledTonalButton(
-                    onClick = onDisconnect,
-                    enabled = canDisconnect,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(56.dp)
+                AnimatedVisibility(
+                    visible = keyboardExpanded,
+                    enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { it }) + fadeOut()
                 ) {
-                    Text("Disconnect")
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                        tonalElevation = 6.dp,
+                        shadowElevation = 6.dp,
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh
+                    ) {
+                        KeyboardPanel(
+                            text = text,
+                            onTextChange = { value -> text = value },
+                            onSendText = {
+                                if (text.isNotBlank()) {
+                                    actions.onText(InputTextBody(text))
+                                    text = ""
+                                }
+                            },
+                            onKey = actions::onKey
+                        )
+                    }
+                }
+            }
+        } else {
+            RemoteBackButton(onBack = onBack)
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text("目前未連線", style = MaterialTheme.typography.headlineSmall)
+                Text(
+                    text = localizedStatus(state.connectionStatus),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Button(onClick = actions::onReconnect) {
+                    Text("重新連線")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteBackButton(onBack: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .padding(14.dp)
+            .size(48.dp),
+        shape = CircleShape,
+        tonalElevation = 4.dp,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f)
+    ) {
+        IconButton(onClick = onBack) {
+            Text("‹", fontSize = 30.sp)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    state: EdgeLinkUiState,
+    actions: EdgeLinkActions,
+    onBack: () -> Unit
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("設定") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Text("‹", fontSize = 30.sp)
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                SettingsSection(title = "裝置資訊") {
+                    MonoTextRow(label = "本機 ID", value = state.localDeviceId.ifEmpty { "尚未註冊" })
+                    MonoTextRow(label = "Peer ID", value = state.peerDeviceId.ifEmpty { "尚未配對" })
                 }
             }
 
-            SettingsToggleRow(
-                label = "Auto reconnect",
-                checked = autoReconnectEnabled,
-                onCheckedChange = onAutoReconnectChange
-            )
+            item {
+                SettingsSection(title = "同步") {
+                    SettingsToggleRow(
+                        label = "自動重新連線",
+                        checked = state.autoReconnectEnabled,
+                        onCheckedChange = actions::onAutoReconnectChange
+                    )
+                    HorizontalDivider()
+                    NotificationToggleRow(
+                        enabled = state.notificationSyncEnabled,
+                        accessGranted = state.notificationAccessGranted,
+                        postGranted = state.notificationPostGranted,
+                        onCheckedChange = actions::onNotificationSyncChange,
+                        onOpenSettings = actions::onOpenNotificationSettings
+                    )
+                }
+            }
 
-            NotificationToggleRow(
-                enabled = notificationSyncEnabled,
-                accessGranted = notificationAccessGranted,
-                postGranted = notificationPostGranted,
-                onCheckedChange = onNotificationSyncChange,
-                onOpenSettings = onOpenNotificationSettings
-            )
+            item {
+                SettingsSection(title = "權限明細") {
+                    PermissionStatusRow(
+                        label = "遠端輸入",
+                        granted = state.remoteInputAccessGranted,
+                        missingText = "需要啟用輔助使用服務",
+                        onOpenSettings = actions::onOpenRemoteInputSettings
+                    )
+                    PermissionStatusRow(
+                        label = "螢幕保持喚醒",
+                        granted = state.screenDimmingAccessGranted,
+                        missingText = "需要修改系統設定或顯示在其他應用程式上層",
+                        onOpenSettings = actions::onOpenScreenDimmingSettings
+                    )
+                    PermissionStatusRow(
+                        label = "SMS",
+                        granted = state.smsAccessGranted,
+                        missingText = "需要簡訊權限",
+                        onOpenSettings = actions::onOpenSmsSettings
+                    )
+                }
+            }
 
-            PermissionStatusRow(
-                label = "Remote input",
-                granted = remoteInputAccessGranted,
-                missingText = "Accessibility needed",
-                onOpenSettings = onOpenRemoteInputSettings
-            )
+            item {
+                FilledTonalButton(
+                    onClick = actions::onDisconnect,
+                    enabled = state.canDisconnect,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("中斷連線")
+                }
+            }
 
-            PermissionStatusRow(
-                label = "Screen dim",
-                granted = screenDimmingAccessGranted,
-                missingText = "Settings / overlay needed",
-                onOpenSettings = onOpenScreenDimmingSettings
-            )
-
-            PermissionStatusRow(
-                label = "SMS",
-                granted = smsAccessGranted,
-                missingText = "SMS permissions needed",
-                onOpenSettings = onOpenSmsSettings
-            )
-        }
-
-        FilledTonalButton(
-            onClick = onQuit,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-        ) {
-            Text("Quit EdgeLink")
+            item {
+                Button(
+                    onClick = actions::onQuit,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("結束 EdgeLink")
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+            content()
+        }
+    }
+}
+
+@Composable
+private fun MonoTextRow(label: String, value: String) {
+    ListItem(
+        headlineContent = { Text(label) },
+        supportingContent = {
+            Text(
+                text = value,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
 }
 
 @Composable
@@ -314,21 +711,16 @@ private fun SettingsToggleRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange
-        )
-    }
+    ListItem(
+        headlineContent = { Text(label) },
+        trailingContent = {
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange
+            )
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
 }
 
 @Composable
@@ -339,29 +731,26 @@ private fun NotificationToggleRow(
     onCheckedChange: (Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column {
         SettingsToggleRow(
-            label = "Notifications",
+            label = "Mac 通知同步",
             checked = enabled,
             onCheckedChange = onCheckedChange
         )
         if (enabled && (!accessGranted || !postGranted)) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (!accessGranted) "Access needed" else "Alerts blocked",
-                    style = MaterialTheme.typography.labelMedium,
+                    text = if (!accessGranted) "需要通知存取權" else "通知提醒被系統擋住",
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.weight(1f)
                 )
-                FilledTonalButton(
-                    onClick = onOpenSettings,
-                    modifier = Modifier.height(48.dp)
-                ) {
-                    Text("Open")
+                FilledTonalButton(onClick = onOpenSettings) {
+                    Text("開啟設定")
                 }
             }
         }
@@ -375,37 +764,20 @@ private fun PermissionStatusRow(
     missingText: String,
     onOpenSettings: () -> Unit
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f)
-        )
-        if (granted) {
-            Text(
-                text = "Ready",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary
-            )
-        } else {
-            Text(
-                text = missingText,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.error
-            )
-            FilledTonalButton(
-                onClick = onOpenSettings,
-                modifier = Modifier.height(48.dp)
-            ) {
-                Text("Open")
+    ListItem(
+        headlineContent = { Text(label) },
+        supportingContent = {
+            Text(if (granted) "就緒" else missingText)
+        },
+        trailingContent = {
+            if (!granted) {
+                FilledTonalButton(onClick = onOpenSettings) {
+                    Text("開啟設定")
+                }
             }
-        }
-    }
+        },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+    )
 }
 
 @Composable
@@ -415,8 +787,8 @@ private fun Touchpad(
 ) {
     Box(
         modifier = modifier
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(28.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(28.dp))
             .pointerInput(onPointer) {
                 detectTapGestures(
                     onTap = { onPointer(InputPointerBody(btn = "left")) },
@@ -460,14 +832,22 @@ private fun KeyboardPanel(
     onSendText: () -> Unit,
     onKey: (InputKeyBody) -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(
+        modifier = Modifier.padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             listOf("esc", "tab", "delete").forEach { key ->
                 FilledTonalButton(
                     onClick = { onKey(InputKeyBody(key)) },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(key.uppercase())
+                    Text(
+                        text = when (key) {
+                            "delete" -> "Delete"
+                            else -> key.uppercase()
+                        }
+                    )
                 }
             }
         }
@@ -502,6 +882,7 @@ private fun KeyboardPanel(
         OutlinedTextField(
             value = text,
             onValueChange = onTextChange,
+            label = { Text("輸入文字") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -509,34 +890,70 @@ private fun KeyboardPanel(
 
         Button(
             onClick = onSendText,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Send", fontSize = 20.sp)
+            Text("送出")
         }
     }
 }
 
 @Composable
-private fun PairingPanel(
+private fun PairingScreen(
     state: EdgeLinkUiState,
-    actions: EdgeLinkActions,
-    modifier: Modifier
+    actions: EdgeLinkActions
 ) {
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            text = displayDeviceIdInput(state.pairingHostIdInput),
-            style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Monospace),
-            maxLines = 1
-        )
-
-        if (state.pairingSas.isNotEmpty()) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("EdgeLink", style = MaterialTheme.typography.headlineMedium)
             Text(
-                text = state.pairingSas,
-                fontSize = 44.sp,
-                fontFamily = FontFamily.Monospace
+                text = if (state.pairingSas.isEmpty()) {
+                    "輸入 Mac 顯示的 9 碼 ID"
+                } else {
+                    "確認兩邊數字相同後按 Confirm"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = displayDeviceIdInput(state.pairingHostIdInput),
+                    style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Monospace),
+                    maxLines = 1
+                )
+
+                if (state.pairingSas.isNotEmpty()) {
+                    Text(
+                        text = state.pairingSas,
+                        fontSize = 44.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    if (state.pairingPeerName.isNotEmpty()) {
+                        Text(
+                            text = state.pairingPeerName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
         }
 
         NumericPad(
@@ -550,9 +967,9 @@ private fun PairingPanel(
                 onClick = actions::onConfirmPairing,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(72.dp)
+                    .height(64.dp)
             ) {
-                Text("Confirm", fontSize = 22.sp)
+                Text("Confirm", fontSize = 20.sp)
             }
         } else {
             Button(
@@ -560,10 +977,18 @@ private fun PairingPanel(
                 enabled = state.pairingHostIdInput.length == 9 && !state.isPairing,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(72.dp)
+                    .height(64.dp)
             ) {
-                Text("Pair", fontSize = 22.sp)
+                Text(if (state.isPairing) "配對中" else "開始配對", fontSize = 20.sp)
             }
+        }
+
+        if (state.connectionStatus.isNotBlank()) {
+            Text(
+                text = localizedStatus(state.connectionStatus),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
@@ -587,7 +1012,7 @@ private fun NumericPad(
                         enabled = enabled,
                         modifier = Modifier
                             .weight(1f)
-                            .height(64.dp)
+                            .height(60.dp)
                     ) {
                         Text(digit, fontSize = 24.sp)
                     }
@@ -601,7 +1026,7 @@ private fun NumericPad(
                 enabled = enabled,
                 modifier = Modifier
                     .weight(1f)
-                    .height(64.dp)
+                    .height(60.dp)
             ) {
                 Text("0", fontSize = 24.sp)
             }
@@ -610,13 +1035,85 @@ private fun NumericPad(
                 enabled = enabled,
                 modifier = Modifier
                     .weight(1f)
-                    .height(64.dp)
+                    .height(60.dp)
             ) {
                 Text("⌫", fontSize = 24.sp)
             }
         }
     }
 }
+
+private data class MissingPermission(
+    val title: String,
+    val detail: String,
+    val onOpen: () -> Unit
+)
+
+private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions): List<MissingPermission> =
+    buildList {
+        if (state.notificationSyncEnabled && (!state.notificationAccessGranted || !state.notificationPostGranted)) {
+            add(
+                MissingPermission(
+                    title = "通知同步",
+                    detail = if (!state.notificationAccessGranted) "需要通知存取權" else "需要允許通知提醒",
+                    onOpen = actions::onOpenNotificationSettings
+                )
+            )
+        }
+        if (!state.remoteInputAccessGranted) {
+            add(
+                MissingPermission(
+                    title = "遠端輸入",
+                    detail = "需要啟用輔助使用服務",
+                    onOpen = actions::onOpenRemoteInputSettings
+                )
+            )
+        }
+        if (!state.screenDimmingAccessGranted) {
+            add(
+                MissingPermission(
+                    title = "螢幕保持喚醒",
+                    detail = "需要修改系統設定或顯示在其他應用程式上層",
+                    onOpen = actions::onOpenScreenDimmingSettings
+                )
+            )
+        }
+        if (!state.smsAccessGranted) {
+            add(
+                MissingPermission(
+                    title = "SMS",
+                    detail = "需要簡訊權限",
+                    onOpen = actions::onOpenSmsSettings
+                )
+            )
+        }
+    }
+
+private val EdgeLinkUiState.canDisconnect: Boolean
+    get() = connectionPhase == ConnectionPhase.Connected ||
+        connectionPhase == ConnectionPhase.Connecting ||
+        connectionPhase == ConnectionPhase.Handshaking ||
+        connectionPhase == ConnectionPhase.Reconnecting
+
+private fun localizedStatus(status: String): String =
+    when (status) {
+        "Starting" -> "啟動中"
+        "Registering" -> "註冊裝置中"
+        "No paired Mac" -> "尚未配對 Mac"
+        "Invalid Mac ID" -> "Mac ID 不正確"
+        "Opening pairing" -> "正在開啟配對"
+        "Pairing failed" -> "配對失敗"
+        "Waiting for Mac" -> "等待 Mac 確認"
+        "Compare code" -> "比對確認碼"
+        "Paired" -> "已配對"
+        "Setup failed" -> "初始化失敗"
+        "Reconnecting" -> "重新連線中"
+        "Connecting relay" -> "連線到 relay"
+        "Handshaking" -> "握手中"
+        "Connected" -> "已連線"
+        "Disconnected" -> "已中斷"
+        else -> status
+    }
 
 private fun List<PointerInputChange>.averagePositionChange(): Offset {
     val total = fold(Offset.Zero) { partial, change -> partial + change.positionChange() }

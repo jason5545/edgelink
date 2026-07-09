@@ -32,7 +32,11 @@ class EdgeLinkForegroundService : Service() {
         controller = EdgeLinkRuntimeHolder.getOrCreate(applicationContext)
         notificationJob = scope.launch {
             controller.state.collectLatest { state ->
-                val status = if (state.isConnected) "Connected to ${state.peerName}" else state.connectionStatus
+                val status = if (state.isConnected) {
+                    "已連線到 ${state.peerName}"
+                } else {
+                    localizedStatus(state.connectionStatus)
+                }
                 startForeground(
                     EDGE_LINK_SERVICE_NOTIFICATION_ID,
                     AndroidNotificationPresenter.serviceNotification(applicationContext, status)
@@ -67,5 +71,25 @@ class EdgeLinkForegroundService : Service() {
                 context.startService(intent)
             }
         }
+
+        private fun localizedStatus(status: String): String =
+            when (status) {
+                "Starting" -> "啟動中"
+                "Registering" -> "註冊裝置中"
+                "No paired Mac" -> "尚未配對 Mac"
+                "Invalid Mac ID" -> "Mac ID 不正確"
+                "Opening pairing" -> "正在開啟配對"
+                "Pairing failed" -> "配對失敗"
+                "Waiting for Mac" -> "等待 Mac 確認"
+                "Compare code" -> "比對確認碼"
+                "Paired" -> "已配對"
+                "Setup failed" -> "初始化失敗"
+                "Reconnecting" -> "重新連線中"
+                "Connecting relay" -> "連線到 relay"
+                "Handshaking" -> "握手中"
+                "Connected" -> "已連線"
+                "Disconnected" -> "已中斷"
+                else -> status
+            }
     }
 }

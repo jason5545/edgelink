@@ -11,6 +11,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var isPinned = false
 
     let videoView = PhoneVideoRendererView()
+    var onWindowVisibilityChanged: ((Bool) -> Void)?
 
     private let encoder = JSONEncoder()
     private var sendPlaintext: ((Data) -> Void)?
@@ -263,6 +264,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             window.delegate = nil
             window.close()
             isClosingWindow = false
+            onWindowVisibilityChanged?(false)
         }
         stop(sendRemoteStop: sendRemoteStop)
     }
@@ -286,6 +288,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             window.makeFirstResponder(videoView)
             NSApp.activate(ignoringOtherApps: true)
             sendViewerVisibility(visible: true, reason: "showWindow")
+            onWindowVisibilityChanged?(true)
             return
         }
 
@@ -307,6 +310,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         sendViewerVisibility(visible: true, reason: "showWindow")
+        onWindowVisibilityChanged?(true)
     }
 
     private func applyPinnedWindowState() {
@@ -752,6 +756,7 @@ extension MacScreenSession: NSWindowDelegate {
         }
         sender.orderOut(nil)
         sendViewerVisibility(visible: false, reason: "windowShouldClose")
+        onWindowVisibilityChanged?(false)
         DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
         return false
     }
@@ -762,6 +767,7 @@ extension MacScreenSession: NSWindowDelegate {
             return
         }
         sendViewerVisibility(visible: false, reason: "windowWillClose")
+        onWindowVisibilityChanged?(false)
         stop(sendRemoteStop: true)
         window = nil
     }

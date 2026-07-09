@@ -1,58 +1,45 @@
+import AppKit
 import EdgeLinkKit
 import SwiftUI
 
 @main
 struct EdgeLinkMacApp: App {
     @StateObject private var runtime = EdgeLinkRuntime()
-    @State private var smsRecipient = ""
-    @State private var smsText = ""
 
     var body: some Scene {
         MenuBarExtra("EdgeLink", systemImage: runtime.isConnected ? "link.circle.fill" : "link.circle") {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("EdgeLink")
-                    .font(.headline)
+            MenuBarPopover(runtime: runtime)
+        }
+        .menuBarExtraStyle(.window)
 
-                Text("ID \(runtime.localDeviceId)")
-                    .monospacedDigit()
+        Window("訊息", id: "sms") {
+            MessagesWindow(runtime: runtime)
+                .background(WindowFrameAutosaver(name: "EdgeLinkMessagesWindow"))
+        }
+        .defaultSize(width: 360, height: 480)
+    }
+}
 
-                Divider()
+private struct MenuBarPopover: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+    @Environment(\.openWindow) private var openWindow
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(runtime.connectionStatus)
-                        .font(.subheadline)
-                    Text(runtime.peerName)
-                        .lineLimit(1)
-                    if !runtime.peerDeviceId.isEmpty {
-                        Text(runtime.peerDeviceId)
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                    }
-                }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if runtime.isPairing {
+                PairingPanel(runtime: runtime)
+            } else {
+                StatusSummary(runtime: runtime)
 
                 if !runtime.peerDeviceId.isEmpty {
-                    HStack {
-                        Button {
-                            runtime.reconnect()
-                        } label: {
-                            Label("Reconnect", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(runtime.canDisconnect)
-
-                        Button {
-                            runtime.disconnect()
-                        } label: {
-                            Label("Disconnect", systemImage: "xmark.circle")
-                        }
-                        .disabled(!runtime.canDisconnect)
-                    }
+                    Divider()
+                    ConnectionActions(runtime: runtime)
                 }
 
                 Divider()
 
                 Toggle(
-                    "Mac Notifications",
+                    "Mac 通知",
                     isOn: Binding(
                         get: { runtime.macNotificationSyncEnabled },
                         set: { runtime.setMacNotificationSyncEnabled($0) }
@@ -61,99 +48,284 @@ struct EdgeLinkMacApp: App {
                 .toggleStyle(.switch)
 
                 Button {
-                    runtime.viewPhoneScreen()
+                    if runtime.isViewingPhoneScreen {
+                        runtime.stopPhoneScreen()
+                    } else {
+                        runtime.viewPhoneScreen()
+                    }
                 } label: {
-                    Label("View Phone Screen", systemImage: "iphone")
+                    Label(
+                        runtime.isViewingPhoneScreen ? "停止檢視" : "檢視手機畫面",
+                        systemImage: runtime.isViewingPhoneScreen ? "stop.circle" : "iphone"
+                    )
                 }
-                .disabled(!runtime.isConnected)
+                .disabled(!runtime.isConnected && !runtime.isViewingPhoneScreen)
 
                 Button {
-                    runtime.stopPhoneScreen()
+                    openWindow(id: "sms")
                 } label: {
-                    Label("Stop Phone Screen", systemImage: "stop.circle")
+                    Label("訊息…", systemImage: "message")
                 }
-                .disabled(!runtime.isConnected)
 
                 Divider()
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("SMS")
-                        .font(.subheadline)
-                    TextField("Recipient", text: $smsRecipient)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Message", text: $smsText)
-                        .textFieldStyle(.roundedBorder)
+                Button {
+                    runtime.startPairing()
+                } label: {
+                    Label("配對新裝置", systemImage: "plus.circle")
+                }
+
+                Button(role: .destructive) {
+                    runtime.quit()
+                } label: {
+                    Label("結束 EdgeLink", systemImage: "power")
+                }
+            }
+        }
+        .padding()
+        .frame(width: 280)
+    }
+}
+
+private struct StatusSummary: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("EdgeLink")
+                .font(.headline)
+            Text(localizedConnectionStatus(runtime.connectionStatus))
+                .font(.subheadline)
+            Text(runtime.peerDeviceId.isEmpty ? "尚未配對 Android" : runtime.peerName)
+                .lineLimit(1)
+            Text("本機 \(runtime.localDeviceId)")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if !runtime.peerDeviceId.isEmpty {
+                Text("Peer \(runtime.peerDeviceId)")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+private struct ConnectionActions: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        HStack {
+            Button {
+                runtime.reconnect()
+            } label: {
+                Label("重新連線", systemImage: "arrow.clockwise")
+            }
+
+            Button {
+                runtime.disconnect()
+            } label: {
+                Label("中斷", systemImage: "xmark.circle")
+            }
+            .disabled(!runtime.canDisconnect)
+        }
+    }
+}
+
+private struct PairingPanel: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("配對 EdgeLink")
+                .font(.headline)
+            Text("本機 ID \(runtime.localDeviceId)")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Text(localizedPairingStatus(runtime.pairingStatus))
+                .font(.subheadline)
+
+            if !runtime.pairingPeerName.isEmpty {
+                Text(runtime.pairingPeerName)
+                    .lineLimit(1)
+            }
+
+            if !runtime.pairingSAS.isEmpty {
+                PairingView(sasDisplay: runtime.pairingSAS) {
+                    runtime.acceptPairing()
+                }
+                .disabled(!runtime.canAcceptPairing)
+            }
+        }
+    }
+}
+
+private struct MessagesWindow: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+    @State private var smsRecipient = ""
+    @State private var smsText = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(runtime.smsMessages) { message in
+                        MessageRow(message: message)
+                    }
+
+                    if runtime.smsMessages.isEmpty {
+                        Text("還沒有訊息")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
+                    }
+                }
+                .padding()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("收件人", text: $smsRecipient)
+                    .textFieldStyle(.roundedBorder)
+                TextField("訊息", text: $smsText, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    if !runtime.smsSendStatus.isEmpty {
+                        Text(runtime.smsSendStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
                     Button {
                         runtime.sendSms(to: smsRecipient, text: smsText)
                         smsText = ""
                     } label: {
-                        Label("Send SMS", systemImage: "paperplane")
+                        Label("送出", systemImage: "paperplane")
                     }
                     .disabled(
                         !runtime.isConnected ||
                             smsRecipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                             smsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
-
-                    if !runtime.smsSendStatus.isEmpty {
-                        Text(runtime.smsSendStatus)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if !runtime.smsMessages.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(runtime.smsMessages.prefix(5))) { message in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(message.direction == "outbound" ? "To \(message.address)" : "From \(message.address)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                    Text(message.text)
-                                        .font(.caption)
-                                        .lineLimit(2)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Divider()
-
-                if runtime.isPairing {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(runtime.pairingStatus)
-                            .font(.subheadline)
-                        if !runtime.pairingPeerName.isEmpty {
-                            Text(runtime.pairingPeerName)
-                                .lineLimit(1)
-                        }
-                        if !runtime.pairingSAS.isEmpty {
-                            PairingView(sasDisplay: runtime.pairingSAS) {
-                                runtime.acceptPairing()
-                            }
-                            .disabled(!runtime.canAcceptPairing)
-                        }
-                    }
-                } else {
-                    Button("Pair New Device") {
-                        runtime.startPairing()
-                    }
-                    .controlSize(.large)
-                    .frame(maxWidth: .infinity)
-                }
-
-                Divider()
-
-                Button(role: .destructive) {
-                    runtime.quit()
-                } label: {
-                    Label("Quit EdgeLink", systemImage: "power")
                 }
             }
             .padding()
-            .frame(width: 320)
         }
-        .menuBarExtraStyle(.window)
+        .frame(minWidth: 320, minHeight: 420)
+    }
+}
+
+private struct MessageRow: View {
+    let message: SmsMessageBody
+
+    private var isOutbound: Bool {
+        message.direction == "outbound"
+    }
+
+    var body: some View {
+        HStack {
+            if isOutbound {
+                Spacer(minLength: 36)
+            }
+
+            VStack(alignment: isOutbound ? .trailing : .leading, spacing: 4) {
+                Text(isOutbound ? "傳給 \(message.address)" : "來自 \(message.address)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Text(message.text)
+                    .font(.body)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(.quaternary)
+                    )
+
+                Text(Date(timeIntervalSince1970: TimeInterval(message.ts)), style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !isOutbound {
+                Spacer(minLength: 36)
+            }
+        }
+    }
+}
+
+private struct WindowFrameAutosaver: NSViewRepresentable {
+    let name: NSWindow.FrameAutosaveName
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            view.window?.setFrameAutosaveName(name)
+        }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            view.window?.setFrameAutosaveName(name)
+        }
+    }
+}
+
+private func localizedConnectionStatus(_ status: String) -> String {
+    switch status {
+    case "Starting":
+        return "啟動中"
+    case "Registering":
+        return "註冊裝置中"
+    case "No paired Android":
+        return "尚未配對 Android"
+    case "Setup failed":
+        return "初始化失敗"
+    case "Reconnecting":
+        return "重新連線中"
+    case "Connecting relay":
+        return "連線到 relay"
+    case "Handshaking":
+        return "握手中"
+    case "Connected":
+        return "已連線"
+    case "Disconnected":
+        return "已中斷"
+    default:
+        return status
+    }
+}
+
+private func localizedPairingStatus(_ status: String) -> String {
+    switch status {
+    case "Registering":
+        return "註冊裝置中"
+    case "Opening pairing":
+        return "正在開啟配對"
+    case "Compare code":
+        return "確認兩邊數字相同"
+    case "Waiting for Android":
+        return "等待 Android 確認"
+    case "Pairing failed":
+        return "配對失敗"
+    case "Paired":
+        return "已配對"
+    default:
+        return status
     }
 }

@@ -23,6 +23,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var macNotificationSyncEnabled: Bool
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
+    @Published private(set) var isViewingPhoneScreen = false
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -58,6 +59,11 @@ final class EdgeLinkRuntime: ObservableObject {
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
+        screenSession.onWindowVisibilityChanged = { [weak self] visible in
+            Task { @MainActor in
+                self?.isViewingPhoneScreen = visible
+            }
+        }
         observeSystemSleepWake()
         task = Task { await run() }
     }
@@ -118,10 +124,12 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         screenSession.openAndStart()
+        isViewingPhoneScreen = true
     }
 
     func stopPhoneScreen() {
         screenSession.closeWindow(sendRemoteStop: isConnected)
+        isViewingPhoneScreen = false
     }
 
     func disconnect() {
@@ -139,6 +147,7 @@ final class EdgeLinkRuntime: ObservableObject {
         currentSession = nil
         screenSession.clearSender()
         isConnected = false
+        isViewingPhoneScreen = false
         connectionStatus = peerDeviceId.isEmpty ? "No paired Android" : "Disconnected"
     }
 
@@ -181,11 +190,11 @@ final class EdgeLinkRuntime: ObservableObject {
         let recipient = rawRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !recipient.isEmpty, !text.isEmpty else {
-            smsSendStatus = "SMS needs recipient and text"
+            smsSendStatus = "請填收件人與訊息"
             return
         }
         guard let session = currentSession, isConnected else {
-            smsSendStatus = "SMS unavailable"
+            smsSendStatus = "SMS 目前不可用"
             DiagnosticsLog.warn("sms.mac.send_ignored not_connected")
             return
         }
@@ -193,7 +202,7 @@ final class EdgeLinkRuntime: ObservableObject {
         let requestId = UUID().uuidString
         let body = SmsSendBody(requestId: requestId, to: recipient, text: text)
         pendingSmsSends[requestId] = body
-        smsSendStatus = "Sending SMS"
+        smsSendStatus = "正在送出 SMS"
 
         Task {
             do {
@@ -203,7 +212,7 @@ final class EdgeLinkRuntime: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.pendingSmsSends.removeValue(forKey: requestId)
-                    self.smsSendStatus = "SMS send failed"
+                    self.smsSendStatus = "SMS 送出失敗"
                 }
                 DiagnosticsLog.error("sms.mac.send_request_failed requestId=\(requestId)", error)
             }
@@ -638,9 +647,6 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleSmsMessage(_ message: SmsMessageBody) {
         smsMessages.removeAll { $0.id == message.id }
         smsMessages.insert(message, at: 0)
-        if smsMessages.count > 30 {
-            smsMessages.removeLast(smsMessages.count - 30)
-        }
 
         DiagnosticsLog.info("sms.mac.message_received id=\(message.id) addressFp=\(Self.fingerprint(message.address)) backfill=\(message.isBackfill)")
         if !message.isBackfill && message.direction == "inbound" {
@@ -662,7 +668,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleSmsSendResult(_ result: SmsSendResultBody) {
         let pending = pendingSmsSends.removeValue(forKey: result.requestId)
         if result.success {
-            smsSendStatus = "SMS queued"
+            smsSendStatus = "SMS 已送出佇列"
             if let pending {
                 handleSmsMessage(
                     SmsMessageBody(
@@ -679,7 +685,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             DiagnosticsLog.info("sms.mac.send_result requestId=\(result.requestId) success=true toFp=\(Self.fingerprint(result.to))")
         } else {
-            smsSendStatus = "SMS failed: \(result.error ?? "unknown")"
+            smsSendStatus = "SMS 失敗：\(result.error ?? "未知錯誤")"
             DiagnosticsLog.warn("sms.mac.send_result requestId=\(result.requestId) success=false error=\(result.error ?? "unknown")")
         }
     }
