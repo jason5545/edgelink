@@ -1,15 +1,23 @@
 package com.edgelink.app
 
 import android.content.Context
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileWriter
 import java.security.MessageDigest
 import java.time.Instant
 
 object EdgeLinkLog {
     private const val TAG = "EdgeLink"
+    private val writerThread = HandlerThread("EdgeLinkDiagnosticsLog").apply { start() }
+    private val writerHandler = Handler(writerThread.looper)
     @Volatile
     private var logFile: File? = null
+    private var writerFile: File? = null
+    private var writer: BufferedWriter? = null
 
     fun configure(context: Context) {
         logFile = File(context.filesDir, "diagnostics.log")
@@ -36,13 +44,26 @@ object EdgeLinkLog {
         return digest.take(6).joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    @Synchronized
     private fun write(level: String, message: String) {
         val target = logFile ?: return
-        runCatching {
-            target.parentFile?.mkdirs()
-            target.appendText("${Instant.now()} $level $message\n")
+        val line = "${Instant.now()} $level $message\n"
+        writerHandler.post {
+            runCatching {
+                val activeWriter = writerFor(target)
+                activeWriter.write(line)
+                activeWriter.flush()
+            }
         }
+    }
+
+    private fun writerFor(target: File): BufferedWriter {
+        if (writerFile != target || writer == null) {
+            writer?.close()
+            target.parentFile?.mkdirs()
+            writer = BufferedWriter(FileWriter(target, true))
+            writerFile = target
+        }
+        return checkNotNull(writer) { "Diagnostics writer was not initialized." }
     }
 
     private fun messageWithThrowable(message: String, throwable: Throwable?): String =

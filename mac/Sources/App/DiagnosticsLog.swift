@@ -4,7 +4,7 @@ import OSLog
 
 enum DiagnosticsLog {
     private static let logger = Logger(subsystem: "com.edgelink.mac", category: "diagnostics")
-    private static let lock = NSLock()
+    private static let fileQueue = DispatchQueue(label: "EdgeLink.DiagnosticsLogFile")
 
     static func info(_ message: String) {
         logger.info("\(message, privacy: .public)")
@@ -28,23 +28,22 @@ enum DiagnosticsLog {
     }
 
     private static func write(_ level: String, _ message: String) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        do {
-            let url = try logURL()
-            let line = "\(timestamp()) \(level) \(message)\n"
-            let data = Data(line.utf8)
-            if FileManager.default.fileExists(atPath: url.path) {
-                let handle = try FileHandle(forWritingTo: url)
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-                try handle.close()
-            } else {
-                try data.write(to: url, options: .atomic)
+        fileQueue.async {
+            do {
+                let url = try logURL()
+                let line = "\(timestamp()) \(level) \(message)\n"
+                let data = Data(line.utf8)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    let handle = try FileHandle(forWritingTo: url)
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } else {
+                    try data.write(to: url, options: .atomic)
+                }
+            } catch {
+                logger.error("diagnostics.log write failed: \(String(describing: error), privacy: .public)")
             }
-        } catch {
-            logger.error("diagnostics.log write failed: \(String(describing: error), privacy: .public)")
         }
     }
 

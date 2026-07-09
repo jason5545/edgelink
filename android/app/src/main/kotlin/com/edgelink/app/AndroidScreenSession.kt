@@ -14,6 +14,7 @@ import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
 import com.edgelink.core.ScreenMetaBody
 import org.webrtc.DataChannel
+import org.webrtc.CapturerObserver
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
@@ -32,6 +33,7 @@ import org.webrtc.SessionDescription
 import org.webrtc.SdpObserver
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoCapturer
+import org.webrtc.VideoFrame
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.util.Locale
@@ -87,7 +89,11 @@ class AndroidScreenSession(
 
             val localVideoSource = localFactory.createVideoSource(true)
             videoSource = localVideoSource
-            localCapturer.initialize(helper, appContext, localVideoSource.capturerObserver)
+            localCapturer.initialize(
+                helper,
+                appContext,
+                GapLoggingCapturerObserver(localVideoSource.capturerObserver)
+            )
             localCapturer.startCapture(captureSize.width, captureSize.height, SCREEN_FPS)
 
             val track = localFactory.createVideoTrack(SCREEN_VIDEO_TRACK_ID, localVideoSource)
@@ -125,6 +131,18 @@ class AndroidScreenSession(
         }
         EdgeLinkLog.info("screen.android.ice_in mid=${body.mid} index=${body.index}")
         pc.addIceCandidate(IceCandidate(body.mid, body.index, body.candidate))
+    }
+
+    fun noteControlEvent(kind: String) {
+        val pc = peerConnection ?: return
+        val handler = statsHandler ?: return
+        CONTROL_STATS_DELAYS_MS.forEach { delayMs ->
+            handler.postDelayed({
+                if (peerConnection === pc && !isStopping.get()) {
+                    collectStats(pc, "control:$kind:+${delayMs}ms")
+                }
+            }, delayMs)
+        }
     }
 
     fun stop(sendStopToService: Boolean = true) {
@@ -249,15 +267,22 @@ class AndroidScreenSession(
                 if (peerConnection !== pc || isStopping.get()) {
                     return
                 }
-                pc.getStats { report ->
-                    if (peerConnection === pc && !isStopping.get()) {
-                        statsLogger.log(report)
-                    }
-                }
+                collectStats(pc, "periodic")
                 handler.postDelayed(this, STATS_INTERVAL_MS)
             }
         }
         handler.postDelayed(task, STATS_INTERVAL_MS)
+    }
+
+    private fun collectStats(pc: PeerConnection, reason: String) {
+        val handler = statsHandler ?: return
+        pc.getStats { report ->
+            handler.post {
+                if (peerConnection === pc && !isStopping.get()) {
+                    statsLogger.log(report, reason)
+                }
+            }
+        }
     }
 
     private fun stopStatsLogging() {
@@ -365,7 +390,7 @@ class AndroidScreenSession(
             previousOutbound.clear()
         }
 
-        fun log(report: RTCStatsReport) {
+        fun log(report: RTCStatsReport, reason: String) {
             val statsById = report.statsMap
             val outbound = statsById.values.firstOrNull { stat ->
                 stat.type == "outbound-rtp" && stat.members.isVideo()
@@ -377,6 +402,8 @@ class AndroidScreenSession(
             }
 
             val line = StringBuilder("screen.android.stats")
+            line.append(" reason=$reason")
+            line.append(" sinceCtrlMs=${ControlTimeline.sinceLastControlMs()}")
             if (outbound != null) {
                 appendOutbound(line, outbound)
             }
@@ -389,6 +416,9 @@ class AndroidScreenSession(
         private fun appendOutbound(line: StringBuilder, stat: RTCStats) {
             val members = stat.members
             val framesEncoded = members.long("framesEncoded")
+            val framesSent = members.long("framesSent")
+            val bytesSent = members.long("bytesSent")
+            val packetsSent = members.long("packetsSent")
             val totalEncodeTime = members.double("totalEncodeTime")
             val qpSum = members.long("qpSum")
             val previous = previousOutbound[stat.id]
@@ -400,6 +430,16 @@ class AndroidScreenSession(
             }?.takeIf { it > 0 }
             val measuredFps = deltaFrames?.let { frames ->
                 deltaSeconds?.let { seconds -> frames.toDouble() / seconds }
+            }
+            val sendKbps = if (
+                previous != null &&
+                bytesSent != null &&
+                previous.bytesSent != null &&
+                deltaSeconds != null
+            ) {
+                (bytesSent - previous.bytesSent).toDouble() * 8.0 / deltaSeconds / 1000.0
+            } else {
+                null
             }
             val avgEncodeMs = if (
                 previous != null &&
@@ -424,10 +464,20 @@ class AndroidScreenSession(
                 null
             }
 
-            if (framesEncoded != null || totalEncodeTime != null || qpSum != null) {
+            if (
+                framesEncoded != null ||
+                framesSent != null ||
+                bytesSent != null ||
+                packetsSent != null ||
+                totalEncodeTime != null ||
+                qpSum != null
+            ) {
                 previousOutbound[stat.id] = OutboundSnapshot(
                     timestampUs = stat.timestampUs,
                     framesEncoded = framesEncoded ?: previous?.framesEncoded,
+                    framesSent = framesSent ?: previous?.framesSent,
+                    bytesSent = bytesSent ?: previous?.bytesSent,
+                    packetsSent = packetsSent ?: previous?.packetsSent,
                     totalEncodeTime = totalEncodeTime ?: previous?.totalEncodeTime,
                     qpSum = qpSum ?: previous?.qpSum
                 )
@@ -439,8 +489,16 @@ class AndroidScreenSession(
             line.append(" h=${members.long("frameHeight") ?: "-"}")
             line.append(" limit=${members.string("qualityLimitationReason") ?: "-"}")
             line.append(" targetKbps=${formatKbps(members.double("targetBitrate"))}")
+            line.append(" sendKbps=${format1(sendKbps)}")
             line.append(" encMs=${format1(avgEncodeMs)}")
             line.append(" qp=${format1(avgQp)}")
+            line.append(" sent=${framesSent ?: "-"}")
+            line.append(" bytes=${bytesSent ?: "-"}")
+            line.append(" packets=${packetsSent ?: "-"}")
+            line.append(" huge=${members.long("hugeFramesSent") ?: "-"}")
+            line.append(" key=${members.long("keyFramesEncoded") ?: "-"}")
+            line.append(" drop=${members.long("framesDropped") ?: "-"}")
+            line.append(" qldur=${formatDurationMap(members["qualityLimitationDurations"]) ?: "-"}")
             line.append(" impl=${members.string("encoderImplementation") ?: "-"}")
         }
 
@@ -463,6 +521,9 @@ class AndroidScreenSession(
         private data class OutboundSnapshot(
             val timestampUs: Double,
             val framesEncoded: Long?,
+            val framesSent: Long?,
+            val bytesSent: Long?,
+            val packetsSent: Long?,
             val totalEncodeTime: Double?,
             val qpSum: Long?
         )
@@ -483,6 +544,35 @@ class AndroidScreenSession(
         }
     }
 
+    private class GapLoggingCapturerObserver(
+        private val delegate: CapturerObserver
+    ) : CapturerObserver {
+        private var lastFrameAtNanos = 0L
+
+        override fun onCapturerStarted(success: Boolean) {
+            delegate.onCapturerStarted(success)
+        }
+
+        override fun onCapturerStopped() {
+            delegate.onCapturerStopped()
+        }
+
+        override fun onFrameCaptured(frame: VideoFrame) {
+            val now = android.os.SystemClock.elapsedRealtimeNanos()
+            val last = lastFrameAtNanos
+            lastFrameAtNanos = now
+            if (last != 0L) {
+                val gapMs = (now - last) / 1_000_000L
+                if (gapMs > CAPTURE_GAP_LOG_THRESHOLD_MS) {
+                    EdgeLinkLog.info(
+                        "screen.android.capture_gap gapMs=$gapMs sinceCtrlMs=${ControlTimeline.sinceLastControlMs()}"
+                    )
+                }
+            }
+            delegate.onFrameCaptured(frame)
+        }
+    }
+
     companion object {
         private const val SCREEN_FPS = 30
         private const val SCREEN_MIN_BITRATE_BPS = 300_000
@@ -492,7 +582,9 @@ class AndroidScreenSession(
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
-        private const val STATS_INTERVAL_MS = 2_000L
+        private const val STATS_INTERVAL_MS = 1_000L
+        private const val CAPTURE_GAP_LOG_THRESHOLD_MS = 150L
+        private val CONTROL_STATS_DELAYS_MS = longArrayOf(0L, 300L, 900L)
         private val initialized = AtomicBoolean(false)
 
         private fun ensureWebRtcInitialized(context: Context) {
@@ -540,3 +632,17 @@ private fun format1(value: Double?): String =
 
 private fun formatKbps(value: Double?): String =
     value?.let { String.format(Locale.US, "%.0f", it / 1000.0) } ?: "-"
+
+private fun formatDurationMap(value: Any?): String? {
+    val map = value as? Map<*, *> ?: return null
+    return listOf("bandwidth", "cpu", "other", "none").mapNotNull { key ->
+        val duration = map[key]?.let {
+            when (it) {
+                is Number -> it.toDouble()
+                is String -> it.toDoubleOrNull()
+                else -> null
+            }
+        }
+        duration?.let { "$key=${format1(it)}" }
+    }.takeIf { it.isNotEmpty() }?.joinToString(",")
+}

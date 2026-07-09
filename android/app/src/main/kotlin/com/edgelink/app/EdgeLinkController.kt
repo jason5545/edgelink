@@ -849,6 +849,10 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.CTRL_POINTER -> {
                 val envelope = EnvelopeCodec.decode<CtrlPointerBody>(plaintext)
+                ControlTimeline.mark()
+                if (envelope.b.action != "move") {
+                    screenSession.noteControlEvent("pointer:${envelope.b.action}")
+                }
                 if (envelope.b.action != "move") {
                     EdgeLinkLog.info("control.android.pointer_in action=${envelope.b.action} bytes=${plaintext.size}")
                 }
@@ -858,6 +862,8 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.CTRL_GLOBAL -> {
                 val startedAt = SystemClock.elapsedRealtimeNanos()
                 val envelope = EnvelopeCodec.decode<CtrlGlobalBody>(plaintext)
+                ControlTimeline.mark()
+                screenSession.noteControlEvent("global:${envelope.b.action}")
                 EdgeLinkLog.info("control.android.global_in action=${envelope.b.action} bytes=${plaintext.size}")
                 RemoteInputService.dispatchGlobal(envelope.b)
                 EdgeLinkLog.info(
@@ -867,11 +873,15 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.CTRL_TEXT -> {
                 val envelope = EnvelopeCodec.decode<CtrlTextBody>(plaintext)
+                ControlTimeline.mark()
+                screenSession.noteControlEvent("text")
                 RemoteInputService.dispatchText(envelope.b)
                 null
             }
             EnvelopeTypes.CTRL_KEY -> {
                 val envelope = EnvelopeCodec.decode<CtrlKeyBody>(plaintext)
+                ControlTimeline.mark()
+                screenSession.noteControlEvent("key:${envelope.b.key}:${envelope.b.down}")
                 RemoteInputService.dispatchKey(envelope.b)
                 null
             }

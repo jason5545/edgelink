@@ -28,6 +28,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private let statsQueue = DispatchQueue(label: "EdgeLinkMac.ScreenStats")
     private var statsTimer: DispatchSourceTimer?
     private let statsLogger = MacScreenStatsLogger()
+    private let mainThreadWatchdog = MainThreadWatchdog()
 
     override init() {
         super.init()
@@ -151,6 +152,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func sendGlobal(_ action: String) {
+        markControlSent(kind: "global:\(action)", shouldLog: false)
         DiagnosticsLog.info("screen.mac.global_out action=\(action)")
         sendEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
@@ -266,6 +268,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         flushPendingPointerMove()
+        markControlSent(kind: "pointer:\(action)", shouldLog: true)
         sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
@@ -276,6 +279,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
 
         if isDown, shouldSendText(for: event), let text = event.characters, !text.isEmpty {
+            markControlSent(kind: "text", shouldLog: true)
             sendEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
             return true
         }
@@ -295,6 +299,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func sendKey(_ key: String, down: Bool, modifiers: [String]) {
+        markControlSent(kind: "key:\(key):\(down)", shouldLog: true)
         sendEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
     }
 
@@ -339,6 +344,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
         lastPointerMoveSentAt = now
+        markControlSent(kind: "pointer:move", shouldLog: false)
         sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
@@ -376,6 +382,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         pendingWheel = nil
+        markControlSent(kind: "pointer:wheel", shouldLog: false)
         DiagnosticsLog.info("screen.mac.wheel_out dy=\(body.wheelDy ?? 0)")
         sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
@@ -487,12 +494,21 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
     }
 
+    private func markControlSent(kind: String, shouldLog: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        videoView.markControlSent(at: now)
+        if shouldLog {
+            DiagnosticsLog.info("screen.mac.control_out kind=\(kind)")
+        }
+    }
+
     private func startStatsLogging(on peerConnection: RTCPeerConnection) {
         stopStatsLogging()
         statsQueue.sync {
             statsLogger.reset()
         }
         videoView.resetStats()
+        mainThreadWatchdog.start()
 
         let timer = DispatchSource.makeTimerSource(queue: statsQueue)
         timer.schedule(deadline: .now() + Self.statsIntervalSeconds, repeating: Self.statsIntervalSeconds)
@@ -500,7 +516,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             guard let self, let peerConnection, self.peerConnection === peerConnection else {
                 return
             }
-            peerConnection.stats(for: nil, statsOutputLevel: .standard) { [weak self, weak peerConnection] reports in
+            peerConnection.statistics { [weak self, weak peerConnection] report in
                 guard let self, let peerConnection, self.peerConnection === peerConnection else {
                     return
                 }
@@ -509,7 +525,7 @@ final class MacScreenSession: NSObject, ObservableObject {
                     guard let self, let peerConnection, self.peerConnection === peerConnection else {
                         return
                     }
-                    self.statsLogger.logLegacy(reports: reports as [AnyObject], renderer: renderer)
+                    self.statsLogger.log(report: report, renderer: renderer)
                 }
             }
         }
@@ -519,6 +535,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func stopStatsLogging() {
+        mainThreadWatchdog.stop()
         statsTimer?.setEventHandler {}
         statsTimer?.cancel()
         statsTimer = nil
@@ -531,7 +548,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
     private static let wheelIntervalSeconds: TimeInterval = 1.0 / 20.0
     private static let maxPendingWheelDy = 240
-    private static let statsIntervalSeconds: TimeInterval = 2.0
+    private static let statsIntervalSeconds: TimeInterval = 1.0
 }
 
 extension MacScreenSession: NSWindowDelegate {
@@ -669,6 +686,37 @@ struct PhoneVideoView: NSViewRepresentable {
     func updateNSView(_ nsView: PhoneVideoRendererView, context: Context) {}
 }
 
+private final class MainThreadWatchdog {
+    private let queue = DispatchQueue(label: "EdgeLinkMac.MainThreadWatchdog")
+    private var timer: DispatchSourceTimer?
+
+    func start() {
+        stop()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.intervalSeconds, repeating: Self.intervalSeconds)
+        timer.setEventHandler {
+            let postedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.async {
+                let stallMs = (ProcessInfo.processInfo.systemUptime - postedAt) * 1000.0
+                if stallMs > Self.stallThresholdMs {
+                    DiagnosticsLog.warn("screen.mac.main_stall stallMs=\(format1(stallMs))")
+                }
+            }
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    func stop() {
+        timer?.setEventHandler {}
+        timer?.cancel()
+        timer = nil
+    }
+
+    private static let intervalSeconds: TimeInterval = 0.1
+    private static let stallThresholdMs = 100.0
+}
+
 private struct RendererStatsSnapshot {
     let timestamp: TimeInterval
     let receivedFrames: Int
@@ -717,16 +765,9 @@ private final class MacScreenStatsLogger {
         DiagnosticsLog.info(line as String)
     }
 
-    func log(report: AnyObject, renderer: RendererStatsSnapshot) {
-        guard
-            let report = report as? NSObject,
-            let statsById = report.value(forKey: "statistics") as? [String: NSObject]
-        else {
-            let line = NSMutableString(string: "screen.mac.stats")
-            appendRenderer(line, renderer)
-            line.append(" stats=unavailable")
-            DiagnosticsLog.warn(line as String)
-            return
+    func log(report: RTCStatisticsReport, renderer: RendererStatsSnapshot) {
+        let statsById = report.statistics.reduce(into: [String: NSObject]()) { partial, item in
+            partial[item.key] = item.value
         }
         let inbound = statsById.values.first { stat in
             stat.rtcStatType == "inbound-rtp" && stat.rtcStatValues.isVideo()
@@ -782,9 +823,13 @@ private final class MacScreenStatsLogger {
             previousInbound[report.rtcLegacyId] = InboundSnapshot(
                 timestampUs: report.rtcLegacyTimestampMs * 1000.0,
                 framesDecoded: framesDecoded ?? previous?.framesDecoded,
+                packetsReceived: previous?.packetsReceived,
+                bytesReceived: previous?.bytesReceived,
                 totalDecodeTime: totalDecodeTime ?? previous?.totalDecodeTime,
                 jitterBufferDelay: jitterBufferDelay ?? previous?.jitterBufferDelay,
-                jitterBufferEmittedCount: values.int("jitterBufferEmittedCount") ?? previous?.jitterBufferEmittedCount
+                jitterBufferEmittedCount: values.int("jitterBufferEmittedCount") ?? previous?.jitterBufferEmittedCount,
+                totalFreezesDuration: previous?.totalFreezesDuration,
+                totalPausesDuration: previous?.totalPausesDuration
             )
         }
 
@@ -813,9 +858,13 @@ private final class MacScreenStatsLogger {
     private func appendInbound(_ line: NSMutableString, _ stat: NSObject) {
         let values = stat.rtcStatValues
         let framesDecoded = values.int("framesDecoded")
+        let packetsReceived = values.int("packetsReceived")
+        let bytesReceived = values.int("bytesReceived")
         let jitterBufferEmittedCount = values.int("jitterBufferEmittedCount")
         let totalDecodeTime = values.double("totalDecodeTime")
         let jitterBufferDelay = values.double("jitterBufferDelay")
+        let totalFreezesDuration = values.double("totalFreezesDuration")
+        let totalPausesDuration = values.double("totalPausesDuration")
         let previous = previousInbound[stat.rtcStatId]
         let deltaFrames = framesDecoded.flatMap { current in
             previous?.framesDecoded.map { current - $0 }
@@ -825,6 +874,16 @@ private final class MacScreenStatsLogger {
         }.flatMap { $0 > 0 ? $0 : nil }
         let measuredFps = deltaFrames.flatMap { frames in
             deltaSeconds.map { Double(frames) / $0 }
+        }
+        let receiveKbps: Double?
+        if
+            let previous,
+            let bytesReceived,
+            let previousBytesReceived = previous.bytesReceived,
+            let deltaSeconds {
+            receiveKbps = Double(bytesReceived - previousBytesReceived) * 8.0 / deltaSeconds / 1000.0
+        } else {
+            receiveKbps = nil
         }
         let avgDecodeMs: Double?
         if
@@ -849,14 +908,41 @@ private final class MacScreenStatsLogger {
         } else {
             jitterMs = nil
         }
+        let freezeDeltaMs: Double?
+        if
+            let previous,
+            let totalFreezesDuration,
+            let previousTotalFreezesDuration = previous.totalFreezesDuration {
+            freezeDeltaMs = (totalFreezesDuration - previousTotalFreezesDuration) * 1000.0
+        } else {
+            freezeDeltaMs = nil
+        }
+        let pauseDeltaMs: Double?
+        if
+            let previous,
+            let totalPausesDuration,
+            let previousTotalPausesDuration = previous.totalPausesDuration {
+            pauseDeltaMs = (totalPausesDuration - previousTotalPausesDuration) * 1000.0
+        } else {
+            pauseDeltaMs = nil
+        }
 
-        if framesDecoded != nil || totalDecodeTime != nil || jitterBufferDelay != nil {
+        if
+            framesDecoded != nil ||
+            packetsReceived != nil ||
+            bytesReceived != nil ||
+            totalDecodeTime != nil ||
+            jitterBufferDelay != nil {
             previousInbound[stat.rtcStatId] = InboundSnapshot(
                 timestampUs: stat.rtcStatTimestampUs,
                 framesDecoded: framesDecoded ?? previous?.framesDecoded,
+                packetsReceived: packetsReceived ?? previous?.packetsReceived,
+                bytesReceived: bytesReceived ?? previous?.bytesReceived,
                 totalDecodeTime: totalDecodeTime ?? previous?.totalDecodeTime,
                 jitterBufferDelay: jitterBufferDelay ?? previous?.jitterBufferDelay,
-                jitterBufferEmittedCount: jitterBufferEmittedCount ?? previous?.jitterBufferEmittedCount
+                jitterBufferEmittedCount: jitterBufferEmittedCount ?? previous?.jitterBufferEmittedCount,
+                totalFreezesDuration: totalFreezesDuration ?? previous?.totalFreezesDuration,
+                totalPausesDuration: totalPausesDuration ?? previous?.totalPausesDuration
             )
         }
 
@@ -867,6 +953,16 @@ private final class MacScreenStatsLogger {
         line.append(" h=\(values.int("frameHeight").map(String.init) ?? "-")")
         line.append(" decMs=\(format1(avgDecodeMs))")
         line.append(" jitterMs=\(format1(jitterMs))")
+        line.append(" recvKbps=\(format1(receiveKbps))")
+        line.append(" packets=\(packetsReceived.map(String.init) ?? "-")")
+        line.append(" bytes=\(bytesReceived.map(String.init) ?? "-")")
+        line.append(" key=\(values.int("keyFramesDecoded").map(String.init) ?? "-")")
+        line.append(" pli=\(values.int("pliCount").map(String.init) ?? "-")")
+        line.append(" nack=\(values.int("nackCount").map(String.init) ?? "-")")
+        line.append(" freeze=\(values.int("freezeCount").map(String.init) ?? "-")")
+        line.append(" freezeMs=\(format1(freezeDeltaMs))")
+        line.append(" pause=\(values.int("pauseCount").map(String.init) ?? "-")")
+        line.append(" pauseMs=\(format1(pauseDeltaMs))")
         line.append(" impl=\(values.string("decoderImplementation") ?? "-")")
     }
 
@@ -922,9 +1018,13 @@ private final class MacScreenStatsLogger {
     private struct InboundSnapshot {
         let timestampUs: Double
         let framesDecoded: Int?
+        let packetsReceived: Int?
+        let bytesReceived: Int?
         let totalDecodeTime: Double?
         let jitterBufferDelay: Double?
         let jitterBufferEmittedCount: Int?
+        let totalFreezesDuration: Double?
+        let totalPausesDuration: Double?
     }
 }
 
@@ -943,6 +1043,8 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     private var totalConvertMs = 0.0
     private var pendingMainFrames = 0
     private var maxPendingMainFrames = 0
+    private var lastRenderFrameAt: TimeInterval = 0
+    private var lastControlSentAt: TimeInterval = 0
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -1005,7 +1107,7 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     }
 
     func renderFrame(_ frame: RTCVideoFrame?) {
-        recordReceivedFrame()
+        recordReceivedFrameAndGap()
         guard let frame, let cvBuffer = frame.buffer as? RTCCVPixelBuffer else {
             logUnsupportedFrameBuffer(frame)
             return
@@ -1049,6 +1151,14 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         totalConvertMs = 0
         pendingMainFrames = 0
         maxPendingMainFrames = 0
+        lastRenderFrameAt = 0
+        lastControlSentAt = 0
+        statsLock.unlock()
+    }
+
+    func markControlSent(at timestamp: TimeInterval) {
+        statsLock.lock()
+        lastControlSentAt = timestamp
         statsLock.unlock()
     }
 
@@ -1105,10 +1215,29 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         DiagnosticsLog.warn("screen.mac.unsupported_frame_buffer type=\(bufferType)")
     }
 
-    private func recordReceivedFrame() {
+    private func recordReceivedFrameAndGap() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let gapMs: Double?
+        let sinceControlMs: Double?
         statsLock.lock()
         receivedFrames += 1
+        if lastRenderFrameAt > 0 {
+            gapMs = (now - lastRenderFrameAt) * 1000.0
+        } else {
+            gapMs = nil
+        }
+        lastRenderFrameAt = now
+        if lastControlSentAt > 0 {
+            sinceControlMs = (now - lastControlSentAt) * 1000.0
+        } else {
+            sinceControlMs = nil
+        }
         statsLock.unlock()
+        if let gapMs, gapMs > Self.renderGapLogThresholdMs {
+            DiagnosticsLog.info(
+                "screen.mac.render_gap gapMs=\(format1(gapMs)) sinceCtrlMs=\(format1(sinceControlMs))"
+            )
+        }
     }
 
     private func recordConvertedFrame(ms: Double) {
@@ -1131,6 +1260,8 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         drawnFrames += 1
         statsLock.unlock()
     }
+
+    private static let renderGapLogThresholdMs = 150.0
 }
 
 private extension Dictionary where Key == String, Value == NSObject {
