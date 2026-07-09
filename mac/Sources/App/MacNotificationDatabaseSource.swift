@@ -103,7 +103,7 @@ actor MacNotificationDatabaseSource {
             select lower(hex(r.uuid)), r.delivered_date, r.data, a.identifier
             from record r
             left join app a on r.app_id = a.app_id
-            where r.delivered_date is not null and r.delivered_date > ?
+            where r.delivered_date is not null and r.presented = 1 and r.delivered_date > ?
             order by r.delivered_date asc
             limit 50
             """

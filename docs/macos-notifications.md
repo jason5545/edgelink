@@ -18,6 +18,7 @@ app 後，正常會看到 `notification.mac.db.initial_baseline`。
 - schema 或解析失敗只寫 log，不影響 relay
 - 啟動時以目前最新通知作 baseline，不回放歷史通知
 - 保守輪詢，用 notification UUID 去重
+- 只鏡射 `presented = 1` 的紀錄；`delivered_date` 代表 usernoted 收到，不代表 Mac 真的顯示給使用者
 - 解析到的通知資料不進密碼學信任模型
 
 ## 公開 API
