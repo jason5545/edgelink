@@ -185,7 +185,7 @@ class AndroidScreenSession(
         )
         val parameters = sender?.parameters
         if (parameters != null) {
-            parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
+            parameters.degradationPreference = RtpParameters.DegradationPreference.BALANCED
             parameters.encodings.forEach { encoding ->
                 encoding.minBitrateBps = SCREEN_MIN_BITRATE_BPS
                 encoding.maxBitrateBps = SCREEN_MAX_BITRATE_BPS
@@ -485,10 +485,10 @@ class AndroidScreenSession(
 
     companion object {
         private const val SCREEN_FPS = 30
-        private const val SCREEN_MIN_BITRATE_BPS = 3_500_000
-        private const val SCREEN_START_BITRATE_BPS = 10_000_000
-        private const val SCREEN_MAX_BITRATE_BPS = 16_000_000
-        private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 2560
+        private const val SCREEN_MIN_BITRATE_BPS = 300_000
+        private const val SCREEN_START_BITRATE_BPS = 2_500_000
+        private const val SCREEN_MAX_BITRATE_BPS = 4_000_000
+        private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 1280
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
