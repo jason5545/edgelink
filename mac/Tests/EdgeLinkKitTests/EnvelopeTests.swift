@@ -17,6 +17,13 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(meta.t, "screen.meta")
         XCTAssertEqual(meta.b, ScreenMetaBody(w: 1080, h: 2400, scale: 1.0, dpi: 420))
 
+        let visibilityData = try encoder.encode(
+            Envelope(t: EnvelopeType.screenViewerVisibility, b: ScreenViewerVisibilityBody(visible: false))
+        )
+        let visibility = try decoder.decode(Envelope<ScreenViewerVisibilityBody>.self, from: visibilityData)
+        XCTAssertEqual(visibility.t, "screen.viewerVisibility")
+        XCTAssertEqual(visibility.b, ScreenViewerVisibilityBody(visible: false))
+
         let pointerData = try encoder.encode(
             Envelope(t: EnvelopeType.ctrlPointer, b: CtrlPointerBody(x: 540, y: 1200, action: "wheel", wheelDy: -120))
         )

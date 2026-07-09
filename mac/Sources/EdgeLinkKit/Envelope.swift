@@ -23,6 +23,7 @@ public enum EnvelopeType {
     public static let screenStart = "screen.start"
     public static let screenStop = "screen.stop"
     public static let screenMeta = "screen.meta"
+    public static let screenViewerVisibility = "screen.viewerVisibility"
     public static let ctrlPointer = "ctrl.pointer"
     public static let ctrlKey = "ctrl.key"
     public static let ctrlText = "ctrl.text"
@@ -83,6 +84,14 @@ public struct ScreenMetaBody: Codable, Equatable, Sendable {
         self.h = h
         self.scale = scale
         self.dpi = dpi
+    }
+}
+
+public struct ScreenViewerVisibilityBody: Codable, Equatable, Sendable {
+    public let visible: Bool
+
+    public init(visible: Bool) {
+        self.visible = visible
     }
 }
 

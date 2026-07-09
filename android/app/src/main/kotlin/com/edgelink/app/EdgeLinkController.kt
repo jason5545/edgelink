@@ -30,6 +30,7 @@ import com.edgelink.core.PairingWire
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
+import com.edgelink.core.ScreenViewerVisibilityBody
 import com.edgelink.core.SodiumHandshakeCrypto
 import com.edgelink.core.SmsMessageBody
 import com.edgelink.core.SmsSendBody
@@ -133,6 +134,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     init {
         EdgeLinkLog.configure(appContext)
+        screenSession.setControlDataChannelHandler(::handleScreenControlDataChannel)
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
         }.onFailure { error ->
@@ -145,6 +147,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     fun close() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        screenSession.setControlDataChannelHandler(null)
         screenSession.stop()
         session?.close()
         scope.cancel()
@@ -792,6 +795,16 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             }
         }
     }
+
+    private fun handleScreenControlDataChannel(plaintext: ByteArray) {
+        scope.launch(Dispatchers.Default) {
+            runCatching {
+                dispatcher.handle(plaintext)
+            }.onFailure { error ->
+                EdgeLinkLog.error("screen.android.control_data_channel_dispatch_failed", error)
+            }
+        }
+    }
 }
 
 private class AndroidCommandDispatcher(
@@ -847,9 +860,17 @@ private class AndroidCommandDispatcher(
                 screenSession.handleIce(envelope.b)
                 null
             }
+            EnvelopeTypes.SCREEN_VIEWER_VISIBILITY -> {
+                val envelope = EnvelopeCodec.decode<ScreenViewerVisibilityBody>(plaintext)
+                screenSession.setViewerVisible(envelope.b.visible)
+                null
+            }
             EnvelopeTypes.CTRL_POINTER -> {
                 val envelope = EnvelopeCodec.decode<CtrlPointerBody>(plaintext)
                 ControlTimeline.mark()
+                if (envelope.b.action == "down") {
+                    screenSession.boostForIncomingInput()
+                }
                 if (envelope.b.action != "move") {
                     screenSession.noteControlEvent("pointer:${envelope.b.action}")
                 }
@@ -863,6 +884,7 @@ private class AndroidCommandDispatcher(
                 val startedAt = SystemClock.elapsedRealtimeNanos()
                 val envelope = EnvelopeCodec.decode<CtrlGlobalBody>(plaintext)
                 ControlTimeline.mark()
+                screenSession.boostForIncomingInput()
                 screenSession.noteControlEvent("global:${envelope.b.action}")
                 EdgeLinkLog.info("control.android.global_in action=${envelope.b.action} bytes=${plaintext.size}")
                 RemoteInputService.dispatchGlobal(envelope.b)

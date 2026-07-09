@@ -376,9 +376,9 @@ AEAD：
 - 新增 `screen.*`、`ctrl.*` 是 Mac -> Android 螢幕控制，指標使用 Android 裝置像素空間的絕對座標。
 - 兩組 envelope 並存，不互相取代，也不要重用 `input.pointer` 來表示螢幕點擊。
 
-螢幕會話控制平面仍走現有 secure frame，也就是 E2EE envelope、64 KB frame 上限、
-relay/LAN 兩種 transport 共用。Mac 送 `screen.start` 要求 Android 開始螢幕會話；
-Mac 送 `screen.stop` 結束。Android 開始投影後回：
+螢幕會話啟停與 WebRTC signaling 仍走現有 secure frame，也就是 E2EE envelope、
+64 KB frame 上限、relay/LAN 兩種 transport 共用。Mac 送 `screen.start` 要求 Android
+開始螢幕會話；Mac 送 `screen.stop` 結束。Android 開始投影後回：
 
 ```json
 {"t":"screen.meta","b":{"w":1080,"h":2400,"scale":1.0,"dpi":420}}
@@ -392,10 +392,22 @@ Mac -> Android 控制 envelope：
 
 - `screen.start` b:`{}`
 - `screen.stop` b:`{}`
+- `screen.viewerVisibility` b:`{"visible":bool}`
 - `ctrl.pointer` b:`{"x":int,"y":int,"action":"down|move|up|rightUp|wheel","wheelDy":int?}`
 - `ctrl.key` b:`{"key":string,"down":bool,"mods":[string]}`
 - `ctrl.text` b:`{"text":string}`
 - `ctrl.global` b:`{"action":"back|home|recents|power"}`
+
+`ctrl.*` 與 `screen.viewerVisibility` envelope 的 JSON 格式不因傳輸路徑而改變。WebRTC
+session 建立後，Android 會開 `edgelink-control` data channel；Mac 若看到該 channel
+open，優先把 `ctrl.pointer`、`ctrl.key`、`ctrl.text`、`ctrl.global`、
+`screen.viewerVisibility` 以 binary `RTCDataBuffer` 送入 channel。channel 尚未 open 或送出
+失敗時，Mac 必須 fallback 到既有 secure frame。
+
+`screen.viewerVisibility.b.visible` 表示 Mac 端 phone viewer 視窗是否至少部分可見；視窗被
+order out、關閉、或 AppKit occlusion state 顯示完全遮住時送 `false`。Android 收到 `true`
+時可使用較高螢幕串流 bitrate，收到 `false` 時應降到背景 profile。重新建立 Android screen
+session 時預設 `visible=true`。
 
 Android -> Mac metadata envelope：
 
@@ -413,7 +425,7 @@ Android -> Mac metadata envelope：
 - Mac 麥克風 -> Android 喇叭是另一條 audio track。
 - 媒體封包走 P2P DTLS-SRTP；NAT 穿不過時走 TURN。
 
-SDP / ICE signaling 仍是控制平面 envelope，雙向傳送：
+SDP / ICE signaling 仍是 secure frame envelope，雙向傳送：
 
 - `rtc.offer` b:`{"sdp":string}`
 - `rtc.answer` b:`{"sdp":string}`

@@ -22,6 +22,7 @@ object EnvelopeTypes {
     const val SCREEN_START = "screen.start"
     const val SCREEN_STOP = "screen.stop"
     const val SCREEN_META = "screen.meta"
+    const val SCREEN_VIEWER_VISIBILITY = "screen.viewerVisibility"
     const val CTRL_POINTER = "ctrl.pointer"
     const val CTRL_KEY = "ctrl.key"
     const val CTRL_TEXT = "ctrl.text"
@@ -79,6 +80,11 @@ data class ScreenMetaBody(
     val h: Int,
     val scale: Double,
     val dpi: Int
+)
+
+@Serializable
+data class ScreenViewerVisibilityBody(
+    val visible: Boolean
 )
 
 @Serializable

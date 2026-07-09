@@ -6,6 +6,7 @@ import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.edgelink.core.EnvelopeCodec
@@ -32,11 +33,14 @@ import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SdpObserver
 import org.webrtc.SurfaceTextureHelper
+import org.webrtc.ThreadUtils
 import org.webrtc.VideoCapturer
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
+import java.nio.ByteBuffer
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidScreenSession(
@@ -49,22 +53,39 @@ class AndroidScreenSession(
     private var peerConnection: PeerConnection? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
     private var capturer: VideoCapturer? = null
+    private var capturerObserver: GapLoggingCapturerObserver? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
+    private var controlDataChannel: DataChannel? = null
+    private var controlDataChannelObserver: DataChannel.Observer? = null
+    @Volatile
+    private var controlDataChannelHandler: ((ByteArray) -> Unit)? = null
+    @Volatile
+    private var viewerVisible = true
     private var statsHandlerThread: HandlerThread? = null
     private var statsHandler: Handler? = null
     private val statsLogger = ScreenStatsLogger()
     private val isStopping = AtomicBoolean(false)
+    private val boostHandler = Handler(appContext.mainLooper)
+    private val restoreBitrateRunnable = Runnable {
+        if (isStopping.get()) return@Runnable
+        applyViewerBitrate(reason = "boost_restore")
+    }
 
     fun requestStart() {
         EdgeLinkLog.info("screen.android.start_requested")
         ScreenCapturePermissionActivity.start(appContext)
     }
 
+    fun setControlDataChannelHandler(handler: ((ByteArray) -> Unit)?) {
+        controlDataChannelHandler = handler
+    }
+
     fun startWithPermission(resultCode: Int, data: Intent) {
         EdgeLinkLog.info("screen.android.permission_granted resultCode=$resultCode")
         stop(sendStopToService = false)
         isStopping.set(false)
+        viewerVisible = true
 
         try {
             initializeWebRtc()
@@ -89,11 +110,12 @@ class AndroidScreenSession(
 
             val localVideoSource = localFactory.createVideoSource(true)
             videoSource = localVideoSource
-            localCapturer.initialize(
-                helper,
-                appContext,
-                GapLoggingCapturerObserver(localVideoSource.capturerObserver)
+            val localCapturerObserver = GapLoggingCapturerObserver(
+                helper.handler,
+                localVideoSource.capturerObserver
             )
+            capturerObserver = localCapturerObserver
+            localCapturer.initialize(helper, appContext, localCapturerObserver)
             localCapturer.startCapture(captureSize.width, captureSize.height, SCREEN_FPS)
 
             val track = localFactory.createVideoTrack(SCREEN_VIDEO_TRACK_ID, localVideoSource)
@@ -104,6 +126,7 @@ class AndroidScreenSession(
             peerConnection = pc
             val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
             configureVideoQuality(pc, sender)
+            setupControlDataChannel(pc)
             createOffer(pc)
             startStatsLogging(pc)
         } catch (error: Throwable) {
@@ -133,6 +156,13 @@ class AndroidScreenSession(
         pc.addIceCandidate(IceCandidate(body.mid, body.index, body.candidate))
     }
 
+    fun setViewerVisible(visible: Boolean) {
+        viewerVisible = visible
+        boostHandler.removeCallbacks(restoreBitrateRunnable)
+        val applied = applyViewerBitrate(reason = "viewer_visibility")
+        EdgeLinkLog.info("screen.android.viewer_visibility visible=$visible applied=$applied")
+    }
+
     fun noteControlEvent(kind: String) {
         val pc = peerConnection ?: return
         val handler = statsHandler ?: return
@@ -145,12 +175,34 @@ class AndroidScreenSession(
         }
     }
 
+    fun boostForIncomingInput() {
+        val pc = peerConnection ?: return
+        if (isStopping.get()) return
+        if (viewerVisible) {
+            return
+        }
+        val applied = pc.setBitrate(
+            SCREEN_BOOST_MIN_BITRATE_BPS,
+            SCREEN_BOOST_START_BITRATE_BPS,
+            SCREEN_MAX_BITRATE_BPS
+        )
+        EdgeLinkLog.info(
+            "screen.android.bitrate_boost applied=$applied min=$SCREEN_BOOST_MIN_BITRATE_BPS start=$SCREEN_BOOST_START_BITRATE_BPS max=$SCREEN_MAX_BITRATE_BPS durationMs=$SCREEN_BOOST_DURATION_MS"
+        )
+        boostHandler.removeCallbacks(restoreBitrateRunnable)
+        boostHandler.postDelayed(restoreBitrateRunnable, SCREEN_BOOST_DURATION_MS)
+    }
+
     fun stop(sendStopToService: Boolean = true) {
         if (!isStopping.compareAndSet(false, true)) {
             return
         }
         EdgeLinkLog.info("screen.android.stop")
+        boostHandler.removeCallbacks(restoreBitrateRunnable)
+        capturerObserver?.stopRepeating()
+        capturerObserver = null
         stopStatsLogging()
+        closeControlDataChannel()
         runCatching { capturer?.stopCapture() }
         runCatching { capturer?.dispose() }
         capturer = null
@@ -170,6 +222,7 @@ class AndroidScreenSession(
         if (sendStopToService) {
             ScreenProjectionForegroundService.stop(appContext)
         }
+        viewerVisible = true
         isStopping.set(false)
     }
 
@@ -195,18 +248,63 @@ class AndroidScreenSession(
             ?: error("Unable to create PeerConnection.")
     }
 
+    private fun setupControlDataChannel(pc: PeerConnection) {
+        closeControlDataChannel()
+        val channel = pc.createDataChannel(
+            SCREEN_CONTROL_CHANNEL_LABEL,
+            DataChannel.Init().apply { ordered = true }
+        )
+        if (channel == null) {
+            EdgeLinkLog.warn("screen.android.control_data_channel_create_failed")
+            return
+        }
+        val observer = object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) = Unit
+
+            override fun onStateChange() {
+                EdgeLinkLog.info(
+                    "screen.android.control_data_channel_state label=${channel.label()} state=${channel.state()}"
+                )
+            }
+
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                val bytes = buffer.data.toByteArray()
+                EdgeLinkLog.info(
+                    "screen.android.control_data_channel_in bytes=${bytes.size} binary=${buffer.binary}"
+                )
+                controlDataChannelHandler?.invoke(bytes)
+            }
+        }
+        controlDataChannelObserver = observer
+        controlDataChannel = channel
+        channel.registerObserver(observer)
+        EdgeLinkLog.info("screen.android.control_data_channel_created label=${channel.label()}")
+    }
+
+    private fun closeControlDataChannel() {
+        val channel = controlDataChannel
+        controlDataChannel = null
+        controlDataChannelObserver = null
+        if (channel != null) {
+            runCatching { channel.unregisterObserver() }
+            runCatching { channel.close() }
+            runCatching { channel.dispose() }
+        }
+    }
+
     private fun configureVideoQuality(pc: PeerConnection, sender: RtpSender?) {
+        val profile = currentViewerBitrateProfile()
         val bitrateApplied = pc.setBitrate(
-            SCREEN_MIN_BITRATE_BPS,
-            SCREEN_START_BITRATE_BPS,
-            SCREEN_MAX_BITRATE_BPS
+            profile.minBps,
+            profile.startBps,
+            profile.maxBps
         )
         val parameters = sender?.parameters
         if (parameters != null) {
             parameters.degradationPreference = RtpParameters.DegradationPreference.BALANCED
             parameters.encodings.forEach { encoding ->
-                encoding.minBitrateBps = SCREEN_MIN_BITRATE_BPS
-                encoding.maxBitrateBps = SCREEN_MAX_BITRATE_BPS
+                encoding.minBitrateBps = profile.minBps
+                encoding.maxBitrateBps = profile.maxBps
                 encoding.maxFramerate = SCREEN_FPS
                 encoding.scaleResolutionDownBy = 1.0
             }
@@ -217,9 +315,34 @@ class AndroidScreenSession(
             false
         }
         EdgeLinkLog.info(
-            "screen.android.quality bitrateApplied=$bitrateApplied senderApplied=$senderApplied min=$SCREEN_MIN_BITRATE_BPS start=$SCREEN_START_BITRATE_BPS max=$SCREEN_MAX_BITRATE_BPS"
+            "screen.android.quality bitrateApplied=$bitrateApplied senderApplied=$senderApplied visible=$viewerVisible min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps}"
         )
     }
+
+    private fun applyViewerBitrate(reason: String): Boolean {
+        val pc = peerConnection ?: return false
+        val profile = currentViewerBitrateProfile()
+        val applied = pc.setBitrate(profile.minBps, profile.startBps, profile.maxBps)
+        EdgeLinkLog.info(
+            "screen.android.bitrate_viewer reason=$reason visible=$viewerVisible applied=$applied min=${profile.minBps} start=${profile.startBps} max=${profile.maxBps}"
+        )
+        return applied
+    }
+
+    private fun currentViewerBitrateProfile(): BitrateProfile =
+        if (viewerVisible) {
+            BitrateProfile(
+                minBps = SCREEN_VISIBLE_MIN_BITRATE_BPS,
+                startBps = SCREEN_VISIBLE_START_BITRATE_BPS,
+                maxBps = SCREEN_MAX_BITRATE_BPS
+            )
+        } else {
+            BitrateProfile(
+                minBps = SCREEN_HIDDEN_MIN_BITRATE_BPS,
+                startBps = SCREEN_HIDDEN_START_BITRATE_BPS,
+                maxBps = SCREEN_MAX_BITRATE_BPS
+            )
+        }
 
     private fun createOffer(pc: PeerConnection) {
         pc.createOffer(
@@ -545,45 +668,175 @@ class AndroidScreenSession(
     }
 
     private class GapLoggingCapturerObserver(
+        private val captureHandler: Handler,
         private val delegate: CapturerObserver
     ) : CapturerObserver {
         private var lastFrameAtNanos = 0L
+        private var repeatBuffer: VideoFrame.I420Buffer? = null
+        private var repeatRotation = 0
+        private var lastForwardedTimestampNs = 0L
+        @Volatile
+        private var repeatingStopped = false
+        private val firstRepeatRunnable = Runnable {
+            repeatLastFrame(index = 1, delayMs = LAST_FRAME_REPEAT_DELAYS_MS[0])
+        }
+        private val secondRepeatRunnable = Runnable {
+            repeatLastFrame(index = 2, delayMs = LAST_FRAME_REPEAT_DELAYS_MS[1])
+        }
 
         override fun onCapturerStarted(success: Boolean) {
+            if (success) {
+                repeatingStopped = false
+            }
             delegate.onCapturerStarted(success)
         }
 
         override fun onCapturerStopped() {
+            stopRepeating()
             delegate.onCapturerStopped()
         }
 
         override fun onFrameCaptured(frame: VideoFrame) {
-            val now = android.os.SystemClock.elapsedRealtimeNanos()
+            val now = SystemClock.elapsedRealtimeNanos()
             val last = lastFrameAtNanos
             lastFrameAtNanos = now
             if (last != 0L) {
                 val gapMs = (now - last) / 1_000_000L
                 if (gapMs > CAPTURE_GAP_LOG_THRESHOLD_MS) {
+                    val sinceCtrlMs = ControlTimeline.sinceLastControlMs()
                     EdgeLinkLog.info(
-                        "screen.android.capture_gap gapMs=$gapMs sinceCtrlMs=${ControlTimeline.sinceLastControlMs()}"
+                        "screen.android.capture_gap gapMs=$gapMs phase=${gapPhase(sinceCtrlMs)} sinceCtrlMs=$sinceCtrlMs"
                     )
                 }
             }
+            if (!repeatingStopped) {
+                updateRepeatFrame(frame)
+            }
             delegate.onFrameCaptured(frame)
+        }
+
+        fun stopRepeating() {
+            repeatingStopped = true
+            if (Thread.currentThread() == captureHandler.looper.thread) {
+                clearRepeatFrame()
+            } else {
+                runCatching {
+                    ThreadUtils.invokeAtFrontUninterruptibly(captureHandler, Runnable {
+                        clearRepeatFrame()
+                    })
+                }.onFailure { error ->
+                    EdgeLinkLog.warn("screen.android.last_frame_repeat_stop_failed", error)
+                }
+            }
+        }
+
+        private fun updateRepeatFrame(frame: VideoFrame) {
+            cancelRepeatCallbacks()
+            val copiedBuffer = runCatching {
+                frame.buffer.toI420()
+            }.onFailure { error ->
+                EdgeLinkLog.warn("screen.android.last_frame_copy_failed", error)
+            }.getOrNull()
+            val rotation = frame.rotation
+            val timestampNs = frame.timestampNs
+            val update = Runnable {
+                replaceRepeatFrame(copiedBuffer, rotation, timestampNs)
+            }
+            if (Thread.currentThread() == captureHandler.looper.thread) {
+                update.run()
+            } else if (!captureHandler.post(update)) {
+                copiedBuffer?.release()
+            }
+        }
+
+        private fun replaceRepeatFrame(
+            copiedBuffer: VideoFrame.I420Buffer?,
+            rotation: Int,
+            timestampNs: Long
+        ) {
+            cancelRepeatCallbacks()
+            repeatBuffer?.release()
+            repeatBuffer = null
+            if (repeatingStopped || copiedBuffer == null) {
+                copiedBuffer?.release()
+                return
+            }
+            repeatBuffer = copiedBuffer
+            repeatRotation = rotation
+            lastForwardedTimestampNs = maxOf(lastForwardedTimestampNs, timestampNs)
+            captureHandler.postDelayed(firstRepeatRunnable, LAST_FRAME_REPEAT_DELAYS_MS[0])
+            captureHandler.postDelayed(secondRepeatRunnable, LAST_FRAME_REPEAT_DELAYS_MS[1])
+        }
+
+        private fun repeatLastFrame(index: Int, delayMs: Long) {
+            if (repeatingStopped) {
+                return
+            }
+            val buffer = repeatBuffer ?: return
+            val timestampNs = nextRepeatTimestampNs()
+            buffer.retain()
+            val repeatedFrame = VideoFrame(buffer, repeatRotation, timestampNs)
+            try {
+                delegate.onFrameCaptured(repeatedFrame)
+                EdgeLinkLog.info(
+                    "screen.android.last_frame_repeat index=$index delayMs=$delayMs w=${buffer.width} h=${buffer.height} sinceCtrlMs=${ControlTimeline.sinceLastControlMs()}"
+                )
+            } finally {
+                repeatedFrame.release()
+            }
+        }
+
+        private fun nextRepeatTimestampNs(): Long {
+            val timestampNs = maxOf(
+                SystemClock.elapsedRealtimeNanos(),
+                lastForwardedTimestampNs + 1
+            )
+            lastForwardedTimestampNs = timestampNs
+            return timestampNs
+        }
+
+        private fun clearRepeatFrame() {
+            cancelRepeatCallbacks()
+            repeatBuffer?.release()
+            repeatBuffer = null
+            lastFrameAtNanos = 0L
+            lastForwardedTimestampNs = 0L
+        }
+
+        private fun cancelRepeatCallbacks() {
+            captureHandler.removeCallbacks(firstRepeatRunnable)
+            captureHandler.removeCallbacks(secondRepeatRunnable)
         }
     }
 
+    private data class BitrateProfile(
+        val minBps: Int,
+        val startBps: Int,
+        val maxBps: Int
+    )
+
     companion object {
         private const val SCREEN_FPS = 30
-        private const val SCREEN_MIN_BITRATE_BPS = 300_000
-        private const val SCREEN_START_BITRATE_BPS = 2_500_000
-        private const val SCREEN_MAX_BITRATE_BPS = 4_000_000
+        private const val SCREEN_VISIBLE_MIN_BITRATE_BPS = 2_500_000
+        private const val SCREEN_VISIBLE_START_BITRATE_BPS = 2_500_000
+        private const val SCREEN_HIDDEN_MIN_BITRATE_BPS = 300_000
+        private const val SCREEN_HIDDEN_START_BITRATE_BPS = 1_000_000
+        private const val SCREEN_BOOST_MIN_BITRATE_BPS = 2_500_000
+        private const val SCREEN_BOOST_START_BITRATE_BPS = 2_500_000
+        private const val SCREEN_MAX_BITRATE_BPS = 8_000_000
+        private const val SCREEN_BOOST_DURATION_MS = 3_000L
         private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 1280
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
+        private const val SCREEN_CONTROL_CHANNEL_LABEL = "edgelink-control"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
-        private const val STATS_INTERVAL_MS = 1_000L
+        private const val STATS_INTERVAL_MS = 2_000L
         private const val CAPTURE_GAP_LOG_THRESHOLD_MS = 150L
+        private const val POST_CONTROL_GAP_WINDOW_MS = 2_000L
+        private val LAST_FRAME_REPEAT_DELAYS_MS = longArrayOf(
+            TimeUnit.MILLISECONDS.toMillis(400L),
+            TimeUnit.SECONDS.toMillis(1L)
+        )
         private val CONTROL_STATS_DELAYS_MS = longArrayOf(0L, 300L, 900L)
         private val initialized = AtomicBoolean(false)
 
@@ -595,7 +848,21 @@ class AndroidScreenSession(
                 )
             }
         }
+
+        private fun gapPhase(sinceCtrlMs: Long?): String =
+            when {
+                sinceCtrlMs == null || sinceCtrlMs < 0 -> "unknown"
+                sinceCtrlMs <= POST_CONTROL_GAP_WINDOW_MS -> "post_control"
+                else -> "idle_or_static"
+            }
     }
+}
+
+private fun ByteBuffer.toByteArray(): ByteArray {
+    val duplicate = duplicate()
+    val bytes = ByteArray(duplicate.remaining())
+    duplicate.get(bytes)
+    return bytes
 }
 
 private fun Map<String, Any>.isVideo(): Boolean =

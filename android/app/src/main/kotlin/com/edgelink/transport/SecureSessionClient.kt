@@ -40,12 +40,12 @@ class SecureSessionClient(
     }
 
     suspend fun sendPlaintext(plaintext: ByteArray) {
-        val frame = secureMutex.withLock {
+        secureMutex.withLock {
             val session = established ?: error("Secure session is not established.")
-            session.channel.seal(plaintext)
+            val frame = session.channel.seal(plaintext)
+            EdgeLinkLog.info("secure.android.frame_out plaintext=${plaintext.size} frame=${frame.size}")
+            channel.send(frame)
         }
-        EdgeLinkLog.info("secure.android.frame_out plaintext=${plaintext.size} frame=${frame.size}")
-        channel.send(frame)
     }
 
     suspend fun receiveLoop(handler: suspend (ByteArray) -> ByteArray?) {

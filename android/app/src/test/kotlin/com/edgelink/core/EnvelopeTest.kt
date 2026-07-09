@@ -17,6 +17,14 @@ class EnvelopeTest {
         assertEquals(EnvelopeTypes.SCREEN_META, meta.t)
         assertEquals(ScreenMetaBody(w = 1080, h = 2400, scale = 1.0, dpi = 420), meta.b)
 
+        val visibilityBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.SCREEN_VIEWER_VISIBILITY,
+            ScreenViewerVisibilityBody(visible = false)
+        )
+        val visibility = EnvelopeCodec.decode<ScreenViewerVisibilityBody>(visibilityBytes)
+        assertEquals(EnvelopeTypes.SCREEN_VIEWER_VISIBILITY, visibility.t)
+        assertEquals(ScreenViewerVisibilityBody(visible = false), visibility.b)
+
         val pointerBytes = EnvelopeCodec.encode(
             EnvelopeTypes.CTRL_POINTER,
             CtrlPointerBody(x = 540, y = 1200, action = "wheel", wheelDy = -120)

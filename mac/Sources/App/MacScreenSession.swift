@@ -17,6 +17,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var factory: RTCPeerConnectionFactory?
     private var peerConnection: RTCPeerConnection?
     private var remoteVideoTrack: RTCVideoTrack?
+    private var controlDataChannel: RTCDataChannel?
     private var didInitializeSSL = false
     private var isClosingWindow = false
     private var forwardedKeyCodes = Set<UInt16>()
@@ -130,6 +131,9 @@ final class MacScreenSession: NSObject, ObservableObject {
         remoteVideoTrack?.remove(videoView)
         stopStatsLogging()
         videoView.clear()
+        controlDataChannel?.delegate = nil
+        controlDataChannel?.close()
+        controlDataChannel = nil
         remoteVideoTrack = nil
         peerConnection?.close()
         peerConnection = nil
@@ -141,20 +145,21 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func closeWindow(sendRemoteStop: Bool = true) {
-        stop(sendRemoteStop: sendRemoteStop)
         guard let window else {
+            stop(sendRemoteStop: sendRemoteStop)
             return
         }
         isClosingWindow = true
         window.close()
         isClosingWindow = false
         self.window = nil
+        stop(sendRemoteStop: sendRemoteStop)
     }
 
     func sendGlobal(_ action: String) {
         markControlSent(kind: "global:\(action)", shouldLog: false)
         DiagnosticsLog.info("screen.mac.global_out action=\(action)")
-        sendEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
+        sendControlEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
 
     private func showWindow() {
@@ -162,6 +167,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(videoView)
             NSApp.activate(ignoringOtherApps: true)
+            sendViewerVisibility(visible: true, reason: "showWindow")
             return
         }
 
@@ -181,6 +187,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        sendViewerVisibility(visible: true, reason: "showWindow")
     }
 
     private func ensurePeerConnection() -> RTCPeerConnection {
@@ -269,7 +276,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
         flushPendingPointerMove()
         markControlSent(kind: "pointer:\(action)", shouldLog: true)
-        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
@@ -280,7 +287,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
         if isDown, shouldSendText(for: event), let text = event.characters, !text.isEmpty {
             markControlSent(kind: "text", shouldLog: true)
-            sendEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
+            sendControlEnvelope(type: EnvelopeType.ctrlText, body: CtrlTextBody(text: text))
             return true
         }
 
@@ -300,7 +307,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func sendKey(_ key: String, down: Bool, modifiers: [String]) {
         markControlSent(kind: "key:\(key):\(down)", shouldLog: true)
-        sendEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
+        sendControlEnvelope(type: EnvelopeType.ctrlKey, body: CtrlKeyBody(key: key, down: down, mods: modifiers))
     }
 
     private func sendCoalescedPointerMove(_ body: CtrlPointerBody) {
@@ -345,7 +352,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
         lastPointerMoveSentAt = now
         markControlSent(kind: "pointer:move", shouldLog: false)
-        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func sendCoalescedWheel(_ body: CtrlPointerBody) {
@@ -384,7 +391,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         pendingWheel = nil
         markControlSent(kind: "pointer:wheel", shouldLog: false)
         DiagnosticsLog.info("screen.mac.wheel_out dy=\(body.wheelDy ?? 0)")
-        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 
     private func cancelPendingWheel() {
@@ -481,17 +488,59 @@ final class MacScreenSession: NSObject, ObservableObject {
         min(max(Int(value), lower), upper)
     }
 
+    private func sendControlEnvelope<Body: Codable & Sendable>(type: String, body: Body) {
+        do {
+            let data = try encoder.encode(Envelope(t: type, b: body))
+            if sendControlData(data, type: type) {
+                return
+            }
+            sendEnvelopeData(data, type: type)
+        } catch {
+            DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
+        }
+    }
+
+    private func sendViewerVisibility(visible: Bool, reason: String) {
+        DiagnosticsLog.info("screen.mac.viewer_visibility_out visible=\(visible) reason=\(reason)")
+        sendControlEnvelope(
+            type: EnvelopeType.screenViewerVisibility,
+            body: ScreenViewerVisibilityBody(visible: visible)
+        )
+    }
+
+    private func currentViewerVisible(for window: NSWindow?) -> Bool {
+        guard let window, window.isVisible else {
+            return false
+        }
+        return window.occlusionState.contains(.visible)
+    }
+
+    private func sendControlData(_ data: Data, type: String) -> Bool {
+        guard let controlDataChannel, controlDataChannel.readyState == .open else {
+            return false
+        }
+        let sent = controlDataChannel.sendData(RTCDataBuffer(data: data, isBinary: true))
+        if !sent {
+            DiagnosticsLog.warn("screen.mac.control_data_channel_send_failed type=\(type)")
+        }
+        return sent
+    }
+
     private func sendEnvelope<Body: Codable & Sendable>(type: String, body: Body) {
+        do {
+            let data = try encoder.encode(Envelope(t: type, b: body))
+            sendEnvelopeData(data, type: type)
+        } catch {
+            DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
+        }
+    }
+
+    private func sendEnvelopeData(_ data: Data, type: String) {
         guard let sendPlaintext else {
             DiagnosticsLog.warn("screen.mac.send_ignored no_secure_session type=\(type)")
             return
         }
-        do {
-            let data = try encoder.encode(Envelope(t: type, b: body))
-            sendPlaintext(data)
-        } catch {
-            DiagnosticsLog.error("screen.mac.encode_failed type=\(type)", error)
-        }
+        sendPlaintext(data)
     }
 
     private func markControlSent(kind: String, shouldLog: Bool) {
@@ -548,7 +597,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
     private static let wheelIntervalSeconds: TimeInterval = 1.0 / 20.0
     private static let maxPendingWheelDy = 240
-    private static let statsIntervalSeconds: TimeInterval = 1.0
+    private static let statsIntervalSeconds: TimeInterval = 2.0
+    private static let controlChannelLabel = "edgelink-control"
 }
 
 extension MacScreenSession: NSWindowDelegate {
@@ -557,17 +607,30 @@ extension MacScreenSession: NSWindowDelegate {
             return true
         }
         sender.orderOut(nil)
+        sendViewerVisibility(visible: false, reason: "windowShouldClose")
         DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
         return false
     }
 
     func windowWillClose(_ notification: Notification) {
+        sendViewerVisibility(visible: false, reason: "windowWillClose")
         guard !isClosingWindow else {
             window = nil
             return
         }
         stop(sendRemoteStop: true)
         window = nil
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        let changedWindow = notification.object as? NSWindow
+        guard changedWindow === window else {
+            return
+        }
+        sendViewerVisibility(
+            visible: currentViewerVisible(for: changedWindow),
+            reason: "occlusion"
+        )
     }
 }
 
@@ -616,7 +679,27 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+        guard dataChannel.label == Self.controlChannelLabel else {
+            DiagnosticsLog.info("screen.mac.data_channel_ignored label=\(dataChannel.label)")
+            return
+        }
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection else {
+                dataChannel.close()
+                return
+            }
+            self.controlDataChannel?.delegate = nil
+            self.controlDataChannel?.close()
+            self.controlDataChannel = dataChannel
+            dataChannel.delegate = self
+            DiagnosticsLog.info("screen.mac.control_data_channel_open label=\(dataChannel.label)")
+            self.sendViewerVisibility(
+                visible: self.currentViewerVisible(for: self.window),
+                reason: "dataChannelOpen"
+            )
+        }
+    }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didStartReceivingOn transceiver: RTCRtpTransceiver) {
         guard let track = transceiver.receiver.track as? RTCVideoTrack else {
@@ -625,6 +708,25 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.attachRemoteVideoTrack(track)
         }
+    }
+}
+
+extension MacScreenSession: RTCDataChannelDelegate {
+    func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            DiagnosticsLog.info("screen.mac.control_data_channel_state state=\(dataChannel.readyState.rawValue)")
+            if self.controlDataChannel === dataChannel, dataChannel.readyState == .closed {
+                self.controlDataChannel?.delegate = nil
+                self.controlDataChannel = nil
+            }
+        }
+    }
+
+    func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        DiagnosticsLog.info("screen.mac.control_data_channel_message_ignored bytes=\(buffer.data.count)")
     }
 }
 
@@ -1235,7 +1337,7 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         statsLock.unlock()
         if let gapMs, gapMs > Self.renderGapLogThresholdMs {
             DiagnosticsLog.info(
-                "screen.mac.render_gap gapMs=\(format1(gapMs)) sinceCtrlMs=\(format1(sinceControlMs))"
+                "screen.mac.render_gap gapMs=\(format1(gapMs)) phase=\(Self.gapPhase(sinceControlMs)) sinceCtrlMs=\(format1(sinceControlMs))"
             )
         }
     }
@@ -1262,6 +1364,14 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     }
 
     private static let renderGapLogThresholdMs = 150.0
+    private static let postControlGapWindowMs = 2_000.0
+
+    private static func gapPhase(_ sinceControlMs: Double?) -> String {
+        guard let sinceControlMs else {
+            return "unknown"
+        }
+        return sinceControlMs <= postControlGapWindowMs ? "post_control" : "idle_or_static"
+    }
 }
 
 private extension Dictionary where Key == String, Value == NSObject {
