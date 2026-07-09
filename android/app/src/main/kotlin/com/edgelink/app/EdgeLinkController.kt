@@ -98,7 +98,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
-            screenDimmingAccessGranted = AndroidScreenPowerGuard.canWriteSettings(appContext),
+            screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
             smsAccessGranted = smsSync.smsAccessGranted()
         )
     )
@@ -267,7 +267,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     override fun onOpenScreenDimmingSettings() {
         EdgeLinkLog.info("screen.android.dimming_open_settings")
-        val intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
+        val action = if (!AndroidScreenPowerGuard.canWriteSettings(appContext)) {
+            Settings.ACTION_MANAGE_WRITE_SETTINGS
+        } else {
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION
+        }
+        val intent = Intent(action)
             .setData(Uri.parse("package:${appContext.packageName}"))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         appContext.startActivity(intent)
@@ -283,7 +288,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
-                screenDimmingAccessGranted = AndroidScreenPowerGuard.canWriteSettings(appContext),
+                screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
                 smsAccessGranted = smsSync.smsAccessGranted()
             )
         }

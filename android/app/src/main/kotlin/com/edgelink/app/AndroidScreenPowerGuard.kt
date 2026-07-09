@@ -28,6 +28,7 @@ class AndroidScreenPowerGuard(context: Context) {
     private var wakeLock: PowerManager.WakeLock? = null
     private var originalBrightnessSettings: BrightnessSnapshot? = null
     private var originalScreensaverSettings: ScreensaverSnapshot? = null
+    private val keepScreenOnWindow = AndroidKeepScreenOnWindow(appContext)
     private var sharingActive = false
     private val dimRunnable = Runnable { dimIfSharingActive() }
 
@@ -39,6 +40,8 @@ class AndroidScreenPowerGuard(context: Context) {
     fun onSharingStarted() {
         sharingActive = true
         acquireWakeLock()
+        keepScreenOnWindow.show()
+        ScreenPowerForegroundService.start(appContext)
         disableScreensaver()
         mainHandler.removeCallbacks(dimRunnable)
         mainHandler.postDelayed(dimRunnable, SCREEN_DIM_DELAY_MS)
@@ -50,7 +53,9 @@ class AndroidScreenPowerGuard(context: Context) {
         mainHandler.removeCallbacks(dimRunnable)
         restoreBrightnessIfNeeded(reason = "sharing_stopped")
         restoreScreensaverIfNeeded(reason = "sharing_stopped")
+        keepScreenOnWindow.hide()
         releaseWakeLock()
+        ScreenPowerForegroundService.stop(appContext)
     }
 
     private fun dimIfSharingActive() {
@@ -245,5 +250,8 @@ class AndroidScreenPowerGuard(context: Context) {
     companion object {
         fun canWriteSettings(context: Context): Boolean =
             Build.VERSION.SDK_INT < 23 || Settings.System.canWrite(context.applicationContext)
+
+        fun hasRequiredScreenPowerAccess(context: Context): Boolean =
+            canWriteSettings(context) && AndroidKeepScreenOnWindow.canDrawOverlays(context)
     }
 }

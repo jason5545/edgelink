@@ -260,7 +260,7 @@ private fun DeviceCard(
             PermissionStatusRow(
                 label = "Screen dim",
                 granted = screenDimmingAccessGranted,
-                missingText = "Settings access needed",
+                missingText = "Settings / overlay needed",
                 onOpenSettings = onOpenScreenDimmingSettings
             )
 
