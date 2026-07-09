@@ -68,7 +68,6 @@ class AndroidScreenSession(
     private var controlDataChannel: DataChannel? = null
     private var controlDataChannelObserver: DataChannel.Observer? = null
     private val screenPowerGuard = AndroidScreenPowerGuard(appContext)
-    private val screenShareProtectionGuard = AndroidScreenShareProtectionGuard(appContext)
     @Volatile
     private var controlDataChannelHandler: ((ByteArray) -> Unit)? = null
     @Volatile
@@ -128,7 +127,7 @@ class AndroidScreenSession(
         viewerVisible = true
 
         try {
-            screenShareProtectionGuard.onSharingStarted()
+            AndroidNotificationListenerService.onScreenSharingStarted(appContext)
             initializeWebRtc()
             val meta = currentScreenMeta()
             val captureSize = captureSizeFor(meta)
@@ -247,7 +246,7 @@ class AndroidScreenSession(
             EdgeLinkLog.info("screen.android.stream_stop keepProjection=${mediaProjection != null}")
             boostHandler.removeCallbacks(restoreBitrateRunnable)
             screenPowerGuard.onSharingStopped()
-            screenShareProtectionGuard.onSharingStopped()
+            AndroidNotificationListenerService.onScreenSharingStopped()
             stopStatsLogging()
             closeControlDataChannel()
             detachProjectionFrames()

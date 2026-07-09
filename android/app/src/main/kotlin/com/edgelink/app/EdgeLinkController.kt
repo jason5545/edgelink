@@ -665,6 +665,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
                 session = nextSession
+                AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
                 stateFlow.update { it.copy(connectionStatus = "Connected", isConnected = true) }
 

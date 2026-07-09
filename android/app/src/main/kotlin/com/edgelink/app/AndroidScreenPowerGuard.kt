@@ -106,7 +106,7 @@ class AndroidScreenPowerGuard(context: Context) {
     }
 
     private fun disableScreensaver() {
-        if (!AndroidScreenShareProtectionGuard.canWriteProtectedSettings(appContext)) {
+        if (!AndroidProtectedSettings.canWriteSecureSettings(appContext)) {
             EdgeLinkLog.warn("screen.android.screensaver_disable_skipped missing_write_secure_settings")
             return
         }
@@ -126,7 +126,7 @@ class AndroidScreenPowerGuard(context: Context) {
 
     private fun restoreScreensaverIfNeeded(reason: String) {
         val snapshot = originalScreensaverSettings ?: loadScreensaverSnapshot() ?: return
-        if (!AndroidScreenShareProtectionGuard.canWriteProtectedSettings(appContext)) {
+        if (!AndroidProtectedSettings.canWriteSecureSettings(appContext)) {
             EdgeLinkLog.warn("screen.android.screensaver_restore_skipped reason=$reason missing_write_secure_settings")
             return
         }
