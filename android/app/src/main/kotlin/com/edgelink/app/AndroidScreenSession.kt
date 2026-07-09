@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjection
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.edgelink.core.EnvelopeCodec
@@ -23,6 +25,8 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.RtpParameters
 import org.webrtc.RtpSender
+import org.webrtc.RTCStats
+import org.webrtc.RTCStatsReport
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SdpObserver
@@ -30,6 +34,7 @@ import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoCapturer
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidScreenSession(
@@ -44,6 +49,9 @@ class AndroidScreenSession(
     private var capturer: VideoCapturer? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
+    private var statsHandlerThread: HandlerThread? = null
+    private var statsHandler: Handler? = null
+    private val statsLogger = ScreenStatsLogger()
     private val isStopping = AtomicBoolean(false)
 
     fun requestStart() {
@@ -91,6 +99,7 @@ class AndroidScreenSession(
             val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
             configureVideoQuality(pc, sender)
             createOffer(pc)
+            startStatsLogging(pc)
         } catch (error: Throwable) {
             EdgeLinkLog.error("screen.android.start_failed", error)
             stop()
@@ -123,6 +132,7 @@ class AndroidScreenSession(
             return
         }
         EdgeLinkLog.info("screen.android.stop")
+        stopStatsLogging()
         runCatching { capturer?.stopCapture() }
         runCatching { capturer?.dispose() }
         capturer = null
@@ -227,6 +237,37 @@ class AndroidScreenSession(
         )
     }
 
+    private fun startStatsLogging(pc: PeerConnection) {
+        stopStatsLogging()
+        statsLogger.reset()
+        val thread = HandlerThread("EdgeLinkScreenStats").apply { start() }
+        val handler = Handler(thread.looper)
+        statsHandlerThread = thread
+        statsHandler = handler
+        val task = object : Runnable {
+            override fun run() {
+                if (peerConnection !== pc || isStopping.get()) {
+                    return
+                }
+                pc.getStats { report ->
+                    if (peerConnection === pc && !isStopping.get()) {
+                        statsLogger.log(report)
+                    }
+                }
+                handler.postDelayed(this, STATS_INTERVAL_MS)
+            }
+        }
+        handler.postDelayed(task, STATS_INTERVAL_MS)
+    }
+
+    private fun stopStatsLogging() {
+        statsHandler?.removeCallbacksAndMessages(null)
+        statsHandler = null
+        statsHandlerThread?.quitSafely()
+        statsHandlerThread = null
+        statsLogger.reset()
+    }
+
     private fun peerObserver(): PeerConnection.Observer =
         object : PeerConnection.Observer {
             override fun onSignalingChange(newState: PeerConnection.SignalingState) {
@@ -317,6 +358,116 @@ class AndroidScreenSession(
         val height: Int
     )
 
+    private class ScreenStatsLogger {
+        private val previousOutbound = mutableMapOf<String, OutboundSnapshot>()
+
+        fun reset() {
+            previousOutbound.clear()
+        }
+
+        fun log(report: RTCStatsReport) {
+            val statsById = report.statsMap
+            val outbound = statsById.values.firstOrNull { stat ->
+                stat.type == "outbound-rtp" && stat.members.isVideo()
+            }
+            val pair = statsById.values.firstOrNull { stat ->
+                stat.type == "candidate-pair" &&
+                    stat.members.string("state") == "succeeded" &&
+                    (stat.members.boolean("nominated") == true || stat.members.boolean("selected") == true)
+            }
+
+            val line = StringBuilder("screen.android.stats")
+            if (outbound != null) {
+                appendOutbound(line, outbound)
+            }
+            if (pair != null) {
+                appendCandidatePair(line, pair, statsById)
+            }
+            EdgeLinkLog.info(line.toString())
+        }
+
+        private fun appendOutbound(line: StringBuilder, stat: RTCStats) {
+            val members = stat.members
+            val framesEncoded = members.long("framesEncoded")
+            val totalEncodeTime = members.double("totalEncodeTime")
+            val qpSum = members.long("qpSum")
+            val previous = previousOutbound[stat.id]
+            val deltaFrames = framesEncoded?.let { current ->
+                previous?.framesEncoded?.let { current - it }
+            }
+            val deltaSeconds = previous?.let { previousStat ->
+                (stat.timestampUs - previousStat.timestampUs) / 1_000_000.0
+            }?.takeIf { it > 0 }
+            val measuredFps = deltaFrames?.let { frames ->
+                deltaSeconds?.let { seconds -> frames.toDouble() / seconds }
+            }
+            val avgEncodeMs = if (
+                previous != null &&
+                deltaFrames != null &&
+                deltaFrames > 0 &&
+                totalEncodeTime != null &&
+                previous.totalEncodeTime != null
+            ) {
+                (totalEncodeTime - previous.totalEncodeTime) * 1000.0 / deltaFrames.toDouble()
+            } else {
+                null
+            }
+            val avgQp = if (
+                previous != null &&
+                deltaFrames != null &&
+                deltaFrames > 0 &&
+                qpSum != null &&
+                previous.qpSum != null
+            ) {
+                (qpSum - previous.qpSum).toDouble() / deltaFrames.toDouble()
+            } else {
+                null
+            }
+
+            if (framesEncoded != null || totalEncodeTime != null || qpSum != null) {
+                previousOutbound[stat.id] = OutboundSnapshot(
+                    timestampUs = stat.timestampUs,
+                    framesEncoded = framesEncoded ?: previous?.framesEncoded,
+                    totalEncodeTime = totalEncodeTime ?: previous?.totalEncodeTime,
+                    qpSum = qpSum ?: previous?.qpSum
+                )
+            }
+
+            line.append(" fps=${format1(members.double("framesPerSecond") ?: measuredFps)}")
+            line.append(" enc=${framesEncoded ?: "-"}")
+            line.append(" w=${members.long("frameWidth") ?: "-"}")
+            line.append(" h=${members.long("frameHeight") ?: "-"}")
+            line.append(" limit=${members.string("qualityLimitationReason") ?: "-"}")
+            line.append(" targetKbps=${formatKbps(members.double("targetBitrate"))}")
+            line.append(" encMs=${format1(avgEncodeMs)}")
+            line.append(" qp=${format1(avgQp)}")
+            line.append(" impl=${members.string("encoderImplementation") ?: "-"}")
+        }
+
+        private fun appendCandidatePair(
+            line: StringBuilder,
+            pair: RTCStats,
+            statsById: Map<String, RTCStats>
+        ) {
+            val members = pair.members
+            val localType = candidateType(statsById, members.string("localCandidateId"))
+            val remoteType = candidateType(statsById, members.string("remoteCandidateId"))
+            line.append(" rttMs=${format1(members.double("currentRoundTripTime")?.times(1000.0))}")
+            line.append(" abwKbps=${formatKbps(members.double("availableOutgoingBitrate"))}")
+            line.append(" path=${localType ?: "-"}>${remoteType ?: "-"}")
+        }
+
+        private fun candidateType(statsById: Map<String, RTCStats>, id: String?): String? =
+            id?.let { statsById[it]?.members?.string("candidateType") }
+
+        private data class OutboundSnapshot(
+            val timestampUs: Double,
+            val framesEncoded: Long?,
+            val totalEncodeTime: Double?,
+            val qpSum: Long?
+        )
+    }
+
     private class LoggingSdpObserver(private val label: String) : SdpObserver {
         override fun onCreateSuccess(description: SessionDescription) = Unit
         override fun onSetSuccess() {
@@ -341,6 +492,7 @@ class AndroidScreenSession(
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
+        private const val STATS_INTERVAL_MS = 2_000L
         private val initialized = AtomicBoolean(false)
 
         private fun ensureWebRtcInitialized(context: Context) {
@@ -353,3 +505,38 @@ class AndroidScreenSession(
         }
     }
 }
+
+private fun Map<String, Any>.isVideo(): Boolean =
+    string("kind") == "video" ||
+        string("mediaType") == "video" ||
+        string("trackIdentifier")?.contains("video", ignoreCase = true) == true
+
+private fun Map<String, Any>.string(name: String): String? =
+    this[name]?.toString()
+
+private fun Map<String, Any>.double(name: String): Double? =
+    when (val value = this[name]) {
+        is Number -> value.toDouble()
+        is String -> value.toDoubleOrNull()
+        else -> null
+    }
+
+private fun Map<String, Any>.long(name: String): Long? =
+    when (val value = this[name]) {
+        is Number -> value.toLong()
+        is String -> value.toLongOrNull()
+        else -> null
+    }
+
+private fun Map<String, Any>.boolean(name: String): Boolean? =
+    when (val value = this[name]) {
+        is Boolean -> value
+        is String -> value.toBooleanStrictOrNull()
+        else -> null
+    }
+
+private fun format1(value: Double?): String =
+    value?.let { String.format(Locale.US, "%.1f", it) } ?: "-"
+
+private fun formatKbps(value: Double?): String =
+    value?.let { String.format(Locale.US, "%.0f", it / 1000.0) } ?: "-"

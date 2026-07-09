@@ -23,6 +23,9 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var lastPointerMoveSentAt: TimeInterval = 0
     private var pendingPointerMove: CtrlPointerBody?
     private var pointerMoveFlushWorkItem: DispatchWorkItem?
+    private let statsQueue = DispatchQueue(label: "EdgeLinkMac.ScreenStats")
+    private var statsTimer: DispatchSourceTimer?
+    private let statsLogger = MacScreenStatsLogger()
 
     override init() {
         super.init()
@@ -121,6 +124,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
         remoteVideoTrack?.remove(videoView)
+        stopStatsLogging()
         videoView.clear()
         remoteVideoTrack = nil
         peerConnection?.close()
@@ -199,6 +203,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             fatalError("Unable to create RTCPeerConnection.")
         }
         self.peerConnection = peerConnection
+        startStatsLogging(on: peerConnection)
         return peerConnection
     }
 
@@ -430,7 +435,49 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
     }
 
+    private func startStatsLogging(on peerConnection: RTCPeerConnection) {
+        stopStatsLogging()
+        statsQueue.sync {
+            statsLogger.reset()
+        }
+        videoView.resetStats()
+
+        let timer = DispatchSource.makeTimerSource(queue: statsQueue)
+        timer.schedule(deadline: .now() + Self.statsIntervalSeconds, repeating: Self.statsIntervalSeconds)
+        let statsWorkItem = DispatchWorkItem { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection else {
+                return
+            }
+            peerConnection.stats(for: nil, statsOutputLevel: .standard) { [weak self, weak peerConnection] reports in
+                guard let self, let peerConnection, self.peerConnection === peerConnection else {
+                    return
+                }
+                let renderer = self.videoView.statsSnapshot()
+                self.statsQueue.async { [weak self, weak peerConnection] in
+                    guard let self, let peerConnection, self.peerConnection === peerConnection else {
+                        return
+                    }
+                    self.statsLogger.logLegacy(reports: reports as [AnyObject], renderer: renderer)
+                }
+            }
+        }
+        timer.setEventHandler(handler: statsWorkItem)
+        statsTimer = timer
+        timer.resume()
+    }
+
+    private func stopStatsLogging() {
+        statsTimer?.setEventHandler {}
+        statsTimer?.cancel()
+        statsTimer = nil
+        statsQueue.sync {
+            statsLogger.reset()
+        }
+        videoView.resetStats()
+    }
+
     private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
+    private static let statsIntervalSeconds: TimeInterval = 2.0
 }
 
 extension MacScreenSession: NSWindowDelegate {
@@ -568,13 +615,280 @@ struct PhoneVideoView: NSViewRepresentable {
     func updateNSView(_ nsView: PhoneVideoRendererView, context: Context) {}
 }
 
+private struct RendererStatsSnapshot {
+    let timestamp: TimeInterval
+    let receivedFrames: Int
+    let drawnFrames: Int
+    let unsupportedFrames: Int
+    let convertedFrames: Int
+    let totalConvertMs: Double
+    let pendingMainFrames: Int
+    let maxPendingMainFrames: Int
+}
+
+private final class MacScreenStatsLogger {
+    private var previousInbound = [String: InboundSnapshot]()
+    private var previousRenderer: RendererStatsSnapshot?
+
+    func reset() {
+        previousInbound.removeAll()
+        previousRenderer = nil
+    }
+
+    func logLegacy(reports: [AnyObject], renderer: RendererStatsSnapshot) {
+        let reports = reports.compactMap { $0 as? NSObject }
+        let inbound = reports.first { report in
+            let values = report.rtcLegacyValues
+            return values.isVideo() ||
+                values.string("googFrameRateDecoded") != nil ||
+                values.string("googFrameWidthReceived") != nil ||
+                report.rtcLegacyId.localizedCaseInsensitiveContains("video")
+        }
+        let pair = reports.first { report in
+            let values = report.rtcLegacyValues
+            return (report.rtcLegacyType == "googCandidatePair" || report.rtcLegacyType == "candidate-pair") &&
+                (values.bool("googActiveConnection") == true ||
+                    values.bool("selected") == true ||
+                    values.bool("nominated") == true)
+        }
+
+        let line = NSMutableString(string: "screen.mac.stats")
+        if let inbound {
+            appendLegacyInbound(line, inbound)
+        }
+        if let pair {
+            appendLegacyCandidatePair(line, pair)
+        }
+        appendRenderer(line, renderer)
+        DiagnosticsLog.info(line as String)
+    }
+
+    func log(report: AnyObject, renderer: RendererStatsSnapshot) {
+        guard
+            let report = report as? NSObject,
+            let statsById = report.value(forKey: "statistics") as? [String: NSObject]
+        else {
+            let line = NSMutableString(string: "screen.mac.stats")
+            appendRenderer(line, renderer)
+            line.append(" stats=unavailable")
+            DiagnosticsLog.warn(line as String)
+            return
+        }
+        let inbound = statsById.values.first { stat in
+            stat.rtcStatType == "inbound-rtp" && stat.rtcStatValues.isVideo()
+        }
+        let pair = statsById.values.first { stat in
+            stat.rtcStatType == "candidate-pair" &&
+                stat.rtcStatValues.string("state") == "succeeded" &&
+                (stat.rtcStatValues.bool("nominated") == true || stat.rtcStatValues.bool("selected") == true)
+        }
+
+        let line = NSMutableString(string: "screen.mac.stats")
+        if let inbound {
+            appendInbound(line, inbound)
+        }
+        if let pair {
+            appendCandidatePair(line, pair, statsById: statsById)
+        }
+        appendRenderer(line, renderer)
+        DiagnosticsLog.info(line as String)
+    }
+
+    private func appendLegacyInbound(_ line: NSMutableString, _ report: NSObject) {
+        let values = report.rtcLegacyValues
+        let framesDecoded = values.int("framesDecoded")
+        let totalDecodeTime = values.double("totalDecodeTime")
+        let jitterBufferDelay = values.double("jitterBufferDelay")
+        let previous = previousInbound[report.rtcLegacyId]
+        let deltaFrames = framesDecoded.flatMap { current in
+            previous?.framesDecoded.map { current - $0 }
+        }
+        let deltaSeconds = previous.map { previousStat in
+            (report.rtcLegacyTimestampMs * 1000.0 - previousStat.timestampUs) / 1_000_000.0
+        }.flatMap { $0 > 0 ? $0 : nil }
+        let measuredFps = deltaFrames.flatMap { frames in
+            deltaSeconds.map { Double(frames) / $0 }
+        }
+        let avgDecodeMs: Double?
+        if
+            let previous,
+            let deltaFrames,
+            deltaFrames > 0,
+            let totalDecodeTime,
+            let previousTotalDecodeTime = previous.totalDecodeTime {
+            avgDecodeMs = (totalDecodeTime - previousTotalDecodeTime) * 1000.0 / Double(deltaFrames)
+        } else {
+            avgDecodeMs = values.double("googDecodeMs")
+        }
+        let jitterMs = values.double("jitterBufferDelay").map { $0 * 1000.0 } ??
+            values.double("googJitterBufferMs") ??
+            values.double("googCurrentDelayMs")
+
+        if framesDecoded != nil || totalDecodeTime != nil || jitterBufferDelay != nil {
+            previousInbound[report.rtcLegacyId] = InboundSnapshot(
+                timestampUs: report.rtcLegacyTimestampMs * 1000.0,
+                framesDecoded: framesDecoded ?? previous?.framesDecoded,
+                totalDecodeTime: totalDecodeTime ?? previous?.totalDecodeTime,
+                jitterBufferDelay: jitterBufferDelay ?? previous?.jitterBufferDelay,
+                jitterBufferEmittedCount: values.int("jitterBufferEmittedCount") ?? previous?.jitterBufferEmittedCount
+            )
+        }
+
+        line.append(" fps=\(format1(values.double("framesPerSecond") ?? values.double("googFrameRateDecoded") ?? values.double("googFrameRateOutput") ?? measuredFps))")
+        line.append(" dec=\(framesDecoded.map(String.init) ?? "-")")
+        line.append(" drop=\(values.int("framesDropped").map(String.init) ?? "-")")
+        line.append(" w=\((values.int("frameWidth") ?? values.int("googFrameWidthReceived")).map(String.init) ?? "-")")
+        line.append(" h=\((values.int("frameHeight") ?? values.int("googFrameHeightReceived")).map(String.init) ?? "-")")
+        line.append(" decMs=\(format1(avgDecodeMs))")
+        line.append(" jitterMs=\(format1(jitterMs))")
+        line.append(" impl=\(values.string("decoderImplementation") ?? "-")")
+    }
+
+    private func appendLegacyCandidatePair(_ line: NSMutableString, _ report: NSObject) {
+        let values = report.rtcLegacyValues
+        let rttMs = values.double("currentRoundTripTime").map { $0 * 1000.0 } ?? values.double("googRtt")
+        let availableBitrate = values.double("availableIncomingBitrate") ??
+            values.double("availableOutgoingBitrate") ??
+            values.double("googAvailableReceiveBandwidth") ??
+            values.double("googAvailableSendBandwidth")
+        line.append(" rttMs=\(format1(rttMs))")
+        line.append(" abwKbps=\(formatKbps(availableBitrate))")
+        line.append(" path=\(values.string("localCandidateType") ?? values.string("googLocalCandidateType") ?? "-")>\(values.string("remoteCandidateType") ?? values.string("googRemoteCandidateType") ?? "-")")
+    }
+
+    private func appendInbound(_ line: NSMutableString, _ stat: NSObject) {
+        let values = stat.rtcStatValues
+        let framesDecoded = values.int("framesDecoded")
+        let jitterBufferEmittedCount = values.int("jitterBufferEmittedCount")
+        let totalDecodeTime = values.double("totalDecodeTime")
+        let jitterBufferDelay = values.double("jitterBufferDelay")
+        let previous = previousInbound[stat.rtcStatId]
+        let deltaFrames = framesDecoded.flatMap { current in
+            previous?.framesDecoded.map { current - $0 }
+        }
+        let deltaSeconds = previous.map { previousStat in
+            (stat.rtcStatTimestampUs - previousStat.timestampUs) / 1_000_000.0
+        }.flatMap { $0 > 0 ? $0 : nil }
+        let measuredFps = deltaFrames.flatMap { frames in
+            deltaSeconds.map { Double(frames) / $0 }
+        }
+        let avgDecodeMs: Double?
+        if
+            let previous,
+            let deltaFrames,
+            deltaFrames > 0,
+            let totalDecodeTime,
+            let previousTotalDecodeTime = previous.totalDecodeTime {
+            avgDecodeMs = (totalDecodeTime - previousTotalDecodeTime) * 1000.0 / Double(deltaFrames)
+        } else {
+            avgDecodeMs = nil
+        }
+        let jitterMs: Double?
+        if
+            let previous,
+            let jitterBufferEmittedCount,
+            let previousCount = previous.jitterBufferEmittedCount,
+            let jitterBufferDelay,
+            let previousDelay = previous.jitterBufferDelay {
+            let deltaCount = jitterBufferEmittedCount - previousCount
+            jitterMs = deltaCount > 0 ? (jitterBufferDelay - previousDelay) * 1000.0 / Double(deltaCount) : nil
+        } else {
+            jitterMs = nil
+        }
+
+        if framesDecoded != nil || totalDecodeTime != nil || jitterBufferDelay != nil {
+            previousInbound[stat.rtcStatId] = InboundSnapshot(
+                timestampUs: stat.rtcStatTimestampUs,
+                framesDecoded: framesDecoded ?? previous?.framesDecoded,
+                totalDecodeTime: totalDecodeTime ?? previous?.totalDecodeTime,
+                jitterBufferDelay: jitterBufferDelay ?? previous?.jitterBufferDelay,
+                jitterBufferEmittedCount: jitterBufferEmittedCount ?? previous?.jitterBufferEmittedCount
+            )
+        }
+
+        line.append(" fps=\(format1(values.double("framesPerSecond") ?? measuredFps))")
+        line.append(" dec=\(framesDecoded.map(String.init) ?? "-")")
+        line.append(" drop=\(values.int("framesDropped").map(String.init) ?? "-")")
+        line.append(" w=\(values.int("frameWidth").map(String.init) ?? "-")")
+        line.append(" h=\(values.int("frameHeight").map(String.init) ?? "-")")
+        line.append(" decMs=\(format1(avgDecodeMs))")
+        line.append(" jitterMs=\(format1(jitterMs))")
+        line.append(" impl=\(values.string("decoderImplementation") ?? "-")")
+    }
+
+    private func appendCandidatePair(
+        _ line: NSMutableString,
+        _ pair: NSObject,
+        statsById: [String: NSObject]
+    ) {
+        let values = pair.rtcStatValues
+        let localType = candidateType(statsById: statsById, id: values.string("localCandidateId"))
+        let remoteType = candidateType(statsById: statsById, id: values.string("remoteCandidateId"))
+        let availableBitrate = values.double("availableIncomingBitrate") ?? values.double("availableOutgoingBitrate")
+        line.append(" rttMs=\(format1(values.double("currentRoundTripTime").map { $0 * 1000.0 }))")
+        line.append(" abwKbps=\(formatKbps(availableBitrate))")
+        line.append(" path=\(localType ?? "-")>\(remoteType ?? "-")")
+    }
+
+    private func appendRenderer(_ line: NSMutableString, _ renderer: RendererStatsSnapshot) {
+        let previous = previousRenderer
+        let deltaSeconds = previous.map { renderer.timestamp - $0.timestamp }.flatMap { $0 > 0 ? $0 : nil }
+        let receivedFps = previous.flatMap { previous in
+            deltaSeconds.map { Double(renderer.receivedFrames - previous.receivedFrames) / $0 }
+        }
+        let drawnFps = previous.flatMap { previous in
+            deltaSeconds.map { Double(renderer.drawnFrames - previous.drawnFrames) / $0 }
+        }
+        let convertMs: Double?
+        if let previous {
+            let convertedDelta = renderer.convertedFrames - previous.convertedFrames
+            convertMs = convertedDelta > 0
+                ? (renderer.totalConvertMs - previous.totalConvertMs) / Double(convertedDelta)
+                : nil
+        } else {
+            convertMs = nil
+        }
+        previousRenderer = renderer
+
+        line.append(" renderInFps=\(format1(receivedFps))")
+        line.append(" renderDrawFps=\(format1(drawnFps))")
+        line.append(" pending=\(renderer.pendingMainFrames)")
+        line.append(" maxPending=\(renderer.maxPendingMainFrames)")
+        line.append(" convertMs=\(format1(convertMs))")
+        line.append(" unsupported=\(renderer.unsupportedFrames)")
+    }
+
+    private func candidateType(statsById: [String: NSObject], id: String?) -> String? {
+        guard let id else {
+            return nil
+        }
+        return statsById[id]?.rtcStatValues.string("candidateType")
+    }
+
+    private struct InboundSnapshot {
+        let timestampUs: Double
+        let framesDecoded: Int?
+        let totalDecodeTime: Double?
+        let jitterBufferDelay: Double?
+        let jitterBufferEmittedCount: Int?
+    }
+}
+
 final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     var pointerHandler: ((String, NSEvent, Int?) -> Void)?
     var keyHandler: ((NSEvent, Bool) -> Bool)?
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let statsLock = NSLock()
     private var lastSize: CGSize = .zero
     private var didLogUnsupportedFrameBuffer = false
+    private var receivedFrames = 0
+    private var drawnFrames = 0
+    private var unsupportedFrames = 0
+    private var convertedFrames = 0
+    private var totalConvertMs = 0.0
+    private var pendingMainFrames = 0
+    private var maxPendingMainFrames = 0
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -637,11 +951,13 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     }
 
     func renderFrame(_ frame: RTCVideoFrame?) {
+        recordReceivedFrame()
         guard let frame, let cvBuffer = frame.buffer as? RTCCVPixelBuffer else {
             logUnsupportedFrameBuffer(frame)
             return
         }
 
+        let convertStartedAt = ProcessInfo.processInfo.systemUptime
         var image = CIImage(cvPixelBuffer: cvBuffer.pixelBuffer)
         if cvBuffer.requiresCropping() {
             image = image.cropped(to: CGRect(
@@ -656,8 +972,11 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
             return
         }
+        recordConvertedFrame(ms: (ProcessInfo.processInfo.systemUptime - convertStartedAt) * 1000.0)
+        recordMainFrameQueued()
         DispatchQueue.main.async { [weak self] in
             self?.layer?.contents = cgImage
+            self?.recordMainFrameDrawn()
         }
     }
 
@@ -665,6 +984,35 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         DispatchQueue.main.async { [weak self] in
             self?.layer?.contents = nil
         }
+    }
+
+    func resetStats() {
+        statsLock.lock()
+        receivedFrames = 0
+        drawnFrames = 0
+        unsupportedFrames = 0
+        convertedFrames = 0
+        totalConvertMs = 0
+        pendingMainFrames = 0
+        maxPendingMainFrames = 0
+        statsLock.unlock()
+    }
+
+    fileprivate func statsSnapshot() -> RendererStatsSnapshot {
+        statsLock.lock()
+        let snapshot = RendererStatsSnapshot(
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            receivedFrames: receivedFrames,
+            drawnFrames: drawnFrames,
+            unsupportedFrames: unsupportedFrames,
+            convertedFrames: convertedFrames,
+            totalConvertMs: totalConvertMs,
+            pendingMainFrames: pendingMainFrames,
+            maxPendingMainFrames: maxPendingMainFrames
+        )
+        maxPendingMainFrames = pendingMainFrames
+        statsLock.unlock()
+        return snapshot
     }
 
     override func layout() {
@@ -692,6 +1040,9 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     }
 
     private func logUnsupportedFrameBuffer(_ frame: RTCVideoFrame?) {
+        statsLock.lock()
+        unsupportedFrames += 1
+        statsLock.unlock()
         guard !didLogUnsupportedFrameBuffer else {
             return
         }
@@ -699,4 +1050,130 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         let bufferType = frame.map { String(describing: type(of: $0.buffer)) } ?? "nil"
         DiagnosticsLog.warn("screen.mac.unsupported_frame_buffer type=\(bufferType)")
     }
+
+    private func recordReceivedFrame() {
+        statsLock.lock()
+        receivedFrames += 1
+        statsLock.unlock()
+    }
+
+    private func recordConvertedFrame(ms: Double) {
+        statsLock.lock()
+        convertedFrames += 1
+        totalConvertMs += ms
+        statsLock.unlock()
+    }
+
+    private func recordMainFrameQueued() {
+        statsLock.lock()
+        pendingMainFrames += 1
+        maxPendingMainFrames = max(maxPendingMainFrames, pendingMainFrames)
+        statsLock.unlock()
+    }
+
+    private func recordMainFrameDrawn() {
+        statsLock.lock()
+        pendingMainFrames = max(0, pendingMainFrames - 1)
+        drawnFrames += 1
+        statsLock.unlock()
+    }
+}
+
+private extension Dictionary where Key == String, Value == NSObject {
+    func isVideo() -> Bool {
+        string("kind") == "video" ||
+            string("mediaType") == "video" ||
+            string("trackIdentifier")?.localizedCaseInsensitiveContains("video") == true
+    }
+
+    func string(_ key: String) -> String? {
+        self[key] as? String ?? self[key]?.description
+    }
+
+    func double(_ key: String) -> Double? {
+        if let number = self[key] as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = self[key] as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
+    func int(_ key: String) -> Int? {
+        if let number = self[key] as? NSNumber {
+            return number.intValue
+        }
+        if let string = self[key] as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    func bool(_ key: String) -> Bool? {
+        if let number = self[key] as? NSNumber {
+            return number.boolValue
+        }
+        if let string = self[key] as? String {
+            return Bool(string)
+        }
+        return nil
+    }
+}
+
+private extension NSObject {
+    var rtcLegacyId: String {
+        value(forKey: "reportId") as? String ?? ""
+    }
+
+    var rtcLegacyType: String {
+        value(forKey: "type") as? String ?? ""
+    }
+
+    var rtcLegacyTimestampMs: Double {
+        if let number = value(forKey: "timestamp") as? NSNumber {
+            return number.doubleValue
+        }
+        return 0
+    }
+
+    var rtcLegacyValues: [String: NSObject] {
+        value(forKey: "values") as? [String: NSObject] ?? [:]
+    }
+
+    var rtcStatId: String {
+        value(forKey: "id") as? String ?? ""
+    }
+
+    var rtcStatType: String {
+        value(forKey: "type") as? String ?? ""
+    }
+
+    var rtcStatTimestampUs: Double {
+        if let number = value(forKey: "timestamp_us") as? NSNumber {
+            return number.doubleValue
+        }
+        if let number = value(forKey: "timestamp") as? NSNumber {
+            return number.doubleValue * 1000.0
+        }
+        return 0
+    }
+
+    var rtcStatValues: [String: NSObject] {
+        value(forKey: "values") as? [String: NSObject] ?? [:]
+    }
+}
+
+private func format1(_ value: Double?) -> String {
+    guard let value else {
+        return "-"
+    }
+    return String(format: "%.1f", value)
+}
+
+private func formatKbps(_ value: Double?) -> String {
+    guard let value else {
+        return "-"
+    }
+    return String(format: "%.0f", value / 1000.0)
 }

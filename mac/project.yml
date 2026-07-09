@@ -50,6 +50,7 @@ targets:
           #import <WebRTC/RTCI420Buffer.h>
           #import <WebRTC/RTCIceCandidate.h>
           #import <WebRTC/RTCIceServer.h>
+          #import <WebRTC/RTCLegacyStatsReport.h>
           #import <WebRTC/RTCMediaConstraints.h>
           #import <WebRTC/RTCMediaStream.h>
           #import <WebRTC/RTCMediaStreamTrack.h>
@@ -59,6 +60,7 @@ targets:
           #import <WebRTC/RTCRtpTransceiver.h>
           #import <WebRTC/RTCSSLAdapter.h>
           #import <WebRTC/RTCSessionDescription.h>
+          #import <WebRTC/RTCStatisticsReport.h>
           #import <WebRTC/RTCYUVPlanarBuffer.h>
           #import <WebRTC/RTCVideoFrame.h>
           #import <WebRTC/RTCVideoFrameBuffer.h>
