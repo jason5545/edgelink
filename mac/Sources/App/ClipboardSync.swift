@@ -46,6 +46,19 @@ final class ClipboardSync {
         lastChangeCount = pasteboard.changeCount
     }
 
+    func setLocalTextWithoutPublishing(_ text: String) {
+        let hash = Self.hash(text)
+        guard hash != Self.hash(NSPasteboard.general.string(forType: .string) ?? "") else {
+            suppressedHash = hash
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        suppressedHash = hash
+        lastChangeCount = pasteboard.changeCount
+    }
+
     static func hash(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8))
             .map { String(format: "%02x", $0) }

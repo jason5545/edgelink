@@ -47,6 +47,29 @@ private struct MenuBarPopover: View {
                 )
                 .toggleStyle(.switch)
 
+                Toggle(
+                    "系統驗證碼",
+                    isOn: Binding(
+                        get: { runtime.verificationCodeSystemBridgeEnabled },
+                        set: { runtime.setVerificationCodeSystemBridgeEnabled($0) }
+                    )
+                )
+                .toggleStyle(.switch)
+
+                Toggle(
+                    "自動複製驗證碼",
+                    isOn: Binding(
+                        get: { runtime.verificationCodeAutoCopyEnabled },
+                        set: { runtime.setVerificationCodeAutoCopyEnabled($0) }
+                    )
+                )
+                .toggleStyle(.switch)
+
+                if runtime.latestVerificationCode != nil {
+                    Divider()
+                    LatestVerificationCodePanel(runtime: runtime)
+                }
+
                 Button {
                     if runtime.isViewingPhoneScreen {
                         runtime.stopPhoneScreen()
@@ -84,6 +107,36 @@ private struct MenuBarPopover: View {
         }
         .padding()
         .frame(width: 280)
+    }
+}
+
+private struct LatestVerificationCodePanel: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        if let candidate = runtime.latestVerificationCode {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(candidate.displayCode)
+                        .font(.system(.title3, design: .monospaced))
+                        .lineLimit(1)
+                    Text(candidate.sourceAddress ?? "驗證碼")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    runtime.copyLatestVerificationCode()
+                } label: {
+                    Label("複製", systemImage: "doc.on.doc")
+                }
+                .labelStyle(.iconOnly)
+                .help("複製驗證碼")
+            }
+        }
     }
 }
 

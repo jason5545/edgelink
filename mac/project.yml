@@ -75,6 +75,7 @@ targets:
         DEVELOPMENT_TEAM: MW4GWYGX56
         OTHER_SWIFT_FLAGS: "$(inherited) -Xcc -Wno-incomplete-umbrella"
         PRODUCT_BUNDLE_IDENTIFIER: com.edgelink.mac
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/App/EdgeLinkMac-Bridging-Header.h
     info:
       path: Sources/App/Info.plist
       properties:

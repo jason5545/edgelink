@@ -21,6 +21,9 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var isPairing = false
     @Published private(set) var canAcceptPairing = false
     @Published private(set) var macNotificationSyncEnabled: Bool
+    @Published private(set) var verificationCodeSystemBridgeEnabled: Bool
+    @Published private(set) var verificationCodeAutoCopyEnabled: Bool
+    @Published private(set) var latestVerificationCode: VerificationCodeCandidate?
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var isViewingPhoneScreen = false
@@ -32,6 +35,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
     private let notificationPresenter = MacNotificationPresenter()
+    private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
     private let encoder = JSONEncoder()
@@ -55,16 +59,24 @@ final class EdgeLinkRuntime: ObservableObject {
         pairingWebSocketURL: URL = EdgeLinkConfig.pairingWebSocketURL
     ) {
         macNotificationSyncEnabled = UserDefaults.standard.object(forKey: Self.macNotificationSyncDefaultsKey) as? Bool ?? true
+        verificationCodeSystemBridgeEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeSystemBridgeDefaultsKey) as? Bool ?? true
+        verificationCodeAutoCopyEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeAutoCopyDefaultsKey) as? Bool ?? true
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
+        notificationPresenter.onCopyVerificationCode = { [weak self] code in
+            Task { @MainActor in
+                self?.copyVerificationCode(code, reason: "notification_action")
+            }
+        }
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
             Task { @MainActor in
                 self?.isViewingPhoneScreen = visible
             }
         }
         observeSystemSleepWake()
+        verificationCodeBridge.warmObservers()
         task = Task { await run() }
     }
 
@@ -116,6 +128,28 @@ final class EdgeLinkRuntime: ObservableObject {
         if enabled {
             Task { await macNotificationSource.resetBaseline() }
         }
+    }
+
+    func setVerificationCodeSystemBridgeEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.verificationCodeSystemBridgeDefaultsKey)
+        verificationCodeSystemBridgeEnabled = enabled
+        DiagnosticsLog.info("verification.mac.system_bridge_enabled enabled=\(enabled)")
+        if enabled {
+            verificationCodeBridge.warmObservers()
+        }
+    }
+
+    func setVerificationCodeAutoCopyEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.verificationCodeAutoCopyDefaultsKey)
+        verificationCodeAutoCopyEnabled = enabled
+        DiagnosticsLog.info("verification.mac.auto_copy_enabled enabled=\(enabled)")
+    }
+
+    func copyLatestVerificationCode() {
+        guard let latestVerificationCode else {
+            return
+        }
+        copyVerificationCode(latestVerificationCode.code, reason: "menu")
     }
 
     func viewPhoneScreen() {
@@ -650,19 +684,48 @@ final class EdgeLinkRuntime: ObservableObject {
 
         DiagnosticsLog.info("sms.mac.message_received id=\(message.id) addressFp=\(Self.fingerprint(message.address)) backfill=\(message.isBackfill)")
         if !message.isBackfill && message.direction == "inbound" {
-            notificationPresenter.show(
-                NotificationPostBody(
-                    id: message.id,
-                    sourceDeviceId: message.sourceDeviceId,
-                    sourcePlatform: message.sourcePlatform,
-                    app: "SMS",
-                    bundle: "sms",
-                    title: message.address,
-                    text: message.text,
-                    ts: message.ts
+            if let candidate = VerificationCodeExtractor.extract(
+                from: message.text,
+                sourceAddress: message.address,
+                sourceMessageId: message.id,
+                timestamp: message.ts
+            ) {
+                handleVerificationCode(candidate, message: message)
+            } else {
+                notificationPresenter.show(
+                    NotificationPostBody(
+                        id: message.id,
+                        sourceDeviceId: message.sourceDeviceId,
+                        sourcePlatform: message.sourcePlatform,
+                        app: "SMS",
+                        bundle: "sms",
+                        title: message.address,
+                        text: message.text,
+                        ts: message.ts
+                    )
                 )
-            )
+            }
         }
+    }
+
+    private func handleVerificationCode(_ candidate: VerificationCodeCandidate, message: SmsMessageBody) {
+        latestVerificationCode = candidate
+        DiagnosticsLog.info(
+            "verification.mac.detected id=\(candidate.id) codeFp=\(Self.fingerprint(candidate.code)) domain=\(candidate.domain ?? "none") addressFp=\(Self.fingerprint(message.address))"
+        )
+
+        if verificationCodeAutoCopyEnabled {
+            copyVerificationCode(candidate.code, reason: "auto")
+        }
+        if verificationCodeSystemBridgeEnabled {
+            verificationCodeBridge.deliver(candidate)
+        }
+        notificationPresenter.showVerificationCode(candidate, message: message)
+    }
+
+    private func copyVerificationCode(_ code: String, reason: String) {
+        clipboardSync.setLocalTextWithoutPublishing(code)
+        DiagnosticsLog.info("verification.mac.copied reason=\(reason) codeFp=\(Self.fingerprint(code))")
     }
 
     private func handleSmsSendResult(_ result: SmsSendResultBody) {
@@ -695,6 +758,8 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"
+    private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
+    private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
 }
 
 enum EdgeLinkConfig {
