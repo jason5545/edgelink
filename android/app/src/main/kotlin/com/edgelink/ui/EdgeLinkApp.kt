@@ -83,6 +83,8 @@ interface EdgeLinkActions {
     fun onStartPairing()
     fun onConfirmPairing()
     fun onReconnect()
+    fun onDisconnect()
+    fun onQuit()
     fun onAutoReconnectChange(enabled: Boolean)
     fun onNotificationSyncChange(enabled: Boolean)
     fun onOpenNotificationSettings()
@@ -99,6 +101,8 @@ interface EdgeLinkActions {
         override fun onStartPairing() = Unit
         override fun onConfirmPairing() = Unit
         override fun onReconnect() = Unit
+        override fun onDisconnect() = Unit
+        override fun onQuit() = Unit
         override fun onAutoReconnectChange(enabled: Boolean) = Unit
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onOpenNotificationSettings() = Unit
@@ -132,6 +136,8 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             screenDimmingAccessGranted = state.screenDimmingAccessGranted,
             smsAccessGranted = state.smsAccessGranted,
             onReconnect = actions::onReconnect,
+            onDisconnect = actions::onDisconnect,
+            onQuit = actions::onQuit,
             onAutoReconnectChange = actions::onAutoReconnectChange,
             onNotificationSyncChange = actions::onNotificationSyncChange,
             onOpenNotificationSettings = actions::onOpenNotificationSettings,
@@ -186,6 +192,8 @@ private fun DeviceCard(
     screenDimmingAccessGranted: Boolean,
     smsAccessGranted: Boolean,
     onReconnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onQuit: () -> Unit,
     onAutoReconnectChange: (Boolean) -> Unit,
     onNotificationSyncChange: (Boolean) -> Unit,
     onOpenNotificationSettings: () -> Unit,
@@ -227,13 +235,30 @@ private fun DeviceCard(
         )
 
         if (hasPeer) {
-            Button(
-                onClick = onReconnect,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-            ) {
-                Text("Reconnect")
+            val canDisconnect = connected ||
+                status == "Connecting relay" ||
+                status == "Handshaking" ||
+                status == "Reconnecting"
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = onReconnect,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp)
+                ) {
+                    Text("Reconnect")
+                }
+
+                FilledTonalButton(
+                    onClick = onDisconnect,
+                    enabled = canDisconnect,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp)
+                ) {
+                    Text("Disconnect")
+                }
             }
 
             SettingsToggleRow(
@@ -270,6 +295,15 @@ private fun DeviceCard(
                 missingText = "SMS permissions needed",
                 onOpenSettings = onOpenSmsSettings
             )
+        }
+
+        FilledTonalButton(
+            onClick = onQuit,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+        ) {
+            Text("Quit EdgeLink")
         }
     }
 }

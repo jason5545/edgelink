@@ -14,6 +14,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var peerDeviceId = ""
     @Published private(set) var connectionStatus = "Starting"
     @Published private(set) var isConnected = false
+    @Published private(set) var canDisconnect = false
     @Published private(set) var pairingSAS = ""
     @Published private(set) var pairingPeerName = ""
     @Published private(set) var pairingStatus = ""
@@ -38,6 +39,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var pairingTask: Task<Void, Never>?
     private var pendingPairing: MacPendingPairing?
     private var task: Task<Void, Never>?
+    private var connectionTask: Task<Void, Never>?
+    private var currentPeer: PinnedPeer?
+    private var currentConnectionGeneration: UUID?
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
     private var lastSecurePongAt = Date.distantPast
@@ -61,6 +65,7 @@ final class EdgeLinkRuntime: ObservableObject {
     deinit {
         task?.cancel()
         pairingTask?.cancel()
+        connectionTask?.cancel()
         currentChannel?.close()
         screenSession.closeWindow(sendRemoteStop: false)
     }
@@ -119,6 +124,59 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.closeWindow(sendRemoteStop: isConnected)
     }
 
+    func disconnect() {
+        DiagnosticsLog.info("relay.mac.disconnect_requested")
+        currentConnectionGeneration = nil
+        canDisconnect = false
+        connectionTask?.cancel()
+        connectionTask = nil
+
+        let shouldSendRemoteStop = isConnected
+        screenSession.closeWindow(sendRemoteStop: shouldSendRemoteStop)
+        currentChannel?.close()
+        currentChannel = nil
+        currentChannelGeneration = nil
+        currentSession = nil
+        screenSession.clearSender()
+        isConnected = false
+        connectionStatus = peerDeviceId.isEmpty ? "No paired Android" : "Disconnected"
+    }
+
+    func reconnect() {
+        guard let identity = localIdentity else {
+            DiagnosticsLog.warn("relay.mac.reconnect_requested before_identity_ready")
+            connectionStatus = "Registering"
+            task?.cancel()
+            task = Task { await run() }
+            return
+        }
+        let storedPeer: PinnedPeer?
+        do {
+            storedPeer = try pairingStore?.loadPeers().first
+        } catch {
+            DiagnosticsLog.error("relay.mac.reconnect_peer_load_failed", error)
+            storedPeer = nil
+        }
+        guard let peer = currentPeer ?? storedPeer else {
+            DiagnosticsLog.warn("relay.mac.reconnect_requested no_paired_peer")
+            isConnected = false
+            canDisconnect = false
+            connectionStatus = "No paired Android"
+            return
+        }
+
+        DiagnosticsLog.info("relay.mac.reconnect_requested hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+        peerName = peer.name
+        peerDeviceId = DeviceID.display(peer.deviceId)
+        startConnection(identity: identity, peer: peer, reason: "manual")
+    }
+
+    func quit() {
+        DiagnosticsLog.info("runtime.mac.quit_requested")
+        disconnect()
+        NSApplication.shared.terminate(nil)
+    }
+
     func sendSms(to rawRecipient: String, text rawText: String) {
         let recipient = rawRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -163,16 +221,19 @@ final class EdgeLinkRuntime: ObservableObject {
             guard let peer = try pairingStore?.loadPeers().first else {
                 DiagnosticsLog.info("runtime.mac.no_paired_peer")
                 connectionStatus = "No paired Android"
+                canDisconnect = false
                 return
             }
 
             DiagnosticsLog.info("runtime.mac.loaded_peer clientId=\(peer.deviceId) pkfp=\(DiagnosticsLog.fingerprint(peer.publicKey))")
             peerName = peer.name
             peerDeviceId = DeviceID.display(peer.deviceId)
-            await connectLoop(identity: identity, peer: peer)
+            currentPeer = peer
+            startConnection(identity: identity, peer: peer, reason: "startup")
         } catch {
             DiagnosticsLog.error("runtime.mac.setup_failed", error)
             isConnected = false
+            canDisconnect = false
             connectionStatus = "Setup failed"
         }
     }
@@ -276,7 +337,7 @@ final class EdgeLinkRuntime: ObservableObject {
             isPairing = false
             canAcceptPairing = false
             DiagnosticsLog.info("pair.mac.done hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
-            await connectLoop(identity: identity, peer: peer)
+            startConnection(identity: identity, peer: peer, reason: "pairing")
         } catch {
             DiagnosticsLog.error("pair.mac.failed hostId=\(identity.deviceId)", error)
             pairingStatus = "Pairing failed"
@@ -304,10 +365,38 @@ final class EdgeLinkRuntime: ObservableObject {
         return identity
     }
 
-    private func connectLoop(identity: LocalIdentity, peer: PinnedPeer) async {
+    private func startConnection(identity: LocalIdentity, peer: PinnedPeer, reason: String) {
+        let connectionGeneration = UUID()
+        currentPeer = peer
+        currentConnectionGeneration = connectionGeneration
+        canDisconnect = true
+
+        connectionTask?.cancel()
+        currentChannel?.close()
+        currentChannel = nil
+        currentChannelGeneration = nil
+        currentSession = nil
+        screenSession.clearSender()
+        if reason == "manual" {
+            connectionStatus = "Reconnecting"
+        }
+
+        connectionTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            await self.connectLoop(
+                identity: identity,
+                peer: peer,
+                connectionGeneration: connectionGeneration
+            )
+        }
+    }
+
+    private func connectLoop(identity: LocalIdentity, peer: PinnedPeer, connectionGeneration: UUID) async {
         var retryDelay: UInt64 = 1_000_000_000
 
-        while !Task.isCancelled {
+        while !Task.isCancelled && currentConnectionGeneration == connectionGeneration {
             var channel: ByteChannel?
             let channelGeneration = UUID()
 
@@ -322,8 +411,13 @@ final class EdgeLinkRuntime: ObservableObject {
 
                 DiagnosticsLog.info("relay.mac.connect_start hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 isConnected = false
+                canDisconnect = true
                 connectionStatus = "Connecting relay"
                 let connectedChannel = try await relayTransport.connect(hostId: identity.deviceId, identity: identity)
+                guard currentConnectionGeneration == connectionGeneration else {
+                    connectedChannel.close()
+                    return
+                }
                 channel = connectedChannel
                 currentChannel = connectedChannel
                 currentChannelGeneration = channelGeneration
@@ -357,6 +451,10 @@ final class EdgeLinkRuntime: ObservableObject {
 
                 connectionStatus = "Handshaking"
                 try await session.connect()
+                guard currentConnectionGeneration == connectionGeneration else {
+                    connectedChannel.close()
+                    return
+                }
                 DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
                 lastSecurePongAt = Date()
@@ -403,6 +501,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
                 throw SecureKeepaliveError.receiveLoopEnded
             } catch {
+                if Task.isCancelled || currentConnectionGeneration != connectionGeneration {
+                    DiagnosticsLog.info("relay.mac.connect_cancelled hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                    return
+                }
                 DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
                 isConnected = false
                 currentSession = nil

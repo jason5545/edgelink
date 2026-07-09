@@ -46,7 +46,8 @@ class MainActivity : ComponentActivity() {
             ::handleOpenNotificationSettings,
             ::handleOpenRemoteInputSettings,
             ::handleOpenScreenDimmingSettings,
-            ::handleOpenSmsSettings
+            ::handleOpenSmsSettings,
+            ::handleQuit
         )
         setContent {
             val state by controller.state.collectAsState()
@@ -85,6 +86,11 @@ class MainActivity : ComponentActivity() {
     private fun handleOpenSmsSettings() {
         controller.onOpenSmsSettings()
         smsPermissionLauncher.launch(AndroidSmsSync.requiredPermissions)
+    }
+
+    private fun handleQuit() {
+        controller.onQuit()
+        finishAndRemoveTask()
     }
 
     private fun ensureNotificationPermissions() {
@@ -128,7 +134,8 @@ private class EdgeLinkActivityActions(
     private val openNotificationSettingsHandler: () -> Unit,
     private val openRemoteInputSettingsHandler: () -> Unit,
     private val openScreenDimmingSettingsHandler: () -> Unit,
-    private val openSmsSettingsHandler: () -> Unit
+    private val openSmsSettingsHandler: () -> Unit,
+    private val quitHandler: () -> Unit
 ) : EdgeLinkActions {
     override fun onPointer(body: InputPointerBody) = delegate.onPointer(body)
     override fun onKey(body: InputKeyBody) = delegate.onKey(body)
@@ -138,6 +145,8 @@ private class EdgeLinkActivityActions(
     override fun onStartPairing() = delegate.onStartPairing()
     override fun onConfirmPairing() = delegate.onConfirmPairing()
     override fun onReconnect() = delegate.onReconnect()
+    override fun onDisconnect() = delegate.onDisconnect()
+    override fun onQuit() = quitHandler.invoke()
     override fun onAutoReconnectChange(enabled: Boolean) = delegate.onAutoReconnectChange(enabled)
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()

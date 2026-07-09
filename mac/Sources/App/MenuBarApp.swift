@@ -31,6 +31,24 @@ struct EdgeLinkMacApp: App {
                     }
                 }
 
+                if !runtime.peerDeviceId.isEmpty {
+                    HStack {
+                        Button {
+                            runtime.reconnect()
+                        } label: {
+                            Label("Reconnect", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(runtime.canDisconnect)
+
+                        Button {
+                            runtime.disconnect()
+                        } label: {
+                            Label("Disconnect", systemImage: "xmark.circle")
+                        }
+                        .disabled(!runtime.canDisconnect)
+                    }
+                }
+
                 Divider()
 
                 Toggle(
@@ -123,6 +141,14 @@ struct EdgeLinkMacApp: App {
                     }
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)
+                }
+
+                Divider()
+
+                Button(role: .destructive) {
+                    runtime.quit()
+                } label: {
+                    Label("Quit EdgeLink", systemImage: "power")
                 }
             }
             .padding()
