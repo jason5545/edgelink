@@ -23,6 +23,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var lastPointerMoveSentAt: TimeInterval = 0
     private var pendingPointerMove: CtrlPointerBody?
     private var pointerMoveFlushWorkItem: DispatchWorkItem?
+    private var pendingWheel: CtrlPointerBody?
+    private var wheelFlushWorkItem: DispatchWorkItem?
     private let statsQueue = DispatchQueue(label: "EdgeLinkMac.ScreenStats")
     private var statsTimer: DispatchSourceTimer?
     private let statsLogger = MacScreenStatsLogger()
@@ -120,6 +122,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         screenMeta = nil
         hasRemoteVideo = false
         cancelPendingPointerMove()
+        cancelPendingWheel()
         if sendRemoteStop {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
@@ -253,6 +256,11 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         let body = CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: action, wheelDy: wheelDy)
+        if action == "wheel" {
+            sendCoalescedWheel(body)
+            return
+        }
+        flushPendingWheel()
         if action == "move" {
             sendCoalescedPointerMove(body)
             return
@@ -332,6 +340,50 @@ final class MacScreenSession: NSObject, ObservableObject {
     private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
         lastPointerMoveSentAt = now
         sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+    }
+
+    private func sendCoalescedWheel(_ body: CtrlPointerBody) {
+        guard let wheelDy = body.wheelDy, wheelDy != 0 else {
+            return
+        }
+
+        if let currentPendingWheel = pendingWheel, let pendingDy = currentPendingWheel.wheelDy {
+            let mergedDy = min(max(pendingDy + wheelDy, -Self.maxPendingWheelDy), Self.maxPendingWheelDy)
+            pendingWheel = mergedDy == 0
+                ? nil
+                : CtrlPointerBody(x: body.x, y: body.y, action: body.action, wheelDy: mergedDy)
+        } else {
+            pendingWheel = body
+        }
+        scheduleWheelFlush()
+    }
+
+    private func scheduleWheelFlush() {
+        guard wheelFlushWorkItem == nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushPendingWheel()
+        }
+        wheelFlushWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wheelIntervalSeconds, execute: workItem)
+    }
+
+    private func flushPendingWheel() {
+        wheelFlushWorkItem?.cancel()
+        wheelFlushWorkItem = nil
+        guard let body = pendingWheel else {
+            return
+        }
+        pendingWheel = nil
+        DiagnosticsLog.info("screen.mac.wheel_out dy=\(body.wheelDy ?? 0)")
+        sendEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+    }
+
+    private func cancelPendingWheel() {
+        wheelFlushWorkItem?.cancel()
+        wheelFlushWorkItem = nil
+        pendingWheel = nil
     }
 
     private func screenCoordinate(for event: NSEvent) -> (x: Int, y: Int)? {
@@ -477,6 +529,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private static let pointerMoveIntervalSeconds: TimeInterval = 1.0 / 30.0
+    private static let wheelIntervalSeconds: TimeInterval = 1.0 / 20.0
+    private static let maxPendingWheelDy = 240
     private static let statsIntervalSeconds: TimeInterval = 2.0
 }
 

@@ -27,6 +27,7 @@ private const val TOUCH_SEGMENT_MS = 24L
 private const val TAP_SEGMENT_MS = 40L
 private const val LONG_PRESS_MS = 620L
 private const val WHEEL_GESTURE_MS = 140L
+private const val MAX_PENDING_WHEEL_DY = 240
 
 class RemoteInputService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -34,6 +35,7 @@ class RemoteInputService : AccessibilityService() {
     private var gestureInFlight = false
     private var activeStroke: GestureDescription.StrokeDescription? = null
     private var pendingDragPoint: DragPoint? = null
+    private var pendingWheel: WheelPoint? = null
     private var pendingStartStroke = false
     private var lastX = 0f
     private var lastY = 0f
@@ -140,6 +142,7 @@ class RemoteInputService : AccessibilityService() {
         activeStroke = null
         pendingStrokes.clear()
         pendingDragPoint = null
+        pendingWheel = null
         lastX = cleanCoordinate(x)
         lastY = cleanCoordinate(y)
         val path = Path().apply { moveTo(lastX, lastY) }
@@ -191,16 +194,21 @@ class RemoteInputService : AccessibilityService() {
             return
         }
         finishActiveStroke(cleanCoordinate(x), cleanCoordinate(y))
-        val distance = min(720f, max(96f, abs(wheelDy).toFloat() * 2.6f))
-        val direction = if (wheelDy > 0) 1f else -1f
         val startX = cleanCoordinate(x)
         val startY = cleanCoordinate(y)
-        val endY = cleanCoordinate(startY + distance * direction)
-        val path = Path().apply {
-            moveTo(startX, startY)
-            lineTo(startX, endY)
+        val mergedDy = pendingWheel
+            ?.let { it.wheelDy + wheelDy }
+            ?: wheelDy
+        pendingWheel = if (mergedDy == 0) {
+            null
+        } else {
+            WheelPoint(
+                x = startX,
+                y = startY,
+                wheelDy = mergedDy.coerceIn(-MAX_PENDING_WHEEL_DY, MAX_PENDING_WHEEL_DY)
+            )
         }
-        enqueueStroke(GestureDescription.StrokeDescription(path, 0, WHEEL_GESTURE_MS, false))
+        dispatchNextStroke()
     }
 
     private fun finishActiveStroke(x: Float, y: Float) {
@@ -230,8 +238,26 @@ class RemoteInputService : AccessibilityService() {
         if (dispatchPendingDragPoint()) {
             return
         }
+        if (dispatchPendingWheel()) {
+            return
+        }
         val stroke = pendingStrokes.poll() ?: return
         dispatchStroke(stroke)
+    }
+
+    private fun dispatchPendingWheel(): Boolean {
+        val point = pendingWheel ?: return false
+        pendingWheel = null
+        val distance = min(720f, max(96f, abs(point.wheelDy).toFloat() * 2.6f))
+        val direction = if (point.wheelDy > 0) 1f else -1f
+        val endY = cleanCoordinate(point.y + distance * direction)
+        val path = Path().apply {
+            moveTo(point.x, point.y)
+            lineTo(point.x, endY)
+        }
+        EdgeLinkLog.info("remote_input.android.wheel_dispatch dy=${point.wheelDy}")
+        dispatchStroke(GestureDescription.StrokeDescription(path, 0, WHEEL_GESTURE_MS, false))
+        return true
     }
 
     private fun dispatchStroke(stroke: GestureDescription.StrokeDescription) {
@@ -265,6 +291,12 @@ class RemoteInputService : AccessibilityService() {
         val x: Float,
         val y: Float,
         val willContinue: Boolean
+    )
+
+    private data class WheelPoint(
+        val x: Float,
+        val y: Float,
+        val wheelDy: Int
     )
 
     companion object {
