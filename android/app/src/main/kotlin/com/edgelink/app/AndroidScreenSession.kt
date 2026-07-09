@@ -2,12 +2,16 @@ package com.edgelink.app
 
 import android.content.Context
 import android.content.Intent
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.DisplayMetrics
+import android.view.Surface
 import android.view.WindowManager
 import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.EnvelopeTypes
@@ -29,13 +33,12 @@ import org.webrtc.RtpParameters
 import org.webrtc.RtpSender
 import org.webrtc.RTCStats
 import org.webrtc.RTCStatsReport
-import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SdpObserver
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.ThreadUtils
-import org.webrtc.VideoCapturer
 import org.webrtc.VideoFrame
+import org.webrtc.VideoSink
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.nio.ByteBuffer
@@ -52,12 +55,18 @@ class AndroidScreenSession(
     private var factory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
-    private var capturer: VideoCapturer? = null
+    private var mediaProjection: MediaProjection? = null
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var projectionSurface: Surface? = null
+    private var projectionCaptureSize: CaptureSize? = null
+    private var projectionFrameSink: VideoSink? = null
     private var capturerObserver: GapLoggingCapturerObserver? = null
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var controlDataChannel: DataChannel? = null
     private var controlDataChannelObserver: DataChannel.Observer? = null
+    private val screenPowerGuard = AndroidScreenPowerGuard(appContext)
     @Volatile
     private var controlDataChannelHandler: ((ByteArray) -> Unit)? = null
     @Volatile
@@ -74,6 +83,11 @@ class AndroidScreenSession(
 
     fun requestStart() {
         EdgeLinkLog.info("screen.android.start_requested")
+        if (mediaProjection != null) {
+            EdgeLinkLog.info("screen.android.start_reusing_projection")
+            startWithActiveProjection()
+            return
+        }
         ScreenCapturePermissionActivity.start(appContext)
     }
 
@@ -83,29 +97,45 @@ class AndroidScreenSession(
 
     fun startWithPermission(resultCode: Int, data: Intent) {
         EdgeLinkLog.info("screen.android.permission_granted resultCode=$resultCode")
-        stop(sendStopToService = false)
+        releaseProjection(stopService = false)
+
+        try {
+            val manager = appContext.getSystemService(MediaProjectionManager::class.java)
+            val projection = manager.getMediaProjection(resultCode, data)
+                ?: error("MediaProjectionManager returned null projection.")
+            val callback = projectionCallback()
+            mediaProjection = projection
+            mediaProjectionCallback = callback
+            projection.registerCallback(callback, Handler(appContext.mainLooper))
+            startWithActiveProjection()
+        } catch (error: Throwable) {
+            EdgeLinkLog.error("screen.android.permission_start_failed", error)
+            releaseProjection(stopService = true)
+        }
+    }
+
+    private fun startWithActiveProjection() {
+        val projection = mediaProjection ?: run {
+            EdgeLinkLog.warn("screen.android.start_needs_permission")
+            ScreenCapturePermissionActivity.start(appContext)
+            return
+        }
+
+        stopStreaming()
         isStopping.set(false)
         viewerVisible = true
 
         try {
             initializeWebRtc()
             val meta = currentScreenMeta()
-            sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SCREEN_META, meta))
-
-            val localEglBase = eglBase ?: error("EGL is not initialized.")
-            val localFactory = factory ?: error("PeerConnectionFactory is not initialized.")
-            val helper = SurfaceTextureHelper.create(
-                "EdgeLinkScreenCapture",
-                localEglBase.eglBaseContext
-            )
-            surfaceTextureHelper = helper
-
-            val localCapturer = ScreenCapturerAndroid(data, projectionCallback())
-            capturer = localCapturer
-
             val captureSize = captureSizeFor(meta)
+            val reusedProjectionDisplay = virtualDisplay != null
+            val helper = ensureProjectionDisplay(projection, captureSize)
+            val localFactory = factory ?: error("PeerConnectionFactory is not initialized.")
+
+            sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SCREEN_META, meta))
             EdgeLinkLog.info(
-                "screen.android.capture_start source=${meta.w}x${meta.h} capture=${captureSize.width}x${captureSize.height} fps=$SCREEN_FPS"
+                "screen.android.capture_start source=${meta.w}x${meta.h} capture=${captureSize.width}x${captureSize.height} fps=$SCREEN_FPS warmProjection=$reusedProjectionDisplay"
             )
 
             val localVideoSource = localFactory.createVideoSource(true)
@@ -115,8 +145,7 @@ class AndroidScreenSession(
                 localVideoSource.capturerObserver
             )
             capturerObserver = localCapturerObserver
-            localCapturer.initialize(helper, appContext, localCapturerObserver)
-            localCapturer.startCapture(captureSize.width, captureSize.height, SCREEN_FPS)
+            attachProjectionFrames(helper, localCapturerObserver)
 
             val track = localFactory.createVideoTrack(SCREEN_VIDEO_TRACK_ID, localVideoSource)
             track.setEnabled(true)
@@ -129,9 +158,10 @@ class AndroidScreenSession(
             setupControlDataChannel(pc)
             createOffer(pc)
             startStatsLogging(pc)
+            screenPowerGuard.onSharingStarted()
         } catch (error: Throwable) {
             EdgeLinkLog.error("screen.android.start_failed", error)
-            stop()
+            stopStreaming()
         }
     }
 
@@ -193,42 +223,50 @@ class AndroidScreenSession(
         boostHandler.postDelayed(restoreBitrateRunnable, SCREEN_BOOST_DURATION_MS)
     }
 
-    fun stop(sendStopToService: Boolean = true) {
+    fun stop() {
+        stopStreaming()
+    }
+
+    fun shutdown() {
+        releaseProjection(stopService = true)
+    }
+
+    private fun stopStreaming() {
         if (!isStopping.compareAndSet(false, true)) {
             return
         }
-        EdgeLinkLog.info("screen.android.stop")
-        boostHandler.removeCallbacks(restoreBitrateRunnable)
-        capturerObserver?.stopRepeating()
-        capturerObserver = null
-        stopStatsLogging()
-        closeControlDataChannel()
-        runCatching { capturer?.stopCapture() }
-        runCatching { capturer?.dispose() }
-        capturer = null
-        videoTrack?.dispose()
-        videoTrack = null
-        videoSource?.dispose()
-        videoSource = null
-        surfaceTextureHelper?.dispose()
-        surfaceTextureHelper = null
-        peerConnection?.close()
-        peerConnection?.dispose()
-        peerConnection = null
-        factory?.dispose()
-        factory = null
-        eglBase?.release()
-        eglBase = null
-        if (sendStopToService) {
-            ScreenProjectionForegroundService.stop(appContext)
+        try {
+            val hadPeerConnection = peerConnection != null
+            EdgeLinkLog.info("screen.android.stream_stop keepProjection=${mediaProjection != null}")
+            boostHandler.removeCallbacks(restoreBitrateRunnable)
+            screenPowerGuard.onSharingStopped()
+            stopStatsLogging()
+            closeControlDataChannel()
+            detachProjectionFrames()
+            videoTrack?.dispose()
+            videoTrack = null
+            videoSource?.dispose()
+            videoSource = null
+            peerConnection?.close()
+            peerConnection?.dispose()
+            peerConnection = null
+            factory?.dispose()
+            factory = null
+            if (mediaProjection == null) {
+                releaseCaptureResources()
+            }
+            if (hadPeerConnection) {
+                EdgeLinkLog.info("screen.android.stream_stopped")
+            }
+            viewerVisible = true
+        } finally {
+            isStopping.set(false)
         }
-        viewerVisible = true
-        isStopping.set(false)
     }
 
     private fun initializeWebRtc() {
         ensureWebRtcInitialized(appContext)
-        val localEglBase = EglBase.create()
+        val localEglBase = eglBase ?: EglBase.create().also { eglBase = it }
         eglBase = localEglBase
         val encoderFactory = DefaultVideoEncoderFactory(localEglBase.eglBaseContext, true, true)
         val decoderFactory = DefaultVideoDecoderFactory(localEglBase.eglBaseContext)
@@ -236,6 +274,131 @@ class AndroidScreenSession(
             .setVideoEncoderFactory(encoderFactory)
             .setVideoDecoderFactory(decoderFactory)
             .createPeerConnectionFactory()
+    }
+
+    private fun ensureProjectionDisplay(
+        projection: MediaProjection,
+        captureSize: CaptureSize
+    ): SurfaceTextureHelper {
+        val localEglBase = eglBase ?: error("EGL is not initialized.")
+        val helper = surfaceTextureHelper ?: SurfaceTextureHelper.create(
+            "EdgeLinkScreenCapture",
+            localEglBase.eglBaseContext
+        ).also { surfaceTextureHelper = it }
+
+        helper.setTextureSize(captureSize.width, captureSize.height)
+        val surface = projectionSurface ?: Surface(helper.surfaceTexture).also {
+            projectionSurface = it
+        }
+        val display = virtualDisplay
+        if (display == null) {
+            virtualDisplay = projection.createVirtualDisplay(
+                "EdgeLinkScreenCapture",
+                captureSize.width,
+                captureSize.height,
+                VIRTUAL_DISPLAY_DPI,
+                DISPLAY_FLAGS,
+                surface,
+                null,
+                helper.handler
+            )
+            projectionCaptureSize = captureSize
+            EdgeLinkLog.info(
+                "screen.android.projection_display_created capture=${captureSize.width}x${captureSize.height}"
+            )
+            return helper
+        }
+
+        if (projectionCaptureSize != captureSize) {
+            if (Build.VERSION.SDK_INT >= 31) {
+                display.resize(captureSize.width, captureSize.height, VIRTUAL_DISPLAY_DPI)
+                display.setSurface(surface)
+                projectionCaptureSize = captureSize
+                EdgeLinkLog.info(
+                    "screen.android.projection_display_resized capture=${captureSize.width}x${captureSize.height}"
+                )
+            } else {
+                EdgeLinkLog.warn(
+                    "screen.android.projection_display_resize_unavailable requested=${captureSize.width}x${captureSize.height}"
+                )
+            }
+        }
+        return helper
+    }
+
+    private fun attachProjectionFrames(
+        helper: SurfaceTextureHelper,
+        observer: GapLoggingCapturerObserver
+    ) {
+        val sink = VideoSink { frame ->
+            observer.onFrameCaptured(frame)
+        }
+        projectionFrameSink = sink
+        observer.onCapturerStarted(true)
+        helper.startListening(sink)
+    }
+
+    private fun detachProjectionFrames() {
+        val observer = capturerObserver
+        val hadSink = projectionFrameSink != null
+        capturerObserver = null
+        projectionFrameSink = null
+        val helper = surfaceTextureHelper
+        if (helper != null && (hadSink || observer != null)) {
+            runCatching {
+                if (Thread.currentThread() == helper.handler.looper.thread) {
+                    helper.stopListening()
+                } else {
+                    ThreadUtils.invokeAtFrontUninterruptibly(helper.handler, Runnable {
+                        helper.stopListening()
+                    })
+                }
+            }.onFailure { error ->
+                EdgeLinkLog.warn("screen.android.frame_listener_stop_failed", error)
+            }
+        }
+        observer?.onCapturerStopped()
+    }
+
+    private fun releaseProjection(stopService: Boolean, stopProjection: Boolean = true) {
+        val hadProjection = mediaProjection != null
+        stopStreaming()
+
+        val projection = mediaProjection
+        val callback = mediaProjectionCallback
+        mediaProjection = null
+        mediaProjectionCallback = null
+        if (projection != null && callback != null) {
+            runCatching { projection.unregisterCallback(callback) }
+                .onFailure { error -> EdgeLinkLog.warn("screen.android.projection_callback_unregister_failed", error) }
+        }
+        releaseCaptureResources()
+        if (stopProjection) {
+            runCatching { projection?.stop() }
+                .onFailure { error -> EdgeLinkLog.warn("screen.android.projection_stop_failed", error) }
+        }
+        if (stopService) {
+            ScreenProjectionForegroundService.stop(appContext)
+        }
+        if (hadProjection) {
+            EdgeLinkLog.info("screen.android.projection_released stopService=$stopService stopProjection=$stopProjection")
+        }
+    }
+
+    private fun releaseCaptureResources() {
+        runCatching { virtualDisplay?.release() }
+            .onFailure { error -> EdgeLinkLog.warn("screen.android.virtual_display_release_failed", error) }
+        virtualDisplay = null
+        projectionCaptureSize = null
+        runCatching { projectionSurface?.release() }
+            .onFailure { error -> EdgeLinkLog.warn("screen.android.projection_surface_release_failed", error) }
+        projectionSurface = null
+        runCatching { surfaceTextureHelper?.dispose() }
+            .onFailure { error -> EdgeLinkLog.warn("screen.android.surface_helper_dispose_failed", error) }
+        surfaceTextureHelper = null
+        runCatching { eglBase?.release() }
+            .onFailure { error -> EdgeLinkLog.warn("screen.android.egl_release_failed", error) }
+        eglBase = null
     }
 
     private fun createPeerConnection(localFactory: PeerConnectionFactory): PeerConnection {
@@ -458,7 +621,7 @@ class AndroidScreenSession(
         object : MediaProjection.Callback() {
             override fun onStop() {
                 EdgeLinkLog.info("screen.android.projection_stopped")
-                stop()
+                releaseProjection(stopService = true, stopProjection = false)
             }
         }
 
@@ -826,6 +989,10 @@ class AndroidScreenSession(
         private const val SCREEN_MAX_BITRATE_BPS = 8_000_000
         private const val SCREEN_BOOST_DURATION_MS = 3_000L
         private const val SCREEN_MAX_CAPTURE_LONG_EDGE = 1280
+        private const val VIRTUAL_DISPLAY_DPI = 400
+        private val DISPLAY_FLAGS =
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
         private const val SCREEN_CONTROL_CHANNEL_LABEL = "edgelink-control"

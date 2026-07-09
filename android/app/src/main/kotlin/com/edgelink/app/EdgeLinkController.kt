@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
@@ -97,6 +98,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
+            screenDimmingAccessGranted = AndroidScreenPowerGuard.canWriteSettings(appContext),
             smsAccessGranted = smsSync.smsAccessGranted()
         )
     )
@@ -148,7 +150,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     fun close() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         screenSession.setControlDataChannelHandler(null)
-        screenSession.stop()
+        screenSession.shutdown()
         session?.close()
         scope.cancel()
     }
@@ -263,6 +265,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         RemoteInputService.openSettings(appContext)
     }
 
+    override fun onOpenScreenDimmingSettings() {
+        EdgeLinkLog.info("screen.android.dimming_open_settings")
+        val intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
+            .setData(Uri.parse("package:${appContext.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        appContext.startActivity(intent)
+    }
+
     override fun onOpenSmsSettings() {
         EdgeLinkLog.info("sms.android.permission_request")
     }
@@ -273,6 +283,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
+                screenDimmingAccessGranted = AndroidScreenPowerGuard.canWriteSettings(appContext),
                 smsAccessGranted = smsSync.smsAccessGranted()
             )
         }

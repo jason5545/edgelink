@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
             ::handleNotificationSyncChange,
             ::handleOpenNotificationSettings,
             ::handleOpenRemoteInputSettings,
+            ::handleOpenScreenDimmingSettings,
             ::handleOpenSmsSettings
         )
         setContent {
@@ -75,6 +76,10 @@ class MainActivity : ComponentActivity() {
 
     private fun handleOpenRemoteInputSettings() {
         controller.onOpenRemoteInputSettings()
+    }
+
+    private fun handleOpenScreenDimmingSettings() {
+        controller.onOpenScreenDimmingSettings()
     }
 
     private fun handleOpenSmsSettings() {
@@ -122,6 +127,7 @@ private class EdgeLinkActivityActions(
     private val notificationSyncChangeHandler: (Boolean) -> Unit,
     private val openNotificationSettingsHandler: () -> Unit,
     private val openRemoteInputSettingsHandler: () -> Unit,
+    private val openScreenDimmingSettingsHandler: () -> Unit,
     private val openSmsSettingsHandler: () -> Unit
 ) : EdgeLinkActions {
     override fun onPointer(body: InputPointerBody) = delegate.onPointer(body)
@@ -136,5 +142,6 @@ private class EdgeLinkActivityActions(
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
+    override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
 }

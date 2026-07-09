@@ -70,6 +70,7 @@ data class EdgeLinkUiState(
     val remoteInputAccessGranted: Boolean = false,
     val notificationAccessGranted: Boolean = false,
     val notificationPostGranted: Boolean = true,
+    val screenDimmingAccessGranted: Boolean = false,
     val smsAccessGranted: Boolean = false
 )
 
@@ -86,6 +87,7 @@ interface EdgeLinkActions {
     fun onNotificationSyncChange(enabled: Boolean)
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
+    fun onOpenScreenDimmingSettings()
     fun onOpenSmsSettings()
 
     object Noop : EdgeLinkActions {
@@ -101,6 +103,7 @@ interface EdgeLinkActions {
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
+        override fun onOpenScreenDimmingSettings() = Unit
         override fun onOpenSmsSettings() = Unit
     }
 }
@@ -126,12 +129,14 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             remoteInputAccessGranted = state.remoteInputAccessGranted,
             notificationAccessGranted = state.notificationAccessGranted,
             notificationPostGranted = state.notificationPostGranted,
+            screenDimmingAccessGranted = state.screenDimmingAccessGranted,
             smsAccessGranted = state.smsAccessGranted,
             onReconnect = actions::onReconnect,
             onAutoReconnectChange = actions::onAutoReconnectChange,
             onNotificationSyncChange = actions::onNotificationSyncChange,
             onOpenNotificationSettings = actions::onOpenNotificationSettings,
             onOpenRemoteInputSettings = actions::onOpenRemoteInputSettings,
+            onOpenScreenDimmingSettings = actions::onOpenScreenDimmingSettings,
             onOpenSmsSettings = actions::onOpenSmsSettings
         )
 
@@ -178,12 +183,14 @@ private fun DeviceCard(
     remoteInputAccessGranted: Boolean,
     notificationAccessGranted: Boolean,
     notificationPostGranted: Boolean,
+    screenDimmingAccessGranted: Boolean,
     smsAccessGranted: Boolean,
     onReconnect: () -> Unit,
     onAutoReconnectChange: (Boolean) -> Unit,
     onNotificationSyncChange: (Boolean) -> Unit,
     onOpenNotificationSettings: () -> Unit,
     onOpenRemoteInputSettings: () -> Unit,
+    onOpenScreenDimmingSettings: () -> Unit,
     onOpenSmsSettings: () -> Unit
 ) {
     Column(
@@ -248,6 +255,13 @@ private fun DeviceCard(
                 granted = remoteInputAccessGranted,
                 missingText = "Accessibility needed",
                 onOpenSettings = onOpenRemoteInputSettings
+            )
+
+            PermissionStatusRow(
+                label = "Screen dim",
+                granted = screenDimmingAccessGranted,
+                missingText = "Settings access needed",
+                onOpenSettings = onOpenScreenDimmingSettings
             )
 
             PermissionStatusRow(

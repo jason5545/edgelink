@@ -378,7 +378,13 @@ AEAD：
 
 螢幕會話啟停與 WebRTC signaling 仍走現有 secure frame，也就是 E2EE envelope、
 64 KB frame 上限、relay/LAN 兩種 transport 共用。Mac 送 `screen.start` 要求 Android
-開始螢幕會話；Mac 送 `screen.stop` 結束。Android 開始投影後回：
+開始或重接螢幕串流；Mac 送 `screen.stop` 結束 WebRTC 串流。Android 可保留 foreground
+MediaProjection service 與既有 virtual display，讓下一次 `screen.start` 不必重新消耗一次性
+permission token。Android 開始投影後回：
+
+Android 端在活躍螢幕串流開始後可持有 wake lock 防止螢幕鎖定，並在約 5 秒後暫時把系統亮度降到
+最低；收到 `screen.stop`、relay 斷線、或 projection 結束時必須恢復原本亮度設定。亮度寫入需要
+Android `WRITE_SETTINGS` special app access，未授權時不應阻擋螢幕串流。
 
 ```json
 {"t":"screen.meta","b":{"w":1080,"h":2400,"scale":1.0,"dpi":420}}
