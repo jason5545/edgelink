@@ -69,6 +69,9 @@ private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 
+private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
+    (endedAtNanos - startedAtNanos) / 1_000_000L
+
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -597,7 +600,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 isConnected = false
             )
         }
-        connectionJob = scope.launch {
+        connectionJob = scope.launch(Dispatchers.IO) {
             connectLoop(identity, peer)
         }
     }
@@ -846,12 +849,20 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.CTRL_POINTER -> {
                 val envelope = EnvelopeCodec.decode<CtrlPointerBody>(plaintext)
+                if (envelope.b.action != "move") {
+                    EdgeLinkLog.info("control.android.pointer_in action=${envelope.b.action} bytes=${plaintext.size}")
+                }
                 RemoteInputService.dispatchPointer(envelope.b)
                 null
             }
             EnvelopeTypes.CTRL_GLOBAL -> {
+                val startedAt = SystemClock.elapsedRealtimeNanos()
                 val envelope = EnvelopeCodec.decode<CtrlGlobalBody>(plaintext)
+                EdgeLinkLog.info("control.android.global_in action=${envelope.b.action} bytes=${plaintext.size}")
                 RemoteInputService.dispatchGlobal(envelope.b)
+                EdgeLinkLog.info(
+                    "control.android.global_queued action=${envelope.b.action} durationMs=${elapsedMs(startedAt)}"
+                )
                 null
             }
             EnvelopeTypes.CTRL_TEXT -> {

@@ -74,7 +74,11 @@ class RemoteInputService : AccessibilityService() {
         }
     }
 
-    private fun handleGlobal(body: CtrlGlobalBody) {
+    private fun handleGlobal(body: CtrlGlobalBody, postedAtNanos: Long) {
+        val startedAt = SystemClock.elapsedRealtimeNanos()
+        EdgeLinkLog.info(
+            "remote_input.android.global_start action=${body.action} queueMs=${elapsedMs(postedAtNanos, startedAt)}"
+        )
         val action = when (body.action) {
             "back" -> GLOBAL_ACTION_BACK
             "home" -> GLOBAL_ACTION_HOME
@@ -86,7 +90,11 @@ class RemoteInputService : AccessibilityService() {
             EdgeLinkLog.warn("remote_input.android.global_ignored action=${body.action}")
             return
         }
-        performGlobalAction(action)
+        val actionStartedAt = SystemClock.elapsedRealtimeNanos()
+        val dispatched = performGlobalAction(action)
+        EdgeLinkLog.info(
+            "remote_input.android.global_done action=${body.action} dispatched=$dispatched durationMs=${elapsedMs(actionStartedAt)}"
+        )
     }
 
     private fun handleText(body: CtrlTextBody) {
@@ -279,7 +287,10 @@ class RemoteInputService : AccessibilityService() {
         }
 
         fun dispatchPointer(body: CtrlPointerBody) = postToActive("pointer") { handlePointer(body) }
-        fun dispatchGlobal(body: CtrlGlobalBody) = postToActive("global") { handleGlobal(body) }
+        fun dispatchGlobal(body: CtrlGlobalBody) {
+            val postedAtNanos = SystemClock.elapsedRealtimeNanos()
+            postToActive("global") { handleGlobal(body, postedAtNanos) }
+        }
         fun dispatchText(body: CtrlTextBody) = postToActive("text") { handleText(body) }
         fun dispatchKey(body: CtrlKeyBody) = postToActive("key") { handleKey(body) }
 
@@ -293,6 +304,9 @@ class RemoteInputService : AccessibilityService() {
         }
     }
 }
+
+private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
+    (endedAtNanos - startedAtNanos) / 1_000_000L
 
 private fun androidKeyCode(key: String): Int? =
     when (key.lowercase()) {

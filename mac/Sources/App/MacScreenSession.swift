@@ -144,6 +144,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func sendGlobal(_ action: String) {
+        DiagnosticsLog.info("screen.mac.global_out action=\(action)")
         sendEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
 
