@@ -8,6 +8,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
+    @Published private(set) var isPinned = false
 
     let videoView = PhoneVideoRendererView()
 
@@ -20,6 +21,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var controlDataChannel: RTCDataChannel?
     private var didInitializeSSL = false
     private var isClosingWindow = false
+    private var isStopping = false
+    private var isScreenSessionActive = false
     private var forwardedKeyCodes = Set<UInt16>()
     private var lastPointerMoveSentAt: TimeInterval = 0
     private var pendingPointerMove: CtrlPointerBody?
@@ -50,6 +53,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func openAndStart() {
+        isScreenSessionActive = true
         showWindow()
         if peerConnection != nil {
             status = hasRemoteVideo ? "Connected" : status
@@ -61,6 +65,10 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func handleMeta(_ body: ScreenMetaBody) {
+        guard isScreenSessionActive else {
+            DiagnosticsLog.warn("screen.mac.meta_ignored inactive_session")
+            return
+        }
         screenMeta = body
         status = "Connecting"
         showWindow()
@@ -68,22 +76,36 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func handleOffer(_ body: RtcSdpBody) {
+        guard isScreenSessionActive else {
+            DiagnosticsLog.warn("screen.mac.offer_ignored inactive_session")
+            return
+        }
         showWindow()
         status = "Answering"
         let pc = ensurePeerConnection()
         let offer = RTCSessionDescription(type: .offer, sdp: body.sdp)
         DiagnosticsLog.info("screen.mac.offer_in bytes=\(body.sdp.count)")
-        pc.setRemoteDescription(offer) { [weak self] error in
-            if let error {
-                DiagnosticsLog.error("screen.mac.set_remote_offer_failed", error)
-                DispatchQueue.main.async { self?.status = "Offer failed" }
-                return
+        pc.setRemoteDescription(offer) { [weak self, weak pc] error in
+            DispatchQueue.main.async {
+                guard let self, let pc, self.peerConnection === pc, self.isScreenSessionActive else {
+                    DiagnosticsLog.warn("screen.mac.offer_set_ignored stale_peer")
+                    return
+                }
+                if let error {
+                    DiagnosticsLog.error("screen.mac.set_remote_offer_failed", error)
+                    self.status = "Offer failed"
+                    return
+                }
+                self.createAnswer(on: pc)
             }
-            self?.createAnswer(on: pc)
         }
     }
 
     func handleAnswer(_ body: RtcSdpBody) {
+        guard isScreenSessionActive else {
+            DiagnosticsLog.warn("screen.mac.answer_ignored inactive_session")
+            return
+        }
         guard let peerConnection else {
             DiagnosticsLog.warn("screen.mac.answer_ignored no_peer_connection")
             return
@@ -91,17 +113,27 @@ final class MacScreenSession: NSObject, ObservableObject {
         status = "Connecting"
         let answer = RTCSessionDescription(type: .answer, sdp: body.sdp)
         DiagnosticsLog.info("screen.mac.answer_in bytes=\(body.sdp.count)")
-        peerConnection.setRemoteDescription(answer) { [weak self] error in
-            if let error {
-                DiagnosticsLog.error("screen.mac.set_remote_answer_failed", error)
-                DispatchQueue.main.async { self?.status = "Answer failed" }
-                return
+        peerConnection.setRemoteDescription(answer) { [weak self, weak peerConnection] error in
+            DispatchQueue.main.async {
+                guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                    DiagnosticsLog.warn("screen.mac.answer_set_ignored stale_peer")
+                    return
+                }
+                if let error {
+                    DiagnosticsLog.error("screen.mac.set_remote_answer_failed", error)
+                    self.status = "Answer failed"
+                    return
+                }
+                self.status = "Connected"
             }
-            DispatchQueue.main.async { self?.status = "Connected" }
         }
     }
 
     func handleIce(_ body: RtcIceBody) {
+        guard isScreenSessionActive else {
+            DiagnosticsLog.warn("screen.mac.ice_ignored inactive_session")
+            return
+        }
         guard let peerConnection else {
             DiagnosticsLog.warn("screen.mac.ice_ignored no_peer_connection")
             return
@@ -120,39 +152,62 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func stop(sendRemoteStop: Bool = true) {
+        guard !isStopping else {
+            DiagnosticsLog.warn("screen.mac.stop_ignored already_stopping")
+            return
+        }
+        let shouldSendRemoteStop = sendRemoteStop && isScreenSessionActive
+        let hadPeerConnection = peerConnection != nil
+        let hadControlDataChannel = controlDataChannel != nil
+        let hadRemoteVideoTrack = remoteVideoTrack != nil
+        let hadSessionState = isScreenSessionActive || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || screenMeta != nil
+        guard hadSessionState || status != "Stopped" else {
+            return
+        }
+
+        isStopping = true
+        defer { isStopping = false }
+        DiagnosticsLog.info(
+            "screen.mac.stop_start sendRemoteStop=\(sendRemoteStop) willSendRemoteStop=\(shouldSendRemoteStop) active=\(isScreenSessionActive) pc=\(hadPeerConnection) dc=\(hadControlDataChannel)"
+        )
+
+        isScreenSessionActive = false
         status = "Stopped"
         screenMeta = nil
         hasRemoteVideo = false
         cancelPendingPointerMove()
         cancelPendingWheel()
-        if sendRemoteStop {
+        if shouldSendRemoteStop {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
-        remoteVideoTrack?.remove(videoView)
+
+        let track = remoteVideoTrack
+        remoteVideoTrack = nil
+        track?.remove(videoView)
         stopStatsLogging()
         videoView.clear()
-        controlDataChannel?.delegate = nil
-        controlDataChannel?.close()
+
+        let dataChannel = controlDataChannel
         controlDataChannel = nil
-        remoteVideoTrack = nil
-        peerConnection?.close()
-        peerConnection = nil
+        dataChannel?.delegate = nil
+
+        let peerConnectionToClose = peerConnection
+        self.peerConnection = nil
+        peerConnectionToClose?.close()
         factory = nil
-        if didInitializeSSL {
-            RTCCleanupSSL()
-            didInitializeSSL = false
-        }
+        DiagnosticsLog.info(
+            "screen.mac.stop_done pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack)"
+        )
     }
 
     func closeWindow(sendRemoteStop: Bool = true) {
-        guard let window else {
-            stop(sendRemoteStop: sendRemoteStop)
-            return
+        if let window {
+            self.window = nil
+            isClosingWindow = true
+            window.delegate = nil
+            window.close()
+            isClosingWindow = false
         }
-        isClosingWindow = true
-        window.close()
-        isClosingWindow = false
-        self.window = nil
         stop(sendRemoteStop: sendRemoteStop)
     }
 
@@ -162,8 +217,15 @@ final class MacScreenSession: NSObject, ObservableObject {
         sendControlEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
 
+    func togglePinned() {
+        isPinned.toggle()
+        applyPinnedWindowState()
+        DiagnosticsLog.info("screen.mac.window_pin pinned=\(isPinned)")
+    }
+
     private func showWindow() {
         if let window {
+            applyPinnedWindowState()
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(videoView)
             NSApp.activate(ignoringOtherApps: true)
@@ -183,11 +245,25 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.contentView = NSHostingView(rootView: content)
         window.center()
         window.delegate = self
+        self.window = window
+        applyPinnedWindowState()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
-        self.window = window
         sendViewerVisibility(visible: true, reason: "showWindow")
+    }
+
+    private func applyPinnedWindowState() {
+        guard let window else {
+            return
+        }
+        window.level = isPinned ? .floating : .normal
+        let pinnedBehaviors: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        if isPinned {
+            window.collectionBehavior = window.collectionBehavior.union(pinnedBehaviors)
+        } else {
+            window.collectionBehavior = window.collectionBehavior.subtracting(pinnedBehaviors)
+        }
     }
 
     private func ensurePeerConnection() -> RTCPeerConnection {
@@ -196,6 +272,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
 
         if !didInitializeSSL {
+            // WebRTC SSL is process-wide; keep it initialized for the app lifetime.
             RTCInitializeSSL()
             didInitializeSSL = true
         }
@@ -221,27 +298,38 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func createAnswer(on peerConnection: RTCPeerConnection) {
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
-        peerConnection.answer(for: constraints) { [weak self] answer, error in
-            if let error {
-                DiagnosticsLog.error("screen.mac.answer_create_failed", error)
-                DispatchQueue.main.async { self?.status = "Answer failed" }
-                return
-            }
-            guard let answer else {
-                DiagnosticsLog.warn("screen.mac.answer_create_empty")
-                DispatchQueue.main.async { self?.status = "Answer failed" }
-                return
-            }
-            peerConnection.setLocalDescription(answer) { error in
-                if let error {
-                    DiagnosticsLog.error("screen.mac.set_local_answer_failed", error)
-                    DispatchQueue.main.async { self?.status = "Answer failed" }
+        peerConnection.answer(for: constraints) { [weak self, weak peerConnection] answer, error in
+            DispatchQueue.main.async {
+                guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                    DiagnosticsLog.warn("screen.mac.answer_create_ignored stale_peer")
                     return
                 }
-                DiagnosticsLog.info("screen.mac.answer_out bytes=\(answer.sdp.count)")
-                DispatchQueue.main.async {
-                    self?.status = "Connected"
-                    self?.sendEnvelope(type: EnvelopeType.rtcAnswer, body: RtcSdpBody(sdp: answer.sdp))
+                if let error {
+                    DiagnosticsLog.error("screen.mac.answer_create_failed", error)
+                    self.status = "Answer failed"
+                    return
+                }
+                guard let answer else {
+                    DiagnosticsLog.warn("screen.mac.answer_create_empty")
+                    self.status = "Answer failed"
+                    return
+                }
+
+                peerConnection.setLocalDescription(answer) { [weak self, weak peerConnection] error in
+                    DispatchQueue.main.async {
+                        guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                            DiagnosticsLog.warn("screen.mac.local_answer_ignored stale_peer")
+                            return
+                        }
+                        if let error {
+                            DiagnosticsLog.error("screen.mac.set_local_answer_failed", error)
+                            self.status = "Answer failed"
+                            return
+                        }
+                        DiagnosticsLog.info("screen.mac.answer_out bytes=\(answer.sdp.count)")
+                        self.status = "Connected"
+                        self.sendEnvelope(type: EnvelopeType.rtcAnswer, body: RtcSdpBody(sdp: answer.sdp))
+                    }
                 }
             }
         }
@@ -613,11 +701,11 @@ extension MacScreenSession: NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        sendViewerVisibility(visible: false, reason: "windowWillClose")
         guard !isClosingWindow else {
             window = nil
             return
         }
+        sendViewerVisibility(visible: false, reason: "windowWillClose")
         stop(sendRemoteStop: true)
         window = nil
     }
@@ -643,14 +731,20 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
         guard let track = stream.videoTracks.first else {
             return
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.attachRemoteVideoTrack(track)
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                return
+            }
+            self.attachRemoteVideoTrack(track)
         }
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
-        DispatchQueue.main.async { [weak self] in
-            self?.hasRemoteVideo = false
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection else {
+                return
+            }
+            self.hasRemoteVideo = false
         }
     }
 
@@ -672,8 +766,11 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
             index: Int(candidate.sdpMLineIndex),
             candidate: candidate.sdp
         )
-        DispatchQueue.main.async { [weak self] in
-            self?.sendEnvelope(type: EnvelopeType.rtcIce, body: body)
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                return
+            }
+            self.sendEnvelope(type: EnvelopeType.rtcIce, body: body)
         }
     }
 
@@ -686,7 +783,7 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
         }
         DispatchQueue.main.async { [weak self, weak peerConnection] in
             guard let self, let peerConnection, self.peerConnection === peerConnection else {
-                dataChannel.close()
+                DiagnosticsLog.info("screen.mac.control_data_channel_ignored stale_peer")
                 return
             }
             self.controlDataChannel?.delegate = nil
@@ -705,8 +802,11 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
         guard let track = transceiver.receiver.track as? RTCVideoTrack else {
             return
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.attachRemoteVideoTrack(track)
+        DispatchQueue.main.async { [weak self, weak peerConnection] in
+            guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
+                return
+            }
+            self.attachRemoteVideoTrack(track)
         }
     }
 }
@@ -749,6 +849,25 @@ struct PhoneScreenView: View {
                 .padding(.vertical, 10)
                 .background(.regularMaterial, in: Capsule())
                 .padding(.bottom, 14)
+            }
+            VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        session.togglePinned()
+                    } label: {
+                        Image(systemName: session.isPinned ? "pin.fill" : "pin")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(session.isPinned ? "Unpin" : "Keep on Top")
+                    .accessibilityLabel(Text(session.isPinned ? "Unpin Phone Window" : "Pin Phone Window"))
+                    .padding(8)
+                    .background(.regularMaterial, in: Circle())
+                    .padding(.top, 12)
+                    .padding(.trailing, 12)
+                }
+                Spacer()
             }
             if !session.hasRemoteVideo {
                 Text(session.status)
