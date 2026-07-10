@@ -155,6 +155,7 @@ internal object EdgeLinkShizukuCommandPolicy {
     )
     private val allowedRuntimePermissions = setOf(
             "android.permission.POST_NOTIFICATIONS",
+            "android.permission.RECORD_AUDIO",
             "android.permission.READ_SMS",
             "android.permission.RECEIVE_SMS",
             "android.permission.SEND_SMS"

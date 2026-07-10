@@ -8,6 +8,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
+    @Published private(set) var hasRemoteAudio = false
     @Published private(set) var isPinned = false
 
     let videoView = PhoneVideoRendererView()
@@ -19,6 +20,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var factory: RTCPeerConnectionFactory?
     private var peerConnection: RTCPeerConnection?
     private var remoteVideoTrack: RTCVideoTrack?
+    private var remoteAudioTrack: RTCMediaStreamTrack?
     private var controlDataChannel: RTCDataChannel?
     private var didInitializeSSL = false
     private var isClosingWindow = false
@@ -166,7 +168,8 @@ final class MacScreenSession: NSObject, ObservableObject {
         let hadPeerConnection = peerConnection != nil
         let hadControlDataChannel = controlDataChannel != nil
         let hadRemoteVideoTrack = remoteVideoTrack != nil
-        let hadSessionState = isScreenSessionActive || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || screenMeta != nil
+        let hadRemoteAudioTrack = remoteAudioTrack != nil
+        let hadSessionState = isScreenSessionActive || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || hadRemoteAudioTrack || screenMeta != nil
         guard hadSessionState || status != "Stopped" else {
             return
         }
@@ -181,6 +184,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         status = "Stopped"
         screenMeta = nil
         hasRemoteVideo = false
+        hasRemoteAudio = false
         cancelPendingPointerMove()
         cancelPendingWheel()
         if shouldSendRemoteStop {
@@ -190,6 +194,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         let track = remoteVideoTrack
         remoteVideoTrack = nil
         track?.remove(videoView)
+        remoteAudioTrack = nil
         stopStatsLogging()
         videoView.clear()
 
@@ -202,7 +207,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         peerConnectionToClose?.close()
         factory = nil
         DiagnosticsLog.info(
-            "screen.mac.stop_done pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack)"
+            "screen.mac.stop_done pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack) audio=\(hadRemoteAudioTrack)"
         )
     }
 
@@ -215,8 +220,9 @@ final class MacScreenSession: NSObject, ObservableObject {
         let hadPeerConnection = peerConnection != nil
         let hadControlDataChannel = controlDataChannel != nil
         let hadRemoteVideoTrack = remoteVideoTrack != nil
+        let hadRemoteAudioTrack = remoteAudioTrack != nil
         let shouldResume = isScreenSessionActive
-        let hadSessionState = shouldResume || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || screenMeta != nil
+        let hadSessionState = shouldResume || hadPeerConnection || hadControlDataChannel || hadRemoteVideoTrack || hadRemoteAudioTrack || screenMeta != nil
         guard hadSessionState else {
             return
         }
@@ -229,12 +235,14 @@ final class MacScreenSession: NSObject, ObservableObject {
 
         status = shouldResume ? "Reconnecting" : "Stopped"
         hasRemoteVideo = false
+        hasRemoteAudio = false
         cancelPendingPointerMove()
         cancelPendingWheel()
 
         let track = remoteVideoTrack
         remoteVideoTrack = nil
         track?.remove(videoView)
+        remoteAudioTrack = nil
         stopStatsLogging()
         videoView.clear()
 
@@ -253,7 +261,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
 
         DiagnosticsLog.info(
-            "screen.mac.transport_interrupted_done resume=\(shouldResume) pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack)"
+            "screen.mac.transport_interrupted_done resume=\(shouldResume) pc=\(hadPeerConnection) dc=\(hadControlDataChannel) video=\(hadRemoteVideoTrack) audio=\(hadRemoteAudioTrack)"
         )
     }
 
@@ -405,6 +413,17 @@ final class MacScreenSession: NSObject, ObservableObject {
         hasRemoteVideo = true
         status = "Connected"
         DiagnosticsLog.info("screen.mac.remote_video_attached")
+    }
+
+    private func attachRemoteAudioTrack(_ track: RTCMediaStreamTrack) {
+        if remoteAudioTrack === track {
+            return
+        }
+        remoteAudioTrack = track
+        track.isEnabled = true
+        hasRemoteAudio = true
+        status = "Connected"
+        DiagnosticsLog.info("screen.mac.remote_audio_attached track=\(track.trackId)")
     }
 
     private func sendPointer(action: String, event: NSEvent, wheelDy: Int? = nil) {
@@ -790,23 +809,36 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
-        guard let track = stream.videoTracks.first else {
-            return
-        }
+        let videoTrack = stream.videoTracks.first
+        let audioTrack = stream.audioTracks.first
         DispatchQueue.main.async { [weak self, weak peerConnection] in
             guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
                 return
             }
-            self.attachRemoteVideoTrack(track)
+            if let videoTrack {
+                self.attachRemoteVideoTrack(videoTrack)
+            }
+            if let audioTrack {
+                self.attachRemoteAudioTrack(audioTrack)
+            }
         }
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
+        let removedVideo = !stream.videoTracks.isEmpty
+        let removedAudio = !stream.audioTracks.isEmpty
         DispatchQueue.main.async { [weak self, weak peerConnection] in
             guard let self, let peerConnection, self.peerConnection === peerConnection else {
                 return
             }
-            self.hasRemoteVideo = false
+            if removedVideo {
+                self.hasRemoteVideo = false
+                self.remoteVideoTrack = nil
+            }
+            if removedAudio {
+                self.hasRemoteAudio = false
+                self.remoteAudioTrack = nil
+            }
         }
     }
 
@@ -861,14 +893,18 @@ extension MacScreenSession: RTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didStartReceivingOn transceiver: RTCRtpTransceiver) {
-        guard let track = transceiver.receiver.track as? RTCVideoTrack else {
+        guard let track = transceiver.receiver.track else {
             return
         }
         DispatchQueue.main.async { [weak self, weak peerConnection] in
             guard let self, let peerConnection, self.peerConnection === peerConnection, self.isScreenSessionActive else {
                 return
             }
-            self.attachRemoteVideoTrack(track)
+            if let videoTrack = track as? RTCVideoTrack {
+                self.attachRemoteVideoTrack(videoTrack)
+            } else if track.kind == "audio" {
+                self.attachRemoteAudioTrack(track)
+            }
         }
     }
 }

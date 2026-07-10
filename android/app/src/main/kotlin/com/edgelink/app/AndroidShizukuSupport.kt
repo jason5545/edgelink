@@ -138,11 +138,16 @@ object AndroidShizukuSupport {
 
     suspend fun prepareScreenAccess(context: Context): ShizukuOperationResult =
         withService(context) { service ->
-            val results = listOf(
+            val results = mutableListOf(
                 service.runCommandResult(arrayOf("cmd", "appops", "set", context.packageName, "PROJECT_MEDIA", "allow")),
                 service.runCommandResult(arrayOf("cmd", "appops", "set", context.packageName, "WRITE_SETTINGS", "allow")),
                 service.runCommandResult(arrayOf("cmd", "appops", "set", context.packageName, "SYSTEM_ALERT_WINDOW", "allow"))
             )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                results += service.runCommandResult(
+                    arrayOf("pm", "grant", context.packageName, Manifest.permission.RECORD_AUDIO)
+                )
+            }
             results.toOperationResult("screen", allowPartial = true)
         }
 

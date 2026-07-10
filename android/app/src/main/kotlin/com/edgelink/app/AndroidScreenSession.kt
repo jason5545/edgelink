@@ -19,6 +19,8 @@ import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
 import com.edgelink.core.ScreenMetaBody
 import org.webrtc.DataChannel
+import org.webrtc.AudioSource
+import org.webrtc.AudioTrack
 import org.webrtc.CapturerObserver
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
@@ -41,6 +43,7 @@ import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
+import org.webrtc.audio.JavaAudioDeviceModule
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -73,6 +76,11 @@ class AndroidScreenSession(
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var videoSender: RtpSender? = null
+    private var playbackAudioCapture: AndroidPlaybackAudioCapture? = null
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
+    private var audioSource: AudioSource? = null
+    private var audioTrack: AudioTrack? = null
+    private var audioSender: RtpSender? = null
     private var controlDataChannel: DataChannel? = null
     private var controlDataChannelObserver: DataChannel.Observer? = null
     private val screenPowerGuard = AndroidScreenPowerGuard(appContext)
@@ -174,7 +182,7 @@ class AndroidScreenSession(
 
         try {
             AndroidNotificationListenerService.onScreenSharingStarted(appContext)
-            initializeWebRtc()
+            val playbackAudioAvailable = initializeWebRtc(projection)
             val meta = currentScreenMeta()
             val captureSize = captureSizeFor(meta)
             val reusedProjectionDisplay = virtualDisplay != null
@@ -203,6 +211,15 @@ class AndroidScreenSession(
             peerConnection = pc
             val sender = pc.addTrack(track, listOf(SCREEN_STREAM_ID))
             videoSender = sender
+            if (playbackAudioAvailable) {
+                val localAudioSource = localFactory.createAudioSource(MediaConstraints())
+                audioSource = localAudioSource
+                val localAudioTrack = localFactory.createAudioTrack(SCREEN_AUDIO_TRACK_ID, localAudioSource)
+                localAudioTrack.setEnabled(true)
+                audioTrack = localAudioTrack
+                audioSender = pc.addTrack(localAudioTrack, listOf(SCREEN_STREAM_ID))
+                EdgeLinkLog.info("screen.android.audio_track_added")
+            }
             configureVideoQuality(pc, sender)
             setupControlDataChannel(pc)
             createOffer(pc)
@@ -362,11 +379,20 @@ class AndroidScreenSession(
             videoTrack = null
             videoSource?.dispose()
             videoSource = null
+            audioSender = null
+            audioTrack?.dispose()
+            audioTrack = null
+            audioSource?.dispose()
+            audioSource = null
             peerConnection?.close()
             peerConnection?.dispose()
             peerConnection = null
             factory?.dispose()
             factory = null
+            audioDeviceModule?.release()
+            audioDeviceModule = null
+            playbackAudioCapture?.stop()
+            playbackAudioCapture = null
             if (mediaProjection == null) {
                 releaseCaptureResources()
             }
@@ -379,16 +405,33 @@ class AndroidScreenSession(
         }
     }
 
-    private fun initializeWebRtc() {
+    private fun initializeWebRtc(projection: MediaProjection): Boolean {
         ensureWebRtcInitialized(appContext)
         val localEglBase = eglBase ?: EglBase.create().also { eglBase = it }
         eglBase = localEglBase
         val encoderFactory = DefaultVideoEncoderFactory(localEglBase.eglBaseContext, true, true)
         val decoderFactory = DefaultVideoDecoderFactory(localEglBase.eglBaseContext)
-        factory = PeerConnectionFactory.builder()
+        val playbackCapture = AndroidPlaybackAudioCapture(appContext, projection)
+        val playbackAudioAvailable = playbackCapture.start()
+        val factoryBuilder = PeerConnectionFactory.builder()
             .setVideoEncoderFactory(encoderFactory)
             .setVideoDecoderFactory(decoderFactory)
-            .createPeerConnectionFactory()
+        if (playbackAudioAvailable) {
+            val localAudioDeviceModule = JavaAudioDeviceModule.builder(appContext)
+                .setInputSampleRate(AndroidPlaybackAudioCapture.AUDIO_SAMPLE_RATE)
+                .setUseStereoInput(true)
+                .setUseHardwareAcousticEchoCanceler(false)
+                .setUseHardwareNoiseSuppressor(false)
+                .setAudioBufferCallback(playbackCapture)
+                .createAudioDeviceModule()
+            // The callback blocks on AudioPlaybackCapture, so WebRTC must not open a microphone AudioRecord.
+            localAudioDeviceModule.setAudioRecordEnabled(false)
+            playbackAudioCapture = playbackCapture
+            audioDeviceModule = localAudioDeviceModule
+            factoryBuilder.setAudioDeviceModule(localAudioDeviceModule)
+        }
+        factory = factoryBuilder.createPeerConnectionFactory()
+        return playbackAudioAvailable
     }
 
     private fun ensureProjectionDisplay(
@@ -1140,6 +1183,7 @@ class AndroidScreenSession(
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
         private const val SCREEN_STREAM_ID = "edgelink-screen"
         private const val SCREEN_VIDEO_TRACK_ID = "edgelink-screen-video"
+        private const val SCREEN_AUDIO_TRACK_ID = "edgelink-screen-audio"
         private const val SCREEN_CONTROL_CHANNEL_LABEL = "edgelink-control"
         private const val STUN_SERVER = "stun:stun.l.google.com:19302"
         private const val STATS_INTERVAL_MS = 2_000L

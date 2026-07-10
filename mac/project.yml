@@ -44,6 +44,7 @@ targets:
           if [ -d "$MAC_HEADERS" ]; then
             /bin/cat > "$MAC_HEADERS/WebRTC.h" <<'EOF'
           #import <WebRTC/RTCMacros.h>
+          #import <WebRTC/RTCAudioTrack.h>
           #import <WebRTC/RTCCVPixelBuffer.h>
           #import <WebRTC/RTCConfiguration.h>
           #import <WebRTC/RTCDataChannel.h>
