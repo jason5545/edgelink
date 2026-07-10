@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+  width="108"
+  height="108"
+  viewBox="0 0 108 108"
+  role="img"
+  aria-labelledby="title description">
+  <title id="title">EdgeLink</title>
+  <desc id="description">Two mirrored device frames joined by one horizontal capsule.</desc>
+
+  <!-- 824 x 824 at 1024 px, with a 185 px corner radius and transparent margin. -->
+  <path
+    id="background"
+    fill="#071526"
+    d="M30.058594,10.546875 H77.941406 A19.511719,19.511719 0 0 1 97.453125,30.058594 V77.941406 A19.511719,19.511719 0 0 1 77.941406,97.453125 H30.058594 A19.511719,19.511719 0 0 1 10.546875,77.941406 V30.058594 A19.511719,19.511719 0 0 1 30.058594,10.546875 Z" />
+
+  <!-- Closed mirrored rings. All mark geometry is inside the Android 66 dp safe circle. -->
+  <path
+    id="left-frame"
+    fill="#3978D4"
+    fill-rule="evenodd"
+    d="M35,30 H42 A8,8 0 0 1 50,38 V70 A8,8 0 0 1 42,78 H35 A8,8 0 0 1 27,70 V38 A8,8 0 0 1 35,30 Z M35,36 A2,2 0 0 0 33,38 V70 A2,2 0 0 0 35,72 H42 A2,2 0 0 0 44,70 V38 A2,2 0 0 0 42,36 Z" />
+  <path
+    id="right-frame"
+    fill="#A8C7FA"
+    fill-rule="evenodd"
+    d="M66,30 H73 A8,8 0 0 1 81,38 V70 A8,8 0 0 1 73,78 H66 A8,8 0 0 1 58,70 V38 A8,8 0 0 1 66,30 Z M66,36 A2,2 0 0 0 64,38 V70 A2,2 0 0 0 66,72 H73 A2,2 0 0 0 75,70 V38 A2,2 0 0 0 73,36 Z" />
+  <path
+    id="link-capsule"
+    fill="#D6E3FF"
+    d="M44,48 H64 A6,6 0 0 1 70,54 A6,6 0 0 1 64,60 H44 A6,6 0 0 1 38,54 A6,6 0 0 1 44,48 Z" />
+</svg>

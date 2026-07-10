@@ -34,7 +34,7 @@ class AndroidNotificationPresenter(private val context: Context) {
         val title = body.title.ifBlank { body.app }
         val text = body.text
         val notification = Notification.Builder(appContext, REMOTE_NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_more)
+            .setSmallIcon(R.drawable.ic_stat_edgelink)
             .setContentTitle(title)
             .setContentText(text)
             .setSubText(body.app)
@@ -74,7 +74,7 @@ class AndroidNotificationPresenter(private val context: Context) {
         fun serviceNotification(context: Context, status: String): Notification {
             createChannels(context)
             return Notification.Builder(context, SERVICE_NOTIFICATION_CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                .setSmallIcon(R.drawable.ic_stat_edgelink)
                 .setContentTitle("EdgeLink")
                 .setContentText(status)
                 .setContentIntent(openAppIntent(context))
