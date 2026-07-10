@@ -2,8 +2,15 @@ import AppKit
 import EdgeLinkKit
 import SwiftUI
 
+private final class EdgeLinkAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 @main
 struct EdgeLinkMacApp: App {
+    @NSApplicationDelegateAdaptor(EdgeLinkAppDelegate.self) private var appDelegate
     @StateObject private var runtime = EdgeLinkRuntime()
 
     var body: some Scene {
@@ -70,19 +77,32 @@ private struct MenuBarPopover: View {
                     LatestVerificationCodePanel(runtime: runtime)
                 }
 
-                Button {
-                    if runtime.isViewingPhoneScreen {
-                        runtime.stopPhoneScreen()
-                    } else {
-                        runtime.viewPhoneScreen()
+                if runtime.isPhoneScreenSessionActive {
+                    Button {
+                        runtime.showPhoneScreen()
+                    } label: {
+                        Label(
+                            runtime.isPhoneScreenViewerVisible ? "重新檢視" : "重新檢視手機畫面",
+                            systemImage: "rectangle.on.rectangle"
+                        )
                     }
-                } label: {
-                    Label(
-                        runtime.isViewingPhoneScreen ? "停止檢視" : "檢視手機畫面",
-                        systemImage: runtime.isViewingPhoneScreen ? "stop.circle" : "iphone"
-                    )
+
+                    Button {
+                        runtime.stopPhoneScreen()
+                    } label: {
+                        Label("停止手機投放", systemImage: "stop.circle")
+                    }
+                } else {
+                    Button {
+                        runtime.viewPhoneScreen()
+                    } label: {
+                        Label(
+                            runtime.hasViewedPhoneScreen ? "重新檢視" : "檢視手機畫面",
+                            systemImage: "iphone"
+                        )
+                    }
+                    .disabled(!runtime.isConnected)
                 }
-                .disabled(!runtime.isConnected && !runtime.isViewingPhoneScreen)
 
                 Button {
                     openWindow(id: "sms")

@@ -26,7 +26,9 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var latestVerificationCode: VerificationCodeCandidate?
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
-    @Published private(set) var isViewingPhoneScreen = false
+    @Published private(set) var isPhoneScreenSessionActive = false
+    @Published private(set) var isPhoneScreenViewerVisible = false
+    @Published private(set) var hasViewedPhoneScreen = false
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -72,7 +74,12 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
             Task { @MainActor in
-                self?.isViewingPhoneScreen = visible
+                self?.isPhoneScreenViewerVisible = visible
+            }
+        }
+        screenSession.onSessionActivityChanged = { [weak self] active in
+            Task { @MainActor in
+                self?.isPhoneScreenSessionActive = active
             }
         }
         observeSystemSleepWake()
@@ -158,12 +165,24 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         screenSession.openAndStart()
-        isViewingPhoneScreen = true
+        isPhoneScreenSessionActive = true
+        isPhoneScreenViewerVisible = true
+        hasViewedPhoneScreen = true
+    }
+
+    func showPhoneScreen() {
+        guard isPhoneScreenSessionActive else {
+            viewPhoneScreen()
+            return
+        }
+        screenSession.showActiveWindow()
+        isPhoneScreenViewerVisible = true
     }
 
     func stopPhoneScreen() {
-        screenSession.closeWindow(sendRemoteStop: isConnected)
-        isViewingPhoneScreen = false
+        screenSession.hideWindowAndStop(sendRemoteStop: isConnected)
+        isPhoneScreenSessionActive = false
+        isPhoneScreenViewerVisible = false
     }
 
     func disconnect() {
@@ -174,14 +193,15 @@ final class EdgeLinkRuntime: ObservableObject {
         connectionTask = nil
 
         let shouldSendRemoteStop = isConnected
-        screenSession.closeWindow(sendRemoteStop: shouldSendRemoteStop)
+        screenSession.hideWindowAndStop(sendRemoteStop: shouldSendRemoteStop)
         currentChannel?.close()
         currentChannel = nil
         currentChannelGeneration = nil
         currentSession = nil
         screenSession.clearSender()
         isConnected = false
-        isViewingPhoneScreen = false
+        isPhoneScreenSessionActive = false
+        isPhoneScreenViewerVisible = false
         connectionStatus = peerDeviceId.isEmpty ? "No paired Android" : "Disconnected"
     }
 

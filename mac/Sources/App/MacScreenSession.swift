@@ -13,6 +13,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     let videoView = PhoneVideoRendererView()
     var onWindowVisibilityChanged: ((Bool) -> Void)?
+    var onSessionActivityChanged: ((Bool) -> Void)?
 
     private let encoder = JSONEncoder()
     private var sendPlaintext: ((Data) -> Void)?
@@ -62,6 +63,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     func openAndStart() {
         isScreenSessionActive = true
+        onSessionActivityChanged?(true)
         showWindow()
         if peerConnection != nil {
             status = hasRemoteVideo ? "Connected" : status
@@ -181,6 +183,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
 
         isScreenSessionActive = false
+        onSessionActivityChanged?(false)
         status = "Stopped"
         screenMeta = nil
         hasRemoteVideo = false
@@ -277,6 +280,23 @@ final class MacScreenSession: NSObject, ObservableObject {
         stop(sendRemoteStop: sendRemoteStop)
     }
 
+    func hideWindowAndStop(sendRemoteStop: Bool = true) {
+        if let window {
+            window.orderOut(nil)
+            reportWindowVisibility(false, reason: "stopAndHide")
+        }
+        DiagnosticsLog.info("screen.mac.window_hidden stop_projection=true keep_window=true")
+        stop(sendRemoteStop: sendRemoteStop)
+    }
+
+    func showActiveWindow() {
+        guard isScreenSessionActive else {
+            DiagnosticsLog.warn("screen.mac.show_ignored inactive_session")
+            return
+        }
+        showWindow()
+    }
+
     func sendGlobal(_ action: String) {
         markControlSent(kind: "global:\(action)", shouldLog: false)
         DiagnosticsLog.info("screen.mac.global_out action=\(action)")
@@ -292,11 +312,13 @@ final class MacScreenSession: NSObject, ObservableObject {
     private func showWindow() {
         if let window {
             applyPinnedWindowState()
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(videoView)
             NSApp.activate(ignoringOtherApps: true)
-            sendViewerVisibility(visible: true, reason: "showWindow")
-            onWindowVisibilityChanged?(true)
+            reportWindowVisibility(true, reason: "showWindow")
             return
         }
 
@@ -317,8 +339,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
-        sendViewerVisibility(visible: true, reason: "showWindow")
-        onWindowVisibilityChanged?(true)
+        reportWindowVisibility(true, reason: "showWindow")
     }
 
     private func applyPinnedWindowState() {
@@ -675,6 +696,11 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
     }
 
+    private func reportWindowVisibility(_ visible: Bool, reason: String) {
+        sendViewerVisibility(visible: visible, reason: reason)
+        onWindowVisibilityChanged?(visible)
+    }
+
     private func currentViewerVisible(for window: NSWindow?) -> Bool {
         guard let window, window.isVisible else {
             return false
@@ -774,8 +800,7 @@ extension MacScreenSession: NSWindowDelegate {
             return true
         }
         sender.orderOut(nil)
-        sendViewerVisibility(visible: false, reason: "windowShouldClose")
-        onWindowVisibilityChanged?(false)
+        reportWindowVisibility(false, reason: "windowShouldClose")
         DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
         return false
     }
@@ -785,10 +810,24 @@ extension MacScreenSession: NSWindowDelegate {
             window = nil
             return
         }
-        sendViewerVisibility(visible: false, reason: "windowWillClose")
-        onWindowVisibilityChanged?(false)
+        reportWindowVisibility(false, reason: "windowWillClose")
         stop(sendRemoteStop: true)
         window = nil
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else {
+            return
+        }
+        reportWindowVisibility(false, reason: "miniaturized")
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        let changedWindow = notification.object as? NSWindow
+        guard changedWindow === window else {
+            return
+        }
+        reportWindowVisibility(currentViewerVisible(for: changedWindow), reason: "deminiaturized")
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
@@ -796,10 +835,7 @@ extension MacScreenSession: NSWindowDelegate {
         guard changedWindow === window else {
             return
         }
-        sendViewerVisibility(
-            visible: currentViewerVisible(for: changedWindow),
-            reason: "occlusion"
-        )
+        reportWindowVisibility(currentViewerVisible(for: changedWindow), reason: "occlusion")
     }
 }
 
