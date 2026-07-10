@@ -14,8 +14,11 @@ struct EdgeLinkMacApp: App {
     @StateObject private var runtime = EdgeLinkRuntime()
 
     var body: some Scene {
-        MenuBarExtra("EdgeLink", systemImage: runtime.isConnected ? "link.circle.fill" : "link.circle") {
+        MenuBarExtra {
             MenuBarPopover(runtime: runtime)
+        } label: {
+            Image("MenuBarIcon")
+                .accessibilityLabel("EdgeLink")
         }
         .menuBarExtraStyle(.window)
 
