@@ -1,6 +1,7 @@
 import CryptoKit
 import EdgeLinkKit
 import Foundation
+import Intents
 import UserNotifications
 
 final class MacNotificationPresenter: @unchecked Sendable {
@@ -78,9 +79,21 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 if body.iconPngBase64 != nil && iconPNGData == nil {
                     DiagnosticsLog.warn("notification.mac.remote_icon_invalid id=\(body.id)")
                 }
+                var finalContent: UNNotificationContent = content
+                if let iconPNGData {
+                    do {
+                        finalContent = try await Self.communicationContent(
+                            base: content,
+                            body: body,
+                            iconPNGData: iconPNGData
+                        )
+                    } catch {
+                        DiagnosticsLog.warn("notification.mac.remote_intent_failed id=\(body.id): \(error)")
+                    }
+                }
                 let request = UNNotificationRequest(
                     identifier: requestIdentifier(id: body.id, sourceDeviceId: body.sourceDeviceId),
-                    content: content,
+                    content: finalContent,
                     trigger: nil
                 )
                 try await center.add(request)
@@ -166,6 +179,36 @@ final class MacNotificationPresenter: @unchecked Sendable {
             }
         }
         return body
+    }
+
+    private static func communicationContent(
+        base: UNMutableNotificationContent,
+        body: NotificationPostBody,
+        iconPNGData: Data
+    ) async throws -> UNNotificationContent {
+        let handleValue = body.bundle ?? body.app
+        let sender = INPerson(
+            personHandle: INPersonHandle(value: handleValue, type: .unknown),
+            nameComponents: nil,
+            displayName: body.app,
+            image: INImage(imageData: iconPNGData),
+            contactIdentifier: nil,
+            customIdentifier: "edgelink.app.\(handleValue)"
+        )
+        let intent = INSendMessageIntent(
+            recipients: nil,
+            outgoingMessageType: .outgoingMessageText,
+            content: base.body,
+            speakableGroupName: nil,
+            conversationIdentifier: "\(base.threadIdentifier).\(handleValue)",
+            serviceName: nil,
+            sender: sender,
+            attachments: nil
+        )
+        let interaction = INInteraction(intent: intent, response: nil)
+        interaction.direction = .incoming
+        try? await interaction.donate()
+        return try base.updating(from: intent)
     }
 
     private static func validIconPNGData(pngBase64: String) -> Data? {

@@ -24,5 +24,9 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 EdgeLink contributors</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
 </dict>
 </plist>
