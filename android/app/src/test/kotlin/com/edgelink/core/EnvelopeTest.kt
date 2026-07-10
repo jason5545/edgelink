@@ -96,4 +96,30 @@ class EnvelopeTest {
         assertEquals(EnvelopeTypes.SMS_SEND_RESULT, result.t)
         assertEquals(true, result.b.success)
     }
+
+    @Test
+    fun notificationBodyRoundTripsAndroidAppIcon() {
+        val bytes = EnvelopeCodec.encode(
+            EnvelopeTypes.NOTIFICATION_POST,
+            NotificationPostBody(
+                id = "android:chat:42",
+                sourcePlatform = "android",
+                app = "Chat",
+                bundle = "com.example.chat",
+                iconPngBase64 = "iVBORw0KGgo=",
+                title = "Alice",
+                text = "Hello",
+                ts = 1_783_510_255
+            )
+        )
+
+        val decoded = EnvelopeCodec.decode<NotificationPostBody>(bytes)
+        assertEquals("iVBORw0KGgo=", decoded.b.iconPngBase64)
+
+        val legacy = EnvelopeCodec.decode<NotificationPostBody>(
+            """{"t":"notification.post","b":{"id":"legacy","app":"Chat","title":"Alice","text":"Hello","ts":1}}"""
+                .encodeToByteArray()
+        )
+        assertEquals(null, legacy.b.iconPngBase64)
+    }
 }

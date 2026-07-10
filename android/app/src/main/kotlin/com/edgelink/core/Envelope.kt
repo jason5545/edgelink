@@ -138,6 +138,7 @@ data class NotificationPostBody(
     val sourcePlatform: String? = null,
     val app: String,
     val bundle: String? = null,
+    val iconPngBase64: String? = null,
     val title: String,
     val text: String,
     val subtitle: String? = null,

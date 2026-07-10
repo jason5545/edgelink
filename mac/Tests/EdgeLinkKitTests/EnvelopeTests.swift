@@ -94,4 +94,31 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(result.t, "sms.send.result")
         XCTAssertTrue(result.b.success)
     }
+
+    func testNotificationBodyRoundTripsAndroidAppIcon() throws {
+        let data = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.notificationPost,
+                b: NotificationPostBody(
+                    id: "android:chat:42",
+                    sourcePlatform: "android",
+                    app: "Chat",
+                    bundle: "com.example.chat",
+                    iconPngBase64: "iVBORw0KGgo=",
+                    title: "Alice",
+                    text: "Hello",
+                    ts: 1_783_510_255
+                )
+            )
+        )
+
+        let decoded = try decoder.decode(Envelope<NotificationPostBody>.self, from: data)
+        XCTAssertEqual(decoded.b.iconPngBase64, "iVBORw0KGgo=")
+
+        let legacyData = Data(
+            #"{"t":"notification.post","b":{"id":"legacy","app":"Chat","title":"Alice","text":"Hello","ts":1}}"#.utf8
+        )
+        let legacy = try decoder.decode(Envelope<NotificationPostBody>.self, from: legacyData)
+        XCTAssertNil(legacy.b.iconPngBase64)
+    }
 }

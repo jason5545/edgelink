@@ -72,6 +72,24 @@ final class MacNotificationPresenter: @unchecked Sendable {
                     "sourcePlatform": body.sourcePlatform ?? ""
                 ]
 
+                var temporaryIconURL: URL?
+                if let iconPngBase64 = body.iconPngBase64 {
+                    do {
+                        let icon = try Self.makeIconAttachment(pngBase64: iconPngBase64)
+                        content.attachments = [icon.attachment]
+                        temporaryIconURL = icon.url
+                    } catch {
+                        DiagnosticsLog.warn(
+                            "notification.mac.remote_icon_invalid id=\(body.id) error=\(error.localizedDescription)"
+                        )
+                    }
+                }
+                defer {
+                    if let temporaryIconURL {
+                        try? FileManager.default.removeItem(at: temporaryIconURL)
+                    }
+                }
+
                 let request = UNNotificationRequest(
                     identifier: requestIdentifier(id: body.id, sourceDeviceId: body.sourceDeviceId),
                     content: content,
@@ -158,6 +176,41 @@ final class MacNotificationPresenter: @unchecked Sendable {
             }
         }
         return body
+    }
+
+    private static func makeIconAttachment(pngBase64: String) throws -> (attachment: UNNotificationAttachment, url: URL) {
+        guard
+            let pngData = Data(base64Encoded: pngBase64),
+            pngData.count <= maximumIconPngBytes,
+            pngData.starts(with: pngSignature)
+        else {
+            throw MacNotificationIconError.invalidPNG
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EdgeLinkNotificationIcons", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("png")
+
+        do {
+            try pngData.write(to: url, options: .atomic)
+            let attachment = try UNNotificationAttachment(identifier: "android-app-icon", url: url)
+            return (attachment, url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
+    private static let maximumIconPngBytes = 32 * 1024
+    private static let pngSignature = Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
+private enum MacNotificationIconError: LocalizedError {
+    case invalidPNG
+
+    var errorDescription: String? {
+        "Invalid Android app icon PNG"
     }
 }
 

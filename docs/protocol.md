@@ -355,7 +355,7 @@ AEAD：
 {"t":"rtc.answer","b":{"sdp":"v=0\r\n..."}}
 {"t":"rtc.ice","b":{"mid":"0","index":0,"candidate":"candidate:..."}}
 {"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"..."}}
-{"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
+{"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","iconPngBase64":"iVBORw0KGgo...","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
 {"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
 {"t":"status.ping","b":{}}
 ```
@@ -459,6 +459,10 @@ AccessibilityService 的平台實作不屬於本章協定格式。
 
 `notification.post` 與 `notification.remove` 是雙向 envelope。接收端用 `id + sourceDeviceId`
 建立本機顯示用 identifier，讓 remove 可以取消之前由 EdgeLink 顯示的遠端通知。
+
+`notification.post.iconPngBase64` 是選填的 app 圖示，內容為 Base64 編碼 PNG。Android 會把來源 app
+的 adaptive/legacy icon rasterize 成 64 x 64 PNG；macOS 將它加為 notification attachment。舊版接收端
+可忽略此欄位，未提供或圖示無效時仍照常顯示文字通知。
 
 Android 可以用 `NotificationListenerService` 讀系統通知；為了 app 不在前景時也能同步，
 Android 端由 foreground service 持有 relay / secure session。Android 必須過濾 EdgeLink

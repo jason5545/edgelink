@@ -175,6 +175,7 @@ public struct NotificationPostBody: Codable, Equatable, Sendable {
     public let sourcePlatform: String?
     public let app: String
     public let bundle: String?
+    public let iconPngBase64: String?
     public let title: String
     public let text: String
     public let subtitle: String?
@@ -186,6 +187,7 @@ public struct NotificationPostBody: Codable, Equatable, Sendable {
         sourcePlatform: String? = nil,
         app: String,
         bundle: String? = nil,
+        iconPngBase64: String? = nil,
         title: String,
         text: String,
         subtitle: String? = nil,
@@ -196,6 +198,7 @@ public struct NotificationPostBody: Codable, Equatable, Sendable {
         self.sourcePlatform = sourcePlatform
         self.app = app
         self.bundle = bundle
+        self.iconPngBase64 = iconPngBase64
         self.title = title
         self.text = text
         self.subtitle = subtitle

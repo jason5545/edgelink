@@ -4,16 +4,21 @@ import android.app.Notification
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Handler
 import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.Base64
 import com.edgelink.core.NotificationPostBody
 import com.edgelink.core.NotificationRemoveBody
+import java.io.ByteArrayOutputStream
 
 class AndroidNotificationListenerService : NotificationListenerService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lastForwardedBodies = linkedMapOf<String, NotificationPostBody>()
+    private val appIconPngBase64Cache = mutableMapOf<String, String?>()
     private var screenSharePolling = false
     private val screenSharePollRunnable = object : Runnable {
         override fun run() {
@@ -179,6 +184,7 @@ class AndroidNotificationListenerService : NotificationListenerService() {
             sourcePlatform = "android",
             app = appLabel(packageName),
             bundle = packageName,
+            iconPngBase64 = appIconPngBase64(packageName),
             title = title,
             text = text,
             subtitle = subtitle,
@@ -200,7 +206,37 @@ class AndroidNotificationListenerService : NotificationListenerService() {
                 ?: packageName
         }.getOrDefault(packageName)
 
+    private fun appIconPngBase64(packageName: String): String? {
+        if (appIconPngBase64Cache.containsKey(packageName)) {
+            return appIconPngBase64Cache[packageName]
+        }
+
+        val encoded = runCatching {
+            val drawable = packageManager.getApplicationIcon(packageName)
+            val bitmap = Bitmap.createBitmap(APP_ICON_SIZE_PX, APP_ICON_SIZE_PX, Bitmap.Config.ARGB_8888)
+            val png = try {
+                val canvas = Canvas(bitmap)
+                drawable.setBounds(0, 0, APP_ICON_SIZE_PX, APP_ICON_SIZE_PX)
+                drawable.draw(canvas)
+                ByteArrayOutputStream().use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                }
+            } finally {
+                bitmap.recycle()
+            }
+            Base64.encodeToString(png, Base64.NO_WRAP)
+        }.onFailure { error ->
+            EdgeLinkLog.warn("notification.android.icon_encode_failed package=$packageName", error)
+        }.getOrNull()
+
+        appIconPngBase64Cache[packageName] = encoded
+        return encoded
+    }
+
     companion object {
+        private const val APP_ICON_SIZE_PX = 64
+
         @Volatile
         private var activeService: AndroidNotificationListenerService? = null
         @Volatile
