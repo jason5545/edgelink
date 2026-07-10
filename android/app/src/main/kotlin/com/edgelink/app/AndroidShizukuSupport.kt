@@ -15,7 +15,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 1
+private const val SHIZUKU_USER_SERVICE_VERSION = 2
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -153,6 +153,31 @@ object AndroidShizukuSupport {
             )
             listOf(result).toOperationResult("secure_setting:$key")
         }
+
+    suspend fun writeScreenShareSetting(
+        context: Context,
+        namespace: String,
+        key: String,
+        value: String?
+    ): ShizukuOperationResult = withService(context) { service ->
+        val writeCommand = if (value == null) {
+            arrayOf("settings", "delete", namespace, key)
+        } else {
+            arrayOf("settings", "put", namespace, key, value)
+        }
+        val writeResult = service.runCommandResult(writeCommand)
+        val readResult = service.runCommandResult(arrayOf("settings", "get", namespace, key))
+        val observed = readResult.stdout.trim().takeUnless { it.isBlank() || it == "null" }
+        val success = writeResult.success && readResult.success && observed == value
+        ShizukuOperationResult(
+            success = success,
+            message = if (success) {
+                "setting:$namespace:$key ok"
+            } else {
+                "setting:$namespace:$key write=${writeResult.exitCode} read=${readResult.exitCode} expected=$value observed=$observed"
+            }
+        )
+    }
 
     private suspend fun <T> withService(
         context: Context,

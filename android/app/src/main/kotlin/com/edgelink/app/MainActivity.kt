@@ -154,6 +154,7 @@ private class EdgeLinkActivityActions(
     override fun onQuit() = quitHandler.invoke()
     override fun onAutoReconnectChange(enabled: Boolean) = delegate.onAutoReconnectChange(enabled)
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
+    override fun onScreenSharePrivacyChange(enabled: Boolean) = delegate.onScreenSharePrivacyChange(enabled)
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
     override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()

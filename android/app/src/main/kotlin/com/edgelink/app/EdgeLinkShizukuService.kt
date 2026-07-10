@@ -17,7 +17,7 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
     }
 
     override fun runCommand(command: Array<String>): String {
-        if (!isAllowedCommand(command)) {
+        if (!EdgeLinkShizukuCommandPolicy.isAllowed(command)) {
             return ShizukuCommandResult(
                 exitCode = 126,
                 stdout = "",
@@ -55,11 +55,33 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
         }
     }
 
-    private fun isAllowedCommand(command: Array<String>): Boolean {
+    private fun readLimited(input: InputStream): String {
+        input.use { stream ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(4096)
+            var total = 0
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) {
+                    break
+                }
+                if (total < COMMAND_OUTPUT_LIMIT) {
+                    val toWrite = min(read, COMMAND_OUTPUT_LIMIT - total)
+                    output.write(buffer, 0, toWrite)
+                    total += toWrite
+                }
+            }
+            return output.toString(Charsets.UTF_8.name())
+        }
+    }
+}
+
+internal object EdgeLinkShizukuCommandPolicy {
+    fun isAllowed(command: Array<String>): Boolean {
         if (command.isEmpty()) {
             return false
         }
-        if (isAllowedSecureSettingsCommand(command)) {
+        if (isAllowedSettingsCommand(command)) {
             return true
         }
         if (isAllowedAppOpsCommand(command)) {
@@ -68,19 +90,26 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
         return isAllowedPermissionGrantCommand(command)
     }
 
-    private fun isAllowedSecureSettingsCommand(command: Array<String>): Boolean {
+    private fun isAllowedSettingsCommand(command: Array<String>): Boolean {
         if (command.size !in 4..5) {
             return false
         }
-        if (command[0] != "settings" || command[2] != "secure") {
+        if (command[0] != "settings") {
             return false
         }
         val action = command[1]
+        val namespace = command[2]
         val key = command[3]
-        if (key !in allowedSecureSettingsKeys) {
+        if (key !in allowedSettingsKeys[namespace].orEmpty()) {
             return false
         }
-        return action == "get" && command.size == 4 || action == "put" && command.size == 5
+        return when (action) {
+            "get" -> command.size == 4
+            "delete" -> command.size == 4 && isScreenShareProtectionKey(namespace, key)
+            "put" -> command.size == 5 &&
+                (!isScreenShareProtectionKey(namespace, key) || command[4] == "0" || command[4] == "1")
+            else -> false
+        }
     }
 
     private fun isAllowedAppOpsCommand(command: Array<String>): Boolean {
@@ -105,43 +134,29 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
             command[3] in allowedRuntimePermissions
     }
 
-    private fun readLimited(input: InputStream): String {
-        input.use { stream ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(4096)
-            var total = 0
-            while (true) {
-                val read = stream.read(buffer)
-                if (read < 0) {
-                    break
-                }
-                if (total < COMMAND_OUTPUT_LIMIT) {
-                    val toWrite = min(read, COMMAND_OUTPUT_LIMIT - total)
-                    output.write(buffer, 0, toWrite)
-                    total += toWrite
-                }
-            }
-            return output.toString(Charsets.UTF_8.name())
-        }
-    }
+    private fun isScreenShareProtectionKey(namespace: String, key: String): Boolean =
+        namespace == "global" && key == GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS ||
+            namespace == "secure" && key == XIAOMI_SCREEN_PROJECT_PRIVATE_ON
 
-    private companion object {
-        val allowedSecureSettingsKeys = setOf(
+    private val allowedSettingsKeys = mapOf(
+        "secure" to setOf(
             "accessibility_enabled",
             "enabled_accessibility_services",
             "enabled_notification_listeners",
-            "screensaver_enabled"
-        )
-        val allowedAppOps = setOf(
+            "screensaver_enabled",
+            XIAOMI_SCREEN_PROJECT_PRIVATE_ON
+        ),
+        "global" to setOf(GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS)
+    )
+    private val allowedAppOps = setOf(
             "PROJECT_MEDIA",
             "SYSTEM_ALERT_WINDOW",
             "WRITE_SETTINGS"
-        )
-        val allowedRuntimePermissions = setOf(
+    )
+    private val allowedRuntimePermissions = setOf(
             "android.permission.POST_NOTIFICATIONS",
             "android.permission.READ_SMS",
             "android.permission.RECEIVE_SMS",
             "android.permission.SEND_SMS"
-        )
-    }
+    )
 }

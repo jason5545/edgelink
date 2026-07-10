@@ -194,6 +194,8 @@ data class EdgeLinkUiState(
     val canConfirmPairing: Boolean = false,
     val autoReconnectEnabled: Boolean = true,
     val notificationSyncEnabled: Boolean = true,
+    val screenSharePrivacyEnabled: Boolean = false,
+    val screenSharePrivacyControlAvailable: Boolean = false,
     val remoteInputAccessGranted: Boolean = false,
     val notificationAccessGranted: Boolean = false,
     val notificationPostGranted: Boolean = true,
@@ -219,6 +221,7 @@ interface EdgeLinkActions {
     fun onQuit()
     fun onAutoReconnectChange(enabled: Boolean)
     fun onNotificationSyncChange(enabled: Boolean)
+    fun onScreenSharePrivacyChange(enabled: Boolean)
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
     fun onOpenScreenDimmingSettings()
@@ -238,6 +241,7 @@ interface EdgeLinkActions {
         override fun onQuit() = Unit
         override fun onAutoReconnectChange(enabled: Boolean) = Unit
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
+        override fun onScreenSharePrivacyChange(enabled: Boolean) = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
         override fun onOpenScreenDimmingSettings() = Unit
@@ -633,6 +637,30 @@ private fun SettingsScreen(
             }
 
             item {
+                SettingsSection(title = "螢幕投放") {
+                    SettingsToggleRow(
+                        label = "投放隱私保護",
+                        supportingText = if (state.screenSharePrivacyEnabled) {
+                            "隱藏投放中的通知與私密內容"
+                        } else {
+                            "投放時顯示通知與私密內容"
+                        },
+                        checked = state.screenSharePrivacyEnabled,
+                        enabled = state.screenSharePrivacyControlAvailable,
+                        onCheckedChange = actions::onScreenSharePrivacyChange
+                    )
+                    if (!state.screenSharePrivacyControlAvailable) {
+                        Text(
+                            text = "需要 WRITE_SECURE_SETTINGS 或 Shizuku 授權",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+            }
+
+            item {
                 SettingsSection(title = "權限明細") {
                     PermissionStatusRow(
                         label = "遠端輸入",
@@ -742,13 +770,19 @@ private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
 private fun SettingsToggleRow(
     label: String,
     checked: Boolean,
+    supportingText: String? = null,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit
 ) {
     ListItem(
         headlineContent = { Text(label) },
+        supportingContent = supportingText?.let { text ->
+            { Text(text) }
+        },
         trailingContent = {
             Switch(
                 checked = checked,
+                enabled = enabled,
                 onCheckedChange = onCheckedChange
             )
         },

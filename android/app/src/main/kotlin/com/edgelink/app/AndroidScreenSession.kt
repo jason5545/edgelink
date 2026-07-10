@@ -46,6 +46,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -53,7 +55,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidScreenSession(
     private val context: Context,
-    private val sendPlaintext: (ByteArray) -> Unit
+    private val sendPlaintext: (ByteArray) -> Unit,
+    private val screenSharePrivacyEnabled: () -> Boolean
 ) {
     private val appContext = context.applicationContext
     private var eglBase: EglBase? = null
@@ -73,6 +76,7 @@ class AndroidScreenSession(
     private var controlDataChannel: DataChannel? = null
     private var controlDataChannelObserver: DataChannel.Observer? = null
     private val screenPowerGuard = AndroidScreenPowerGuard(appContext)
+    private val screenShareProtectionGuard = AndroidScreenShareProtectionGuard(appContext)
     @Volatile
     private var controlDataChannelHandler: ((ByteArray) -> Unit)? = null
     @Volatile
@@ -80,6 +84,8 @@ class AndroidScreenSession(
     private var statsHandlerThread: HandlerThread? = null
     private var statsHandler: Handler? = null
     private val shizukuScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val projectionLifecycleMutex = Mutex()
+    private var permissionRequestPending = false
     private val statsLogger = ScreenStatsLogger()
     private val isStopping = AtomicBoolean(false)
     private val boostHandler = Handler(appContext.mainLooper)
@@ -88,16 +94,39 @@ class AndroidScreenSession(
         applyViewerBitrate(reason = "boost_restore")
     }
 
+    init {
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                screenShareProtectionGuard.restore(reason = "startup_recovery")
+            }
+        }
+    }
+
     fun requestStart() {
         EdgeLinkLog.info("screen.android.start_requested")
-        if (mediaProjection != null) {
-            EdgeLinkLog.info("screen.android.start_reusing_projection")
-            startWithActiveProjection()
-            return
-        }
         shizukuScope.launch {
-            prepareScreenAccessWithShizuku()
-            ScreenCapturePermissionActivity.start(appContext)
+            projectionLifecycleMutex.withLock {
+                if (mediaProjection != null) {
+                    EdgeLinkLog.info("screen.android.start_reusing_projection")
+                    startWithActiveProjection()
+                    return@withLock
+                }
+                if (permissionRequestPending) {
+                    EdgeLinkLog.info("screen.android.start_ignored permission_pending")
+                    return@withLock
+                }
+
+                prepareScreenAccessWithShizuku()
+                prepareScreenShareProtection(reason = "request_start")
+                permissionRequestPending = true
+                runCatching {
+                    ScreenCapturePermissionActivity.start(appContext)
+                }.onFailure { error ->
+                    permissionRequestPending = false
+                    EdgeLinkLog.error("screen.android.permission_activity_start_failed", error)
+                    screenShareProtectionGuard.restore(reason = "permission_activity_start_failed")
+                }
+            }
         }
     }
 
@@ -107,20 +136,28 @@ class AndroidScreenSession(
 
     fun startWithPermission(resultCode: Int, data: Intent) {
         EdgeLinkLog.info("screen.android.permission_granted resultCode=$resultCode")
-        releaseProjection(stopService = false)
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                permissionRequestPending = false
+                if (mediaProjection != null) {
+                    releaseProjectionLocked(stopService = false)
+                }
+                prepareScreenShareProtection(reason = "permission_granted")
 
-        try {
-            val manager = appContext.getSystemService(MediaProjectionManager::class.java)
-            val projection = manager.getMediaProjection(resultCode, data)
-                ?: error("MediaProjectionManager returned null projection.")
-            val callback = projectionCallback()
-            mediaProjection = projection
-            mediaProjectionCallback = callback
-            projection.registerCallback(callback, Handler(appContext.mainLooper))
-            startWithActiveProjection()
-        } catch (error: Throwable) {
-            EdgeLinkLog.error("screen.android.permission_start_failed", error)
-            releaseProjection(stopService = true)
+                try {
+                    val manager = appContext.getSystemService(MediaProjectionManager::class.java)
+                    val projection = manager.getMediaProjection(resultCode, data)
+                        ?: error("MediaProjectionManager returned null projection.")
+                    val callback = projectionCallback()
+                    mediaProjection = projection
+                    mediaProjectionCallback = callback
+                    projection.registerCallback(callback, Handler(appContext.mainLooper))
+                    startWithActiveProjection()
+                } catch (error: Throwable) {
+                    EdgeLinkLog.error("screen.android.permission_start_failed", error)
+                    releaseProjectionLocked(stopService = true)
+                }
+            }
         }
     }
 
@@ -239,12 +276,46 @@ class AndroidScreenSession(
     }
 
     fun stop() {
-        stopStreaming()
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                stopStreaming()
+            }
+        }
     }
 
     fun shutdown() {
-        shizukuScope.cancel()
-        releaseProjection(stopService = true)
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                releaseProjectionLocked(stopService = true)
+            }
+            shizukuScope.cancel()
+        }
+    }
+
+    fun onPermissionDenied() {
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                permissionRequestPending = false
+                if (mediaProjection == null) {
+                    screenShareProtectionGuard.restore(reason = "permission_denied")
+                }
+            }
+        }
+    }
+
+    fun onPrivacyPreferenceChanged() {
+        shizukuScope.launch {
+            projectionLifecycleMutex.withLock {
+                if (mediaProjection != null) {
+                    EdgeLinkLog.info("screen.android.privacy_changed release_projection=true")
+                    releaseProjectionLocked(stopService = true)
+                } else if (permissionRequestPending) {
+                    // The permission dialog has not produced a MediaProjection yet, so retarget
+                    // the pending override before getMediaProjection() can observe it.
+                    prepareScreenShareProtection(reason = "preference_changed_pending")
+                }
+            }
+        }
     }
 
     private suspend fun prepareScreenAccessWithShizuku() {
@@ -260,6 +331,16 @@ class AndroidScreenSession(
             EdgeLinkLog.info("screen.android.shizuku_prepare_ok message=${result.message}")
         } else {
             EdgeLinkLog.warn("screen.android.shizuku_prepare_failed message=${result.message}")
+        }
+    }
+
+    private suspend fun prepareScreenShareProtection(reason: String) {
+        val applied = screenShareProtectionGuard.prepare(
+            privacyEnabled = screenSharePrivacyEnabled(),
+            reason = reason
+        )
+        if (!applied) {
+            EdgeLinkLog.warn("screen.android.protection_unavailable reason=$reason")
         }
     }
 
@@ -394,8 +475,9 @@ class AndroidScreenSession(
         observer?.onCapturerStopped()
     }
 
-    private fun releaseProjection(stopService: Boolean, stopProjection: Boolean = true) {
+    private suspend fun releaseProjectionLocked(stopService: Boolean, stopProjection: Boolean = true) {
         val hadProjection = mediaProjection != null
+        permissionRequestPending = false
         stopStreaming()
 
         val projection = mediaProjection
@@ -414,6 +496,7 @@ class AndroidScreenSession(
         if (stopService) {
             ScreenProjectionForegroundService.stop(appContext)
         }
+        screenShareProtectionGuard.restore(reason = "projection_released")
         if (hadProjection) {
             EdgeLinkLog.info("screen.android.projection_released stopService=$stopService stopProjection=$stopProjection")
         }
@@ -671,7 +754,11 @@ class AndroidScreenSession(
         object : MediaProjection.Callback() {
             override fun onStop() {
                 EdgeLinkLog.info("screen.android.projection_stopped")
-                releaseProjection(stopService = true, stopProjection = false)
+                shizukuScope.launch {
+                    projectionLifecycleMutex.withLock {
+                        releaseProjectionLocked(stopService = true, stopProjection = false)
+                    }
+                }
             }
         }
 

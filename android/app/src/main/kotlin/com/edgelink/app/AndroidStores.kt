@@ -96,6 +96,15 @@ class SharedPreferencesSettingsStore(context: Context) {
             .apply()
     }
 
+    fun screenSharePrivacyEnabled(): Boolean =
+        prefs.getBoolean("screenSharePrivacyEnabled", false)
+
+    fun saveScreenSharePrivacyEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean("screenSharePrivacyEnabled", enabled)
+            .apply()
+    }
+
     fun smsLastSeenDateMs(): Long =
         prefs.getLong("smsLastSeenDateMs", 0L)
 

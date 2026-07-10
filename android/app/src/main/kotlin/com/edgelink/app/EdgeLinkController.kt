@@ -99,7 +99,11 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
-    private val screenSession = AndroidScreenSession(appContext, ::sendPlaintext)
+    private val screenSession = AndroidScreenSession(
+        context = appContext,
+        sendPlaintext = ::sendPlaintext,
+        screenSharePrivacyEnabled = settingsStore::screenSharePrivacyEnabled
+    )
     private val initialShizukuState = AndroidShizukuSupport.currentState()
     @Volatile
     private var lastPongElapsedMs = 0L
@@ -107,6 +111,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkUiState(
             autoReconnectEnabled = settingsStore.autoReconnectEnabled(),
             notificationSyncEnabled = settingsStore.notificationSyncEnabled(),
+            screenSharePrivacyEnabled = settingsStore.screenSharePrivacyEnabled(),
+            screenSharePrivacyControlAvailable = AndroidScreenShareProtectionGuard.canControl(appContext),
             remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
@@ -352,6 +358,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    override fun onScreenSharePrivacyChange(enabled: Boolean) {
+        settingsStore.saveScreenSharePrivacyEnabled(enabled)
+        stateFlow.update { it.copy(screenSharePrivacyEnabled = enabled) }
+        EdgeLinkLog.info("screen.android.privacy_preference enabled=$enabled")
+        screenSession.onPrivacyPreferenceChanged()
+    }
+
     override fun onOpenNotificationSettings() {
         if (tryHandleNotificationAccessWithShizuku()) {
             return
@@ -512,6 +525,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
                 screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
+                screenSharePrivacyControlAvailable = AndroidScreenShareProtectionGuard.canControl(appContext),
                 smsAccessGranted = smsSync.smsAccessGranted(),
                 shizukuAvailable = shizukuState.available,
                 shizukuSupported = shizukuState.supported,
@@ -644,6 +658,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     fun onScreenCapturePermissionDenied() {
         EdgeLinkLog.warn("screen.android.permission_denied")
+        screenSession.onPermissionDenied()
     }
 
     private suspend fun run() {
