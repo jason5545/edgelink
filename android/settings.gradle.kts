@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "EdgeLink"
 include(":app")
+include(":xposed-api-stubs")

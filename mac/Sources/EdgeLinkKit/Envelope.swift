@@ -37,6 +37,7 @@ public enum EnvelopeType {
     public static let smsMessage = "sms.message"
     public static let smsSend = "sms.send"
     public static let smsSendResult = "sms.send.result"
+    public static let miLinkStatus = "milink.status"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -271,6 +272,46 @@ public struct SmsSendResultBody: Codable, Equatable, Sendable {
         self.to = to
         self.success = success
         self.error = error
+        self.ts = ts
+    }
+}
+
+public struct MiLinkStatusBody: Codable, Equatable, Sendable {
+    public let sourceDeviceId: String?
+    public let sourcePlatform: String
+    public let route: String
+    public let officialDiscoveryRequired: Bool
+    public let available: Bool
+    public let rootProbeOk: Bool
+    public let attributionProbeOk: Bool
+    public let messengerTransportOk: Bool
+    public let castServiceOk: Bool
+    public let summary: String
+    public let ts: Int64
+
+    public init(
+        sourceDeviceId: String? = nil,
+        sourcePlatform: String = "android",
+        route: String = "edgelink.secure",
+        officialDiscoveryRequired: Bool = false,
+        available: Bool,
+        rootProbeOk: Bool,
+        attributionProbeOk: Bool,
+        messengerTransportOk: Bool,
+        castServiceOk: Bool,
+        summary: String,
+        ts: Int64
+    ) {
+        self.sourceDeviceId = sourceDeviceId
+        self.sourcePlatform = sourcePlatform
+        self.route = route
+        self.officialDiscoveryRequired = officialDiscoveryRequired
+        self.available = available
+        self.rootProbeOk = rootProbeOk
+        self.attributionProbeOk = attributionProbeOk
+        self.messengerTransportOk = messengerTransportOk
+        self.castServiceOk = castServiceOk
+        self.summary = summary
         self.ts = ts
     }
 }

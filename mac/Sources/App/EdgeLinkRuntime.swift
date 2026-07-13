@@ -26,6 +26,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var latestVerificationCode: VerificationCodeCandidate?
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
+    @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var isPhoneScreenSessionActive = false
     @Published private(set) var isPhoneScreenViewerVisible = false
     @Published private(set) var hasViewedPhoneScreen = false
@@ -215,7 +216,7 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         let storedPeer: PinnedPeer?
         do {
-            storedPeer = try pairingStore?.loadPeers().first
+            storedPeer = try loadPreferredPeer()
         } catch {
             DiagnosticsLog.error("relay.mac.reconnect_peer_load_failed", error)
             storedPeer = nil
@@ -281,7 +282,7 @@ final class EdgeLinkRuntime: ObservableObject {
             localDeviceId = DeviceID.display(identity.deviceId)
             DiagnosticsLog.info("runtime.mac.identity deviceId=\(identity.deviceId) pkfp=\(DiagnosticsLog.fingerprint(identity.publicKey))")
 
-            guard let peer = try pairingStore?.loadPeers().first else {
+            guard let peer = try loadPreferredPeer() else {
                 DiagnosticsLog.info("runtime.mac.no_paired_peer")
                 connectionStatus = "No paired Android"
                 canDisconnect = false
@@ -299,6 +300,17 @@ final class EdgeLinkRuntime: ObservableObject {
             canDisconnect = false
             connectionStatus = "Setup failed"
         }
+    }
+
+    private func loadPreferredPeer() throws -> PinnedPeer? {
+        let peers = try pairingStore?.loadPeers() ?? []
+        let peer = peers.max { lhs, rhs in
+            lhs.pairedAt < rhs.pairedAt
+        }
+        if peers.count > 1, let peer {
+            DiagnosticsLog.info("runtime.mac.preferred_peer clientId=\(peer.deviceId) peerCount=\(peers.count)")
+        }
+        return peer
     }
 
     private func runPairing(identity: LocalIdentity) async {
@@ -502,6 +514,11 @@ final class EdgeLinkRuntime: ObservableObject {
                     onSmsSendResult: { [weak self] result in
                         Task { @MainActor in
                             self?.handleSmsSendResult(result)
+                        }
+                    },
+                    onMiLinkStatus: { [weak self] status in
+                        Task { @MainActor in
+                            self?.handleMiLinkStatus(status)
                         }
                     }
                 )
@@ -727,6 +744,16 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
             }
         }
+    }
+
+    private func handleMiLinkStatus(_ status: MiLinkStatusBody) {
+        latestMiLinkStatus = status
+        DiagnosticsLog.info(
+            "milink.mac.status available=\(status.available) route=\(status.route) " +
+                "officialDiscoveryRequired=\(status.officialDiscoveryRequired) " +
+                "root=\(status.rootProbeOk) attribution=\(status.attributionProbeOk) " +
+                "messenger=\(status.messengerTransportOk) cast=\(status.castServiceOk)"
+        )
     }
 
     private func handleVerificationCode(_ candidate: VerificationCodeCandidate, message: SmsMessageBody) {

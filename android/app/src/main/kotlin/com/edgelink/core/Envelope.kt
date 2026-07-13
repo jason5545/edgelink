@@ -36,6 +36,7 @@ object EnvelopeTypes {
     const val SMS_MESSAGE = "sms.message"
     const val SMS_SEND = "sms.send"
     const val SMS_SEND_RESULT = "sms.send.result"
+    const val MILINK_STATUS = "milink.status"
 }
 
 object EnvelopeCodec {
@@ -176,5 +177,20 @@ data class SmsSendResultBody(
     val to: String,
     val success: Boolean,
     val error: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class MiLinkStatusBody(
+    val sourceDeviceId: String? = null,
+    val sourcePlatform: String = "android",
+    val route: String = "edgelink.secure",
+    val officialDiscoveryRequired: Boolean = false,
+    val available: Boolean,
+    val rootProbeOk: Boolean,
+    val attributionProbeOk: Boolean,
+    val messengerTransportOk: Boolean,
+    val castServiceOk: Boolean,
+    val summary: String,
     val ts: Long
 )

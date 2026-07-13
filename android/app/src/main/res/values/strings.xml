@@ -2,4 +2,5 @@
 <resources>
   <string name="remote_input_service_label">EdgeLink 遠端輸入</string>
   <string name="remote_input_service_description">允許 EdgeLink 從已配對的 Mac 控制這支手機。</string>
+  <string name="xposed_description">讓 EdgeLink 在已授權的 root hook 環境中對接 Xiaomi MiLink runtime。</string>
 </resources>

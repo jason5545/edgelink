@@ -122,4 +122,28 @@ class EnvelopeTest {
         )
         assertEquals(null, legacy.b.iconPngBase64)
     }
+
+    @Test
+    fun miLinkStatusBodyRoundTrips() {
+        val bytes = EnvelopeCodec.encode(
+            EnvelopeTypes.MILINK_STATUS,
+            MiLinkStatusBody(
+                sourceDeviceId = "android-1",
+                available = true,
+                rootProbeOk = true,
+                attributionProbeOk = false,
+                messengerTransportOk = true,
+                castServiceOk = true,
+                summary = "MiLink messenger transport ok",
+                ts = 1_783_510_256
+            )
+        )
+
+        val decoded = EnvelopeCodec.decode<MiLinkStatusBody>(bytes)
+        assertEquals(EnvelopeTypes.MILINK_STATUS, decoded.t)
+        assertEquals("edgelink.secure", decoded.b.route)
+        assertEquals(false, decoded.b.officialDiscoveryRequired)
+        assertEquals(true, decoded.b.messengerTransportOk)
+        assertEquals(true, decoded.b.castServiceOk)
+    }
 }

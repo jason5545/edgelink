@@ -219,6 +219,21 @@ EdgeLink should not link or impersonate them.
 
 ## Suggested Implementation Shape
 
+### Root Shizuku Diagnostic Probe
+
+With Shizuku running as root, EdgeLink can run a bounded MiLink diagnostic probe through its
+UserService. This is for capability discovery only, not a product dependency on Xiaomi's private SDK.
+
+The current probe allows only these exact `content call` shapes:
+
+- `content://com.milink.service.circulate`, `check_permission`, `common`
+- `content://com.milink.service.circulate`, `check_permission`, `miplay_url_circulate`
+- `content://provider.milink.mi.com/messenger`, `ping`
+- `content://com.milink.service.public`, `milink_casting`
+
+The Android app runs this once when Shizuku reports uid `0`, exposes a manual "MiLink" probe button
+in the Shizuku section, and logs each result under `xiaomi.milink.root_probe`.
+
 1. Keep one Android device-family helper:
    - `isXiaomiFamily = manufacturer/brand/model contains xiaomi, redmi, or poco`
    - include normalized manufacturer, brand, model, and product in diagnostics.
@@ -241,5 +256,86 @@ EdgeLink should not link or impersonate them.
 
 5. Add settings shortcuts only as user affordances:
    - open MiLink settings/help when the user needs to enable Xiaomi's native stack.
-   - do not require them for EdgeLink's own pairing.
 
+### Vector / Xposed Hook Path
+
+Root UID alone is not enough for `provider.milink.mi.com/messenger`. The provider gates calls
+through `com.milink.base.utils.p.e(Context, String)`, which checks the caller package against
+MiLink's signature/internal/whitelist rules. The Messenger service path similarly checks
+`com.milink.base.utils.p.d(Context)` against packages for `Binder.getCallingUid()`.
+
+EdgeLink now ships an opt-in legacy Xposed module entry point:
+
+- `assets/xposed_init` -> `com.edgelink.app.MiLinkPrivilegeXposedHook`
+- Scope target: `com.milink.service`
+- Runtime process guard: `com.milink.runtime` for `provider.milink.mi.com/messenger`
+- Main process guard: `com.milink.service` for `ClientV2PublicService`
+- Allowed caller package: `com.edgelink.app`
+
+The hook returns `true` only for EdgeLink as the caller. It does not allow `com.android.shell`,
+does not allow arbitrary null callers, and does not patch MiLink's APK on disk. On Android 16 +
+KernelSU, this expects a Zygisk/Xposed-compatible runtime such as Vector with a working Zygisk
+environment.
+
+### Messenger Provider Transport
+
+MiLink's provider-backed messenger client uses these stable calls:
+
+- Register: `insert content://provider.milink.mi.com/messenger/register`
+- Poll: `call content://provider.milink.mi.com`, method
+  `content://provider.milink.mi.com/messenger#poll`, arg `<clientNo>`
+- Send: `call content://provider.milink.mi.com`, method
+  `content://provider.milink.mi.com/messenger#send`, arg `<clientNo>`, extras byte array `dat`
+- Unregister: `delete <registeredUriWithoutCodeQuery>`
+
+Registration returns a URI like
+`content://provider.milink.mi.com/messenger/register/<uid>-<pid>?code=0`; the final path segment is
+the `clientNo`. Poll returns `code`, `has_next`, optional `dat`, and optional `start`.
+
+EdgeLink's current transport probe performs `ping -> register -> poll -> unregister`. It does not
+send arbitrary packets yet; `send(dat)` is available internally after a real MiLink packet source is
+chosen.
+
+### EdgeLink MiLink Bridge
+
+Xiaomi/HyperConnect discovery is not a required dependency for EdgeLink. On third-party ROMs such as
+Xiaomi.eu, MiLink may expose useful local phone-side IPC while still failing to discover the Mac. The
+bridge shape is therefore:
+
+- Android uses the privileged MiLink provider/binder paths locally.
+- Android reports MiLink capability state over EdgeLink's existing encrypted Mac session.
+- Mac treats this as EdgeLink telemetry/control, not as a Xiaomi-discovered peer.
+
+The first bridge envelope is `milink.status`. It reports:
+
+- `route = edgelink.secure`
+- `officialDiscoveryRequired = false`
+- root/Shizuku probe status
+- provider attribution status
+- messenger transport status
+- public cast binder status
+
+The Android controller keeps the latest status and re-sends it when the secure session connects, so
+an early automatic probe is not lost if it runs before the Mac relay session is ready.
+
+### Public Cast Service Binder
+
+MiLink also exposes a public cast SDK binder:
+
+- Service action: `com.milink.sdk.cast.v2.client.public`
+- Package: `com.milink.service`
+- Implementation: `com.milink.client.ClientV2PublicService`
+- Binder descriptor: `com.milink.sdk.cast.v2.IMiLinkCastServiceV2`
+
+The first safe probe binds to the service and reads simple state transactions only:
+
+- `27`: `isAgreePrivacy()`
+- `32`: `isAuthDeviceConnecting()`
+- `30`: `isVerifyCodeInputShown()`
+
+This verifies the high-level cast SDK IPC path without starting discovery, opening UI, or sending
+media/cast commands.
+
+`ClientV2PublicService` still calls `BaseClientService.b()`, which rejects non-whitelisted caller
+UIDs with `Uid <uid> is not allowed to call MiLinkCast.` EdgeLink's module hooks that check only in
+the MiLink main process and only for caller packages containing `com.edgelink.app`.

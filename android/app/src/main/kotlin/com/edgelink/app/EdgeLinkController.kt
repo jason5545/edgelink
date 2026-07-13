@@ -23,6 +23,7 @@ import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
+import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
 import com.edgelink.core.NotificationRemoveBody
 import com.edgelink.core.PairConfirmRequest
@@ -82,7 +83,8 @@ private enum class PendingShizukuAction {
     Notification,
     RemoteInput,
     Screen,
-    Sms
+    Sms,
+    MiLinkProbe
 }
 
 class EdgeLinkController(context: Context) : EdgeLinkActions {
@@ -122,7 +124,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             shizukuSupported = initialShizukuState.supported,
             shizukuPermissionGranted = initialShizukuState.permissionGranted,
             shizukuPermissionRequestBlocked = initialShizukuState.permissionRequestBlocked,
-            shizukuUid = initialShizukuState.uid
+            shizukuUid = initialShizukuState.uid,
+            xiaomiMiLinkProbeStatus = if (initialShizukuState.uid == 0) "尚未測試" else null
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
@@ -155,6 +158,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var smsPendingDrainJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private var pendingShizukuAction: PendingShizukuAction? = null
+    @Volatile
+    private var latestMiLinkStatus: MiLinkStatusBody? = null
+    private var miLinkRootProbeAttempted = false
     @Volatile
     private var manuallyDisconnected = false
     private val connectionGeneration = AtomicInteger(0)
@@ -199,6 +205,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         scope.launch {
             run()
         }
+        runMiLinkRootProbeIfReady("init")
     }
 
     fun close() {
@@ -430,6 +437,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         refreshNotificationAccess()
     }
 
+    override fun onProbeMiLink() {
+        miLinkRootProbeAttempted = false
+        if (!tryRunOrRequestShizuku(PendingShizukuAction.MiLinkProbe)) {
+            stateFlow.update {
+                it.copy(xiaomiMiLinkProbeStatus = "需要 Shizuku root")
+            }
+        }
+    }
+
     fun tryHandleNotificationAccessWithShizuku(): Boolean =
         tryRunOrRequestShizuku(PendingShizukuAction.Notification)
 
@@ -472,11 +488,26 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     PendingShizukuAction.RemoteInput -> AndroidShizukuSupport.enableRemoteInput(appContext)
                     PendingShizukuAction.Screen -> AndroidShizukuSupport.prepareScreenAccess(appContext)
                     PendingShizukuAction.Sms -> AndroidShizukuSupport.grantSmsPermissions(appContext)
+                    PendingShizukuAction.MiLinkProbe -> {
+                        val status = probeMiLinkStatus()
+                        latestMiLinkStatus = status
+                        sendEnvelope(EnvelopeTypes.MILINK_STATUS, status)
+                        ShizukuOperationResult(
+                            success = status.available,
+                            message = status.summary
+                        )
+                    }
                 }
             }.getOrElse { error ->
+                EdgeLinkLog.warn("shizuku.android.action_exception action=$action", error)
                 ShizukuOperationResult(success = false, message = error.message.orEmpty())
             }
 
+            if (action == PendingShizukuAction.MiLinkProbe) {
+                stateFlow.update {
+                    it.copy(xiaomiMiLinkProbeStatus = result.message)
+                }
+            }
             if (result.success) {
                 EdgeLinkLog.info("shizuku.android.action_ok action=$action message=${result.message}")
             } else {
@@ -485,6 +516,29 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             refreshNotificationAccess()
             fallbackAfterShizukuAction(action)
         }
+    }
+
+    private suspend fun probeMiLinkStatus(): MiLinkStatusBody {
+        val rootProbe = AndroidShizukuSupport.probeMiLinkRoot(appContext)
+        val attributionProbe = AndroidShizukuSupport.probeMiLinkAttributionSpoof(appContext)
+        val messengerTransportProbe = AndroidMiLinkMessengerTransport.probe(appContext)
+        val castServiceProbe = AndroidMiLinkCastServiceBridge.probe(appContext)
+        val summary = "${rootProbe.message}; ${attributionProbe.message}; " +
+            messengerTransportProbe.message +
+            "; ${castServiceProbe.message}"
+        return MiLinkStatusBody(
+            sourceDeviceId = localIdentity?.deviceId,
+            available = rootProbe.success ||
+                attributionProbe.success ||
+                messengerTransportProbe.success ||
+                castServiceProbe.success,
+            rootProbeOk = rootProbe.success,
+            attributionProbeOk = attributionProbe.success,
+            messengerTransportOk = messengerTransportProbe.success,
+            castServiceOk = castServiceProbe.success,
+            summary = summary,
+            ts = System.currentTimeMillis() / 1_000L
+        )
     }
 
     private fun fallbackAfterShizukuAction(action: PendingShizukuAction) {
@@ -505,7 +559,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     openScreenDimmingSettingsDirect()
                 }
             }
-            PendingShizukuAction.Sms -> Unit
+            PendingShizukuAction.Sms,
+            PendingShizukuAction.MiLinkProbe -> Unit
         }
     }
 
@@ -514,7 +569,18 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         refreshNotificationAccess()
         if (AndroidShizukuSupport.hasPermission()) {
             runPendingShizukuAction()
+            runMiLinkRootProbeIfReady(reason)
         }
+    }
+
+    private fun runMiLinkRootProbeIfReady(reason: String) {
+        val state = AndroidShizukuSupport.currentState()
+        if (state.uid != 0 || miLinkRootProbeAttempted) {
+            return
+        }
+        miLinkRootProbeAttempted = true
+        EdgeLinkLog.info("xiaomi.milink.root_probe_start reason=$reason")
+        runShizukuAction(PendingShizukuAction.MiLinkProbe)
     }
 
     fun refreshNotificationAccess() {
@@ -531,7 +597,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 shizukuSupported = shizukuState.supported,
                 shizukuPermissionGranted = shizukuState.permissionGranted,
                 shizukuPermissionRequestBlocked = shizukuState.permissionRequestBlocked,
-                shizukuUid = shizukuState.uid
+                shizukuUid = shizukuState.uid,
+                xiaomiMiLinkProbeStatus = if (shizukuState.uid == 0) {
+                    it.xiaomiMiLinkProbeStatus ?: "尚未測試"
+                } else {
+                    null
+                }
             )
         }
     }
@@ -960,6 +1031,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
                 session = nextSession
+                sendLatestMiLinkStatus(nextSession, identity)
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
                 stateFlow.update {
@@ -1109,6 +1181,21 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             EdgeLinkLog.info("sms.android.pending_sent count=$sent reason=$reason")
         }.onFailure { error ->
             EdgeLinkLog.error("sms.android.pending_send_failed reason=$reason", error)
+        }
+    }
+
+    private suspend fun sendLatestMiLinkStatus(activeSession: SecureSessionClient, identity: LocalIdentity) {
+        val status = latestMiLinkStatus ?: return
+        val sourcedStatus = status.copy(sourceDeviceId = identity.deviceId)
+        latestMiLinkStatus = sourcedStatus
+        runCatching {
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_STATUS, sourcedStatus))
+            EdgeLinkLog.info(
+                "milink.android.status_sent available=${sourcedStatus.available} " +
+                    "messenger=${sourcedStatus.messengerTransportOk} cast=${sourcedStatus.castServiceOk}"
+            )
+        }.onFailure { error ->
+            EdgeLinkLog.error("milink.android.status_send_failed", error)
         }
     }
 

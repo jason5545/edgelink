@@ -160,4 +160,5 @@ private class EdgeLinkActivityActions(
     override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
     override fun onRequestShizukuPermission() = delegate.onRequestShizukuPermission()
+    override fun onProbeMiLink() = delegate.onProbeMiLink()
 }

@@ -5,17 +5,20 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 2
+private const val SHIZUKU_USER_SERVICE_VERSION = 3
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -38,6 +41,7 @@ data class ShizukuOperationResult(
 
 object AndroidShizukuSupport {
     val requestCode: Int = SHIZUKU_REQUEST_CODE
+    private val serviceMutex = Mutex()
 
     fun currentState(): AndroidShizukuState {
         val available = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
@@ -159,6 +163,75 @@ object AndroidShizukuSupport {
             listOf(result).toOperationResult("secure_setting:$key")
         }
 
+    suspend fun probeMiLinkRoot(context: Context): ShizukuOperationResult {
+        val state = currentState()
+        if (state.uid != 0) {
+            return ShizukuOperationResult(
+                success = false,
+                message = "MiLink probe requires Shizuku root uid; current=${state.uid}"
+            )
+        }
+
+        return withService(context) { service ->
+            val results = miLinkProbeCommands.map { probe ->
+                val result = service.runCommandResult(probe.command)
+                EdgeLinkLog.info(
+                    "xiaomi.milink.root_probe name=${probe.name} exit=${result.exitCode} " +
+                        "stdout=${result.stdout.forSingleLineLog()} stderr=${result.stderr.forSingleLineLog()}"
+                )
+                probe to result
+            }
+            val successCount = results.count { (_, result) -> result.isProbeSuccess }
+            val summary = results.joinToString { (probe, result) ->
+                "${probe.name}=${if (result.isProbeSuccess) "ok" else "exit:${result.exitCode}"}"
+            }
+            ShizukuOperationResult(
+                success = successCount > 0,
+                message = "MiLink root probe $successCount/${results.size}: $summary"
+            )
+        }
+    }
+
+    suspend fun probeMiLinkAttributionSpoof(context: Context): ShizukuOperationResult =
+        withContext(Dispatchers.IO) {
+            val probes = listOf(
+                "edgelink_direct" to context.applicationContext,
+                "com.milink.service" to context.createPackageContext(
+                    "com.milink.service",
+                    Context.CONTEXT_IGNORE_SECURITY
+                ),
+                "com.xiaomi.mi_connect_service" to context.createPackageContext(
+                    "com.xiaomi.mi_connect_service",
+                    Context.CONTEXT_IGNORE_SECURITY
+                ),
+                "com.xiaomi.mirror" to context.createPackageContext(
+                    "com.xiaomi.mirror",
+                    Context.CONTEXT_IGNORE_SECURITY
+                )
+            )
+            val results = probes.map { (name, probeContext) ->
+                val result = runCatching {
+                    val bundle = probeContext.contentResolver.call(
+                        Uri.parse("content://provider.milink.mi.com/messenger"),
+                        "content://provider.milink.mi.com/messenger#ping",
+                        null,
+                        null
+                    )
+                    "ok package=${probeContext.packageName} op=${probeContext.opPackageName} result=$bundle"
+                }.getOrElse { error ->
+                    "failed package=${probeContext.packageName} op=${probeContext.opPackageName} " +
+                        "error=${error.javaClass.simpleName}:${error.message}"
+                }
+                EdgeLinkLog.info("xiaomi.milink.attribution_probe name=$name $result")
+                name to result
+            }
+            val successCount = results.count { (_, result) -> result.startsWith("ok ") }
+            ShizukuOperationResult(
+                success = successCount > 0,
+                message = "MiLink attribution probe $successCount/${results.size}"
+            )
+        }
+
     suspend fun writeScreenShareSetting(
         context: Context,
         namespace: String,
@@ -188,12 +261,14 @@ object AndroidShizukuSupport {
         context: Context,
         block: (IEdgeLinkShizukuService) -> T
     ): T = withContext(Dispatchers.IO) {
-        ensureUsable()
-        val boundService = bindService(context.applicationContext)
-        try {
-            block(boundService.service)
-        } finally {
-            boundService.close()
+        serviceMutex.withLock {
+            ensureUsable()
+            val boundService = bindService(context.applicationContext)
+            try {
+                block(boundService.service)
+            } finally {
+                boundService.close()
+            }
         }
     }
 
@@ -288,6 +363,70 @@ object AndroidShizukuSupport {
         }
         return ShizukuOperationResult(success = success, message = message)
     }
+
+    private data class MiLinkProbeCommand(
+        val name: String,
+        val command: Array<String>
+    )
+
+    private val miLinkProbeCommands = listOf(
+        MiLinkProbeCommand(
+            name = "circulate_common",
+            command = arrayOf(
+                "content",
+                "call",
+                "--uri",
+                "content://com.milink.service.circulate",
+                "--method",
+                "check_permission",
+                "--arg",
+                "common"
+            )
+        ),
+        MiLinkProbeCommand(
+            name = "circulate_miplay_url",
+            command = arrayOf(
+                "content",
+                "call",
+                "--uri",
+                "content://com.milink.service.circulate",
+                "--method",
+                "check_permission",
+                "--arg",
+                "miplay_url_circulate"
+            )
+        ),
+        MiLinkProbeCommand(
+            name = "runtime_ping",
+            command = arrayOf(
+                "content",
+                "call",
+                "--uri",
+                "content://provider.milink.mi.com/messenger",
+                "--method",
+                "content://provider.milink.mi.com/messenger#ping"
+            )
+        ),
+        MiLinkProbeCommand(
+            name = "public_casting",
+            command = arrayOf(
+                "content",
+                "call",
+                "--uri",
+                "content://com.milink.service.public",
+                "--method",
+                "milink_casting"
+            )
+        )
+    )
+
+    private fun String.forSingleLineLog(): String =
+        replace(Regex("\\s+"), " ")
+            .trim()
+            .take(512)
+
+    private val ShizukuCommandResult.isProbeSuccess: Boolean
+        get() = success && stderr.isBlank()
 
     private class BoundShizukuService(
         private val args: Shizuku.UserServiceArgs,

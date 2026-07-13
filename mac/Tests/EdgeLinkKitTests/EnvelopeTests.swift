@@ -121,4 +121,29 @@ final class EnvelopeTests: XCTestCase {
         let legacy = try decoder.decode(Envelope<NotificationPostBody>.self, from: legacyData)
         XCTAssertNil(legacy.b.iconPngBase64)
     }
+
+    func testMiLinkStatusBodyRoundTrips() throws {
+        let data = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.miLinkStatus,
+                b: MiLinkStatusBody(
+                    sourceDeviceId: "android-1",
+                    available: true,
+                    rootProbeOk: true,
+                    attributionProbeOk: false,
+                    messengerTransportOk: true,
+                    castServiceOk: true,
+                    summary: "MiLink messenger transport ok",
+                    ts: 1_783_510_256
+                )
+            )
+        )
+
+        let decoded = try decoder.decode(Envelope<MiLinkStatusBody>.self, from: data)
+        XCTAssertEqual(decoded.t, "milink.status")
+        XCTAssertEqual(decoded.b.route, "edgelink.secure")
+        XCTAssertFalse(decoded.b.officialDiscoveryRequired)
+        XCTAssertTrue(decoded.b.messengerTransportOk)
+        XCTAssertTrue(decoded.b.castServiceOk)
+    }
 }

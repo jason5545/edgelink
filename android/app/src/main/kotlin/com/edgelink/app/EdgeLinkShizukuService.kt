@@ -87,6 +87,9 @@ internal object EdgeLinkShizukuCommandPolicy {
         if (isAllowedAppOpsCommand(command)) {
             return true
         }
+        if (isAllowedMiLinkProbeCommand(command)) {
+            return true
+        }
         return isAllowedPermissionGrantCommand(command)
     }
 
@@ -134,6 +137,27 @@ internal object EdgeLinkShizukuCommandPolicy {
             command[3] in allowedRuntimePermissions
     }
 
+    private fun isAllowedMiLinkProbeCommand(command: Array<String>): Boolean {
+        if (command.size != 6 && command.size != 8) {
+            return false
+        }
+        if (command[0] != "content" ||
+            command[1] != "call" ||
+            command[2] != "--uri" ||
+            command[4] != "--method"
+        ) {
+            return false
+        }
+        if (command.size == 8 && command[6] != "--arg") {
+            return false
+        }
+
+        val uri = command[3]
+        val method = command[5]
+        val arg = command.getOrNull(7)
+        return arg in allowedMiLinkContentCalls[uri to method].orEmpty()
+    }
+
     private fun isScreenShareProtectionKey(namespace: String, key: String): Boolean =
         namespace == "global" && key == GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS ||
             namespace == "secure" && key == XIAOMI_SCREEN_PROJECT_PRIVATE_ON
@@ -159,5 +183,16 @@ internal object EdgeLinkShizukuCommandPolicy {
             "android.permission.READ_SMS",
             "android.permission.RECEIVE_SMS",
             "android.permission.SEND_SMS"
+    )
+    private val allowedMiLinkContentCalls = mapOf(
+        ("content://com.milink.service.circulate" to "check_permission") to setOf(
+            "common",
+            "miplay_url_circulate"
+        ),
+        (
+            "content://provider.milink.mi.com/messenger" to
+                "content://provider.milink.mi.com/messenger#ping"
+        ) to setOf(null),
+        ("content://com.milink.service.public" to "milink_casting") to setOf(null)
     )
 }

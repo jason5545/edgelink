@@ -52,4 +52,64 @@ class EdgeLinkShizukuCommandPolicyTest {
             )
         )
     }
+
+    @Test
+    fun allowsExactMiLinkProbeCommands() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "content",
+                    "call",
+                    "--uri",
+                    "content://com.milink.service.circulate",
+                    "--method",
+                    "check_permission",
+                    "--arg",
+                    "common"
+                )
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "content",
+                    "call",
+                    "--uri",
+                    "content://provider.milink.mi.com/messenger",
+                    "--method",
+                    "content://provider.milink.mi.com/messenger#ping"
+                )
+            )
+        )
+    }
+
+    @Test
+    fun rejectsUnexpectedMiLinkProbeShape() {
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "content",
+                    "call",
+                    "--uri",
+                    "content://com.milink.service.circulate",
+                    "--method",
+                    "check_permission",
+                    "--arg",
+                    "private_session"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "content",
+                    "call",
+                    "--uri",
+                    "content://com.xiaomi.continuity.universal.clipboard",
+                    "--method",
+                    "query"
+                )
+            )
+        )
+    }
 }

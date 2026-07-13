@@ -205,7 +205,8 @@ data class EdgeLinkUiState(
     val shizukuSupported: Boolean = false,
     val shizukuPermissionGranted: Boolean = false,
     val shizukuPermissionRequestBlocked: Boolean = false,
-    val shizukuUid: Int? = null
+    val shizukuUid: Int? = null,
+    val xiaomiMiLinkProbeStatus: String? = null
 )
 
 interface EdgeLinkActions {
@@ -227,6 +228,7 @@ interface EdgeLinkActions {
     fun onOpenScreenDimmingSettings()
     fun onOpenSmsSettings()
     fun onRequestShizukuPermission()
+    fun onProbeMiLink()
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -247,6 +249,7 @@ interface EdgeLinkActions {
         override fun onOpenScreenDimmingSettings() = Unit
         override fun onOpenSmsSettings() = Unit
         override fun onRequestShizukuPermission() = Unit
+        override fun onProbeMiLink() = Unit
     }
 }
 
@@ -754,11 +757,28 @@ private fun MonoTextRow(label: String, value: String) {
 private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
     ListItem(
         headlineContent = { Text("狀態") },
-        supportingContent = { Text(shizukuStatusText(state)) },
+        supportingContent = {
+            Column {
+                Text(shizukuStatusText(state))
+                state.xiaomiMiLinkProbeStatus?.let { status ->
+                    Text(
+                        text = "MiLink：$status",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        },
         trailingContent = {
             if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionGranted && !state.shizukuPermissionRequestBlocked) {
                 FilledTonalButton(onClick = actions::onRequestShizukuPermission) {
                     Text("授權")
+                }
+            } else if (state.shizukuUid == 0) {
+                FilledTonalButton(onClick = actions::onProbeMiLink) {
+                    Text("測 MiLink")
                 }
             }
         },
