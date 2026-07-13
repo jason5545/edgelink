@@ -318,6 +318,15 @@ The first bridge envelope is `milink.status`. It reports:
 The Android controller keeps the latest status and re-sends it when the secure session connects, so
 an early automatic probe is not lost if it runs before the Mac relay session is ready.
 
+The next bridge envelope is `milink.frame`. Once the EdgeLink secure session is established,
+Android registers a MiLink messenger client, polls it, and forwards non-empty `dat` frames to Mac as
+base64 payloads with `clientNo`, `sequence`, `bytes`, and `hasNext` metadata. The bridge unregisters
+the MiLink client when the EdgeLink session ends.
+
+This is intentionally receive-only for now. The provider `send(dat)` helper exists in code, but
+EdgeLink should not emit unknown MiLink packets until a real packet source and command contract are
+identified.
+
 ### Public Cast Service Binder
 
 MiLink also exposes a public cast SDK binder:

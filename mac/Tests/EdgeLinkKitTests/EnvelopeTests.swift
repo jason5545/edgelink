@@ -146,4 +146,29 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertTrue(decoded.b.messengerTransportOk)
         XCTAssertTrue(decoded.b.castServiceOk)
     }
+
+    func testMiLinkFrameBodyRoundTrips() throws {
+        let data = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.miLinkFrame,
+                b: MiLinkFrameBody(
+                    sourceDeviceId: "android-1",
+                    clientNo: "10340-30593",
+                    sequence: 7,
+                    dataBase64: "AQIDBA==",
+                    bytes: 4,
+                    hasNext: false,
+                    ts: 1_783_510_257
+                )
+            )
+        )
+
+        let decoded = try decoder.decode(Envelope<MiLinkFrameBody>.self, from: data)
+        XCTAssertEqual(decoded.t, "milink.frame")
+        XCTAssertEqual(decoded.b.route, "edgelink.secure")
+        XCTAssertEqual(decoded.b.clientNo, "10340-30593")
+        XCTAssertEqual(decoded.b.sequence, 7)
+        XCTAssertEqual(decoded.b.dataBase64, "AQIDBA==")
+        XCTAssertEqual(decoded.b.bytes, 4)
+    }
 }

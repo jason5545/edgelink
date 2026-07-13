@@ -38,6 +38,7 @@ public enum EnvelopeType {
     public static let smsSend = "sms.send"
     public static let smsSendResult = "sms.send.result"
     public static let miLinkStatus = "milink.status"
+    public static let miLinkFrame = "milink.frame"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -312,6 +313,40 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         self.messengerTransportOk = messengerTransportOk
         self.castServiceOk = castServiceOk
         self.summary = summary
+        self.ts = ts
+    }
+}
+
+public struct MiLinkFrameBody: Codable, Equatable, Sendable {
+    public let sourceDeviceId: String?
+    public let sourcePlatform: String
+    public let route: String
+    public let clientNo: String
+    public let sequence: Int
+    public let dataBase64: String
+    public let bytes: Int
+    public let hasNext: Bool
+    public let ts: Int64
+
+    public init(
+        sourceDeviceId: String? = nil,
+        sourcePlatform: String = "android",
+        route: String = "edgelink.secure",
+        clientNo: String,
+        sequence: Int,
+        dataBase64: String,
+        bytes: Int,
+        hasNext: Bool,
+        ts: Int64
+    ) {
+        self.sourceDeviceId = sourceDeviceId
+        self.sourcePlatform = sourcePlatform
+        self.route = route
+        self.clientNo = clientNo
+        self.sequence = sequence
+        self.dataBase64 = dataBase64
+        self.bytes = bytes
+        self.hasNext = hasNext
         self.ts = ts
     }
 }

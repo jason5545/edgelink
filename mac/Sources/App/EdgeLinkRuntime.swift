@@ -27,6 +27,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
+    @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
     @Published private(set) var isPhoneScreenViewerVisible = false
     @Published private(set) var hasViewedPhoneScreen = false
@@ -520,6 +521,11 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.handleMiLinkStatus(status)
                         }
+                    },
+                    onMiLinkFrame: { [weak self] frame in
+                        Task { @MainActor in
+                            self?.handleMiLinkFrame(frame)
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -753,6 +759,14 @@ final class EdgeLinkRuntime: ObservableObject {
                 "officialDiscoveryRequired=\(status.officialDiscoveryRequired) " +
                 "root=\(status.rootProbeOk) attribution=\(status.attributionProbeOk) " +
                 "messenger=\(status.messengerTransportOk) cast=\(status.castServiceOk)"
+        )
+    }
+
+    private func handleMiLinkFrame(_ frame: MiLinkFrameBody) {
+        latestMiLinkFrame = frame
+        DiagnosticsLog.info(
+            "milink.mac.frame_received clientNo=\(frame.clientNo) seq=\(frame.sequence) " +
+                "bytes=\(frame.bytes) hasNext=\(frame.hasNext) route=\(frame.route)"
         )
     }
 

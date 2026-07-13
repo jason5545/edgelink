@@ -146,4 +146,28 @@ class EnvelopeTest {
         assertEquals(true, decoded.b.messengerTransportOk)
         assertEquals(true, decoded.b.castServiceOk)
     }
+
+    @Test
+    fun miLinkFrameBodyRoundTrips() {
+        val bytes = EnvelopeCodec.encode(
+            EnvelopeTypes.MILINK_FRAME,
+            MiLinkFrameBody(
+                sourceDeviceId = "android-1",
+                clientNo = "10340-30593",
+                sequence = 7,
+                dataBase64 = "AQIDBA==",
+                bytes = 4,
+                hasNext = false,
+                ts = 1_783_510_257
+            )
+        )
+
+        val decoded = EnvelopeCodec.decode<MiLinkFrameBody>(bytes)
+        assertEquals(EnvelopeTypes.MILINK_FRAME, decoded.t)
+        assertEquals("edgelink.secure", decoded.b.route)
+        assertEquals("10340-30593", decoded.b.clientNo)
+        assertEquals(7, decoded.b.sequence)
+        assertEquals("AQIDBA==", decoded.b.dataBase64)
+        assertEquals(4, decoded.b.bytes)
+    }
 }

@@ -23,6 +23,7 @@ import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
+import com.edgelink.core.MiLinkFrameBody
 import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
 import com.edgelink.core.NotificationRemoveBody
@@ -1046,12 +1047,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     val pingJob = launch { pingLoop(nextSession) }
                     val clipboardJob = launch { clipboardLoop(nextSession) }
                     val smsPendingJob = launch { drainPendingSms(nextSession, identity, reason = "connected") }
+                    val miLinkMessengerJob = launch { miLinkMessengerLoop(nextSession, identity) }
                     try {
                         nextSession.receiveLoop(dispatcher::handle)
                     } finally {
                         pingJob.cancelAndJoin()
                         clipboardJob.cancelAndJoin()
                         smsPendingJob.cancelAndJoin()
+                        miLinkMessengerJob.cancelAndJoin()
                     }
                 }
                 throw IllegalStateException("Relay receive loop ended.")
@@ -1196,6 +1199,67 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             )
         }.onFailure { error ->
             EdgeLinkLog.error("milink.android.status_send_failed", error)
+        }
+    }
+
+    private suspend fun miLinkMessengerLoop(activeSession: SecureSessionClient, identity: LocalIdentity) {
+        var registeredClient: AndroidMiLinkMessengerTransport.RegisteredClient? = null
+        var sequence = 0
+        try {
+            val registerResult = AndroidMiLinkMessengerTransport.register(appContext)
+            val client = registerResult.client ?: run {
+                EdgeLinkLog.warn("milink.android.messenger_bridge_register_failed code=${registerResult.code}")
+                return
+            }
+            registeredClient = client
+            EdgeLinkLog.info("milink.android.messenger_bridge_registered clientNo=${client.clientNo}")
+
+            while (coroutineContext.isActive) {
+                val poll = AndroidMiLinkMessengerTransport.poll(appContext, client.clientNo)
+                if (poll.code != 0) {
+                    EdgeLinkLog.warn(
+                        "milink.android.messenger_bridge_poll_failed clientNo=${client.clientNo} code=${poll.code}"
+                    )
+                    delay(1_000)
+                    continue
+                }
+
+                val data = poll.data
+                if (data != null && data.isNotEmpty()) {
+                    sequence += 1
+                    val body = MiLinkFrameBody(
+                        sourceDeviceId = identity.deviceId,
+                        clientNo = client.clientNo,
+                        sequence = sequence,
+                        dataBase64 = Base64.getEncoder().encodeToString(data),
+                        bytes = data.size,
+                        hasNext = poll.hasNext,
+                        ts = System.currentTimeMillis() / 1_000L
+                    )
+                    activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_FRAME, body))
+                    EdgeLinkLog.info(
+                        "milink.android.frame_sent clientNo=${client.clientNo} " +
+                            "seq=$sequence bytes=${data.size} hasNext=${poll.hasNext}"
+                    )
+                }
+
+                if (!poll.hasNext) {
+                    delay(1_000)
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            EdgeLinkLog.error("milink.android.messenger_bridge_failed", error)
+        } finally {
+            registeredClient?.let { client ->
+                val result = runCatching {
+                    AndroidMiLinkMessengerTransport.unregister(appContext, client)
+                }.getOrElse { error ->
+                    "${error.javaClass.simpleName}:${error.message}"
+                }
+                EdgeLinkLog.info("milink.android.messenger_bridge_unregistered clientNo=${client.clientNo} result=$result")
+            }
         }
     }
 

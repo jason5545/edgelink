@@ -19,7 +19,7 @@ object AndroidMiLinkMessengerTransport {
         withContext(Dispatchers.IO) {
             val resolver = context.applicationContext.contentResolver
             val steps = mutableListOf<String>()
-            var registeredUri: Uri? = null
+            var registeredClient: RegisteredClient? = null
             var success = false
 
             try {
@@ -27,28 +27,23 @@ object AndroidMiLinkMessengerTransport {
                 val pingCode = ping.codeOrNull()
                 steps += "ping=${pingCode.asStep()}"
 
-                registeredUri = resolver.insert(registerUri, ContentValues())
-                val registerCode = registeredUri?.getQueryParameter("code")?.toIntOrNull()
-                val clientNo = registeredUri?.lastPathSegment
-                val registered = registerCode == 0 && !clientNo.isNullOrBlank()
-                steps += if (registered) {
-                    "register=ok:$clientNo"
+                val registerResult = register(context)
+                registeredClient = registerResult.client
+                steps += if (registerResult.client != null) {
+                    "register=ok:${registerResult.client.clientNo}"
                 } else {
-                    "register=${registerCode.asStep()}"
+                    "register=${registerResult.code.asStep()}"
                 }
 
-                if (registered) {
-                    val poll = resolver.call(providerUri, pollMethod, clientNo, null)
-                    val pollCode = poll.codeOrNull()
-                    val data = poll?.getByteArray("dat")
-                    val hasNext = poll?.getBoolean("has_next", false) == true
-                    steps += "poll=${pollCode.asStep()}:bytes=${data?.size ?: 0}:hasNext=$hasNext"
-                    success = pingCode == 0 && pollCode == 0
+                if (registeredClient != null) {
+                    val poll = poll(context, registeredClient.clientNo)
+                    steps += "poll=${poll.code.asStep()}:bytes=${poll.data?.size ?: 0}:hasNext=${poll.hasNext}"
+                    success = pingCode == 0 && poll.code == 0
                 }
             } catch (error: Throwable) {
                 steps += "error=${error.javaClass.simpleName}:${error.message}"
             } finally {
-                val unregisterResult = unregister(resolver, registeredUri)
+                val unregisterResult = registeredClient?.let { unregister(context, it) }
                 if (unregisterResult != null) {
                     steps += "unregister=$unregisterResult"
                 }
@@ -58,6 +53,30 @@ object AndroidMiLinkMessengerTransport {
                 steps.joinToString()
             EdgeLinkLog.info("xiaomi.milink.messenger_transport_probe $message")
             ShizukuOperationResult(success = success, message = message)
+        }
+
+    suspend fun register(context: Context): RegisterResult =
+        withContext(Dispatchers.IO) {
+            val registeredUri = context.applicationContext.contentResolver.insert(registerUri, ContentValues())
+            val code = registeredUri?.getQueryParameter("code")?.toIntOrNull()
+            val clientNo = registeredUri?.lastPathSegment
+            val client = if (code == 0 && !clientNo.isNullOrBlank()) {
+                RegisteredClient(clientNo = clientNo, registeredUri = registeredUri)
+            } else {
+                null
+            }
+            RegisterResult(code = code, client = client)
+        }
+
+    suspend fun poll(context: Context, clientNo: String): PollResult =
+        withContext(Dispatchers.IO) {
+            val poll = context.applicationContext.contentResolver.call(providerUri, pollMethod, clientNo, null)
+            PollResult(
+                code = poll.codeOrNull(),
+                data = poll?.getByteArray("dat"),
+                hasNext = poll?.getBoolean("has_next", false) == true,
+                start = poll?.getLong("start", -1L)?.takeIf { it >= 0L }
+            )
         }
 
     suspend fun send(context: Context, clientNo: String, data: ByteArray): Int =
@@ -71,9 +90,14 @@ object AndroidMiLinkMessengerTransport {
                 ?: -1001
         }
 
-    private fun unregister(resolver: ContentResolver, registeredUri: Uri?): String? =
+    suspend fun unregister(context: Context, client: RegisteredClient): String? =
+        withContext(Dispatchers.IO) {
+            unregister(context.applicationContext.contentResolver, client.registeredUri)
+        }
+
+    private fun unregister(resolver: ContentResolver, registeredUri: Uri): String? =
         registeredUri
-            ?.buildUpon()
+            .buildUpon()
             ?.clearQuery()
             ?.build()
             ?.let { uri ->
@@ -90,4 +114,21 @@ object AndroidMiLinkMessengerTransport {
             null -> "null"
             else -> "code:$this"
         }
+
+    data class RegisteredClient(
+        val clientNo: String,
+        val registeredUri: Uri
+    )
+
+    data class RegisterResult(
+        val code: Int?,
+        val client: RegisteredClient?
+    )
+
+    data class PollResult(
+        val code: Int?,
+        val data: ByteArray?,
+        val hasNext: Boolean,
+        val start: Long?
+    )
 }
