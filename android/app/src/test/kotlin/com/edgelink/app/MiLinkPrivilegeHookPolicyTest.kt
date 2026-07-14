@@ -194,6 +194,35 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteAudioStartMode() {
+        assertEquals("source", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("1"))
+        assertEquals("source", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("true"))
+        assertEquals("source", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("source"))
+        assertEquals("source", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("START_SOURCE"))
+        assertEquals("sink", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("sink"))
+        assertEquals("sink", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("audio_sink"))
+        assertEquals("both", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("both"))
+        assertEquals("both", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("source+sink"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("0"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode("false"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteAudioSinkArg() {
+        assertEquals(1, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg(" 1 "))
+        assertEquals(7102, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg("7102"))
+        assertEquals(65535, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg("65535"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg("0"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg("65536"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg("abc"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg(null))
+    }
+
+    @Test
     fun parsesMirrorFakeRemoteEndpointHost() {
         assertEquals("10.0.0.42", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(" 10.0.0.42 "))
         assertEquals("fd00::1234", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost("fd00::1234"))

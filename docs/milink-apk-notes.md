@@ -402,6 +402,11 @@ spoof:
   fields immediately before the default guard blocks `onCallStart`/source/sink startup. This records
   the candidate opposite id, shared-key length, string fields, int fields, and byte-array sizes
   without exposing key material or starting native audio.
+- `debug.edgelink.mirror_fake_remote_audio_start=source|sink|both` keeps the default `onCallStart`
+  guard in place but, immediately before blocking `onCallStart`, invokes the narrower native audio
+  startup method(s). `true`/`probe` map to `source`. `sink`/`both` require
+  `debug.edgelink.mirror_fake_remote_audio_sink_arg=<1..65535>` because the official sink entry
+  point takes the peer source port from event `31`.
 - `debug.edgelink.mirror_fake_remote_peer_ip=<host>` and
   `debug.edgelink.mirror_fake_remote_peer_port=<1..65535>` override the fake peer `KeyData` endpoint
   that Mirror stores as `n/p`. This is the candidate Mac-side PHONERELAY endpoint.
@@ -439,13 +444,92 @@ This has been verified with Mac `10.5.50.154` and phone route source `10.5.51.78
 then blocked `onCallStart` reports
 `strings=12:m:10.5.51.78,13:n:10.5.50.154 ints=11:l:320,14:o:7102,15:p:7102,16:q:0 byteArrays=17:r:32b`.
 
-On macOS, `MiLinkPhoneRelayProbe` is a disabled-by-default listener for the next protocol step. It
-binds TCP and UDP on port `7102`, logs incoming connections/datagrams to diagnostics with byte count,
-fingerprint, and a short hex prefix, and deliberately does not decode or reply to packets yet. Local
-verification has confirmed both protocols are bound by `EdgeLinkMac` and produce
-`phonerelay.mac.probe_packet` logs for TCP/UDP loopback packets. The next Android-side probe should
-start Mirror audio source/sink through a narrower control point than full `onCallStart`, so we can
-observe the native PHONERELAY handshake without also toggling call active/microphone mute state.
+The decompiled official `Mirror.apk` confirms the Pad call path. `MirrorCallService.onCallStart`
+sets call/mic state, sends the official call event, then starts `MirrorControlAudioSource` through
+`X()`. For Pad-like opposite terminals, the phone source later reports its port through display-info
+event `110001`; Mirror forwards that as SimpleEvent `31`, and the peer's handler calls `W(port)` to
+start `MirrorControlAudioSink`. In other words, spoofing a Mi Pad is the correct door for phone-call
+relay, but the spoof still has to provide enough session state, endpoint fields, and RTSP/audio
+handshake for the native source/sink to stay up.
+
+The first PHONERELAY wire checks are now verified:
+
+- With `audio_start=both`, endpoint override, and `audio_sink_arg=7102`, Mirror invokes both
+  `startAudioSource` and `startAudioSink` while the broader `onCallStart` side effects remain
+  blocked by the guard.
+- The phone sink connects to the Mac-side peer endpoint `10.5.50.154:7102`.
+- A Mac TCP client can connect to the phone source at `10.5.51.78:7102` and receive the official
+  `OPTIONS * RTSP/1.0` greeting with `Require: org.wfa.wfd1.0`.
+- A temporary Mac RTSP listener on port `7103` receives the phone sink connection, and the phone
+  replies `RTSP/1.0 200 OK` to Mac's `OPTIONS`, then sends its own `OPTIONS`.
+
+On macOS, `MiLinkPhoneRelayProbe` is a disabled-by-default listener for this protocol step. It binds
+TCP and UDP on port `7102`, logs incoming connections/datagrams to diagnostics with byte count,
+fingerprint, and a short hex prefix, parses RTSP messages, answers RTSP requests with `200 OK`, and
+sends the minimal `OPTIONS` greeting needed by Xiaomi's PHONERELAY stack. For source-side probing,
+hidden defaults can also make the Mac connect out to the phone source:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbeEnabled -bool true
+defaults write com.edgelink.mac phoneRelayProbePeerHost 10.5.51.78
+defaults write com.edgelink.mac phoneRelayProbePeerPort -int 7102
+```
+
+The Mac probe now also binds RTP/RTCP UDP ports `19000-19003`. The verified phone-source path is:
+
+- Phone sends WFD RTSP `OPTIONS`/`GET_PARAMETER`/`SET_PARAMETER`.
+- Mac replies with minimal audio-only WFD parameters and advertises `client_port=19000-19001`.
+- Phone accepts Mac `SETUP`/`PLAY` and reports `server_port=26466-26467`.
+- Mac receives RTP on UDP `19000` with static RTP payload type `33`.
+- RTP payload is MPEG-TS. Each RTP packet payload is a multiple of 188-byte TS packets.
+- TS demux identifies one AAC stream at PID `0x1100`.
+
+For an immediate Mac playback path, the probe starts `/opt/homebrew/bin/ffplay` when RTP/MPEG-TS
+arrives and writes the TS payload to `ffplay` stdin. This can be disabled with:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbePlaybackEnabled -bool false
+```
+
+For debugging, the probe also writes a bounded TS capture to `/private/tmp/edgelink-phonerelay.ts`
+up to 8 MB by default. This can be disabled with:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbeCaptureEnabled -bool false
+```
+
+The fake `offhook` dry-run starts the official source encoder but does not provide a real telephony
+audio source. In that state, `ffprobe` sees the AAC PID but cannot infer sample rate/channel, and
+`ffmpeg` cannot decode useful PCM. A real call is still required to verify whether the phone-source
+AAC frames become fully decodable. The downlink phone-to-Mac transport is now wired through RTSP,
+RTP, MPEG-TS, and `ffplay`; the uplink Mac-microphone-to-phone path still requires making the phone
+sink finish `SETUP` and sending AAC/MPEG-TS RTP from the Mac source port.
+
+For the least-bad real-call standby setup, do not leave the dry-run in `offhook`. Set:
+
+```text
+adb -s <device> shell su -c setprop debug.edgelink.mirror_fake_remote_call_state idle
+```
+
+Then restart Mirror and trigger the debug receiver explicitly:
+
+```text
+adb -s <device> shell am force-stop com.xiaomi.mirror
+adb -s <device> shell am broadcast \
+  -n com.edgelink.app/com.edgelink.app.DebugMiLinkProbeReceiver \
+  -a com.edgelink.app.DEBUG_PROBE_MILINK \
+  --receiver-foreground
+```
+
+In this state, the verified log is `mirror fake pad key data status keyReady=true sharedKeyBytes=32`
+followed by `mirror fake pad call state probe invoking state=0 usingPad=true audioAllowed=false`,
+with no `ffplay` process yet. The Mac remains bound on `7102` and `19000-19001`; the first real
+off-hook call should trigger the source/sink start and create the `ffplay` process from real call
+frames instead of from fake silent frames.
+
+This keeps the experiment bounded: the Mac observes and participates in the RTSP/RTP setup, while
+real call control still stays on EdgeLink's own `phone.action` path until the full bidirectional
+audio stream contract is identified.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 

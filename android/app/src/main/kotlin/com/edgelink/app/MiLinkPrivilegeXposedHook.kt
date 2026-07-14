@@ -31,6 +31,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY = "debug.edgelink.mirror_fake_remote_call_state"
     const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_params"
+    const val MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_start"
+    const val MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_sink_arg"
     const val MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_ip"
     const val MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_port"
     const val MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_local_ip"
@@ -118,6 +120,17 @@ internal object MiLinkPrivilegeHookPolicy {
             else -> false
         }
 
+    fun mirrorFakeRemoteAudioStartMode(rawValue: String?): String? =
+        when (rawValue?.trim()?.lowercase()) {
+            "1", "true", "yes", "on", "probe", "source", "audio_source", "start_source" -> "source"
+            "sink", "audio_sink", "start_sink" -> "sink"
+            "both", "all", "source_sink", "source+sink" -> "both"
+            else -> null
+        }
+
+    fun mirrorFakeRemoteAudioSinkArg(rawValue: String?): Int? =
+        rawValue?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
+
     fun mirrorFakeRemoteEndpointHost(rawValue: String?): String? =
         rawValue
             ?.trim()
@@ -155,6 +168,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorAttachUptimeMs: Long = 0L
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
     private var lastFakeMirrorAudioParamsUptimeMs: Long = 0L
+    private var lastFakeMirrorAudioStartProbeUptimeMs: Long = 0L
+    private var fakeMirrorAudioStartProbeDepth: Int = 0
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
@@ -537,6 +552,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun blockFakeMirrorAudioStart(label: String, param: XC_MethodHook.MethodHookParam) {
         if (shouldBlockFakeMirrorAudioStart()) {
             maybeLogFakeMirrorAudioParams(label, param.thisObject)
+            maybeProbeFakeMirrorAudioStart(label, param.thisObject)
             param.setResult(null)
             log("blocked mirror fake pad audio path label=$label")
         }
@@ -545,7 +561,62 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun shouldBlockFakeMirrorAudioStart(): Boolean =
         currentFakeMirrorRemoteMode() == "pad" &&
             currentFakeMirrorRemoteKeyEnabled() &&
+            fakeMirrorAudioStartProbeDepth == 0 &&
             !currentFakeMirrorRemoteAudioAllowed()
+
+    private fun maybeProbeFakeMirrorAudioStart(label: String, relayService: Any?) {
+        if (label != "onCallStart" || relayService == null) {
+            return
+        }
+        val startMode = currentFakeMirrorRemoteAudioStartMode() ?: return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFakeMirrorAudioStartProbeUptimeMs < FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS) {
+            return
+        }
+        lastFakeMirrorAudioStartProbeUptimeMs = now
+        val relayClass = relayService.javaClass
+        log(
+            "mirror fake pad audio start probe invoking " +
+                "mode=$startMode " +
+                "sinkArg=${currentFakeMirrorRemoteAudioSinkArg()?.toString() ?: "<unset>"}"
+        )
+        fakeMirrorAudioStartProbeDepth += 1
+        try {
+            if (startMode == "source" || startMode == "both") {
+                invokeMirrorAudioStartMethod(relayClass, relayService, "X", null, "startAudioSource")
+            }
+            if (startMode == "sink" || startMode == "both") {
+                val sinkArg = currentFakeMirrorRemoteAudioSinkArg()
+                if (sinkArg == null) {
+                    log("mirror fake pad audio start probe skipped startAudioSink missing sinkArg")
+                } else {
+                    invokeMirrorAudioStartMethod(relayClass, relayService, "W", sinkArg, "startAudioSink")
+                }
+            }
+        } finally {
+            fakeMirrorAudioStartProbeDepth -= 1
+        }
+    }
+
+    private fun invokeMirrorAudioStartMethod(
+        relayClass: Class<*>,
+        relayService: Any,
+        methodName: String,
+        intArg: Int?,
+        label: String
+    ) {
+        runCatching {
+            if (intArg == null) {
+                relayClass.getMethod(methodName).invoke(relayService)
+            } else {
+                relayClass.getMethod(methodName, Integer.TYPE).invoke(relayService, intArg)
+            }
+            log("mirror fake pad audio start probe invoked label=$label")
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("mirror fake pad audio start probe failed label=$label error=${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
 
     private fun maybeLogFakeMirrorAudioParams(label: String, relayService: Any?) {
         if (!currentFakeMirrorRemoteAudioParamsEnabled() || relayService == null) {
@@ -970,6 +1041,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemoteAudioStartMode(): String? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioStartMode(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteAudioSinkArg(): Int? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioSinkArg(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY)
+        )
+
     private fun currentFakeMirrorRemotePeerIp(): String? =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY)
@@ -1017,6 +1098,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_AUDIO_PARAMS_THROTTLE_MS = 1_000L
+        private const val FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
         private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102

@@ -348,8 +348,19 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func startPhoneRelayProbe() {
         do {
-            try phoneRelayProbe.start(port: Self.phoneRelayProbePort)
-            phoneRelayProbeStatus = "PHONERELAY TCP/UDP \(Self.phoneRelayProbePort)"
+            let peerHost = UserDefaults.standard.string(forKey: Self.phoneRelayProbePeerHostDefaultsKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let peerPort = Self.phoneRelayProbePeerPort()
+            try phoneRelayProbe.start(
+                port: Self.phoneRelayProbePort,
+                peerHost: peerHost?.isEmpty == false ? peerHost : nil,
+                peerPort: peerPort
+            )
+            if let peerHost, !peerHost.isEmpty {
+                phoneRelayProbeStatus = "PHONERELAY TCP/UDP \(Self.phoneRelayProbePort) -> \(peerHost):\(peerPort)"
+            } else {
+                phoneRelayProbeStatus = "PHONERELAY TCP/UDP \(Self.phoneRelayProbePort)"
+            }
         } catch {
             phoneRelayProbeEnabled = false
             UserDefaults.standard.set(false, forKey: Self.phoneRelayProbeDefaultsKey)
@@ -972,7 +983,17 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
     private static let phoneRelayProbeDefaultsKey = "phoneRelayProbeEnabled"
+    private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
+    private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102
+
+    private static func phoneRelayProbePeerPort() -> UInt16 {
+        let value = UserDefaults.standard.integer(forKey: phoneRelayProbePeerPortDefaultsKey)
+        guard value > 0, value <= Int(UInt16.max) else {
+            return phoneRelayProbePort
+        }
+        return UInt16(value)
+    }
 }
 
 enum EdgeLinkConfig {
