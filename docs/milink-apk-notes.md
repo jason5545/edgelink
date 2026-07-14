@@ -367,7 +367,8 @@ relay active settings. There are two related but different paths:
 - Phone-to-pad call flow: `MirrorCallService.F(g0)` registers the opposite terminal when the phone
   sees an `AndroidPad`/PC/iPad/iPhone terminal. The audio implementation uses
   `MirrorControlAudioSource`/`MirrorControlAudioSink` with `PHONERELAY` and device direction
-  `PHONE -> PAD` / `PAD -> PHONE`.
+  `PHONE -> PAD` / `PAD -> PHONE`; this matches the official APK behavior where a phone call can
+  flow to a Pad.
 - Car media relay SDK flow: `startMediaRelay(deviceId)` is implemented in
   `SynergySdkHelperForCar` and requires a supported `AndroidPadCar`/Lyra remote whose
   `is_media_relay` is not `-1`.
@@ -397,6 +398,10 @@ spoof:
 - `debug.edgelink.mirror_fake_remote_call_state=offhook|ringing|idle` dry-runs
   `MirrorCallService.s(state)` after the fake key becomes ready. This is for gate tracing; with the
   default audio guard, off-hook should reach `onCallStart` and then be blocked before audio startup.
+- `debug.edgelink.mirror_fake_remote_audio_params=true` logs the `MirrorCallService` audio startup
+  fields immediately before the default guard blocks `onCallStart`/source/sink startup. This records
+  the candidate opposite id, shared-key length, string fields, int fields, and byte-array sizes
+  without exposing key material or starting native audio.
 - `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
   car media-relay path.
 - Any empty or unknown value leaves the spoof fully off.
@@ -412,6 +417,13 @@ blocked by the default guard. With
 `debug.edgelink.mirror_fake_remote_using_pad=true` and
 `debug.edgelink.mirror_fake_remote_call_state=offhook`, the call-state dry-run logs
 `state=2 usingPad=true audioAllowed=false` and then blocks `onCallStart` before audio startup.
+The next probe adds `debug.edgelink.mirror_fake_remote_audio_params=true` so the blocked
+`onCallStart` also reports the official PHONERELAY endpoint fields it was about to use. Verified on
+device with the debug trigger `com.edgelink.app.DEBUG_PROBE_MILINK`: the fake Pad attaches, the
+official ECDH parser reports `keyReady=true sharedKeyBytes=32`, and blocked `onCallStart` logs
+`strings=12:m:<blank>,13:n:127.0.0.1 ints=11:l:320,14:o:7102,15:p:7102,16:q:0 byteArrays=17:r:32b`.
+From `MirrorCallService.G`, those fields map to local p2p IP `m`, peer p2p IP `n`, audio frame size
+`l`, local port `o`, peer port `p`, and shared key `r`.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 
@@ -425,9 +437,10 @@ The Shizuku command policy only allows these exact phone commands:
 - `input keyevent KEYCODE_HEADSETHOOK`
 - `input keyevent KEYCODE_ENDCALL`
 
-This gives EdgeLink a working call-control surface while the Mirror remote-device/session problem
-is still unsolved. Full call audio relay through the official pad flow still depends on providing a
-real or emulated Mirror terminal session/message channel, not only a device-list entry.
+This gives EdgeLink a working call-control surface while the Mirror remote-device/session/audio
+endpoint is still being filled in. Full call audio relay should stay on the official pad flow, but
+the fake Pad has to provide enough real session/message-channel state for the PHONERELAY native
+audio source/sink to connect.
 
 ### Public Cast Service Binder
 

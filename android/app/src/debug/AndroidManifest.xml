@@ -8,5 +8,12 @@
         <action android:name="com.edgelink.app.DEBUG_INJECT_SMS" />
       </intent-filter>
     </receiver>
+    <receiver
+      android:name=".DebugMiLinkProbeReceiver"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="com.edgelink.app.DEBUG_PROBE_MILINK" />
+      </intent-filter>
+    </receiver>
   </application>
 </manifest>

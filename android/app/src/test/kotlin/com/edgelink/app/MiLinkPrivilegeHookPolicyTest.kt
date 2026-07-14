@@ -181,6 +181,19 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteAudioParamsProbeFlag() {
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("1"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("true"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("params"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("PROBE"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("0"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled("false"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled(""))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioParamsEnabled(null))
+    }
+
+    @Test
     fun filtersFakeMirrorRemoteByQuery() {
         assertTrue(
             MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
