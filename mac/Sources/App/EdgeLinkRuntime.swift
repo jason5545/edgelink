@@ -27,6 +27,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
+    @Published private(set) var lastDialedPhoneNumber: String
     @Published private(set) var phoneMicrophoneRelayEnabled = false
     @Published private(set) var phoneRelayProbeEnabled = false
     @Published private(set) var phoneRelayProbeStatus = ""
@@ -72,6 +73,7 @@ final class EdgeLinkRuntime: ObservableObject {
         verificationCodeSystemBridgeEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeSystemBridgeDefaultsKey) as? Bool ?? true
         verificationCodeAutoCopyEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeAutoCopyDefaultsKey) as? Bool ?? true
         phoneRelayProbeEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayProbeDefaultsKey) as? Bool ?? false
+        lastDialedPhoneNumber = UserDefaults.standard.string(forKey: Self.lastDialedPhoneNumberDefaultsKey) ?? ""
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -299,7 +301,12 @@ final class EdgeLinkRuntime: ObservableObject {
             phoneCallStatus = "請填電話號碼"
             return
         }
+        rememberDialedPhoneNumber(number)
         sendPhoneAction(action: "dial", number: number)
+    }
+
+    func redialLastPhoneNumber() {
+        dialPhone(number: lastDialedPhoneNumber)
     }
 
     func answerPhoneCall() {
@@ -308,6 +315,14 @@ final class EdgeLinkRuntime: ObservableObject {
 
     func hangUpPhoneCall() {
         sendPhoneAction(action: "hangup")
+    }
+
+    private func rememberDialedPhoneNumber(_ number: String) {
+        guard lastDialedPhoneNumber != number else {
+            return
+        }
+        lastDialedPhoneNumber = number
+        UserDefaults.standard.set(number, forKey: Self.lastDialedPhoneNumberDefaultsKey)
     }
 
     func setPhoneMicrophoneRelayEnabled(_ enabled: Bool) {
@@ -982,6 +997,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"
     private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
+    private static let lastDialedPhoneNumberDefaultsKey = "lastDialedPhoneNumber"
     private static let phoneRelayProbeDefaultsKey = "phoneRelayProbeEnabled"
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"

@@ -475,7 +475,9 @@ defaults write com.edgelink.mac phoneRelayProbePeerHost 10.5.51.78
 defaults write com.edgelink.mac phoneRelayProbePeerPort -int 7102
 ```
 
-The Mac probe now also binds RTP/RTCP UDP ports `19000-19003`. The verified phone-source path is:
+The Mac probe now also binds the downlink RTP/RTCP UDP ports `19000-19001` and the source-side
+RTCP port `19003`. Port `19002` is reserved for the Mac source RTP sender and is only bound while
+that sender is active. The verified phone-source path is:
 
 - Phone sends WFD RTSP `OPTIONS`/`GET_PARAMETER`/`SET_PARAMETER`.
 - Mac replies with minimal audio-only WFD parameters and advertises `client_port=19000-19001`.
@@ -502,8 +504,27 @@ The fake `offhook` dry-run starts the official source encoder but does not provi
 audio source. In that state, `ffprobe` sees the AAC PID but cannot infer sample rate/channel, and
 `ffmpeg` cannot decode useful PCM. A real call is still required to verify whether the phone-source
 AAC frames become fully decodable. The downlink phone-to-Mac transport is now wired through RTSP,
-RTP, MPEG-TS, and `ffplay`; the uplink Mac-microphone-to-phone path still requires making the phone
-sink finish `SETUP` and sending AAC/MPEG-TS RTP from the Mac source port.
+RTP, MPEG-TS, and `ffplay`.
+
+For the uplink phone-sink path, Mac now advertises `wfd_presentation_URL` with the Mac's reachable
+IPv4 address instead of `localhost`, because the phone has to connect back to that RTSP URL. If the
+automatic interface pick is wrong, override it with:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbeSourceHost <mac-ip>
+```
+
+When the phone sink sends `SETUP`, the Mac records the sink `client_port` from the `Transport`
+header and replies with `server_port=19002-19003`. On `PLAY`, the Mac can start an experimental
+silent AAC/MPEG-TS RTP source from local UDP `19002` to the phone sink port. This is intentionally
+off by default while real-call behavior is still being verified:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbeSourceRTPEnabled -bool true
+```
+
+Leave this disabled for normal call-control testing. With it disabled, the phone mic remains the
+real phone mic path and the Mac only answers the RTSP negotiation.
 
 For the least-bad real-call standby setup, do not leave the dry-run in `offhook`. Set:
 
@@ -547,6 +568,11 @@ This gives EdgeLink a working call-control surface while the Mirror remote-devic
 endpoint is still being filled in. Full call audio relay should stay on the official pad flow, but
 the fake Pad has to provide enough real session/message-channel state for the PHONERELAY native
 audio source/sink to connect.
+
+The first repeat-call failure was a Mac UI routing issue, not a Telecom rejection. After the
+successful outgoing call, later clicks sent `action=answer`, which maps to `KEYCODE_HEADSETHOOK`,
+so InCallUI was never asked to dial again. The menu bar UI now keeps the last dialed number, exposes
+a separate `重撥` action that sends `dial`, and labels the headset-hook path as `接聽來電`.
 
 ### Public Cast Service Binder
 

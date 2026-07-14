@@ -236,13 +236,22 @@ private struct PhoneControlPanel: View {
                     Label("撥號", systemImage: "phone.arrow.up.right")
                 }
                 .disabled(!runtime.isConnected || trimmedPhoneNumber.isEmpty)
+
+                Button {
+                    runtime.redialLastPhoneNumber()
+                    phoneNumber = runtime.lastDialedPhoneNumber
+                } label: {
+                    Label("重撥", systemImage: "phone.arrow.up.right.circle")
+                }
+                .disabled(!runtime.isConnected || runtime.lastDialedPhoneNumber.isEmpty)
+                .help("重撥上一個由 EdgeLink 撥出的號碼")
             }
 
             HStack(spacing: 8) {
                 Button {
                     runtime.answerPhoneCall()
                 } label: {
-                    Label("接聽", systemImage: "phone")
+                    Label("接聽來電", systemImage: "phone")
                 }
                 .disabled(!runtime.isConnected)
 
@@ -281,6 +290,11 @@ private struct PhoneControlPanel: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+            }
+        }
+        .onAppear {
+            if phoneNumber.isEmpty {
+                phoneNumber = runtime.lastDialedPhoneNumber
             }
         }
     }

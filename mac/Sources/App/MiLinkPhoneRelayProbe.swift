@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Network
 
 final class MiLinkPhoneRelayProbe {
@@ -24,11 +25,20 @@ final class MiLinkPhoneRelayProbe {
     private var peerSourceConnectionID: UUID?
     private var peerSourceRetryWorkItem: DispatchWorkItem?
     private var peerSourceRetryAttempt = 0
+    private var sourceRTPConnection: NWConnection?
+    private var sourceRTPConnectionID: UUID?
+    private var sourceRTPProcess: Process?
+    private var sourceRTPOutput: FileHandle?
+    private var sourceRTPDevNull: FileHandle?
+    private var sourceRTPBuffer = Data()
+    private var sourceRTPSequenceNumber: UInt16 = 0
+    private var sourceRTPTimestamp: UInt32 = 0
+    private var sourceRTPPacketsSent = 0
     private var port: UInt16 = 7102
     private let sinkRTPPort: UInt16 = 19_000
     private let sourceRTPPort: UInt16 = 19_002
     private var rtpProbePorts: [UInt16] {
-        [sinkRTPPort, sinkRTPPort + 1, sourceRTPPort, sourceRTPPort + 1]
+        [sinkRTPPort, sinkRTPPort + 1, sourceRTPPort + 1]
     }
 
     func start(port: UInt16 = 7102, peerHost: String? = nil, peerPort: UInt16 = 7102) throws {
@@ -105,6 +115,7 @@ final class MiLinkPhoneRelayProbe {
         rtpPacketCounts.removeAll()
         stopMPEGTSPlayer(reason: "probe_stop")
         stopMPEGTSFileCapture(reason: "probe_stop")
+        stopSourceRTP(reason: "probe_stop")
         if hadActiveProbe {
             DiagnosticsLog.info("phonerelay.mac.probe_stop port=\(activePort)")
             onStatusChanged?("")
@@ -230,6 +241,7 @@ final class MiLinkPhoneRelayProbe {
             if isPeerSourceConnection {
                 markPeerSourceDisconnected(id: id, reason: "state_failed")
             }
+            stopSourceRTPIfOwned(by: id, reason: "connection_failed")
             connections[id] = nil
             tcpStates[id] = nil
             udpConnectionPorts[id] = nil
@@ -238,6 +250,7 @@ final class MiLinkPhoneRelayProbe {
             if isPeerSourceConnection {
                 markPeerSourceDisconnected(id: id, reason: "state_cancelled")
             }
+            stopSourceRTPIfOwned(by: id, reason: "connection_cancelled")
             connections[id] = nil
             tcpStates[id] = nil
             udpConnectionPorts[id] = nil
@@ -260,6 +273,7 @@ final class MiLinkPhoneRelayProbe {
                 if self.tcpStates[id]?.isPeerSourceConnection == true {
                     self.markPeerSourceDisconnected(id: id, reason: "receive_failed")
                 }
+                self.stopSourceRTPIfOwned(by: id, reason: "tcp_receive_failed")
                 connection.cancel()
                 self.connections[id] = nil
                 self.tcpStates[id] = nil
@@ -270,6 +284,7 @@ final class MiLinkPhoneRelayProbe {
                 if self.tcpStates[id]?.isPeerSourceConnection == true {
                     self.markPeerSourceDisconnected(id: id, reason: "receive_complete")
                 }
+                self.stopSourceRTPIfOwned(by: id, reason: "tcp_receive_complete")
                 connection.cancel()
                 self.connections[id] = nil
                 self.tcpStates[id] = nil
@@ -602,6 +617,242 @@ final class MiLinkPhoneRelayProbe {
         return nil
     }
 
+    private func startSourceRTPIfReady(id: UUID, reason: String) {
+        let state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
+        guard !state.isPeerSourceConnection else {
+            return
+        }
+        guard sourceRTPTestEnabled else {
+            DiagnosticsLog.info("phonerelay.mac.source_rtp_disabled id=\(id.uuidString) reason=\(reason)")
+            return
+        }
+        guard let host = state.sourceRemoteHost,
+              let rtpPort = state.sourceRemoteRTPPort else {
+            DiagnosticsLog.warn("phonerelay.mac.source_rtp_missing_destination id=\(id.uuidString) reason=\(reason)")
+            return
+        }
+        if sourceRTPConnectionID == id, sourceRTPProcess?.isRunning == true {
+            return
+        }
+        stopSourceRTP(reason: "restart")
+        guard let remotePort = NWEndpoint.Port(rawValue: rtpPort),
+              let localPort = NWEndpoint.Port(rawValue: sourceRTPPort),
+              let anyIPv4 = IPv4Address("0.0.0.0") else {
+            DiagnosticsLog.warn("phonerelay.mac.source_rtp_invalid_port id=\(id.uuidString) remote=\(host):\(rtpPort)")
+            return
+        }
+
+        let parameters = NWParameters.udp
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(anyIPv4), port: localPort)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: remotePort, using: parameters)
+        sourceRTPConnection = connection
+        sourceRTPConnectionID = id
+        sourceRTPSequenceNumber = 0
+        sourceRTPTimestamp = UInt32.random(in: 0..<UInt32.max)
+        sourceRTPPacketsSent = 0
+        sourceRTPBuffer.removeAll(keepingCapacity: true)
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                DiagnosticsLog.info(
+                    "phonerelay.mac.source_rtp_ready id=\(id.uuidString) localPort=\(self.sourceRTPPort) " +
+                        "remote=\(host):\(rtpPort)"
+                )
+            case .failed(let error):
+                DiagnosticsLog.warn("phonerelay.mac.source_rtp_failed id=\(id.uuidString) error=\(error)")
+            case .cancelled:
+                DiagnosticsLog.info("phonerelay.mac.source_rtp_cancelled id=\(id.uuidString)")
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        startSourceMPEGTSProcess(id: id, reason: reason)
+    }
+
+    private func startSourceMPEGTSProcess(id: UUID, reason: String) {
+        guard let ffmpegURL = ffmpegExecutableURL() else {
+            DiagnosticsLog.warn("phonerelay.mac.source_mpegts_unavailable id=\(id.uuidString) reason=\(reason)")
+            stopSourceRTP(reason: "ffmpeg_unavailable")
+            return
+        }
+        let process = Process()
+        let outputPipe = Pipe()
+        let devNull = FileHandle(forWritingAtPath: "/dev/null")
+        process.executableURL = ffmpegURL
+        process.arguments = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-re",
+            "-f", "lavfi",
+            "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
+            "-ac", "1",
+            "-c:a", "aac",
+            "-profile:a", "aac_low",
+            "-b:a", "64k",
+            "-f", "mpegts",
+            "pipe:1"
+        ]
+        process.standardOutput = outputPipe
+        if let devNull {
+            process.standardError = devNull
+        }
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            self?.queue.async {
+                guard let self, self.sourceRTPProcess === process else {
+                    return
+                }
+                if data.isEmpty {
+                    self.stopSourceRTP(reason: "mpegts_eof")
+                } else {
+                    self.sendSourceMPEGTS(data)
+                }
+            }
+        }
+        process.terminationHandler = { [weak self] terminatedProcess in
+            self?.queue.async {
+                guard self?.sourceRTPProcess === terminatedProcess else {
+                    return
+                }
+                DiagnosticsLog.info("phonerelay.mac.source_mpegts_exit status=\(terminatedProcess.terminationStatus)")
+                self?.stopSourceRTP(reason: "mpegts_exit")
+            }
+        }
+        do {
+            try process.run()
+            sourceRTPProcess = process
+            sourceRTPOutput = outputPipe.fileHandleForReading
+            sourceRTPDevNull = devNull
+            DiagnosticsLog.info("phonerelay.mac.source_mpegts_start path=\(ffmpegURL.path) id=\(id.uuidString) reason=\(reason)")
+        } catch {
+            DiagnosticsLog.warn("phonerelay.mac.source_mpegts_start_failed path=\(ffmpegURL.path) error=\(error)")
+            stopSourceRTP(reason: "mpegts_start_failed")
+        }
+    }
+
+    private func sendSourceMPEGTS(_ data: Data) {
+        sourceRTPBuffer.append(data)
+        while true {
+            guard let syncIndex = sourceRTPBuffer.firstIndex(of: 0x47) else {
+                sourceRTPBuffer.removeAll(keepingCapacity: true)
+                return
+            }
+            if syncIndex != sourceRTPBuffer.startIndex {
+                sourceRTPBuffer.removeSubrange(sourceRTPBuffer.startIndex..<syncIndex)
+            }
+            guard sourceRTPBuffer.count >= 188 else {
+                return
+            }
+            let availablePackets = min(7, sourceRTPBuffer.count / 188)
+            var packetCount = 0
+            while packetCount < availablePackets {
+                let packetStart = sourceRTPBuffer.startIndex.advanced(by: packetCount * 188)
+                guard sourceRTPBuffer[packetStart] == 0x47 else {
+                    break
+                }
+                packetCount += 1
+            }
+            guard packetCount > 0 else {
+                sourceRTPBuffer.removeFirst()
+                continue
+            }
+            let payloadBytes = packetCount * 188
+            let payload = Data(sourceRTPBuffer.prefix(payloadBytes))
+            sourceRTPBuffer.removeSubrange(..<sourceRTPBuffer.index(sourceRTPBuffer.startIndex, offsetBy: payloadBytes))
+            sendSourceRTPPayload(payload)
+        }
+    }
+
+    private func sendSourceRTPPayload(_ payload: Data) {
+        guard let connection = sourceRTPConnection else {
+            return
+        }
+        var packet = Data(capacity: 12 + payload.count)
+        packet.append(0x80)
+        packet.append(0x80 | 33)
+        appendUInt16BE(sourceRTPSequenceNumber, to: &packet)
+        appendUInt32BE(sourceRTPTimestamp, to: &packet)
+        appendUInt32BE(Self.sourceRTPSSRC, to: &packet)
+        packet.append(payload)
+        let sequenceNumber = sourceRTPSequenceNumber
+        let timestamp = sourceRTPTimestamp
+        sourceRTPSequenceNumber &+= 1
+        sourceRTPTimestamp &+= 1_800
+        sourceRTPPacketsSent += 1
+        let count = sourceRTPPacketsSent
+        connection.send(content: packet, completion: .contentProcessed { error in
+            if let error {
+                DiagnosticsLog.warn("phonerelay.mac.source_rtp_send_failed seq=\(sequenceNumber) error=\(error)")
+            }
+        })
+        if count <= 12 || count % 50 == 0 {
+            DiagnosticsLog.info(
+                "phonerelay.mac.source_rtp_packet count=\(count) seq=\(sequenceNumber) ts=\(timestamp) " +
+                    "bytes=\(packet.count) payloadBytes=\(payload.count) fp=\(DiagnosticsLog.fingerprint(packet)) " +
+                    "payloadPrefix=\(hexPrefix(payload))"
+            )
+        }
+    }
+
+    private func stopSourceRTPIfOwned(by id: UUID, reason: String) {
+        guard sourceRTPConnectionID == id else {
+            return
+        }
+        stopSourceRTP(reason: reason)
+    }
+
+    private func stopSourceRTP(reason: String) {
+        let hadSource = sourceRTPConnection != nil || sourceRTPProcess != nil
+        sourceRTPOutput?.readabilityHandler = nil
+        sourceRTPOutput = nil
+        sourceRTPDevNull = nil
+        let process = sourceRTPProcess
+        sourceRTPProcess = nil
+        if let process, process.isRunning {
+            process.terminate()
+        }
+        sourceRTPConnection?.cancel()
+        sourceRTPConnection = nil
+        sourceRTPConnectionID = nil
+        sourceRTPBuffer.removeAll(keepingCapacity: true)
+        sourceRTPSequenceNumber = 0
+        sourceRTPTimestamp = 0
+        sourceRTPPacketsSent = 0
+        if hadSource {
+            DiagnosticsLog.info("phonerelay.mac.source_rtp_stop reason=\(reason)")
+        }
+    }
+
+    private var sourceRTPTestEnabled: Bool {
+        UserDefaults.standard.object(forKey: "phoneRelayProbeSourceRTPEnabled") as? Bool ?? false
+    }
+
+    private func ffmpegExecutableURL() -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg"
+        ]
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return URL(fileURLWithPath: candidate)
+        }
+        return nil
+    }
+
+    private func appendUInt16BE(_ value: UInt16, to data: inout Data) {
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8(value & 0xff))
+    }
+
+    private func appendUInt32BE(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 24) & 0xff))
+        data.append(UInt8((value >> 16) & 0xff))
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8(value & 0xff))
+    }
+
     private func processTCPData(connection: NWConnection, id: UUID, data: Data) {
         var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
         state.buffer.append(data)
@@ -700,6 +951,7 @@ final class MiLinkPhoneRelayProbe {
                 sendSinkSETUPIfNeeded(connection: connection, id: id, reason: "trigger_setup")
             }
         case "SETUP":
+            recordSourceRTPDestination(from: headerText, connection: connection, id: id)
             let session = ensureSessionID(for: id)
             sendRTSPResponse(
                 connection: connection,
@@ -711,8 +963,15 @@ final class MiLinkPhoneRelayProbe {
                     ("Transport", setupResponseTransport(requestHeaderText: headerText))
                 ]
             )
-        case "PLAY", "PAUSE", "TEARDOWN":
+        case "PLAY":
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
+            startSourceRTPIfReady(id: id, reason: "play_request")
+        case "PAUSE":
+            sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
+            stopSourceRTPIfOwned(by: id, reason: "pause_request")
+        case "TEARDOWN":
+            sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
+            stopSourceRTPIfOwned(by: id, reason: "teardown_request")
         default:
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
         }
@@ -796,9 +1055,10 @@ final class MiLinkPhoneRelayProbe {
             return
         }
         state.sentSourceSETParameter = true
+        let presentationURL = "rtsp://\(sourcePresentationHost())/wfd1.0/streamid=0"
         tcpStates[id] = state
         let body = """
-        wfd_presentation_URL: rtsp://localhost/wfd1.0/streamid=0 none\r
+        wfd_presentation_URL: \(presentationURL) none\r
         wfd_platform_type: 2\r
         wfd_trigger_method: SETUP\r
         """
@@ -986,6 +1246,103 @@ final class MiLinkPhoneRelayProbe {
         DiagnosticsLog.info("phonerelay.mac.rtsp_presentation_url id=\(id.uuidString) url=\(sanitizeRTSPLogValue(url))")
     }
 
+    private func recordSourceRTPDestination(from headerText: String, connection: NWConnection, id: UUID) {
+        var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
+        guard !state.isPeerSourceConnection else {
+            return
+        }
+        guard let transport = rtspHeader("Transport", in: headerText),
+              let clientPort = rtspTransportValue("client_port", in: transport),
+              let rtpPort = firstRTPPort(in: clientPort),
+              let host = endpointHostString(connection.endpoint) else {
+            DiagnosticsLog.warn(
+                "phonerelay.mac.source_rtp_destination_missing id=\(id.uuidString) " +
+                    "transport=\(sanitizeRTSPLogValue(rtspHeader("Transport", in: headerText) ?? "none"))"
+            )
+            return
+        }
+        state.sourceRemoteHost = host
+        state.sourceRemoteRTPPort = rtpPort
+        tcpStates[id] = state
+        DiagnosticsLog.info(
+            "phonerelay.mac.source_rtp_destination id=\(id.uuidString) remote=\(host):\(rtpPort) " +
+                "transport=\(sanitizeRTSPLogValue(transport))"
+        )
+    }
+
+    private func firstRTPPort(in value: String) -> UInt16? {
+        let first = value
+            .split(separator: "-")
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first,
+              let port = UInt16(first),
+              port > 0 else {
+            return nil
+        }
+        return port
+    }
+
+    private func endpointHostString(_ endpoint: NWEndpoint) -> String? {
+        guard case .hostPort(let host, _) = endpoint else {
+            return nil
+        }
+        return String(describing: host)
+    }
+
+    private func sourcePresentationHost() -> String {
+        if let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            return override
+        }
+        return Self.preferredLocalIPv4Address() ?? "localhost"
+    }
+
+    private static func preferredLocalIPv4Address() -> String? {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let firstAddress = addresses else {
+            return nil
+        }
+        defer { freeifaddrs(addresses) }
+
+        var fallback: String?
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+            let interface = current.pointee
+            let flags = Int32(interface.ifa_flags)
+            guard flags & IFF_UP != 0,
+                  flags & IFF_LOOPBACK == 0,
+                  let addr = interface.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET) else {
+                continue
+            }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                addr,
+                socklen_t(addr.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            guard result == 0 else {
+                continue
+            }
+            let address = String(cString: host)
+            let interfaceName = String(cString: interface.ifa_name)
+            if interfaceName == "en0" {
+                return address
+            }
+            if fallback == nil {
+                fallback = address
+            }
+        }
+        return fallback
+    }
+
     private func ensureSessionID(for id: UUID) -> String {
         var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
         if let sessionID = state.sessionID, !sessionID.isEmpty {
@@ -1056,6 +1413,7 @@ final class MiLinkPhoneRelayProbe {
     }()
 
     private static let peerSourceRetryDelayMilliseconds = 2_000
+    private static let sourceRTPSSRC: UInt32 = 0xed9e_1101
     private static let mpegTSCaptureLimitBytes = 8 * 1024 * 1024
     private static let mpegTSCapturePath = "/private/tmp/edgelink-phonerelay.ts"
 }
@@ -1067,6 +1425,8 @@ private struct TCPConnectionState {
     var pendingRequests: [String: String] = [:]
     var presentationURL: String?
     var sessionID: String?
+    var sourceRemoteHost: String?
+    var sourceRemoteRTPPort: UInt16?
     var sentSourceGETParameter = false
     var sentSourceSETParameter = false
     var sentSinkSETUP = false
