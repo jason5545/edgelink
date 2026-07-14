@@ -26,6 +26,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var latestVerificationCode: VerificationCodeCandidate?
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
+    @Published private(set) var phoneCallStatus = ""
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -56,6 +57,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var lastSecurePongAt = Date.distantPast
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
+    private var pendingPhoneActions: [String: PhoneActionBody] = [:]
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -271,6 +273,52 @@ final class EdgeLinkRuntime: ObservableObject {
                     self.smsSendStatus = "SMS 送出失敗"
                 }
                 DiagnosticsLog.error("sms.mac.send_request_failed requestId=\(requestId)", error)
+            }
+        }
+    }
+
+    func dialPhone(number rawNumber: String) {
+        let number = rawNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !number.isEmpty else {
+            phoneCallStatus = "請填電話號碼"
+            return
+        }
+        sendPhoneAction(action: "dial", number: number)
+    }
+
+    func answerPhoneCall() {
+        sendPhoneAction(action: "answer")
+    }
+
+    func hangUpPhoneCall() {
+        sendPhoneAction(action: "hangup")
+    }
+
+    private func sendPhoneAction(action: String, number: String? = nil) {
+        guard let session = currentSession, isConnected else {
+            phoneCallStatus = "電話目前不可用"
+            DiagnosticsLog.warn("phone.mac.action_ignored action=\(action) not_connected")
+            return
+        }
+
+        let requestId = UUID().uuidString
+        let body = PhoneActionBody(requestId: requestId, action: action, number: number)
+        pendingPhoneActions[requestId] = body
+        phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
+
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.phoneAction, b: body))
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info(
+                    "phone.mac.action_requested requestId=\(requestId) action=\(action) numberFp=\(number.map(Self.fingerprint) ?? "none")"
+                )
+            } catch {
+                await MainActor.run {
+                    self.pendingPhoneActions.removeValue(forKey: requestId)
+                    self.phoneCallStatus = "\(Self.localizedPhoneAction(action))失敗"
+                }
+                DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(requestId) action=\(action)", error)
             }
         }
     }
@@ -517,6 +565,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handleSmsSendResult(result)
                         }
                     },
+                    onPhoneActionResult: { [weak self] result in
+                        Task { @MainActor in
+                            self?.handlePhoneActionResult(result)
+                        }
+                    },
                     onMiLinkStatus: { [weak self] status in
                         Task { @MainActor in
                             self?.handleMiLinkStatus(status)
@@ -758,7 +811,12 @@ final class EdgeLinkRuntime: ObservableObject {
             "milink.mac.status available=\(status.available) route=\(status.route) " +
                 "officialDiscoveryRequired=\(status.officialDiscoveryRequired) " +
                 "root=\(status.rootProbeOk) attribution=\(status.attributionProbeOk) " +
-                "messenger=\(status.messengerTransportOk) cast=\(status.castServiceOk)"
+                "messenger=\(status.messengerTransportOk) cast=\(status.castServiceOk) " +
+                "phoneContinuity=\(status.phoneContinuityOk ?? false) " +
+                "callRelay=\(status.phoneCallRelayServiceOk ?? false) " +
+                "mediaRelayCallback=\(status.phoneMediaRelayCallbackOk ?? false) " +
+                "phoneDevices=\(status.phoneRemoteDeviceCount ?? 0) " +
+                "mediaRelayCandidates=\(status.phoneMediaRelayCandidateCount ?? 0)"
         )
     }
 
@@ -812,6 +870,33 @@ final class EdgeLinkRuntime: ObservableObject {
         } else {
             smsSendStatus = "SMS 失敗：\(result.error ?? "未知錯誤")"
             DiagnosticsLog.warn("sms.mac.send_result requestId=\(result.requestId) success=false error=\(result.error ?? "unknown")")
+        }
+    }
+
+    private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
+        pendingPhoneActions.removeValue(forKey: result.requestId)
+        let action = Self.localizedPhoneAction(result.action)
+        if result.success {
+            phoneCallStatus = "\(action)已送出"
+            DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
+        } else {
+            phoneCallStatus = "\(action)失敗：\(result.error ?? "未知錯誤")"
+            DiagnosticsLog.warn(
+                "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=false error=\(result.error ?? "unknown")"
+            )
+        }
+    }
+
+    private static func localizedPhoneAction(_ action: String) -> String {
+        switch action {
+        case "dial":
+            return "撥號"
+        case "answer":
+            return "接聽"
+        case "hangup":
+            return "掛斷"
+        default:
+            return "電話操作"
         }
     }
 

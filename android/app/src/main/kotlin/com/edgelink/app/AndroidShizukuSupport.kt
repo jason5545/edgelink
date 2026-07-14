@@ -18,7 +18,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 3
+private const val SHIZUKU_USER_SERVICE_VERSION = 4
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -256,6 +256,20 @@ object AndroidShizukuSupport {
             }
         )
     }
+
+    suspend fun placePhoneCall(context: Context, telUri: String): ShizukuOperationResult =
+        withService(context) { service ->
+            val result = service.runCommandResult(
+                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", telUri)
+            )
+            listOf(result).toOperationResult("phone:dial")
+        }
+
+    suspend fun pressPhoneKey(context: Context, keyCode: String): ShizukuOperationResult =
+        withService(context) { service ->
+            val result = service.runCommandResult(arrayOf("input", "keyevent", keyCode))
+            listOf(result).toOperationResult("phone:keyevent:$keyCode")
+        }
 
     private suspend fun <T> withService(
         context: Context,

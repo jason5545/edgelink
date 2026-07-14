@@ -36,6 +36,8 @@ object EnvelopeTypes {
     const val SMS_MESSAGE = "sms.message"
     const val SMS_SEND = "sms.send"
     const val SMS_SEND_RESULT = "sms.send.result"
+    const val PHONE_ACTION = "phone.action"
+    const val PHONE_ACTION_RESULT = "phone.action.result"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
 }
@@ -182,6 +184,22 @@ data class SmsSendResultBody(
 )
 
 @Serializable
+data class PhoneActionBody(
+    val requestId: String,
+    val action: String,
+    val number: String? = null
+)
+
+@Serializable
+data class PhoneActionResultBody(
+    val requestId: String,
+    val action: String,
+    val success: Boolean,
+    val error: String? = null,
+    val ts: Long
+)
+
+@Serializable
 data class MiLinkStatusBody(
     val sourceDeviceId: String? = null,
     val sourcePlatform: String = "android",
@@ -192,6 +210,11 @@ data class MiLinkStatusBody(
     val attributionProbeOk: Boolean,
     val messengerTransportOk: Boolean,
     val castServiceOk: Boolean,
+    val phoneContinuityOk: Boolean = false,
+    val phoneCallRelayServiceOk: Boolean = false,
+    val phoneMediaRelayCallbackOk: Boolean = false,
+    val phoneRemoteDeviceCount: Int = 0,
+    val phoneMediaRelayCandidateCount: Int = 0,
     val summary: String,
     val ts: Long
 )

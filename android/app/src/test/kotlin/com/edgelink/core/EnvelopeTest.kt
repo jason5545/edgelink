@@ -95,6 +95,23 @@ class EnvelopeTest {
         val result = EnvelopeCodec.decode<SmsSendResultBody>(resultBytes)
         assertEquals(EnvelopeTypes.SMS_SEND_RESULT, result.t)
         assertEquals(true, result.b.success)
+
+        val phoneActionBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_ACTION,
+            PhoneActionBody(requestId = "call-1", action = "dial", number = "+886912345678")
+        )
+        val phoneAction = EnvelopeCodec.decode<PhoneActionBody>(phoneActionBytes)
+        assertEquals(EnvelopeTypes.PHONE_ACTION, phoneAction.t)
+        assertEquals("dial", phoneAction.b.action)
+        assertEquals("+886912345678", phoneAction.b.number)
+
+        val phoneResultBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_ACTION_RESULT,
+            PhoneActionResultBody(requestId = "call-1", action = "dial", success = true, ts = 1783510255)
+        )
+        val phoneResult = EnvelopeCodec.decode<PhoneActionResultBody>(phoneResultBytes)
+        assertEquals(EnvelopeTypes.PHONE_ACTION_RESULT, phoneResult.t)
+        assertEquals(true, phoneResult.b.success)
     }
 
     @Test
@@ -134,6 +151,11 @@ class EnvelopeTest {
                 attributionProbeOk = false,
                 messengerTransportOk = true,
                 castServiceOk = true,
+                phoneContinuityOk = true,
+                phoneCallRelayServiceOk = true,
+                phoneMediaRelayCallbackOk = false,
+                phoneRemoteDeviceCount = 2,
+                phoneMediaRelayCandidateCount = 1,
                 summary = "MiLink messenger transport ok",
                 ts = 1_783_510_256
             )
@@ -145,6 +167,11 @@ class EnvelopeTest {
         assertEquals(false, decoded.b.officialDiscoveryRequired)
         assertEquals(true, decoded.b.messengerTransportOk)
         assertEquals(true, decoded.b.castServiceOk)
+        assertEquals(true, decoded.b.phoneContinuityOk)
+        assertEquals(true, decoded.b.phoneCallRelayServiceOk)
+        assertEquals(false, decoded.b.phoneMediaRelayCallbackOk)
+        assertEquals(2, decoded.b.phoneRemoteDeviceCount)
+        assertEquals(1, decoded.b.phoneMediaRelayCandidateCount)
     }
 
     @Test

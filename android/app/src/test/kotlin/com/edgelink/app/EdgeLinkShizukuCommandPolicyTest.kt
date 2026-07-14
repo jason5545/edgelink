@@ -112,4 +112,47 @@ class EdgeLinkShizukuCommandPolicyTest {
             )
         )
     }
+
+    @Test
+    fun allowsExactPhoneCommands() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:+886912345678")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("input", "keyevent", "KEYCODE_HEADSETHOOK")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("input", "keyevent", "KEYCODE_ENDCALL")
+            )
+        )
+    }
+
+    @Test
+    fun rejectsUnexpectedPhoneCommands() {
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("am", "start", "-a", "android.intent.action.VIEW", "-d", "tel:+886912345678")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "https://example.com")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:*#06#")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("input", "keyevent", "KEYCODE_POWER")
+            )
+        )
+    }
 }

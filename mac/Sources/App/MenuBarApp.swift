@@ -80,6 +80,11 @@ private struct MenuBarPopover: View {
                     LatestVerificationCodePanel(runtime: runtime)
                 }
 
+                if !runtime.peerDeviceId.isEmpty {
+                    Divider()
+                    PhoneControlPanel(runtime: runtime)
+                }
+
                 if runtime.isPhoneScreenSessionActive {
                     Button {
                         runtime.showPhoneScreen()
@@ -207,6 +212,54 @@ private struct ConnectionActions: View {
                 Label("中斷", systemImage: "xmark.circle")
             }
             .disabled(!runtime.canDisconnect)
+        }
+    }
+}
+
+private struct PhoneControlPanel: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+    @State private var phoneNumber = ""
+
+    private var trimmedPhoneNumber: String {
+        phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField("電話號碼", text: $phoneNumber)
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    runtime.dialPhone(number: trimmedPhoneNumber)
+                } label: {
+                    Label("撥號", systemImage: "phone.arrow.up.right")
+                }
+                .disabled(!runtime.isConnected || trimmedPhoneNumber.isEmpty)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    runtime.answerPhoneCall()
+                } label: {
+                    Label("接聽", systemImage: "phone")
+                }
+                .disabled(!runtime.isConnected)
+
+                Button(role: .destructive) {
+                    runtime.hangUpPhoneCall()
+                } label: {
+                    Label("掛斷", systemImage: "phone.down")
+                }
+                .disabled(!runtime.isConnected)
+            }
+
+            if !runtime.phoneCallStatus.isEmpty {
+                Text(runtime.phoneCallStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
         }
     }
 }

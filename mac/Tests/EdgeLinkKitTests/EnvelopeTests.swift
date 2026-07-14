@@ -93,6 +93,27 @@ final class EnvelopeTests: XCTestCase {
         let result = try decoder.decode(Envelope<SmsSendResultBody>.self, from: resultData)
         XCTAssertEqual(result.t, "sms.send.result")
         XCTAssertTrue(result.b.success)
+
+        let phoneActionData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneAction,
+                b: PhoneActionBody(requestId: "call-1", action: "dial", number: "+886912345678")
+            )
+        )
+        let phoneAction = try decoder.decode(Envelope<PhoneActionBody>.self, from: phoneActionData)
+        XCTAssertEqual(phoneAction.t, "phone.action")
+        XCTAssertEqual(phoneAction.b.action, "dial")
+        XCTAssertEqual(phoneAction.b.number, "+886912345678")
+
+        let phoneResultData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneActionResult,
+                b: PhoneActionResultBody(requestId: "call-1", action: "dial", success: true, ts: 1_783_510_255)
+            )
+        )
+        let phoneResult = try decoder.decode(Envelope<PhoneActionResultBody>.self, from: phoneResultData)
+        XCTAssertEqual(phoneResult.t, "phone.action.result")
+        XCTAssertTrue(phoneResult.b.success)
     }
 
     func testNotificationBodyRoundTripsAndroidAppIcon() throws {
@@ -133,6 +154,11 @@ final class EnvelopeTests: XCTestCase {
                     attributionProbeOk: false,
                     messengerTransportOk: true,
                     castServiceOk: true,
+                    phoneContinuityOk: true,
+                    phoneCallRelayServiceOk: true,
+                    phoneMediaRelayCallbackOk: false,
+                    phoneRemoteDeviceCount: 2,
+                    phoneMediaRelayCandidateCount: 1,
                     summary: "MiLink messenger transport ok",
                     ts: 1_783_510_256
                 )
@@ -145,6 +171,11 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertFalse(decoded.b.officialDiscoveryRequired)
         XCTAssertTrue(decoded.b.messengerTransportOk)
         XCTAssertTrue(decoded.b.castServiceOk)
+        XCTAssertTrue(decoded.b.phoneContinuityOk == true)
+        XCTAssertTrue(decoded.b.phoneCallRelayServiceOk == true)
+        XCTAssertFalse(decoded.b.phoneMediaRelayCallbackOk ?? true)
+        XCTAssertEqual(decoded.b.phoneRemoteDeviceCount, 2)
+        XCTAssertEqual(decoded.b.phoneMediaRelayCandidateCount, 1)
     }
 
     func testMiLinkFrameBodyRoundTrips() throws {

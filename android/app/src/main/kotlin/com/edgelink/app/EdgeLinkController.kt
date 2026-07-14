@@ -31,6 +31,8 @@ import com.edgelink.core.PairConfirmRequest
 import com.edgelink.core.Pairing
 import com.edgelink.core.PairingTypes
 import com.edgelink.core.PairingWire
+import com.edgelink.core.PhoneActionBody
+import com.edgelink.core.PhoneActionResultBody
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
@@ -102,6 +104,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
+    private val phoneCallController = AndroidPhoneCallController(appContext)
     private val screenSession = AndroidScreenSession(
         context = appContext,
         sendPlaintext = ::sendPlaintext,
@@ -126,7 +129,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             shizukuPermissionGranted = initialShizukuState.permissionGranted,
             shizukuPermissionRequestBlocked = initialShizukuState.permissionRequestBlocked,
             shizukuUid = initialShizukuState.uid,
-            xiaomiMiLinkProbeStatus = if (initialShizukuState.uid == 0) "尚未測試" else null
+            xiaomiMiLinkProbeStatus = if (initialShizukuState.canUse) "尚未測試" else null
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
@@ -134,6 +137,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         notificationPresenter = notificationPresenter,
         screenSession = screenSession,
         smsSync = smsSync,
+        phoneCallController = phoneCallController,
         onPong = {
             lastPongElapsedMs = SystemClock.elapsedRealtime()
             stateFlow.update {
@@ -145,6 +149,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onSmsSendResult = { result ->
             sendEnvelope(EnvelopeTypes.SMS_SEND_RESULT, result)
+        },
+        onPhoneActionResult = { result ->
+            sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
         }
     )
 
@@ -524,19 +531,26 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         val attributionProbe = AndroidShizukuSupport.probeMiLinkAttributionSpoof(appContext)
         val messengerTransportProbe = AndroidMiLinkMessengerTransport.probe(appContext)
         val castServiceProbe = AndroidMiLinkCastServiceBridge.probe(appContext)
+        val phoneContinuityProbe = AndroidMiLinkPhoneContinuityBridge.probe(appContext)
         val summary = "${rootProbe.message}; ${attributionProbe.message}; " +
             messengerTransportProbe.message +
-            "; ${castServiceProbe.message}"
+            "; ${castServiceProbe.message}; ${phoneContinuityProbe.message}"
         return MiLinkStatusBody(
             sourceDeviceId = localIdentity?.deviceId,
             available = rootProbe.success ||
                 attributionProbe.success ||
                 messengerTransportProbe.success ||
-                castServiceProbe.success,
+                castServiceProbe.success ||
+                phoneContinuityProbe.success,
             rootProbeOk = rootProbe.success,
             attributionProbeOk = attributionProbe.success,
             messengerTransportOk = messengerTransportProbe.success,
             castServiceOk = castServiceProbe.success,
+            phoneContinuityOk = phoneContinuityProbe.success,
+            phoneCallRelayServiceOk = phoneContinuityProbe.callRelayServiceOk,
+            phoneMediaRelayCallbackOk = phoneContinuityProbe.mediaRelayCallbackOk,
+            phoneRemoteDeviceCount = phoneContinuityProbe.remoteDeviceCount,
+            phoneMediaRelayCandidateCount = phoneContinuityProbe.mediaRelayCandidateCount,
             summary = summary,
             ts = System.currentTimeMillis() / 1_000L
         )
@@ -576,11 +590,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     private fun runMiLinkRootProbeIfReady(reason: String) {
         val state = AndroidShizukuSupport.currentState()
-        if (state.uid != 0 || miLinkRootProbeAttempted) {
+        if (!state.canUse || miLinkRootProbeAttempted) {
+            EdgeLinkLog.info(
+                "xiaomi.milink.root_probe_skip reason=$reason canUse=${state.canUse} " +
+                    "uid=${state.uid} attempted=$miLinkRootProbeAttempted"
+            )
             return
         }
         miLinkRootProbeAttempted = true
-        EdgeLinkLog.info("xiaomi.milink.root_probe_start reason=$reason")
+        EdgeLinkLog.info("xiaomi.milink.root_probe_start reason=$reason uid=${state.uid}")
         runShizukuAction(PendingShizukuAction.MiLinkProbe)
     }
 
@@ -599,7 +617,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 shizukuPermissionGranted = shizukuState.permissionGranted,
                 shizukuPermissionRequestBlocked = shizukuState.permissionRequestBlocked,
                 shizukuUid = shizukuState.uid,
-                xiaomiMiLinkProbeStatus = if (shizukuState.uid == 0) {
+                xiaomiMiLinkProbeStatus = if (shizukuState.canUse) {
                     it.xiaomiMiLinkProbeStatus ?: "尚未測試"
                 } else {
                     null
@@ -1195,7 +1213,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_STATUS, sourcedStatus))
             EdgeLinkLog.info(
                 "milink.android.status_sent available=${sourcedStatus.available} " +
-                    "messenger=${sourcedStatus.messengerTransportOk} cast=${sourcedStatus.castServiceOk}"
+                    "messenger=${sourcedStatus.messengerTransportOk} cast=${sourcedStatus.castServiceOk} " +
+                    "phoneContinuity=${sourcedStatus.phoneContinuityOk} " +
+                    "callRelay=${sourcedStatus.phoneCallRelayServiceOk} " +
+                    "mediaRelayCallback=${sourcedStatus.phoneMediaRelayCallbackOk} " +
+                    "phoneDevices=${sourcedStatus.phoneRemoteDeviceCount} " +
+                    "mediaRelayCandidates=${sourcedStatus.phoneMediaRelayCandidateCount}"
             )
         }.onFailure { error ->
             EdgeLinkLog.error("milink.android.status_send_failed", error)
@@ -1292,8 +1315,10 @@ private class AndroidCommandDispatcher(
     private val notificationPresenter: AndroidNotificationPresenter,
     private val screenSession: AndroidScreenSession,
     private val smsSync: AndroidSmsSync,
+    private val phoneCallController: AndroidPhoneCallController,
     private val onPong: () -> Unit,
-    private val onSmsSendResult: (SmsSendResultBody) -> Unit
+    private val onSmsSendResult: (SmsSendResultBody) -> Unit,
+    private val onPhoneActionResult: (PhoneActionResultBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -1320,6 +1345,11 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.SMS_SEND -> {
                 val envelope = EnvelopeCodec.decode<SmsSendBody>(plaintext)
                 onSmsSendResult(smsSync.sendSms(envelope.b))
+                null
+            }
+            EnvelopeTypes.PHONE_ACTION -> {
+                val envelope = EnvelopeCodec.decode<PhoneActionBody>(plaintext)
+                onPhoneActionResult(phoneCallController.handle(envelope.b))
                 null
             }
             EnvelopeTypes.SCREEN_START -> {

@@ -37,6 +37,8 @@ public enum EnvelopeType {
     public static let smsMessage = "sms.message"
     public static let smsSend = "sms.send"
     public static let smsSendResult = "sms.send.result"
+    public static let phoneAction = "phone.action"
+    public static let phoneActionResult = "phone.action.result"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
 }
@@ -277,6 +279,34 @@ public struct SmsSendResultBody: Codable, Equatable, Sendable {
     }
 }
 
+public struct PhoneActionBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let action: String
+    public let number: String?
+
+    public init(requestId: String, action: String, number: String? = nil) {
+        self.requestId = requestId
+        self.action = action
+        self.number = number
+    }
+}
+
+public struct PhoneActionResultBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let action: String
+    public let success: Bool
+    public let error: String?
+    public let ts: Int64
+
+    public init(requestId: String, action: String, success: Bool, error: String? = nil, ts: Int64) {
+        self.requestId = requestId
+        self.action = action
+        self.success = success
+        self.error = error
+        self.ts = ts
+    }
+}
+
 public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let sourceDeviceId: String?
     public let sourcePlatform: String
@@ -287,6 +317,11 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let attributionProbeOk: Bool
     public let messengerTransportOk: Bool
     public let castServiceOk: Bool
+    public let phoneContinuityOk: Bool?
+    public let phoneCallRelayServiceOk: Bool?
+    public let phoneMediaRelayCallbackOk: Bool?
+    public let phoneRemoteDeviceCount: Int?
+    public let phoneMediaRelayCandidateCount: Int?
     public let summary: String
     public let ts: Int64
 
@@ -300,6 +335,11 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         attributionProbeOk: Bool,
         messengerTransportOk: Bool,
         castServiceOk: Bool,
+        phoneContinuityOk: Bool? = nil,
+        phoneCallRelayServiceOk: Bool? = nil,
+        phoneMediaRelayCallbackOk: Bool? = nil,
+        phoneRemoteDeviceCount: Int? = nil,
+        phoneMediaRelayCandidateCount: Int? = nil,
         summary: String,
         ts: Int64
     ) {
@@ -312,6 +352,11 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         self.attributionProbeOk = attributionProbeOk
         self.messengerTransportOk = messengerTransportOk
         self.castServiceOk = castServiceOk
+        self.phoneContinuityOk = phoneContinuityOk
+        self.phoneCallRelayServiceOk = phoneCallRelayServiceOk
+        self.phoneMediaRelayCallbackOk = phoneMediaRelayCallbackOk
+        self.phoneRemoteDeviceCount = phoneRemoteDeviceCount
+        self.phoneMediaRelayCandidateCount = phoneMediaRelayCandidateCount
         self.summary = summary
         self.ts = ts
     }

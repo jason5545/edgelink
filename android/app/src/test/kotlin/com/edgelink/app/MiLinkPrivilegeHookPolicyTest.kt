@@ -52,6 +52,47 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun hooksXiaomiMirrorMainProcessForPhoneContinuity() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHook(
+                packageName = "com.xiaomi.mirror",
+                processName = "com.xiaomi.mirror"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(
+                packageName = "com.xiaomi.mirror",
+                processName = "com.xiaomi.mirror"
+            )
+        )
+
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(
+                packageName = "com.xiaomi.mirror",
+                processName = "com.xiaomi.mirror:remote"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(
+                packageName = "com.milink.service",
+                processName = "com.milink.service"
+            )
+        )
+    }
+
+    @Test
+    fun allowsOnlyKnownMirrorPhoneProviderMethods() {
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("getCallRelayService"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("queryRemoteDevices"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("startMediaRelay"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("stopMediaRelay"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("openRemoteDeviceMirror"))
+        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("sendRemoteBroadcast"))
+        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod(null))
+    }
+
+    @Test
     fun allowsOnlyEdgeLinkCallerPackage() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedCallerPackage("com.edgelink.app"))
         assertTrue(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(arrayOf("com.edgelink.app")))

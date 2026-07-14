@@ -9,6 +9,7 @@ final class CommandDispatcher {
     private let onStatusPong: @Sendable () -> Void
     private let onSmsMessage: @Sendable (SmsMessageBody) -> Void
     private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
+    private let onPhoneActionResult: @Sendable (PhoneActionResultBody) -> Void
     private let onMiLinkStatus: @Sendable (MiLinkStatusBody) -> Void
     private let onMiLinkFrame: @Sendable (MiLinkFrameBody) -> Void
     private let decoder = JSONDecoder()
@@ -22,6 +23,7 @@ final class CommandDispatcher {
         onStatusPong: @escaping @Sendable () -> Void = {},
         onSmsMessage: @escaping @Sendable (SmsMessageBody) -> Void = { _ in },
         onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in },
+        onPhoneActionResult: @escaping @Sendable (PhoneActionResultBody) -> Void = { _ in },
         onMiLinkStatus: @escaping @Sendable (MiLinkStatusBody) -> Void = { _ in },
         onMiLinkFrame: @escaping @Sendable (MiLinkFrameBody) -> Void = { _ in }
     ) {
@@ -32,6 +34,7 @@ final class CommandDispatcher {
         self.onStatusPong = onStatusPong
         self.onSmsMessage = onSmsMessage
         self.onSmsSendResult = onSmsSendResult
+        self.onPhoneActionResult = onPhoneActionResult
         self.onMiLinkStatus = onMiLinkStatus
         self.onMiLinkFrame = onMiLinkFrame
     }
@@ -75,6 +78,10 @@ final class CommandDispatcher {
         case EnvelopeType.smsSendResult:
             let envelope = try decoder.decode(Envelope<SmsSendResultBody>.self, from: plaintext)
             onSmsSendResult(envelope.b)
+            return nil
+        case EnvelopeType.phoneActionResult:
+            let envelope = try decoder.decode(Envelope<PhoneActionResultBody>.self, from: plaintext)
+            onPhoneActionResult(envelope.b)
             return nil
         case EnvelopeType.miLinkStatus:
             let envelope = try decoder.decode(Envelope<MiLinkStatusBody>.self, from: plaintext)
