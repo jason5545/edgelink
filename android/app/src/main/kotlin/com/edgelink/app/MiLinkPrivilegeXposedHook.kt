@@ -188,6 +188,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
     private var lastFakeMirrorAudioParamsUptimeMs: Long = 0L
     private var lastFakeMirrorAudioStartProbeUptimeMs: Long = 0L
+    private var lastInCallUiRelayAnswerUptimeMs: Long = 0L
     private var fakeMirrorAudioStartProbeDepth: Int = 0
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -325,6 +326,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookInCallUiCallRelayExtras(classLoader)
         hookInCallUiRelayHelpers(classLoader)
         hookInCallUiRelayDeviceList(classLoader)
+        hookInCallUiRelayForeground(classLoader)
     }
 
     private fun hookInCallUiCallRelayExtras(classLoader: ClassLoader) {
@@ -485,6 +487,67 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook InCallUI relay device list: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookInCallUiRelayForeground(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_INCALL_PRESENTER,
+                classLoader,
+                "showInCall",
+                java.lang.Boolean.TYPE,
+                java.lang.Boolean.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        forceInCallUiRelayAnswer(param.thisObject, "showInCall")
+                        param.setResult(null)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI showInCall: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_INCALL_PRESENTER,
+                classLoader,
+                "bringToForeground",
+                java.lang.Boolean.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        forceInCallUiRelayAnswer(param.thisObject, "bringToForeground")
+                        param.setResult(null)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI bringToForeground: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_INCALL_PRESENTER,
+                classLoader,
+                "shouldStartActivity",
+                findTargetClass(classLoader, INCALLUI_CALL),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        forceInCallUiRelayAnswer(param.thisObject, "shouldStartActivity")
+                        param.setResult(null)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI shouldStartActivity: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -1516,6 +1579,29 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         return bundle
     }
 
+    private fun forceInCallUiRelayAnswer(inCallPresenter: Any?, source: String) {
+        if (inCallPresenter == null) {
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastInCallUiRelayAnswerUptimeMs < INCALLUI_RELAY_ANSWER_THROTTLE_MS) {
+            return
+        }
+        lastInCallUiRelayAnswerUptimeMs = now
+        runCatching {
+            val relayPresenterField = inCallPresenter.javaClass.getDeclaredField("mRelayPresenter")
+            relayPresenterField.isAccessible = true
+            val relayPresenter = relayPresenterField.get(inCallPresenter) ?: return@runCatching
+            relayPresenter.javaClass
+                .getMethod("relayAnswer", java.lang.Boolean.TYPE)
+                .invoke(relayPresenter, true)
+            log("InCallUI force relay answer source=$source")
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to force InCallUI relay answer source=$source: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
+
     private fun readSystemProperty(name: String): String =
         runCatching {
             Class.forName("android.os.SystemProperties")
@@ -1542,6 +1628,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
         private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
+        private const val INCALLUI_INCALL_PRESENTER = "com.android.incallui.InCallPresenter"
         private const val INCALLUI_CALL = "com.android.incallui.Call"
         private const val INCALLUI_RELAY_UTILS = "com.android.incallui.relay.RelayUtils"
         private const val INCALLUI_RELAY_PRESENTER = "com.android.incallui.relay.RelayPresenter"
@@ -1561,6 +1648,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_AUDIO_PARAMS_THROTTLE_MS = 1_000L
         private const val FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
+        private const val INCALLUI_RELAY_ANSWER_THROTTLE_MS = 750L
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
         private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102
         private const val MIRROR_RELAY_FIELD_LOCAL_IP = "m"
