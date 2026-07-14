@@ -28,7 +28,6 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
     @Published private(set) var lastDialedPhoneNumber: String
-    @Published private(set) var phoneMicrophoneRelayEnabled = false
     @Published private(set) var phoneRelayProbeEnabled = false
     @Published private(set) var phoneRelayProbeStatus = ""
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
@@ -220,7 +219,7 @@ final class EdgeLinkRuntime: ObservableObject {
         currentSession = nil
         screenSession.clearSender()
         screenSession.setMicrophoneRelayEnabled(false)
-        phoneMicrophoneRelayEnabled = false
+        phoneRelayProbe.disarmSourceRTP(reason: "disconnect", stopActive: true)
         isConnected = false
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
@@ -325,27 +324,6 @@ final class EdgeLinkRuntime: ObservableObject {
         UserDefaults.standard.set(number, forKey: Self.lastDialedPhoneNumberDefaultsKey)
     }
 
-    func setPhoneMicrophoneRelayEnabled(_ enabled: Bool) {
-        guard phoneMicrophoneRelayEnabled != enabled else {
-            return
-        }
-        phoneMicrophoneRelayEnabled = enabled
-        screenSession.setMicrophoneRelayEnabled(enabled)
-        DiagnosticsLog.info("phone.mac.microphone_relay_enabled enabled=\(enabled)")
-        if enabled {
-            guard isConnected else {
-                phoneCallStatus = "通話麥克風會在連線後啟用"
-                return
-            }
-            if !isPhoneScreenSessionActive {
-                screenSession.openAndStart()
-                isPhoneScreenSessionActive = true
-                isPhoneScreenViewerVisible = true
-                hasViewedPhoneScreen = true
-            }
-        }
-    }
-
     func setPhoneRelayProbeEnabled(_ enabled: Bool) {
         guard phoneRelayProbeEnabled != enabled else {
             return
@@ -395,6 +373,12 @@ final class EdgeLinkRuntime: ObservableObject {
         let body = PhoneActionBody(requestId: requestId, action: action, number: number)
         pendingPhoneActions[requestId] = body
         phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
+        if action == "dial" || action == "answer" {
+            phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)")
+        }
+        if action == "hangup" {
+            phoneRelayProbe.disarmSourceRTP(reason: "phone_action_hangup", stopActive: true)
+        }
 
         Task {
             do {
@@ -406,6 +390,9 @@ final class EdgeLinkRuntime: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.pendingPhoneActions.removeValue(forKey: requestId)
+                    if action == "dial" || action == "answer" {
+                        self.phoneRelayProbe.disarmSourceRTP(reason: "phone_action_send_failed_\(action)", stopActive: true)
+                    }
                     self.phoneCallStatus = "\(Self.localizedPhoneAction(action))失敗"
                 }
                 DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(requestId) action=\(action)", error)
@@ -970,6 +957,9 @@ final class EdgeLinkRuntime: ObservableObject {
             phoneCallStatus = "\(action)已送出"
             DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
         } else {
+            if result.action == "dial" || result.action == "answer" {
+                phoneRelayProbe.disarmSourceRTP(reason: "phone_action_failed_\(result.action)", stopActive: true)
+            }
             phoneCallStatus = "\(action)失敗：\(result.error ?? "未知錯誤")"
             DiagnosticsLog.warn(
                 "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=false error=\(result.error ?? "unknown")"

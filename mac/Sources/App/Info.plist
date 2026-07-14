@@ -24,11 +24,11 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 EdgeLink contributors</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>EdgeLink uses the microphone only when a relayed phone call requests microphone audio.</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>INSendMessageIntent</string>
 	</array>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>EdgeLink uses the microphone only when you enable call microphone relay.</string>
 </dict>
 </plist>

@@ -39,6 +39,8 @@ final class MiLinkPhoneRelayProbe {
     private var sourceAudioEngine: AVAudioEngine?
     private var sourceAudioConverter: AVAudioConverter?
     private var sourcePCMBytesWritten = 0
+    private var sourceRTPArmedUntil = Date.distantPast
+    private var sourceRTPArmReason: String?
     private var port: UInt16 = 7102
     private let sinkRTPPort: UInt16 = 19_000
     private let sourceRTPPort: UInt16 = 19_002
@@ -95,6 +97,18 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
+    func armSourceRTP(reason: String) {
+        queue.async {
+            self.armSourceRTPOnQueue(reason: reason, duration: Self.sourceRTPArmDurationSeconds)
+        }
+    }
+
+    func disarmSourceRTP(reason: String, stopActive: Bool) {
+        queue.async {
+            self.disarmSourceRTPOnQueue(reason: reason, stopActive: stopActive)
+        }
+    }
+
     func stop() {
         let hadActiveProbe = tcpListener != nil || udpListener != nil || !rtpListeners.isEmpty || !connections.isEmpty
         let activePort = port
@@ -103,6 +117,8 @@ final class MiLinkPhoneRelayProbe {
         peerSourceRetryWorkItem?.cancel()
         peerSourceRetryWorkItem = nil
         peerSourceRetryAttempt = 0
+        sourceRTPArmedUntil = .distantPast
+        sourceRTPArmReason = nil
         tcpListener?.cancel()
         udpListener?.cancel()
         for listener in rtpListeners.values {
@@ -627,8 +643,11 @@ final class MiLinkPhoneRelayProbe {
         guard !state.isPeerSourceConnection else {
             return
         }
-        guard sourceRTPTestEnabled else {
-            DiagnosticsLog.info("phonerelay.mac.source_rtp_disabled id=\(id.uuidString) reason=\(reason)")
+        guard isSourceRTPArmed else {
+            DiagnosticsLog.info(
+                "phonerelay.mac.source_rtp_unarmed id=\(id.uuidString) reason=\(reason) " +
+                    "armReason=\(sourceRTPArmReason ?? "none")"
+            )
             return
         }
         guard let host = state.sourceRemoteHost,
@@ -1146,8 +1165,33 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
-    private var sourceRTPTestEnabled: Bool {
-        UserDefaults.standard.object(forKey: "phoneRelayProbeSourceRTPEnabled") as? Bool ?? false
+    private func armSourceRTPOnQueue(reason: String, duration: TimeInterval) {
+        let boundedDuration = min(max(duration, 1), Self.sourceRTPMaxArmDurationSeconds)
+        let until = Date().addingTimeInterval(boundedDuration)
+        if until > sourceRTPArmedUntil {
+            sourceRTPArmedUntil = until
+            sourceRTPArmReason = reason
+        }
+        DiagnosticsLog.info(
+            "phonerelay.mac.source_rtp_armed reason=\(reason) duration=\(Int(boundedDuration)) " +
+                "until=\(Self.armDateFormatter.string(from: sourceRTPArmedUntil))"
+        )
+    }
+
+    private func disarmSourceRTPOnQueue(reason: String, stopActive: Bool) {
+        let wasArmed = isSourceRTPArmed
+        sourceRTPArmedUntil = .distantPast
+        sourceRTPArmReason = nil
+        if stopActive {
+            stopSourceRTP(reason: "disarm_\(reason)")
+        }
+        if wasArmed || stopActive {
+            DiagnosticsLog.info("phonerelay.mac.source_rtp_disarmed reason=\(reason) stopActive=\(stopActive)")
+        }
+    }
+
+    private var isSourceRTPArmed: Bool {
+        sourceRTPArmedUntil > Date()
     }
 
     private var sourceRTPAudioMode: SourceRTPAudioMode {
@@ -1278,7 +1322,7 @@ final class MiLinkPhoneRelayProbe {
             if bodyText.localizedCaseInsensitiveContains("wfd_trigger_method: TEARDOWN") {
                 stopMPEGTSPlayer(reason: "trigger_teardown")
                 stopMPEGTSFileCapture(reason: "trigger_teardown")
-                stopSourceRTPIfOwned(by: id, reason: "trigger_teardown")
+                disarmSourceRTPOnQueue(reason: "trigger_teardown", stopActive: true)
             }
         case "SETUP":
             recordSourceRTPDestination(from: headerText, connection: connection, id: id)
@@ -1301,7 +1345,7 @@ final class MiLinkPhoneRelayProbe {
             stopSourceRTPIfOwned(by: id, reason: "pause_request")
         case "TEARDOWN":
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
-            stopSourceRTPIfOwned(by: id, reason: "teardown_request")
+            disarmSourceRTPOnQueue(reason: "teardown_request", stopActive: true)
         default:
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
         }
@@ -1687,6 +1731,7 @@ final class MiLinkPhoneRelayProbe {
         state.sourceRemoteHost = host
         state.sourceRemoteRTPPort = rtpPort
         tcpStates[id] = state
+        armSourceRTPOnQueue(reason: "rtsp_setup_destination", duration: Self.sourceRTPRequestArmDurationSeconds)
         DiagnosticsLog.info(
             "phonerelay.mac.source_rtp_destination id=\(id.uuidString) remote=\(host):\(rtpPort) " +
                 "transport=\(sanitizeRTSPLogValue(transport))"
@@ -1883,6 +1928,9 @@ final class MiLinkPhoneRelayProbe {
     }()
 
     private static let peerSourceRetryDelayMilliseconds = 2_000
+    private static let sourceRTPArmDurationSeconds: TimeInterval = 45
+    private static let sourceRTPRequestArmDurationSeconds: TimeInterval = 15
+    private static let sourceRTPMaxArmDurationSeconds: TimeInterval = 120
     private static let sourceRTPSSRC: UInt32 = 0xed9e_1101
     private static let sourceMPEGTSPacketsPerRTPPacket = 5
     private static let sourceMPEGTSOutputArguments = [
@@ -1908,6 +1956,11 @@ final class MiLinkPhoneRelayProbe {
     }
     private static let mpegTSCaptureLimitBytes = 8 * 1024 * 1024
     private static let mpegTSCapturePath = "/private/tmp/edgelink-phonerelay.ts"
+    private static let armDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 }
 
 private enum SourceRTPAudioMode: String {
@@ -1918,8 +1971,10 @@ private enum SourceRTPAudioMode: String {
         switch defaultsValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "mic", "microphone", "input", "mac_microphone", "mac-microphone":
             self = .microphone
-        default:
+        case "silent", "off", "none", "disabled":
             self = .silent
+        default:
+            self = .microphone
         }
     }
 }
