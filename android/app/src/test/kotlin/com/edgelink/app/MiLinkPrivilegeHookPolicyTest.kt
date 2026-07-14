@@ -116,6 +116,19 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteAttachFlag() {
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("1"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("true"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("attach"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("ON"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("0"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled("false"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled(""))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled(null))
+    }
+
+    @Test
     fun filtersFakeMirrorRemoteByQuery() {
         assertTrue(
             MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(

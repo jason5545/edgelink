@@ -5,6 +5,7 @@ import android.content.ContentProvider
 import android.os.Binder
 import android.os.Bundle
 import android.os.Parcelable
+import android.os.SystemClock
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -21,6 +22,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
+    const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val FAKE_MIRROR_REMOTE_ID = "edgelink-mac-mi-pad"
     const val FAKE_MIRROR_REMOTE_NAME = "EdgeLink Mac"
 
@@ -66,6 +68,12 @@ internal object MiLinkPrivilegeHookPolicy {
             else -> null
         }
 
+    fun mirrorFakeRemoteAttachEnabled(rawValue: String?): Boolean =
+        when (rawValue?.trim()?.lowercase()) {
+            "1", "true", "yes", "on", "attach" -> true
+            else -> false
+        }
+
     fun fakeMirrorRemotePlatform(mode: String): String =
         if (mode == "car") "AndroidPadCar" else "AndroidPad"
 
@@ -86,6 +94,8 @@ internal object MiLinkPrivilegeHookPolicy {
 }
 
 class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
+    private var lastFakeMirrorAttachUptimeMs: Long = 0L
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
             return
@@ -222,7 +232,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         val mode = currentFakeMirrorRemoteMode() ?: return
                         val method = param.args.getOrNull(0) as? String ?: return
                         if (method == "queryRemoteDevices" || method == "queryRemoteDevice") {
-                            prepareFakeMirrorTerminal(classLoader, mode)
+                            val terminal = prepareFakeMirrorTerminal(classLoader, mode)
+                            maybeAttachFakeMirrorCallFlow(classLoader, mode, terminal)
                         }
                     }
 
@@ -311,7 +322,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             return
                         }
-                        param.setResult(prepareFakeMirrorTerminal(classLoader, mode))
+                        val terminal = prepareFakeMirrorTerminal(classLoader, mode)
+                        maybeAttachFakeMirrorCallFlow(classLoader, mode, terminal)
+                        param.setResult(terminal)
                         log("mirror fake terminal lookup mode=$mode")
                     }
                 }
@@ -362,6 +375,52 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook mirror car identity check: ${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    private fun maybeAttachFakeMirrorCallFlow(classLoader: ClassLoader, mode: String, terminal: Any?) {
+        if (mode != "pad" || terminal == null || !currentFakeMirrorRemoteAttachEnabled()) {
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFakeMirrorAttachUptimeMs < FAKE_MIRROR_ATTACH_THROTTLE_MS) {
+            return
+        }
+        lastFakeMirrorAttachUptimeMs = now
+        runCatching {
+            val relayClass = findTargetClass(classLoader, XIAOMI_MIRROR_CALL_SERVICE)
+            val terminalClass = findTargetClass(classLoader, XIAOMI_MIRROR_TERMINAL)
+            val relayService = relayClass.getMethod("q").invoke(null) ?: return@runCatching
+            relayClass.getMethod("F", terminalClass).invoke(relayService, terminal)
+            val oppositeId = findAttachedFakeMirrorTerminalId(relayClass, terminalClass, relayService)
+            log(
+                "mirror fake pad call flow attach attempted " +
+                    "attached=${oppositeId == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID} " +
+                    "oppositeId=${oppositeId.orEmpty()}"
+            )
+        }.onFailure { error ->
+            log("failed to attach fake pad call flow: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun findAttachedFakeMirrorTerminalId(
+        relayClass: Class<*>,
+        terminalClass: Class<*>,
+        relayService: Any
+    ): String? {
+        for (field in relayClass.declaredFields) {
+            if (!terminalClass.isAssignableFrom(field.type)) {
+                continue
+            }
+            val terminal = runCatching {
+                field.isAccessible = true
+                field.get(relayService)
+            }.getOrNull() ?: continue
+            val id = runCatching { callTargetMethod(terminal, "h") as? String }.getOrNull()
+            if (id == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID) {
+                return id
+            }
+        }
+        return null
     }
 
     private fun createFakeMirrorRemoteInfo(classLoader: ClassLoader, mode: String): Parcelable? =
@@ -459,6 +518,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemoteAttachEnabled(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAttachEnabled(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY)
+        )
+
     private fun readSystemProperty(name: String): String =
         runCatching {
             Class.forName("android.os.SystemProperties")
@@ -478,5 +542,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_FUSION_UTILS = "o4.B"
         private const val XIAOMI_MIRROR_REMOTE_DEVICE_INFO = "com.xiaomi.mirror.RemoteDeviceInfo"
         private const val XIAOMI_MIRROR_TERMINAL = "com.xiaomi.mirror.g0"
+        private const val XIAOMI_MIRROR_CALL_SERVICE = "com.xiaomi.mirror.relay.G"
+        private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
     }
 }

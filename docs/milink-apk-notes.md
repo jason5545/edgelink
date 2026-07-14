@@ -383,13 +383,19 @@ spoof:
 - `debug.edgelink.mirror_fake_remote=pad` injects one Xiaomi `AndroidPad` remote device with id
   `edgelink-mac-mi-pad` into `queryRemoteDevices`, answers `queryRemoteDevice`, and makes Mirror's
   internal terminal lookup/device-type checks resolve the same fake pad.
+- `debug.edgelink.mirror_fake_remote_attach=true` additionally calls
+  `MirrorCallService.F(fakePadTerminal)` when the fake pad is prepared. This verifies the official
+  phone-to-pad flow's `onOppositeTerminalConnected` gate without directly starting
+  `MirrorControlAudioSource`/`MirrorControlAudioSink`.
 - `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
   car media-relay path.
 - Any empty or unknown value leaves the spoof fully off.
 
 On the current Xiaomi.eu device, `pad` mode has been verified through logcat: `queryRemoteDevices`
 returns one `AndroidPad` candidate for `all`, `xiaomi`, and `androidPad`, while `androidPadCar`
-stays at zero.
+stays at zero. With `debug.edgelink.mirror_fake_remote_attach=true`, the attach probe reaches
+`MirrorCallService.F(fakePadTerminal)` and logs
+`attached=true oppositeId=edgelink-mac-mi-pad`.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 
