@@ -446,6 +446,10 @@ Android -> Mac metadata envelope：
 - Mac 麥克風 -> Android 喇叭是另一條 audio track。
 - 媒體封包走 P2P DTLS-SRTP；NAT 穿不過時走 TURN。
 
+Mac 麥克風 audio track 必須由使用者明確啟用；EdgeLinkMac 目前用「通話麥克風」開關啟用
+`edgelink-mac-microphone` track，並沿用 `edgelink-screen` WebRTC session 送到 Android。
+這條 track 是通話音訊路徑的 Mac -> Android 半邊骨架，不代表 Xiaomi PHONERELAY 已經接上。
+
 SDP / ICE signaling 仍是 secure frame envelope，雙向傳送：
 
 - `rtc.offer` b:`{"sdp":string}`

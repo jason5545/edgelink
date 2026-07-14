@@ -28,5 +28,7 @@
 	<array>
 		<string>INSendMessageIntent</string>
 	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>EdgeLink uses the microphone only when you enable call microphone relay.</string>
 </dict>
 </plist>

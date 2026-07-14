@@ -254,6 +254,14 @@ private struct PhoneControlPanel: View {
                 .disabled(!runtime.isConnected)
             }
 
+            Toggle(isOn: Binding(
+                get: { runtime.phoneMicrophoneRelayEnabled },
+                set: { runtime.setPhoneMicrophoneRelayEnabled($0) }
+            )) {
+                Label("通話麥克風", systemImage: runtime.phoneMicrophoneRelayEnabled ? "mic.fill" : "mic")
+            }
+            .disabled(!runtime.isConnected)
+
             if !runtime.phoneCallStatus.isEmpty {
                 Text(runtime.phoneCallStatus)
                     .font(.caption)

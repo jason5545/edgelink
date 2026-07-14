@@ -44,6 +44,7 @@ targets:
           if [ -d "$MAC_HEADERS" ]; then
             /bin/cat > "$MAC_HEADERS/WebRTC.h" <<'EOF'
           #import <WebRTC/RTCMacros.h>
+          #import <WebRTC/RTCAudioSource.h>
           #import <WebRTC/RTCAudioTrack.h>
           #import <WebRTC/RTCCVPixelBuffer.h>
           #import <WebRTC/RTCConfiguration.h>
@@ -86,6 +87,7 @@ targets:
         LSUIElement: true
         NSUserActivityTypes:
           - INSendMessageIntent
+        NSMicrophoneUsageDescription: EdgeLink uses the microphone only when you enable call microphone relay.
         NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
   EdgeLinkKitTests:
     type: bundle.unit-test

@@ -27,6 +27,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
+    @Published private(set) var phoneMicrophoneRelayEnabled = false
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -203,6 +204,8 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannelGeneration = nil
         currentSession = nil
         screenSession.clearSender()
+        screenSession.setMicrophoneRelayEnabled(false)
+        phoneMicrophoneRelayEnabled = false
         isConnected = false
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
@@ -292,6 +295,27 @@ final class EdgeLinkRuntime: ObservableObject {
 
     func hangUpPhoneCall() {
         sendPhoneAction(action: "hangup")
+    }
+
+    func setPhoneMicrophoneRelayEnabled(_ enabled: Bool) {
+        guard phoneMicrophoneRelayEnabled != enabled else {
+            return
+        }
+        phoneMicrophoneRelayEnabled = enabled
+        screenSession.setMicrophoneRelayEnabled(enabled)
+        DiagnosticsLog.info("phone.mac.microphone_relay_enabled enabled=\(enabled)")
+        if enabled {
+            guard isConnected else {
+                phoneCallStatus = "通話麥克風會在連線後啟用"
+                return
+            }
+            if !isPhoneScreenSessionActive {
+                screenSession.openAndStart()
+                isPhoneScreenSessionActive = true
+                isPhoneScreenViewerVisible = true
+                hasViewedPhoneScreen = true
+            }
+        }
     }
 
     private func sendPhoneAction(action: String, number: String? = nil) {

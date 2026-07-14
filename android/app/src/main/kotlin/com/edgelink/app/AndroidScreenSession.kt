@@ -790,7 +790,14 @@ class AndroidScreenSession(
             override fun onRemoveStream(stream: MediaStream) = Unit
             override fun onDataChannel(dataChannel: DataChannel) = Unit
             override fun onRenegotiationNeeded() = Unit
-            override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) = Unit
+            override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) {
+                val track = receiver.track() ?: return
+                if (track.kind() == "audio") {
+                    EdgeLinkLog.info(
+                        "screen.android.remote_audio_track_received track=${track.id()} streams=${mediaStreams.size}"
+                    )
+                }
+            }
         }
 
     private fun projectionCallback(): MediaProjection.Callback =

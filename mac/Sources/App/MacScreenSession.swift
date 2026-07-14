@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreImage
 import EdgeLinkKit
 import SwiftUI
@@ -22,11 +23,15 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var peerConnection: RTCPeerConnection?
     private var remoteVideoTrack: RTCVideoTrack?
     private var remoteAudioTrack: RTCMediaStreamTrack?
+    private var localMicrophoneSource: RTCAudioSource?
+    private var localMicrophoneTrack: RTCAudioTrack?
+    private var localMicrophoneSender: RTCRtpSender?
     private var controlDataChannel: RTCDataChannel?
     private var didInitializeSSL = false
     private var isClosingWindow = false
     private var isStopping = false
     private var isScreenSessionActive = false
+    private var microphoneRelayEnabled = false
     private var forwardedKeyCodes = Set<UInt16>()
     private var lastPointerMoveSentAt: TimeInterval = 0
     private var pendingPointerMove: CtrlPointerBody?
@@ -59,6 +64,22 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     func clearSender() {
         sendPlaintext = nil
+    }
+
+    func setMicrophoneRelayEnabled(_ enabled: Bool) {
+        guard microphoneRelayEnabled != enabled else {
+            return
+        }
+        microphoneRelayEnabled = enabled
+        DiagnosticsLog.info("screen.mac.microphone_relay_enabled enabled=\(enabled)")
+        if enabled {
+            requestMicrophoneAccessIfNeeded()
+        } else {
+            removeLocalMicrophoneTrack()
+        }
+        if isScreenSessionActive && peerConnection != nil {
+            restartActiveSession(reason: "microphone_relay_changed")
+        }
     }
 
     func openAndStart() {
@@ -198,6 +219,9 @@ final class MacScreenSession: NSObject, ObservableObject {
         remoteVideoTrack = nil
         track?.remove(videoView)
         remoteAudioTrack = nil
+        localMicrophoneSender = nil
+        localMicrophoneTrack = nil
+        localMicrophoneSource = nil
         stopStatsLogging()
         videoView.clear()
 
@@ -246,6 +270,9 @@ final class MacScreenSession: NSObject, ObservableObject {
         remoteVideoTrack = nil
         track?.remove(videoView)
         remoteAudioTrack = nil
+        localMicrophoneSender = nil
+        localMicrophoneTrack = nil
+        localMicrophoneSource = nil
         stopStatsLogging()
         videoView.clear()
 
@@ -381,6 +408,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             fatalError("Unable to create RTCPeerConnection.")
         }
         self.peerConnection = peerConnection
+        addLocalMicrophoneTrackIfNeeded(to: peerConnection, factory: factory)
         startStatsLogging(on: peerConnection)
         return peerConnection
     }
@@ -445,6 +473,77 @@ final class MacScreenSession: NSObject, ObservableObject {
         hasRemoteAudio = true
         status = "Connected"
         DiagnosticsLog.info("screen.mac.remote_audio_attached track=\(track.trackId)")
+    }
+
+    private func addLocalMicrophoneTrackIfNeeded(to peerConnection: RTCPeerConnection, factory: RTCPeerConnectionFactory) {
+        guard microphoneRelayEnabled else {
+            return
+        }
+        guard localMicrophoneSender == nil else {
+            return
+        }
+        guard microphoneCaptureAllowedForTrackCreation() else {
+            DiagnosticsLog.warn("screen.mac.local_microphone_track_skipped permission_denied")
+            return
+        }
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        let source = factory.audioSource(with: constraints)
+        let track = factory.audioTrack(with: source, trackId: Self.microphoneTrackId)
+        track.isEnabled = true
+        guard let sender = peerConnection.add(track, streamIds: [Self.mediaStreamId]) else {
+            DiagnosticsLog.warn("screen.mac.local_microphone_track_add_failed")
+            return
+        }
+        localMicrophoneSource = source
+        localMicrophoneTrack = track
+        localMicrophoneSender = sender
+        DiagnosticsLog.info("screen.mac.local_microphone_track_added track=\(track.trackId)")
+    }
+
+    private func removeLocalMicrophoneTrack() {
+        let sender = localMicrophoneSender
+        localMicrophoneSender = nil
+        localMicrophoneTrack?.isEnabled = false
+        localMicrophoneTrack = nil
+        localMicrophoneSource = nil
+        if let peerConnection, let sender {
+            let removed = peerConnection.removeTrack(sender)
+            DiagnosticsLog.info("screen.mac.local_microphone_track_removed removed=\(removed)")
+        }
+    }
+
+    private func requestMicrophoneAccessIfNeeded() {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else {
+            return
+        }
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async {
+                DiagnosticsLog.info("screen.mac.microphone_permission_result granted=\(granted)")
+            }
+        }
+    }
+
+    private func microphoneCaptureAllowedForTrackCreation() -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized, .notDetermined:
+            return true
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    private func restartActiveSession(reason: String) {
+        guard isScreenSessionActive, sendPlaintext != nil else {
+            return
+        }
+        DiagnosticsLog.info("screen.mac.restart_requested reason=\(reason)")
+        stop(sendRemoteStop: true)
+        isScreenSessionActive = true
+        onSessionActivityChanged?(true)
+        status = "Starting"
+        sendEnvelope(type: EnvelopeType.screenStart, body: EmptyBody())
     }
 
     private func sendPointer(action: String, event: NSEvent, wheelDy: Int? = nil) {
@@ -792,6 +891,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     private static let maxPendingWheelDy = 240
     private static let statsIntervalSeconds: TimeInterval = 2.0
     private static let controlChannelLabel = "edgelink-control"
+    private static let mediaStreamId = "edgelink-screen"
+    private static let microphoneTrackId = "edgelink-mac-microphone"
 }
 
 extension MacScreenSession: NSWindowDelegate {
