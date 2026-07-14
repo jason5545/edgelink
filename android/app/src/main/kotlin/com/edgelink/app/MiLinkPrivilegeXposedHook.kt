@@ -26,6 +26,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
+    const val MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY = "debug.edgelink.mirror_fake_remote_using_pad"
+    const val MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY = "debug.edgelink.mirror_fake_remote_call_state"
     const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val FAKE_MIRROR_REMOTE_ID = "edgelink-mac-mi-pad"
     const val FAKE_MIRROR_REMOTE_NAME = "EdgeLink Mac"
@@ -82,6 +84,20 @@ internal object MiLinkPrivilegeHookPolicy {
         when (rawValue?.trim()?.lowercase()) {
             "1", "true", "yes", "on", "key", "probe" -> true
             else -> false
+        }
+
+    fun mirrorFakeRemoteUsingPadEnabled(rawValue: String?): Boolean =
+        when (rawValue?.trim()?.lowercase()) {
+            "1", "true", "yes", "on", "pad", "usingpad", "using_pad" -> true
+            else -> false
+        }
+
+    fun mirrorFakeRemoteCallState(rawValue: String?): Int? =
+        when (rawValue?.trim()?.lowercase()) {
+            "0", "idle" -> 0
+            "1", "ringing" -> 1
+            "2", "offhook", "off_hook", "active" -> 2
+            else -> null
         }
 
     fun mirrorFakeRemoteAudioAllowed(rawValue: String?): Boolean =
@@ -233,6 +249,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorRemoteProviderResults(classLoader)
         hookMirrorTerminalLookup(classLoader)
         hookMirrorDeviceTypeChecks(classLoader)
+        hookMirrorUsingPadOverride(classLoader)
         hookMirrorAudioStartGuard(classLoader)
     }
 
@@ -395,6 +412,26 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private fun hookMirrorUsingPadOverride(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CALL_SERVICE,
+                classLoader,
+                "A",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (currentFakeMirrorRemoteMode() == "pad" && currentFakeMirrorRemoteUsingPadEnabled()) {
+                            param.setResult(true)
+                            log("mirror fake pad using-pad override active")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror using-pad override: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
     private fun maybeAttachFakeMirrorCallFlow(classLoader: ClassLoader, mode: String, terminal: Any?) {
         if (mode != "pad" || terminal == null || !currentFakeMirrorRemoteAttachEnabled()) {
             return
@@ -508,11 +545,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             Handler(Looper.getMainLooper()).postDelayed(
                 {
                     val sharedKeySize = findMirrorSharedKeySize(relayClass, relayService)
+                    val keyReady = sharedKeySize >= MIRROR_SHARED_KEY_MIN_BYTES
                     log(
                         "mirror fake pad key data status " +
-                            "keyReady=${sharedKeySize >= MIRROR_SHARED_KEY_MIN_BYTES} " +
+                            "keyReady=$keyReady " +
                             "sharedKeyBytes=$sharedKeySize"
                     )
+                    maybeProbeFakeMirrorCallState(relayClass, relayService, keyReady)
                 },
                 FAKE_MIRROR_KEY_STATUS_DELAY_MS
             )
@@ -560,6 +599,30 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             }
         }
         return 0
+    }
+
+    private fun maybeProbeFakeMirrorCallState(
+        relayClass: Class<*>,
+        relayService: Any,
+        keyReady: Boolean
+    ) {
+        val callState = currentFakeMirrorRemoteCallState() ?: return
+        if (!keyReady) {
+            log("mirror fake pad call state probe skipped state=$callState keyReady=false")
+            return
+        }
+        runCatching {
+            val usingPad = relayClass.getMethod("A").invoke(relayService) as? Boolean ?: false
+            log(
+                "mirror fake pad call state probe invoking " +
+                    "state=$callState " +
+                    "usingPad=$usingPad " +
+                    "audioAllowed=${currentFakeMirrorRemoteAudioAllowed()}"
+            )
+            relayClass.getMethod("s", Integer.TYPE).invoke(relayService, callState)
+        }.onFailure { error ->
+            log("failed to probe fake pad call state: ${error.javaClass.simpleName}: ${error.message}")
+        }
     }
 
     private fun findAttachedFakeMirrorTerminalId(
@@ -698,6 +761,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun currentFakeMirrorRemoteKeyEnabled(): Boolean =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled(
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteUsingPadEnabled(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteCallState(): Int? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY)
         )
 
     private fun currentFakeMirrorRemoteAudioAllowed(): Boolean =

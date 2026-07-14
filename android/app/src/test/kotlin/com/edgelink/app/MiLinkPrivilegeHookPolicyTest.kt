@@ -142,6 +142,32 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteUsingPadFlag() {
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("1"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("true"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("pad"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("USING_PAD"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("0"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled("false"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled(""))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteUsingPadEnabled(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteCallState() {
+        assertEquals(0, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("idle"))
+        assertEquals(1, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("ringing"))
+        assertEquals(2, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("offhook"))
+        assertEquals(2, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("OFF_HOOK"))
+        assertEquals(2, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("2"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("true"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(null))
+    }
+
+    @Test
     fun parsesMirrorFakeRemoteAudioAllowFlag() {
         assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("1"))
         assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("true"))

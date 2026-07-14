@@ -392,6 +392,11 @@ spoof:
   own ECDH parser and should only log whether `mKey` becomes ready. While this key probe is enabled,
   the module blocks `onCallStart`, `startAudioSource`, and `startAudioSink` unless
   `debug.edgelink.mirror_fake_remote_audio=allow` is explicitly set.
+- `debug.edgelink.mirror_fake_remote_using_pad=true` overrides the official `isUsingPad` check only
+  inside the fake-pad probe path.
+- `debug.edgelink.mirror_fake_remote_call_state=offhook|ringing|idle` dry-runs
+  `MirrorCallService.s(state)` after the fake key becomes ready. This is for gate tracing; with the
+  default audio guard, off-hook should reach `onCallStart` and then be blocked before audio startup.
 - `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
   car media-relay path.
 - Any empty or unknown value leaves the spoof fully off.
@@ -403,7 +408,10 @@ stays at zero. With `debug.edgelink.mirror_fake_remote_attach=true`, the attach 
 `attached=true oppositeId=edgelink-mac-mi-pad`. With
 `debug.edgelink.mirror_fake_remote_key=true`, the key probe reaches
 `MirrorCallService.D(strValue)` and logs `keyReady=true sharedKeyBytes=32`; audio startup remained
-blocked by the default guard.
+blocked by the default guard. With
+`debug.edgelink.mirror_fake_remote_using_pad=true` and
+`debug.edgelink.mirror_fake_remote_call_state=offhook`, the call-state dry-run logs
+`state=2 usingPad=true audioAllowed=false` and then blocks `onCallStart` before audio startup.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 
