@@ -8,9 +8,12 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.DeadObjectException
 import android.os.IBinder
+import android.os.RemoteException
 import android.telecom.TelecomManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -21,6 +24,8 @@ import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
 private const val SHIZUKU_USER_SERVICE_VERSION = 5
+private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
+private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 
 data class AndroidShizukuState(
@@ -353,6 +358,30 @@ object AndroidShizukuSupport {
     private suspend fun <T> withService(
         context: Context,
         block: (IEdgeLinkShizukuService) -> T
+    ): T {
+        var lastError: Throwable? = null
+        repeat(SHIZUKU_USER_SERVICE_MAX_ATTEMPTS) { index ->
+            val attempt = index + 1
+            try {
+                return withServiceOnce(context, block)
+            } catch (error: Throwable) {
+                if (!error.isTransientShizukuServiceError() || attempt >= SHIZUKU_USER_SERVICE_MAX_ATTEMPTS) {
+                    throw error
+                }
+                lastError = error
+                EdgeLinkLog.warn(
+                    "shizuku.android.user_service_retry attempt=$attempt/${SHIZUKU_USER_SERVICE_MAX_ATTEMPTS}",
+                    error
+                )
+                delay(SHIZUKU_USER_SERVICE_RETRY_DELAY_MS)
+            }
+        }
+        throw lastError ?: IllegalStateException("Shizuku UserService failed.")
+    }
+
+    private suspend fun <T> withServiceOnce(
+        context: Context,
+        block: (IEdgeLinkShizukuService) -> T
     ): T = withContext(Dispatchers.IO) {
         serviceMutex.withLock {
             ensureUsable()
@@ -388,7 +417,7 @@ object AndroidShizukuSupport {
 
                 override fun onServiceDisconnected(name: ComponentName) {
                     if (continuation.isActive) {
-                        continuation.resumeWithException(IllegalStateException("Shizuku UserService disconnected."))
+                        continuation.resumeWithException(ShizukuUserServiceDisconnectedException())
                     }
                 }
             }
@@ -530,4 +559,12 @@ object AndroidShizukuSupport {
             runCatching { Shizuku.unbindUserService(args, connection, true) }
         }
     }
+
+    private fun Throwable.isTransientShizukuServiceError(): Boolean =
+        this is ShizukuUserServiceDisconnectedException ||
+            this is DeadObjectException ||
+            this is RemoteException && message.orEmpty().contains("disconnected", ignoreCase = true)
+
+    private class ShizukuUserServiceDisconnectedException :
+        IllegalStateException("Shizuku UserService disconnected.")
 }

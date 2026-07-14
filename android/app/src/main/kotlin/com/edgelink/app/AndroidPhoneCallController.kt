@@ -68,7 +68,7 @@ class AndroidPhoneCallController(context: Context) {
                     requestId = body.requestId,
                     action = body.action,
                     success = false,
-                    error = error::class.java.simpleName,
+                    error = error.phoneActionErrorMessage(),
                     ts = now
                 )
             }
@@ -110,7 +110,7 @@ class AndroidPhoneCallController(context: Context) {
                     requestId = body.requestId,
                     action = body.action,
                     success = false,
-                    error = error::class.java.simpleName,
+                    error = error.phoneActionErrorMessage(),
                     ts = now
                 )
             }
@@ -159,5 +159,15 @@ class AndroidPhoneCallController(context: Context) {
         return normalized.takeIf { value ->
             value.all { it.isDigit() || it == '+' } && value.any { it.isDigit() }
         }
+    }
+
+    private fun Throwable.phoneActionErrorMessage(): String {
+        val detail = message
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.take(120)
+        return listOfNotNull(this::class.java.simpleName, detail)
+            .joinToString(":")
     }
 }
