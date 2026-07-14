@@ -24,6 +24,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MILINK_RUNTIME_PROCESS = "com.milink.runtime"
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
+    const val INCALLUI_PACKAGE = "com.android.incallui"
+    const val INCALLUI_PROCESS = "com.android.incallui"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
@@ -56,7 +58,8 @@ internal object MiLinkPrivilegeHookPolicy {
     fun shouldHook(packageName: String?, processName: String?): Boolean =
         shouldHookRuntime(packageName, processName) ||
             shouldHookMainService(packageName, processName) ||
-            shouldHookXiaomiMirror(packageName, processName)
+            shouldHookXiaomiMirror(packageName, processName) ||
+            shouldHookInCallUi(packageName, processName)
 
     fun shouldHookRuntime(packageName: String?, processName: String?): Boolean =
         packageName == MILINK_PACKAGE && processName == MILINK_RUNTIME_PROCESS
@@ -66,6 +69,9 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun shouldHookXiaomiMirror(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MIRROR_PACKAGE && processName == XIAOMI_MIRROR_PROCESS
+
+    fun shouldHookInCallUi(packageName: String?, processName: String?): Boolean =
+        packageName == INCALLUI_PACKAGE && processName == INCALLUI_PROCESS
 
     fun isAllowedCallerPackage(packageName: String?): Boolean =
         packageName == EDGE_LINK_PACKAGE
@@ -195,6 +201,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             hookMirrorCallProviderAccessCheck(lpparam.classLoader)
             hookMirrorRemoteExperiment(lpparam.classLoader)
         }
+        if (MiLinkPrivilegeHookPolicy.shouldHookInCallUi(lpparam.packageName, lpparam.processName)) {
+            hookInCallUiRelayExperiment(lpparam.classLoader)
+        }
     }
 
     private fun hookRuntimeCallingPackageCheck(classLoader: ClassLoader) {
@@ -301,6 +310,183 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorUsingPadOverride(classLoader)
         hookMirrorAudioStartGuard(classLoader)
         hookMirrorPlainAudioSink(classLoader)
+    }
+
+    private fun hookInCallUiRelayExperiment(classLoader: ClassLoader) {
+        hookInCallUiCallRelayExtras(classLoader)
+        hookInCallUiRelayHelpers(classLoader)
+        hookInCallUiRelayDeviceList(classLoader)
+    }
+
+    private fun hookInCallUiCallRelayExtras(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_CALL,
+                classLoader,
+                "getCallExtra",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        param.result = fakeInCallUiCallExtras(param.result as? Bundle)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI call extras: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_CALL,
+                classLoader,
+                "getRelayExtra",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        param.result = fakeInCallUiRelayExtras(param.result as? Bundle)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI relay extras: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_CALL,
+                classLoader,
+                "isCallRelayed",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            param.setResult(true)
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI isCallRelayed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_CALL,
+                classLoader,
+                "isRelayCall",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            param.setResult(true)
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI isRelayCall: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_CALL,
+                classLoader,
+                "updateRelay",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            log("InCallUI fake relay update call=${param.thisObject?.javaClass?.name.orEmpty()}")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI updateRelay: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookInCallUiRelayHelpers(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_RELAY_UTILS,
+                classLoader,
+                "getCallRelayAnswered",
+                findTargetClass(classLoader, INCALLUI_CALL),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            param.setResult(true)
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI getCallRelayAnswered: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_RELAY_UTILS,
+                classLoader,
+                "getCallRelayed",
+                findTargetClass(classLoader, INCALLUI_CALL),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            param.setResult(true)
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI getCallRelayed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_RELAY_UTILS,
+                classLoader,
+                "getDeviceIdRelayAnswered",
+                findTargetClass(classLoader, INCALLUI_CALL),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceInCallUiRelay()) {
+                            param.setResult(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI getDeviceIdRelayAnswered: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookInCallUiRelayDeviceList(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_RELAY_PRESENTER,
+                classLoader,
+                "getDeviceIdLists",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        val original = param.result as? List<*>
+                        if (original?.contains(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID) == true) {
+                            return
+                        }
+                        val updated = ArrayList<String>()
+                        original?.forEach { value ->
+                            if (value is String) {
+                                updated.add(value)
+                            }
+                        }
+                        updated.add(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                        param.result = updated
+                        log("InCallUI fake relay device id appended size=${updated.size}")
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI relay device list: ${error.javaClass.simpleName}: ${error.message}")
+        }
     }
 
     private fun hookMirrorRemoteProviderResults(classLoader: ClassLoader) {
@@ -1249,6 +1435,29 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY)
         )
 
+    private fun shouldForceInCallUiRelay(): Boolean =
+        currentFakeMirrorRemoteMode() == "pad" &&
+            currentFakeMirrorRemoteUsingPadEnabled()
+
+    private fun fakeInCallUiCallExtras(original: Bundle?): Bundle {
+        val bundle = if (original == null) Bundle() else Bundle(original)
+        bundle.putBoolean(INCALLUI_EXTRA_RELAY_CALL, true)
+        bundle.putString(INCALLUI_EXTRA_RELAY_DEVICE_NAME, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+        if (!bundle.containsKey(INCALLUI_EXTRA_CONNECT_TIME)) {
+            bundle.putLong(INCALLUI_EXTRA_CONNECT_TIME, System.currentTimeMillis())
+        }
+        return bundle
+    }
+
+    private fun fakeInCallUiRelayExtras(original: Bundle?): Bundle {
+        val bundle = if (original == null) Bundle() else Bundle(original)
+        bundle.putBoolean(INCALLUI_EXTRA_CALL_RELAYED, true)
+        bundle.putBoolean(INCALLUI_EXTRA_CALL_RELAY_ANSWERED, true)
+        bundle.putString(INCALLUI_EXTRA_RELAY_DEVICE_ID, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+        bundle.putString(INCALLUI_EXTRA_RELAY_DEVICE_NAME, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+        return bundle
+    }
+
     private fun readSystemProperty(name: String): String =
         runCatching {
             Class.forName("android.os.SystemProperties")
@@ -1275,6 +1484,15 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
         private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
+        private const val INCALLUI_CALL = "com.android.incallui.Call"
+        private const val INCALLUI_RELAY_UTILS = "com.android.incallui.relay.RelayUtils"
+        private const val INCALLUI_RELAY_PRESENTER = "com.android.incallui.relay.RelayPresenter"
+        private const val INCALLUI_EXTRA_RELAY_CALL = "telecomm.EXTRA_RELAY_CALL"
+        private const val INCALLUI_EXTRA_RELAY_DEVICE_NAME = "telecomm.EXTRA_RELAY_DEVICE_NAME"
+        private const val INCALLUI_EXTRA_CALL_RELAYED = "telecomm.EXTRA_CALL_RELAYED"
+        private const val INCALLUI_EXTRA_CALL_RELAY_ANSWERED = "telecomm.EXTRA_RELAY_ANSWERED"
+        private const val INCALLUI_EXTRA_RELAY_DEVICE_ID = "telecomm.EXTRA_RELAY_DEVICE_ID"
+        private const val INCALLUI_EXTRA_CONNECT_TIME = "telecomm.EXTRA_CONNECT_TIME"
         private const val XIAOMI_JSON_CODEC = "C0.d"
         private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L
