@@ -402,6 +402,13 @@ spoof:
   fields immediately before the default guard blocks `onCallStart`/source/sink startup. This records
   the candidate opposite id, shared-key length, string fields, int fields, and byte-array sizes
   without exposing key material or starting native audio.
+- `debug.edgelink.mirror_fake_remote_peer_ip=<host>` and
+  `debug.edgelink.mirror_fake_remote_peer_port=<1..65535>` override the fake peer `KeyData` endpoint
+  that Mirror stores as `n/p`. This is the candidate Mac-side PHONERELAY endpoint.
+- `debug.edgelink.mirror_fake_remote_local_ip=<host>` and
+  `debug.edgelink.mirror_fake_remote_local_port=<1..65535>` override the local `MirrorCallService`
+  source endpoint fields `m/o`. This lets the fake Pad path dry-run with the phone's real WLAN/P2P
+  endpoint even when no official Mirror group listener populated `m`.
 - `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
   car media-relay path.
 - Any empty or unknown value leaves the spoof fully off.
@@ -424,6 +431,13 @@ official ECDH parser reports `keyReady=true sharedKeyBytes=32`, and blocked `onC
 `strings=12:m:<blank>,13:n:127.0.0.1 ints=11:l:320,14:o:7102,15:p:7102,16:q:0 byteArrays=17:r:32b`.
 From `MirrorCallService.G`, those fields map to local p2p IP `m`, peer p2p IP `n`, audio frame size
 `l`, local port `o`, peer port `p`, and shared key `r`.
+The follow-up endpoint override keeps the same audio guard but can replace `m/o/n/p` with explicit
+phone/Mac values before `onCallStart` is blocked, giving us a safe way to validate the real relay
+addresses before allowing `MirrorControlAudioSource`/`MirrorControlAudioSink` to start.
+This has been verified with Mac `10.5.50.154` and phone route source `10.5.51.78`: the probe logs
+`mirror fake pad audio endpoint override localIp=10.5.51.78 localPort=7102 peerIp=10.5.50.154 peerPort=7102`,
+then blocked `onCallStart` reports
+`strings=12:m:10.5.51.78,13:n:10.5.50.154 ints=11:l:320,14:o:7102,15:p:7102,16:q:0 byteArrays=17:r:32b`.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 

@@ -194,6 +194,29 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteEndpointHost() {
+        assertEquals("10.0.0.42", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(" 10.0.0.42 "))
+        assertEquals("fd00::1234", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost("fd00::1234"))
+        assertEquals("mac.local", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost("mac.local"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost("10.0.0.42 extra"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteEndpointPort() {
+        assertEquals(1, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort("1"))
+        assertEquals(7102, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(" 7102 "))
+        assertEquals(65535, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort("65535"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort("0"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort("65536"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort("abc"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(null))
+    }
+
+    @Test
     fun filtersFakeMirrorRemoteByQuery() {
         assertTrue(
             MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(

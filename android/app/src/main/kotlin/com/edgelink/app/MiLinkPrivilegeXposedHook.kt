@@ -31,6 +31,10 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY = "debug.edgelink.mirror_fake_remote_call_state"
     const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_params"
+    const val MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_ip"
+    const val MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_port"
+    const val MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_local_ip"
+    const val MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY = "debug.edgelink.mirror_fake_remote_local_port"
     const val FAKE_MIRROR_REMOTE_ID = "edgelink-mac-mi-pad"
     const val FAKE_MIRROR_REMOTE_NAME = "EdgeLink Mac"
 
@@ -114,6 +118,18 @@ internal object MiLinkPrivilegeHookPolicy {
             else -> false
         }
 
+    fun mirrorFakeRemoteEndpointHost(rawValue: String?): String? =
+        rawValue
+            ?.trim()
+            ?.takeIf { value ->
+                value.isNotEmpty() &&
+                    value.length <= MAX_ENDPOINT_HOST_CHARS &&
+                    value.none { it.isWhitespace() }
+            }
+
+    fun mirrorFakeRemoteEndpointPort(rawValue: String?): Int? =
+        rawValue?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
+
     fun fakeMirrorRemotePlatform(mode: String): String =
         if (mode == "car") "AndroidPadCar" else "AndroidPad"
 
@@ -131,6 +147,8 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun isFakeMirrorRemoteId(deviceId: String?): Boolean =
         deviceId == FAKE_MIRROR_REMOTE_ID
+
+    private const val MAX_ENDPOINT_HOST_CHARS = 80
 }
 
 class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
@@ -576,10 +594,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         runCatching {
             val keyDataValue = createFakePeerKeyDataValue(classLoader)
             relayClass.getMethod("D", String::class.java).invoke(relayService, keyDataValue.strValue)
+            maybeApplyFakeMirrorAudioEndpointOverrides(relayClass, relayService)
             log(
                 "mirror fake pad key data queued " +
-                    "peerIp=$FAKE_MIRROR_KEY_PEER_IP " +
-                    "peerPort=$FAKE_MIRROR_KEY_PEER_PORT " +
+                    "peerIp=${keyDataValue.peerIp} " +
+                    "peerPort=${keyDataValue.peerPort} " +
                     "peerPublicKeyBytes=${keyDataValue.publicKeySize}"
             )
             Handler(Looper.getMainLooper()).postDelayed(
@@ -602,7 +621,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private data class FakePeerKeyDataValue(
         val strValue: String,
-        val publicKeySize: Int
+        val publicKeySize: Int,
+        val peerIp: String,
+        val peerPort: Int
     )
 
     private fun createFakePeerKeyDataValue(classLoader: ClassLoader): FakePeerKeyDataValue {
@@ -616,13 +637,83 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         val ecdh = ecdhClass.getDeclaredConstructor().newInstance()
         ecdhClass.getMethod("d").invoke(ecdh)
         val publicKey = ecdhClass.getMethod("b").invoke(ecdh) as ByteArray
+        val peerIp = currentFakeMirrorRemotePeerIp() ?: DEFAULT_FAKE_MIRROR_PEER_IP
+        val peerPort = currentFakeMirrorRemotePeerPort() ?: DEFAULT_FAKE_MIRROR_PEER_PORT
         val keyData = keyDataClass.getDeclaredConstructor().newInstance()
         keyDataClass.getField("keyBytes").set(keyData, publicKey)
-        keyDataClass.getField("p2pIp").set(keyData, FAKE_MIRROR_KEY_PEER_IP)
-        keyDataClass.getField("port").setInt(keyData, FAKE_MIRROR_KEY_PEER_PORT)
+        keyDataClass.getField("p2pIp").set(keyData, peerIp)
+        keyDataClass.getField("port").setInt(keyData, peerPort)
         val codec = codecClass.getDeclaredConstructor().newInstance()
         val strValue = codecClass.getMethod("u", Any::class.java).invoke(codec, keyData) as String
-        return FakePeerKeyDataValue(strValue = strValue, publicKeySize = publicKey.size)
+        return FakePeerKeyDataValue(
+            strValue = strValue,
+            publicKeySize = publicKey.size,
+            peerIp = peerIp,
+            peerPort = peerPort
+        )
+    }
+
+    private fun maybeApplyFakeMirrorAudioEndpointOverrides(relayClass: Class<*>, relayService: Any) {
+        val updates = mutableListOf<String>()
+        currentFakeMirrorRemoteLocalIp()?.let { localIp ->
+            if (setMirrorStringField(relayClass, relayService, MIRROR_RELAY_FIELD_LOCAL_IP, localIp)) {
+                updates += "localIp=$localIp"
+            }
+        }
+        currentFakeMirrorRemoteLocalPort()?.let { localPort ->
+            if (setMirrorIntField(relayClass, relayService, MIRROR_RELAY_FIELD_LOCAL_PORT, localPort)) {
+                updates += "localPort=$localPort"
+            }
+        }
+        currentFakeMirrorRemotePeerIp()?.let { peerIp ->
+            if (setMirrorStringField(relayClass, relayService, MIRROR_RELAY_FIELD_PEER_IP, peerIp)) {
+                updates += "peerIp=$peerIp"
+            }
+        }
+        currentFakeMirrorRemotePeerPort()?.let { peerPort ->
+            if (setMirrorIntField(relayClass, relayService, MIRROR_RELAY_FIELD_PEER_PORT, peerPort)) {
+                updates += "peerPort=$peerPort"
+            }
+        }
+        if (updates.isNotEmpty()) {
+            log("mirror fake pad audio endpoint override ${updates.joinToString(" ")}")
+        }
+    }
+
+    private fun setMirrorStringField(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String,
+        value: String
+    ): Boolean =
+        setMirrorField(relayClass, relayService, fieldName, String::class.java) { field ->
+            field.set(relayService, value)
+        }
+
+    private fun setMirrorIntField(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String,
+        value: Int
+    ): Boolean =
+        setMirrorField(relayClass, relayService, fieldName, Integer.TYPE) { field ->
+            field.setInt(relayService, value)
+        }
+
+    private fun setMirrorField(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String,
+        type: Class<*>,
+        setter: (java.lang.reflect.Field) -> Unit
+    ): Boolean {
+        val field = relayClass.declaredFields.firstOrNull { field ->
+            !Modifier.isStatic(field.modifiers) && field.name == fieldName && field.type == type
+        } ?: return false
+        return runCatching {
+            field.isAccessible = true
+            setter(field)
+        }.isSuccess
     }
 
     private fun findMirrorSharedKeySize(relayClass: Class<*>, relayService: Any): Int {
@@ -879,6 +970,26 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemotePeerIp(): String? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemotePeerPort(): Int? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteLocalIp(): String? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteLocalPort(): Int? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY)
+        )
+
     private fun readSystemProperty(name: String): String =
         runCatching {
             Class.forName("android.os.SystemProperties")
@@ -907,8 +1018,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_AUDIO_PARAMS_THROTTLE_MS = 1_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
-        private const val FAKE_MIRROR_KEY_PEER_IP = "127.0.0.1"
-        private const val FAKE_MIRROR_KEY_PEER_PORT = 7102
+        private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
+        private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102
+        private const val MIRROR_RELAY_FIELD_LOCAL_IP = "m"
+        private const val MIRROR_RELAY_FIELD_PEER_IP = "n"
+        private const val MIRROR_RELAY_FIELD_LOCAL_PORT = "o"
+        private const val MIRROR_RELAY_FIELD_PEER_PORT = "p"
         private const val MIRROR_SHARED_KEY_MIN_BYTES = 16
         private const val MAX_MIRROR_AUDIO_PARAM_FIELDS = 12
         private const val MAX_MIRROR_FIELD_VALUE_CHARS = 80
