@@ -213,6 +213,29 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteCallRelayLatch() {
+        assertEquals(1_790_000_000_000L, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil("1790000000000"))
+        assertEquals(0L, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil("0"))
+
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayActive(
+                rawValue = "1790000000000",
+                nowEpochMs = 1_780_000_000_000L
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayActive(
+                rawValue = "1790000000000",
+                nowEpochMs = 1_790_000_000_000L
+            )
+        )
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayActive("0", nowEpochMs = 1L))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil("1790000000000;id"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil(null))
+    }
+
+    @Test
     fun parsesMirrorFakeRemoteCallState() {
         assertEquals(0, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("idle"))
         assertEquals(1, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("ringing"))

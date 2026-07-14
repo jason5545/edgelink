@@ -133,6 +133,48 @@ class EdgeLinkShizukuCommandPolicyTest {
     }
 
     @Test
+    fun allowsOnlyCallRelayLatchPropertyWrites() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+                    "1790000000000"
+                )
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+                    "0"
+                )
+            )
+        )
+
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", "debug.edgelink.mirror_fake_remote_using_pad", "true")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+                    "1790000000000;id"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("getprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY)
+            )
+        )
+    }
+
+    @Test
     fun rejectsUnexpectedPhoneCommands() {
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(

@@ -20,7 +20,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 4
+private const val SHIZUKU_USER_SERVICE_VERSION = 5
+private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -259,6 +260,25 @@ object AndroidShizukuSupport {
         )
     }
 
+    suspend fun armPhoneCallRelay(context: Context, ttlMs: Long): ShizukuOperationResult {
+        val boundedTtlMs = ttlMs.coerceIn(1_000L, PHONE_CALL_RELAY_LATCH_MAX_TTL_MS)
+        val untilEpochMs = System.currentTimeMillis() + boundedTtlMs
+        return writeDebugProperty(
+            context = context,
+            key = MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+            value = untilEpochMs.toString(),
+            name = "phone:relay_latch"
+        )
+    }
+
+    suspend fun clearPhoneCallRelay(context: Context): ShizukuOperationResult =
+        writeDebugProperty(
+            context = context,
+            key = MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+            value = "0",
+            name = "phone:relay_latch_clear"
+        )
+
     suspend fun placePhoneCall(context: Context, telUri: String): ShizukuOperationResult =
         withContext(Dispatchers.IO) {
             val appContext = context.applicationContext
@@ -318,6 +338,16 @@ object AndroidShizukuSupport {
                 }
             )
         }
+    }
+
+    private suspend fun writeDebugProperty(
+        context: Context,
+        key: String,
+        value: String,
+        name: String
+    ): ShizukuOperationResult = withService(context) { service ->
+        val result = service.runCommandResult(arrayOf("setprop", key, value))
+        listOf(result).toOperationResult(name)
     }
 
     private suspend fun <T> withService(

@@ -8,6 +8,7 @@ import java.time.Instant
 private const val PHONE_ACTION_DIAL = "dial"
 private const val PHONE_ACTION_ANSWER = "answer"
 private const val PHONE_ACTION_HANGUP = "hangup"
+private const val PHONE_CALL_RELAY_LATCH_TTL_MS = 30_000L
 
 class AndroidPhoneCallController(context: Context) {
     private val appContext = context.applicationContext
@@ -38,10 +39,14 @@ class AndroidPhoneCallController(context: Context) {
                 ts = now
             )
         val telUri = "tel:$number"
+        armPhoneRelayLatch(PHONE_ACTION_DIAL)
         return runCatching {
             AndroidShizukuSupport.placePhoneCall(appContext, telUri)
         }.fold(
             onSuccess = { result ->
+                if (!result.success) {
+                    clearPhoneRelayLatch("dial_failed")
+                }
                 EdgeLinkLog.info(
                     "phone.android.action_result action=dial success=${result.success} numberFp=${AndroidSmsSync.fingerprint(number)}"
                 )
@@ -54,6 +59,7 @@ class AndroidPhoneCallController(context: Context) {
                 )
             },
             onFailure = { error ->
+                clearPhoneRelayLatch("dial_exception")
                 EdgeLinkLog.error(
                     "phone.android.action_failed action=dial numberFp=${AndroidSmsSync.fingerprint(number)}",
                     error
@@ -70,10 +76,19 @@ class AndroidPhoneCallController(context: Context) {
     }
 
     private suspend fun pressKey(body: PhoneActionBody, keyCode: String, now: Long): PhoneActionResultBody {
+        if (body.action == PHONE_ACTION_ANSWER) {
+            armPhoneRelayLatch(PHONE_ACTION_ANSWER)
+        }
         return runCatching {
             AndroidShizukuSupport.pressPhoneKey(appContext, keyCode)
         }.fold(
             onSuccess = { result ->
+                if (body.action == PHONE_ACTION_ANSWER && !result.success) {
+                    clearPhoneRelayLatch("answer_failed")
+                }
+                if (body.action == PHONE_ACTION_HANGUP) {
+                    clearPhoneRelayLatch("hangup")
+                }
                 EdgeLinkLog.info("phone.android.action_result action=${body.action} success=${result.success}")
                 PhoneActionResultBody(
                     requestId = body.requestId,
@@ -84,6 +99,12 @@ class AndroidPhoneCallController(context: Context) {
                 )
             },
             onFailure = { error ->
+                if (body.action == PHONE_ACTION_ANSWER) {
+                    clearPhoneRelayLatch("answer_exception")
+                }
+                if (body.action == PHONE_ACTION_HANGUP) {
+                    clearPhoneRelayLatch("hangup_exception")
+                }
                 EdgeLinkLog.error("phone.android.action_failed action=${body.action}", error)
                 PhoneActionResultBody(
                     requestId = body.requestId,
@@ -94,6 +115,34 @@ class AndroidPhoneCallController(context: Context) {
                 )
             }
         )
+    }
+
+    private suspend fun armPhoneRelayLatch(action: String) {
+        runCatching {
+            AndroidShizukuSupport.armPhoneCallRelay(appContext, PHONE_CALL_RELAY_LATCH_TTL_MS)
+        }.onSuccess { result ->
+            if (result.success) {
+                EdgeLinkLog.info("phone.android.relay_latch_armed action=$action ttlMs=$PHONE_CALL_RELAY_LATCH_TTL_MS")
+            } else {
+                EdgeLinkLog.warn("phone.android.relay_latch_arm_failed action=$action message=${result.message}")
+            }
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.relay_latch_arm_failed action=$action", error)
+        }
+    }
+
+    private suspend fun clearPhoneRelayLatch(reason: String) {
+        runCatching {
+            AndroidShizukuSupport.clearPhoneCallRelay(appContext)
+        }.onSuccess { result ->
+            if (result.success) {
+                EdgeLinkLog.info("phone.android.relay_latch_cleared reason=$reason")
+            } else {
+                EdgeLinkLog.warn("phone.android.relay_latch_clear_failed reason=$reason message=${result.message}")
+            }
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.relay_latch_clear_failed reason=$reason", error)
+        }
     }
 
     private fun sanitizePhoneNumber(raw: String): String? {

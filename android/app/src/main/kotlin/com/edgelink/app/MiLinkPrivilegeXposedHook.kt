@@ -32,6 +32,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
     const val MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY = "debug.edgelink.mirror_fake_remote_using_pad"
+    const val MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY = "debug.edgelink.mirror_fake_remote_call_relay_until"
     const val MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY = "debug.edgelink.mirror_fake_remote_call_state"
     const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_params"
@@ -112,6 +113,19 @@ internal object MiLinkPrivilegeHookPolicy {
             "1", "true", "yes", "on", "pad", "usingpad", "using_pad" -> true
             else -> false
         }
+
+    fun mirrorFakeRemoteCallRelayUntil(rawValue: String?): Long? {
+        val normalized = rawValue?.trim()?.takeIf { it.length in 1..16 } ?: return null
+        if (normalized.any { it !in '0'..'9' }) {
+            return null
+        }
+        return normalized.toLongOrNull()
+    }
+
+    fun mirrorFakeRemoteCallRelayActive(rawValue: String?, nowEpochMs: Long): Boolean =
+        mirrorFakeRemoteCallRelayUntil(rawValue)?.let { untilEpochMs ->
+            untilEpochMs > nowEpochMs
+        } == true
 
     fun mirrorFakeRemoteCallState(rawValue: String?): Int? =
         when (rawValue?.trim()?.lowercase()) {
@@ -760,7 +774,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 "A",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (currentFakeMirrorRemoteMode() == "pad" && currentFakeMirrorRemoteUsingPadEnabled()) {
+                        if (shouldForceMirrorCallRelay()) {
                             param.setResult(true)
                             log("mirror fake pad using-pad override active")
                         }
@@ -913,7 +927,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun shouldForceFakeMirrorPlainAudioSink(): Boolean =
-        currentFakeMirrorRemoteMode() == "pad" &&
+        shouldForceMirrorCallRelay() &&
             currentFakeMirrorRemoteKeyEnabled() &&
             currentFakeMirrorRemotePlainRtpEnabled()
 
@@ -943,7 +957,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun shouldBlockFakeMirrorAudioStart(): Boolean =
-        currentFakeMirrorRemoteMode() == "pad" &&
+        shouldForceMirrorCallRelay() &&
             currentFakeMirrorRemoteKeyEnabled() &&
             fakeMirrorAudioStartProbeDepth == 0 &&
             !currentFakeMirrorRemoteAudioAllowed()
@@ -1489,6 +1503,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemoteCallRelayActive(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayActive(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY),
+            System.currentTimeMillis()
+        )
+
     private fun currentFakeMirrorRemoteCallState(): Int? =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY)
@@ -1539,13 +1559,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY)
         )
 
-    private fun shouldForceInCallUiRelay(): Boolean =
+    private fun shouldForceMirrorCallRelay(): Boolean =
         currentFakeMirrorRemoteMode() == "pad" &&
-            currentFakeMirrorRemoteUsingPadEnabled()
+            currentFakeMirrorRemoteUsingPadEnabled() &&
+            currentFakeMirrorRemoteCallRelayActive()
+
+    private fun shouldForceInCallUiRelay(): Boolean =
+        shouldForceMirrorCallRelay()
 
     private fun shouldForceAndroidPhoneRelay(): Boolean =
-        currentFakeMirrorRemoteMode() == "pad" &&
-            currentFakeMirrorRemoteUsingPadEnabled()
+        shouldForceMirrorCallRelay()
 
     private fun fakeRelayDeviceIdList(original: List<*>?): ArrayList<String> {
         val updated = ArrayList<String>()

@@ -93,6 +93,9 @@ internal object EdgeLinkShizukuCommandPolicy {
         if (isAllowedPhoneCommand(command)) {
             return true
         }
+        if (isAllowedSystemPropertyCommand(command)) {
+            return true
+        }
         return isAllowedPermissionGrantCommand(command)
     }
 
@@ -170,6 +173,17 @@ internal object EdgeLinkShizukuCommandPolicy {
             command[1] == "keyevent" &&
             command[2] in allowedPhoneKeyEvents
 
+    private fun isAllowedSystemPropertyCommand(command: Array<String>): Boolean {
+        if (command.size != 3 || command[0] != "setprop") {
+            return false
+        }
+        val key = command[1]
+        val value = command[2]
+        return key in allowedDebugProperties &&
+            value.length in 1..16 &&
+            value.all { it in '0'..'9' }
+    }
+
     private fun isScreenShareProtectionKey(namespace: String, key: String): Boolean =
         namespace == "global" && key == GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS ||
             namespace == "secure" && key == XIAOMI_SCREEN_PROJECT_PRIVATE_ON
@@ -200,6 +214,9 @@ internal object EdgeLinkShizukuCommandPolicy {
     private val allowedPhoneKeyEvents = setOf(
         "KEYCODE_HEADSETHOOK",
         "KEYCODE_ENDCALL"
+    )
+    private val allowedDebugProperties = setOf(
+        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY
     )
     private val allowedMiLinkContentCalls = mapOf(
         ("content://com.milink.service.circulate" to "check_permission") to setOf(
