@@ -33,6 +33,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_params"
     const val MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_start"
     const val MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_sink_arg"
+    const val MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY = "debug.edgelink.mirror_fake_remote_plain_rtp"
     const val MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_ip"
     const val MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_port"
     const val MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_local_ip"
@@ -130,6 +131,12 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun mirrorFakeRemoteAudioSinkArg(rawValue: String?): Int? =
         rawValue?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
+
+    fun mirrorFakeRemotePlainRtpEnabled(rawValue: String?): Boolean =
+        when (rawValue?.trim()?.lowercase()) {
+            "0", "false", "no", "off", "encrypt", "encrypted" -> false
+            else -> true
+        }
 
     fun mirrorFakeRemoteEndpointHost(rawValue: String?): String? =
         rawValue
@@ -293,6 +300,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorDeviceTypeChecks(classLoader)
         hookMirrorUsingPadOverride(classLoader)
         hookMirrorAudioStartGuard(classLoader)
+        hookMirrorPlainAudioSink(classLoader)
     }
 
     private fun hookMirrorRemoteProviderResults(classLoader: ClassLoader) {
@@ -549,6 +557,92 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private fun hookMirrorPlainAudioSink(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL_AUDIO_SINK,
+                classLoader,
+                "startAudioSink",
+                findTargetClass(classLoader, XIAOMI_MIRROR_META_INFO),
+                String::class.java,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceFakeMirrorPlainAudioSink()) {
+                            return
+                        }
+                        runCatching {
+                            val field = param.thisObject.javaClass
+                                .getDeclaredField(MIRROR_AUDIO_SINK_FIELD_ENCRYPT_ENABLE)
+                            field.isAccessible = true
+                            field.setBoolean(param.thisObject, false)
+                            log("mirror fake pad plain audio sink enabled")
+                        }.onFailure { error ->
+                            log("failed to disable fake pad audio sink encryption flag: ${error.javaClass.simpleName}: ${error.message}")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror plain audio sink: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL,
+                classLoader,
+                "setMirrorOption",
+                java.lang.Long.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceFakeMirrorPlainAudioSink()) {
+                            return
+                        }
+                        val option = param.args.getOrNull(1) as? Int ?: return
+                        val forcedValue = plainAudioSinkOptionValue(option) ?: return
+                        if (!isMirrorAudioSinkStartStack()) {
+                            return
+                        }
+                        val oldValue = param.args.getOrNull(2)
+                        if (oldValue != forcedValue) {
+                            param.args[2] = forcedValue
+                            log("mirror fake pad plain audio sink option option=$option value=$oldValue->$forcedValue")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror plain audio sink options: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun shouldForceFakeMirrorPlainAudioSink(): Boolean =
+        currentFakeMirrorRemoteMode() == "pad" &&
+            currentFakeMirrorRemoteKeyEnabled() &&
+            currentFakeMirrorRemotePlainRtpEnabled()
+
+    private fun plainAudioSinkOptionValue(option: Int): Int? =
+        when (option) {
+            MIRROR_OPTION_ENCRYPT_TYPE,
+            MIRROR_OPTION_ENCRYPT_DATA_LEN,
+            MIRROR_OPTION_ENCRYPT_DATA_FORMAT,
+            MIRROR_OPTION_DATA_INTEGRITY_ENABLE,
+            MIRROR_OPTION_DATA_INTEGRITY_LEVEL -> 0
+            else -> null
+        }
+
+    private fun isMirrorAudioSinkStartStack(): Boolean =
+        Thread.currentThread().stackTrace.any { frame ->
+            frame.className == XIAOMI_MIRROR_CONTROL_AUDIO_SINK &&
+                frame.methodName == "startAudioSink"
+        }
+
     private fun blockFakeMirrorAudioStart(label: String, param: XC_MethodHook.MethodHookParam) {
         if (shouldBlockFakeMirrorAudioStart()) {
             maybeLogFakeMirrorAudioParams(label, param.thisObject)
@@ -659,6 +753,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         val now = SystemClock.uptimeMillis()
         if (now - lastFakeMirrorKeyUptimeMs < FAKE_MIRROR_KEY_THROTTLE_MS) {
+            maybeProbeFakeMirrorCallStateWithCurrentKey(relayClass, relayService, "key_throttled")
             return
         }
         lastFakeMirrorKeyUptimeMs = now
@@ -674,19 +769,32 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
             Handler(Looper.getMainLooper()).postDelayed(
                 {
-                    val sharedKeySize = findMirrorSharedKeySize(relayClass, relayService)
-                    val keyReady = sharedKeySize >= MIRROR_SHARED_KEY_MIN_BYTES
-                    log(
-                        "mirror fake pad key data status " +
-                            "keyReady=$keyReady " +
-                            "sharedKeyBytes=$sharedKeySize"
-                    )
-                    maybeProbeFakeMirrorCallState(relayClass, relayService, keyReady)
+                    maybeProbeFakeMirrorCallStateWithCurrentKey(relayClass, relayService, "key_injected")
                 },
                 FAKE_MIRROR_KEY_STATUS_DELAY_MS
             )
         }.onFailure { error ->
             log("failed to inject fake pad key data: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun maybeProbeFakeMirrorCallStateWithCurrentKey(
+        relayClass: Class<*>,
+        relayService: Any,
+        reason: String
+    ) {
+        runCatching {
+            val sharedKeySize = findMirrorSharedKeySize(relayClass, relayService)
+            val keyReady = sharedKeySize >= MIRROR_SHARED_KEY_MIN_BYTES
+            log(
+                "mirror fake pad key data status " +
+                    "reason=$reason " +
+                    "keyReady=$keyReady " +
+                    "sharedKeyBytes=$sharedKeySize"
+            )
+            maybeProbeFakeMirrorCallState(relayClass, relayService, keyReady)
+        }.onFailure { error ->
+            log("failed to probe fake pad call state with current key: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -770,6 +878,44 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         setMirrorField(relayClass, relayService, fieldName, Integer.TYPE) { field ->
             field.setInt(relayService, value)
         }
+
+    private fun setMirrorBooleanField(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String,
+        value: Boolean
+    ): Boolean =
+        setMirrorField(relayClass, relayService, fieldName, java.lang.Boolean.TYPE) { field ->
+            field.setBoolean(relayService, value)
+        }
+
+    private fun getMirrorBooleanField(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String
+    ): Boolean? =
+        runCatching {
+            val field = relayClass.declaredFields.firstOrNull { candidate ->
+                !Modifier.isStatic(candidate.modifiers) &&
+                    candidate.name == fieldName &&
+                    candidate.type == java.lang.Boolean.TYPE
+            } ?: return@runCatching null
+            field.isAccessible = true
+            field.getBoolean(relayService)
+        }.getOrNull()
+
+    private fun getMirrorFieldValue(
+        relayClass: Class<*>,
+        relayService: Any,
+        fieldName: String
+    ): Any? =
+        runCatching {
+            val field = relayClass.declaredFields.firstOrNull { candidate ->
+                !Modifier.isStatic(candidate.modifiers) && candidate.name == fieldName
+            } ?: return@runCatching null
+            field.isAccessible = true
+            field.get(relayService)
+        }.getOrNull()
 
     private fun setMirrorField(
         relayClass: Class<*>,
@@ -878,8 +1024,35 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     "audioAllowed=${currentFakeMirrorRemoteAudioAllowed()}"
             )
             relayClass.getMethod("s", Integer.TYPE).invoke(relayService, callState)
+            if (callState == 0) {
+                forceStopFakeMirrorAudioRelay(relayClass, relayService)
+            }
         }.onFailure { error ->
             log("failed to probe fake pad call state: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun forceStopFakeMirrorAudioRelay(relayClass: Class<*>, relayService: Any) {
+        runCatching {
+            val sourceWasOpen = getMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SOURCE_OPEN)
+            val sinkWasOpen = getMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SINK_OPEN)
+            relayClass.getMethod("Z").invoke(relayService)
+            val audioManager = getMirrorFieldValue(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_MANAGER)
+            runCatching { audioManager?.javaClass?.getMethod("l")?.invoke(audioManager) }
+            runCatching { audioManager?.javaClass?.getMethod("k")?.invoke(audioManager) }
+            setMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SOURCE_OPEN, false)
+            setMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SINK_OPEN, false)
+            val sourceOpen = getMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SOURCE_OPEN)
+            val sinkOpen = getMirrorBooleanField(relayClass, relayService, MIRROR_RELAY_FIELD_AUDIO_SINK_OPEN)
+            log(
+                "mirror fake pad audio forced idle " +
+                    "sourceWasOpen=${sourceWasOpen?.toString() ?: "?"} " +
+                    "sinkWasOpen=${sinkWasOpen?.toString() ?: "?"} " +
+                    "sourceOpen=${sourceOpen?.toString() ?: "?"} " +
+                    "sinkOpen=${sinkOpen?.toString() ?: "?"}"
+            )
+        }.onFailure { error ->
+            log("failed to force fake pad audio idle: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -1051,6 +1224,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemotePlainRtpEnabled(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemotePlainRtpEnabled(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY)
+        )
+
     private fun currentFakeMirrorRemotePeerIp(): String? =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY)
@@ -1094,6 +1272,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_ECDH_HELPER = "com.xiaomi.mirror.relay.n"
         private const val XIAOMI_MIRROR_ECDH_HELPER_JADX_NAME = "com.xiaomi.mirror.relay.C0761n"
         private const val XIAOMI_MIRROR_KEY_DATA = "com.xiaomi.mirror.relay.KeyData"
+        private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
+        private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
+        private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
         private const val XIAOMI_JSON_CODEC = "C0.d"
         private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L
@@ -1106,6 +1287,15 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val MIRROR_RELAY_FIELD_PEER_IP = "n"
         private const val MIRROR_RELAY_FIELD_LOCAL_PORT = "o"
         private const val MIRROR_RELAY_FIELD_PEER_PORT = "p"
+        private const val MIRROR_RELAY_FIELD_AUDIO_MANAGER = "a"
+        private const val MIRROR_RELAY_FIELD_AUDIO_SOURCE_OPEN = "i"
+        private const val MIRROR_RELAY_FIELD_AUDIO_SINK_OPEN = "j"
+        private const val MIRROR_AUDIO_SINK_FIELD_ENCRYPT_ENABLE = "mEncryptEnable"
+        private const val MIRROR_OPTION_ENCRYPT_TYPE = 12
+        private const val MIRROR_OPTION_ENCRYPT_DATA_LEN = 13
+        private const val MIRROR_OPTION_ENCRYPT_DATA_FORMAT = 14
+        private const val MIRROR_OPTION_DATA_INTEGRITY_ENABLE = 15
+        private const val MIRROR_OPTION_DATA_INTEGRITY_LEVEL = 16
         private const val MIRROR_SHARED_KEY_MIN_BYTES = 16
         private const val MAX_MIRROR_AUDIO_PARAM_FIELDS = 12
         private const val MAX_MIRROR_FIELD_VALUE_CHARS = 80
