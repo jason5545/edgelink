@@ -1096,7 +1096,7 @@ final class MiLinkPhoneRelayProbe {
         }
 
         if firstLine.uppercased().hasPrefix("RTSP/") {
-            handleRTSPResponse(connection: connection, id: id, headerText: headerText, cseq: cseq)
+            handleRTSPResponse(connection: connection, id: id, headerText: headerText, bodyText: bodyText, cseq: cseq)
         } else if let method = rtspRequestMethod(firstLine), cseq != "?" {
             handleRTSPRequest(
                 method: method,
@@ -1150,6 +1150,11 @@ final class MiLinkPhoneRelayProbe {
             if bodyText.localizedCaseInsensitiveContains("wfd_trigger_method: SETUP") {
                 sendSinkSETUPIfNeeded(connection: connection, id: id, reason: "trigger_setup")
             }
+            if bodyText.localizedCaseInsensitiveContains("wfd_trigger_method: TEARDOWN") {
+                stopMPEGTSPlayer(reason: "trigger_teardown")
+                stopMPEGTSFileCapture(reason: "trigger_teardown")
+                stopSourceRTPIfOwned(by: id, reason: "trigger_teardown")
+            }
         case "SETUP":
             recordSourceRTPDestination(from: headerText, connection: connection, id: id)
             let session = ensureSessionID(for: id)
@@ -1177,7 +1182,13 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
-    private func handleRTSPResponse(connection: NWConnection, id: UUID, headerText: String, cseq: String) {
+    private func handleRTSPResponse(
+        connection: NWConnection,
+        id: UUID,
+        headerText: String,
+        bodyText: String,
+        cseq: String
+    ) {
         var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
         let requestMethod = state.pendingRequests.removeValue(forKey: cseq)
         if let session = rtspHeader("Session", in: headerText)?.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespaces),
@@ -1188,12 +1199,36 @@ final class MiLinkPhoneRelayProbe {
 
         switch requestMethod {
         case "GET_PARAMETER":
+            recordSourceRTPDestination(fromWFDParameters: bodyText, connection: connection, id: id)
             sendSourceSETParameterIfNeeded(connection: connection, id: id, reason: "get_parameter_response")
+        case "SET_PARAMETER":
+            sendSourceSETUPIfNeeded(connection: connection, id: id, reason: "set_parameter_response")
         case "SETUP":
-            sendPLAYIfNeeded(connection: connection, id: id, reason: "setup_response")
+            if tcpStates[id]?.isPeerSourceConnection == true {
+                sendPLAYIfNeeded(connection: connection, id: id, reason: "setup_response")
+            } else {
+                logSourceNonSuccessResponseIfNeeded(headerText: headerText, id: id, requestMethod: "SETUP")
+                sendSourcePLAYIfNeeded(connection: connection, id: id, reason: "setup_response")
+            }
+        case "PLAY":
+            if tcpStates[id]?.isPeerSourceConnection == false {
+                logSourceNonSuccessResponseIfNeeded(headerText: headerText, id: id, requestMethod: "PLAY")
+                startSourceRTPIfReady(id: id, reason: "play_response")
+            }
         default:
             break
         }
+    }
+
+    private func logSourceNonSuccessResponseIfNeeded(headerText: String, id: UUID, requestMethod: String) {
+        let firstLine = headerText.components(separatedBy: "\r\n").first ?? ""
+        guard let status = rtspStatusCode(in: firstLine), status >= 300 else {
+            return
+        }
+        DiagnosticsLog.info(
+            "phonerelay.mac.source_rtsp_non_success_continue id=\(id.uuidString) " +
+                "request=\(requestMethod) status=\(status) firstLine=\(sanitizeRTSPLogValue(firstLine))"
+        )
     }
 
     private func rtspRequestMethod(_ firstLine: String) -> String? {
@@ -1201,6 +1236,15 @@ final class MiLinkPhoneRelayProbe {
             return nil
         }
         return firstLine.components(separatedBy: " ").first?.uppercased()
+    }
+
+    private func rtspStatusCode(in firstLine: String) -> Int? {
+        let parts = firstLine.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2,
+              String(parts[0]).uppercased().hasPrefix("RTSP/") else {
+            return nil
+        }
+        return Int(parts[1])
     }
 
     private func sendRTSPOptionsIfNeeded(connection: NWConnection, id: UUID, reason: String) {
@@ -1255,7 +1299,7 @@ final class MiLinkPhoneRelayProbe {
             return
         }
         state.sentSourceSETParameter = true
-        let presentationURL = "rtsp://\(sourcePresentationHost())/wfd1.0/streamid=0"
+        let presentationURL = sourcePresentationURL()
         tcpStates[id] = state
         let body = """
         wfd_presentation_URL: \(presentationURL) none\r
@@ -1270,6 +1314,53 @@ final class MiLinkPhoneRelayProbe {
             headers: [("Content-Type", "text/parameters")],
             body: body,
             label: "set_parameter_\(reason)"
+        )
+    }
+
+    private func sendSourceSETUPIfNeeded(connection: NWConnection, id: UUID, reason: String) {
+        var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
+        guard !state.isPeerSourceConnection,
+              state.sentSourceSETParameter,
+              !state.sentSourceSETUP else {
+            return
+        }
+        guard let rtpPort = state.sourceRemoteRTPPort else {
+            DiagnosticsLog.warn("phonerelay.mac.source_setup_missing_destination id=\(id.uuidString) reason=\(reason)")
+            return
+        }
+        state.sentSourceSETUP = true
+        tcpStates[id] = state
+        sendRTSPRequest(
+            method: "SETUP",
+            uri: sourcePresentationURL(),
+            connection: connection,
+            id: id,
+            headers: [("Transport", "RTP/AVP/UDP;unicast;client_port=\(rtpPort)-\(rtpPort + 1)")],
+            label: "source_setup_\(reason)"
+        )
+    }
+
+    private func sendSourcePLAYIfNeeded(connection: NWConnection, id: UUID, reason: String) {
+        var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
+        guard !state.isPeerSourceConnection,
+              state.sentSourceSETUP,
+              !state.sentSourcePLAY else {
+            return
+        }
+        state.sentSourcePLAY = true
+        let session = state.sessionID
+        tcpStates[id] = state
+        var headers: [(String, String)] = []
+        if let session, !session.isEmpty {
+            headers.append(("Session", session))
+        }
+        sendRTSPRequest(
+            method: "PLAY",
+            uri: sourcePresentationURL(),
+            connection: connection,
+            id: id,
+            headers: headers,
+            label: "source_play_\(reason)"
         )
     }
 
@@ -1382,6 +1473,13 @@ final class MiLinkPhoneRelayProbe {
             "phonerelay.mac.rtsp_message dir=out id=\(id.uuidString) " +
                 "firstLine=\(sanitizeRTSPLogValue(firstLine)) bytes=\(data.count)"
         )
+        let bodyText = rtspBody(in: message)
+        if !bodyText.isEmpty {
+            DiagnosticsLog.info(
+                "phonerelay.mac.rtsp_body dir=out id=\(id.uuidString) label=\(label) " +
+                    "preview=\(sanitizeRTSPLogValue(bodyText))"
+            )
+        }
         connection.send(content: data, completion: .contentProcessed { error in
             if let error {
                 DiagnosticsLog.warn("phonerelay.mac.rtsp_send_failed id=\(id.uuidString) label=\(label) error=\(error)")
@@ -1470,6 +1568,49 @@ final class MiLinkPhoneRelayProbe {
         )
     }
 
+    private func recordSourceRTPDestination(fromWFDParameters bodyText: String, connection: NWConnection, id: UUID) {
+        var state = tcpStates[id] ?? TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: false)
+        guard !state.isPeerSourceConnection else {
+            return
+        }
+        guard let line = bodyText.components(separatedBy: .newlines).first(where: {
+            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("wfd_client_rtp_ports:")
+        }),
+              let value = line.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init),
+              let rtpPort = firstRTPPortToken(in: value),
+              let host = endpointHostString(connection.endpoint) else {
+            DiagnosticsLog.warn(
+                "phonerelay.mac.source_rtp_destination_missing id=\(id.uuidString) " +
+                    "wfdClientPorts=\(sanitizeRTSPLogValue(wfdClientRTPPortsLine(in: bodyText) ?? "none"))"
+            )
+            return
+        }
+        state.sourceRemoteHost = host
+        state.sourceRemoteRTPPort = rtpPort
+        tcpStates[id] = state
+        DiagnosticsLog.info(
+            "phonerelay.mac.source_rtp_destination id=\(id.uuidString) remote=\(host):\(rtpPort) " +
+                "wfdClientPorts=\(sanitizeRTSPLogValue(value))"
+        )
+    }
+
+    private func wfdClientRTPPortsLine(in bodyText: String) -> String? {
+        bodyText.components(separatedBy: .newlines).first {
+            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("wfd_client_rtp_ports:")
+        }
+    }
+
+    private func firstRTPPortToken(in value: String) -> UInt16? {
+        let normalized = value.replacingOccurrences(of: ";", with: " ")
+        for rawToken in normalized.split(whereSeparator: { $0.isWhitespace }) {
+            let firstValue = rawToken.split(separator: "-").first ?? rawToken[...]
+            if let port = UInt16(firstValue), port > 0 {
+                return port
+            }
+        }
+        return nil
+    }
+
     private func firstRTPPort(in value: String) -> UInt16? {
         let first = value
             .split(separator: "-")
@@ -1497,6 +1638,10 @@ final class MiLinkPhoneRelayProbe {
             return override
         }
         return Self.preferredLocalIPv4Address() ?? "localhost"
+    }
+
+    private func sourcePresentationURL() -> String {
+        "rtsp://\(sourcePresentationHost())/wfd1.0/streamid=0"
     }
 
     private static func preferredLocalIPv4Address() -> String? {
@@ -1654,6 +1799,8 @@ private struct TCPConnectionState {
     var sourceRemoteRTPPort: UInt16?
     var sentSourceGETParameter = false
     var sentSourceSETParameter = false
+    var sentSourceSETUP = false
+    var sentSourcePLAY = false
     var sentSinkSETUP = false
     var sentPLAY = false
     let sendsGreetingOnReady: Bool

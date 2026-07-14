@@ -514,10 +514,15 @@ automatic interface pick is wrong, override it with:
 defaults write com.edgelink.mac phoneRelayProbeSourceHost <mac-ip>
 ```
 
-When the phone sink sends `SETUP`, the Mac records the sink `client_port` from the `Transport`
-header and replies with `server_port=19002-19003`. On `PLAY`, the Mac can start an experimental
-AAC/MPEG-TS RTP source from local UDP `19002` to the phone sink port. This is intentionally off by
-default while real-call behavior is still being verified:
+The verified phone-sink path is slightly different from the earlier WFD assumption. The phone sink
+answers Mac `GET_PARAMETER` with `wfd_client_rtp_ports`, for example
+`RTP/AVP/UDP;unicast 15550 0 mode=play`. After advertising `wfd_presentation_URL`, the Mac records
+that port, sends source-side `SETUP`/`PLAY`, and then starts an experimental AAC/MPEG-TS RTP source
+from local UDP `19002` to the phone sink port. On the current Xiaomi EU build the phone replies
+`405 Method Not Allowed` to those source-side `SETUP`/`PLAY` requests, but still creates
+`MiPlay_RTPSink`, connects back to Mac UDP `19002`, and decodes the incoming AAC stream. Do not treat
+those 405 responses as fatal until we find the cleaner official trigger. Source RTP is intentionally
+off by default while real-call behavior is still being verified:
 
 ```text
 defaults write com.edgelink.mac phoneRelayProbeSourceRTPEnabled -bool true
