@@ -1,5 +1,6 @@
 package com.edgelink.app
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -101,5 +102,55 @@ class MiLinkPrivilegeHookPolicyTest {
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedCallerPackage("com.milink.service"))
         assertFalse(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(arrayOf("com.android.shell")))
         assertFalse(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteMode() {
+        assertEquals("pad", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode("pad"))
+        assertEquals("pad", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode("AndroidPad"))
+        assertEquals("car", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode("androidpadcar"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode("phone"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteMode(null))
+    }
+
+    @Test
+    fun filtersFakeMirrorRemoteByQuery() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
+                mode = "pad",
+                manufacturer = null,
+                platform = null
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
+                mode = "pad",
+                manufacturer = "xiaomi",
+                platform = "AndroidPad"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
+                mode = "pad",
+                manufacturer = "other",
+                platform = "AndroidPad"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
+                mode = "pad",
+                manufacturer = "xiaomi",
+                platform = "AndroidPadCar"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
+                mode = "car",
+                manufacturer = "xiaomi",
+                platform = "AndroidPadCar"
+            )
+        )
     }
 }

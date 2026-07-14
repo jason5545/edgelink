@@ -362,14 +362,34 @@ into Mirror, not a full Mac call-control surface by itself.
 
 The actual call audio relay is in `com.xiaomi.mirror.relay.G` (`MirrorCallService`). It already owns
 phone state listeners, microphone mute state, audio source/sink startup, ECDH key/port exchange, and
-relay active settings. `startMediaRelay(deviceId)` creates the relay audio channel for a supported
-car/lyra remote device; it should only be invoked after `queryRemoteDevices` finds a device whose
-`is_media_relay` is not `-1`.
+relay active settings. There are two related but different paths:
+
+- Phone-to-pad call flow: `MirrorCallService.F(g0)` registers the opposite terminal when the phone
+  sees an `AndroidPad`/PC/iPad/iPhone terminal. The audio implementation uses
+  `MirrorControlAudioSource`/`MirrorControlAudioSink` with `PHONERELAY` and device direction
+  `PHONE -> PAD` / `PAD -> PHONE`.
+- Car media relay SDK flow: `startMediaRelay(deviceId)` is implemented in
+  `SynergySdkHelperForCar` and requires a supported `AndroidPadCar`/Lyra remote whose
+  `is_media_relay` is not `-1`.
 
 EdgeLink currently probes this path by reading the call relay binder descriptor, querying remote
 devices through a local `RemoteDeviceInfo` parcelable shim, and registering/unregistering an
 `IMediaRelayCallback`. The probe deliberately does not call `setCallState`, `startMediaRelay`, or
 `stopMediaRelay`.
+
+For controlled reverse-engineering, the LSPosed module supports a disabled-by-default runtime
+spoof:
+
+- `debug.edgelink.mirror_fake_remote=pad` injects one Xiaomi `AndroidPad` remote device with id
+  `edgelink-mac-mi-pad` into `queryRemoteDevices`, answers `queryRemoteDevice`, and makes Mirror's
+  internal terminal lookup/device-type checks resolve the same fake pad.
+- `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
+  car media-relay path.
+- Any empty or unknown value leaves the spoof fully off.
+
+On the current Xiaomi.eu device, `pad` mode has been verified through logcat: `queryRemoteDevices`
+returns one `AndroidPad` candidate for `all`, `xiaomi`, and `androidPad`, while `androidPadCar`
+stays at zero.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 
@@ -384,9 +404,8 @@ The Shizuku command policy only allows these exact phone commands:
 - `input keyevent KEYCODE_ENDCALL`
 
 This gives EdgeLink a working call-control surface while the Mirror remote-device/session problem
-is still unsolved. Full call audio relay still depends on making Mirror see a supported remote device
-or emulating enough of its trusted-device/session handshake for `startMediaRelay(deviceId)` to have a
-valid target.
+is still unsolved. Full call audio relay through the official pad flow still depends on providing a
+real or emulated Mirror terminal session/message channel, not only a device-list entry.
 
 ### Public Cast Service Binder
 

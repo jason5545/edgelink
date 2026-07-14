@@ -73,6 +73,14 @@ object AndroidMiLinkPhoneContinuityBridge {
                 remoteDeviceCount = devices.size
                 mediaRelayCandidateCount = devices.count { it.isMediaRelay != RemoteDeviceInfo.MEDIA_RELAY_NOT_SUPPORT }
                 steps += "remoteDevicesUnique=${devices.size}:mediaRelayCandidates=$mediaRelayCandidateCount"
+                for (deviceId in devices.mapNotNull { it.id }.distinct().take(3)) {
+                    val device = runProviderStep(steps, "remoteDevice:$deviceId") {
+                        resolver.queryRemoteDevice(deviceId)
+                    }
+                    if (device != null) {
+                        steps += "remoteDevice:$deviceId:sample=${device.compactSummary()}"
+                    }
+                }
             }
 
             val mediaRelayCallback = MediaRelayCallbackBinder { deviceId, volume ->
@@ -173,6 +181,18 @@ object AndroidMiLinkPhoneContinuityBridge {
         return result.getParcelableArrayList<RemoteDeviceInfo>("remoteDevices").orEmpty()
     }
 
+    private fun ContentResolver.queryRemoteDevice(deviceId: String): RemoteDeviceInfo? {
+        val result = callProvider(
+            "queryRemoteDevice",
+            Bundle().apply {
+                putString("remoteDeviceId", deviceId)
+            }
+        ) ?: return null
+        result.classLoader = RemoteDeviceInfo::class.java.classLoader
+        @Suppress("DEPRECATION")
+        return result.getParcelable("remoteDevice")
+    }
+
     private fun IBinder.descriptorStep(): String =
         runCatching { interfaceDescriptor.orEmpty() }
             .getOrElse { error -> "${error.javaClass.simpleName}:${error.message}" }
@@ -243,6 +263,7 @@ object AndroidMiLinkPhoneContinuityBridge {
         RemoteDeviceQuery(label = "windows", platform = RemoteDeviceInfo.PLATFORM_WINDOWS),
         RemoteDeviceQuery(label = "mac", platform = "Mac"),
         RemoteDeviceQuery(label = "commonPc", platform = "CommonPc"),
+        RemoteDeviceQuery(label = "androidPad", platform = RemoteDeviceInfo.PLATFORM_ANDROID_PAD),
         RemoteDeviceQuery(label = "androidPadCar", platform = RemoteDeviceInfo.PLATFORM_ANDROID_PAD_CAR)
     )
 
