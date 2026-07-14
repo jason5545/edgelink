@@ -7,7 +7,9 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
+import android.telecom.TelecomManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -258,11 +260,33 @@ object AndroidShizukuSupport {
     }
 
     suspend fun placePhoneCall(context: Context, telUri: String): ShizukuOperationResult =
-        withService(context) { service ->
-            val result = service.runCommandResult(
-                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", telUri)
+        withContext(Dispatchers.IO) {
+            val appContext = context.applicationContext
+            val permissionResult = ensurePhoneCallPermission(appContext)
+            if (!permissionResult.success) {
+                return@withContext permissionResult
+            }
+            val telecomManager = appContext.getSystemService(TelecomManager::class.java)
+                ?: return@withContext ShizukuOperationResult(
+                    success = false,
+                    message = "phone:dial telecom_service_unavailable"
+                )
+            runCatching {
+                telecomManager.placeCall(Uri.parse(telUri), Bundle())
+            }.fold(
+                onSuccess = {
+                    ShizukuOperationResult(
+                        success = true,
+                        message = "phone:dial telecom_place_call"
+                    )
+                },
+                onFailure = { error ->
+                    ShizukuOperationResult(
+                        success = false,
+                        message = "phone:dial telecom_place_call_failed=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                    )
+                }
             )
-            listOf(result).toOperationResult("phone:dial")
         }
 
     suspend fun pressPhoneKey(context: Context, keyCode: String): ShizukuOperationResult =
@@ -270,6 +294,31 @@ object AndroidShizukuSupport {
             val result = service.runCommandResult(arrayOf("input", "keyevent", keyCode))
             listOf(result).toOperationResult("phone:keyevent:$keyCode")
         }
+
+    private suspend fun ensurePhoneCallPermission(context: Context): ShizukuOperationResult {
+        if (context.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+            return ShizukuOperationResult(
+                success = true,
+                message = "phone:dial_permission already_granted"
+            )
+        }
+        return withService(context) { service ->
+            val grantResult = service.runCommandResult(
+                arrayOf("pm", "grant", context.packageName, Manifest.permission.CALL_PHONE)
+            )
+            val granted = context.checkSelfPermission(Manifest.permission.CALL_PHONE) ==
+                PackageManager.PERMISSION_GRANTED
+            ShizukuOperationResult(
+                success = grantResult.success && granted,
+                message = if (grantResult.success && granted) {
+                    "phone:dial_permission granted"
+                } else {
+                    "phone:dial_permission grant=${grantResult.exitCode} granted=$granted " +
+                        "stderr=${grantResult.stderr.forSingleLineLog()}"
+                }
+            )
+        }
+    }
 
     private suspend fun <T> withService(
         context: Context,

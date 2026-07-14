@@ -162,32 +162,7 @@ internal object EdgeLinkShizukuCommandPolicy {
     }
 
     private fun isAllowedPhoneCommand(command: Array<String>): Boolean =
-        isAllowedPhoneDialCommand(command) || isAllowedPhoneKeyCommand(command)
-
-    private fun isAllowedPhoneDialCommand(command: Array<String>): Boolean {
-        if (command.size != 6 ||
-            command[0] != "am" ||
-            command[1] != "start" ||
-            command[2] != "-a" ||
-            command[3] != "android.intent.action.CALL" ||
-            command[4] != "-d"
-        ) {
-            return false
-        }
-        val telUri = command[5]
-        if (!telUri.startsWith("tel:")) {
-            return false
-        }
-        val number = telUri.removePrefix("tel:")
-        if (number.isBlank() || number.length > 32) {
-            return false
-        }
-        val plusCount = number.count { it == '+' }
-        if (plusCount > 1 || plusCount == 1 && !number.startsWith("+")) {
-            return false
-        }
-        return number.all { it.isDigit() || it == '+' } && number.any { it.isDigit() }
-    }
+        isAllowedPhoneKeyCommand(command)
 
     private fun isAllowedPhoneKeyCommand(command: Array<String>): Boolean =
         command.size == 3 &&
@@ -217,6 +192,7 @@ internal object EdgeLinkShizukuCommandPolicy {
     private val allowedRuntimePermissions = setOf(
             "android.permission.POST_NOTIFICATIONS",
             "android.permission.RECORD_AUDIO",
+            "android.permission.CALL_PHONE",
             "android.permission.READ_SMS",
             "android.permission.RECEIVE_SMS",
             "android.permission.SEND_SMS"

@@ -117,7 +117,7 @@ class EdgeLinkShizukuCommandPolicyTest {
     fun allowsExactPhoneCommands() {
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(
-                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:+886912345678")
+                arrayOf("pm", "grant", "com.edgelink.app", "android.permission.CALL_PHONE")
             )
         )
         assertTrue(
@@ -136,17 +136,17 @@ class EdgeLinkShizukuCommandPolicyTest {
     fun rejectsUnexpectedPhoneCommands() {
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:+886912345678")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("am", "start", "-a", "android.intent.action.VIEW", "-d", "tel:+886912345678")
             )
         )
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(
-                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "https://example.com")
-            )
-        )
-        assertFalse(
-            EdgeLinkShizukuCommandPolicy.isAllowed(
-                arrayOf("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:*#06#")
+                arrayOf("pm", "grant", "com.edgelink.app", "android.permission.READ_CALL_LOG")
             )
         )
         assertFalse(
