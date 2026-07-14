@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Darwin
 import Network
 
@@ -28,12 +29,16 @@ final class MiLinkPhoneRelayProbe {
     private var sourceRTPConnection: NWConnection?
     private var sourceRTPConnectionID: UUID?
     private var sourceRTPProcess: Process?
+    private var sourceRTPInput: FileHandle?
     private var sourceRTPOutput: FileHandle?
     private var sourceRTPDevNull: FileHandle?
     private var sourceRTPBuffer = Data()
     private var sourceRTPSequenceNumber: UInt16 = 0
     private var sourceRTPTimestamp: UInt32 = 0
     private var sourceRTPPacketsSent = 0
+    private var sourceAudioEngine: AVAudioEngine?
+    private var sourceAudioConverter: AVAudioConverter?
+    private var sourcePCMBytesWritten = 0
     private var port: UInt16 = 7102
     private let sinkRTPPort: UInt16 = 19_000
     private let sourceRTPPort: UInt16 = 19_002
@@ -677,23 +682,20 @@ final class MiLinkPhoneRelayProbe {
             stopSourceRTP(reason: "ffmpeg_unavailable")
             return
         }
+        let audioMode = sourceRTPAudioMode
+        if audioMode == .microphone && !microphoneCaptureAuthorizedForSourceRTP(id: id, reason: reason) {
+            stopSourceRTP(reason: "microphone_permission_unavailable")
+            return
+        }
         let process = Process()
+        let inputPipe = audioMode == .microphone ? Pipe() : nil
         let outputPipe = Pipe()
         let devNull = FileHandle(forWritingAtPath: "/dev/null")
         process.executableURL = ffmpegURL
-        process.arguments = [
-            "-hide_banner",
-            "-loglevel", "error",
-            "-re",
-            "-f", "lavfi",
-            "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
-            "-ac", "1",
-            "-c:a", "aac",
-            "-profile:a", "aac_low",
-            "-b:a", "64k",
-            "-f", "mpegts",
-            "pipe:1"
-        ]
+        process.arguments = sourceMPEGTSArguments(audioMode: audioMode)
+        if let inputPipe {
+            process.standardInput = inputPipe
+        }
         process.standardOutput = outputPipe
         if let devNull {
             process.standardError = devNull
@@ -723,12 +725,200 @@ final class MiLinkPhoneRelayProbe {
         do {
             try process.run()
             sourceRTPProcess = process
+            sourceRTPInput = inputPipe?.fileHandleForWriting
             sourceRTPOutput = outputPipe.fileHandleForReading
             sourceRTPDevNull = devNull
-            DiagnosticsLog.info("phonerelay.mac.source_mpegts_start path=\(ffmpegURL.path) id=\(id.uuidString) reason=\(reason)")
+            sourcePCMBytesWritten = 0
+            DiagnosticsLog.info(
+                "phonerelay.mac.source_mpegts_start path=\(ffmpegURL.path) id=\(id.uuidString) " +
+                    "mode=\(audioMode.rawValue) reason=\(reason)"
+            )
+            if audioMode == .microphone {
+                startSourceMicrophoneCapture(id: id)
+            }
         } catch {
             DiagnosticsLog.warn("phonerelay.mac.source_mpegts_start_failed path=\(ffmpegURL.path) error=\(error)")
             stopSourceRTP(reason: "mpegts_start_failed")
+        }
+    }
+
+    private func sourceMPEGTSArguments(audioMode: SourceRTPAudioMode) -> [String] {
+        switch audioMode {
+        case .silent:
+            return [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-re",
+                "-f", "lavfi",
+                "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
+                "-ac", "1",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "64k",
+                "-f", "mpegts",
+                "pipe:1"
+            ]
+        case .microphone:
+            return [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-f", "s16le",
+                "-ar", "\(Int(Self.sourcePCMSampleRate))",
+                "-ac", "\(Int(Self.sourcePCMChannels))",
+                "-i", "pipe:0",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "64k",
+                "-f", "mpegts",
+                "pipe:1"
+            ]
+        }
+    }
+
+    private func microphoneCaptureAuthorizedForSourceRTP(id: UUID, reason: String) -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DiagnosticsLog.info("phonerelay.mac.source_microphone_permission_result granted=\(granted)")
+                guard granted else {
+                    return
+                }
+                self?.queue.async {
+                    self?.startSourceRTPIfReady(id: id, reason: "microphone_permission_granted_\(reason)")
+                }
+            }
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_permission_pending id=\(id.uuidString) reason=\(reason)")
+            return false
+        case .denied, .restricted:
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_permission_denied id=\(id.uuidString) reason=\(reason)")
+            return false
+        @unknown default:
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_permission_unknown id=\(id.uuidString) reason=\(reason)")
+            return false
+        }
+    }
+
+    private func startSourceMicrophoneCapture(id: UUID) {
+        guard sourceAudioEngine == nil else {
+            return
+        }
+        guard let sourceRTPInput else {
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_missing_input id=\(id.uuidString)")
+            stopSourceRTP(reason: "microphone_missing_input")
+            return
+        }
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.channelCount > 0,
+              let outputFormat = Self.sourcePCMFormat,
+              let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            DiagnosticsLog.warn(
+                "phonerelay.mac.source_microphone_format_unavailable id=\(id.uuidString) " +
+                    "inputRate=\(inputFormat.sampleRate) inputChannels=\(inputFormat.channelCount)"
+            )
+            stopSourceRTP(reason: "microphone_format_unavailable")
+            return
+        }
+
+        sourceAudioEngine = engine
+        sourceAudioConverter = converter
+        inputNode.installTap(onBus: 0, bufferSize: Self.sourcePCMFramesPerBuffer, format: inputFormat) { [weak self, converter, outputFormat] buffer, _ in
+            guard let pcm = Self.convertSourceMicrophoneBuffer(buffer, converter: converter, outputFormat: outputFormat),
+                  !pcm.isEmpty else {
+                return
+            }
+            self?.queue.async {
+                guard let self, self.sourceRTPInput === sourceRTPInput else {
+                    return
+                }
+                self.writeSourcePCM(pcm)
+            }
+        }
+
+        do {
+            try engine.start()
+            DiagnosticsLog.info(
+                "phonerelay.mac.source_microphone_start id=\(id.uuidString) " +
+                    "inputRate=\(inputFormat.sampleRate) inputChannels=\(inputFormat.channelCount) " +
+                    "outputRate=\(Self.sourcePCMSampleRate) outputChannels=\(Self.sourcePCMChannels)"
+            )
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            sourceAudioEngine = nil
+            sourceAudioConverter = nil
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_start_failed id=\(id.uuidString) error=\(error)")
+            stopSourceRTP(reason: "microphone_start_failed")
+        }
+    }
+
+    private static func convertSourceMicrophoneBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        outputFormat: AVAudioFormat
+    ) -> Data? {
+        let ratio = outputFormat.sampleRate / buffer.format.sampleRate
+        let frameCapacity = max(1, AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16)
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: frameCapacity) else {
+            return nil
+        }
+        var didProvideInput = false
+        var conversionError: NSError?
+        let status = converter.convert(to: outputBuffer, error: &conversionError) { _, outStatus in
+            if didProvideInput {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            didProvideInput = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        if let conversionError {
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_convert_failed error=\(conversionError)")
+            return nil
+        }
+        guard status != .error,
+              outputBuffer.frameLength > 0,
+              let channelData = outputBuffer.int16ChannelData else {
+            return nil
+        }
+        let byteCount = Int(outputBuffer.frameLength) * Int(outputFormat.channelCount) * MemoryLayout<Int16>.size
+        return Data(bytes: channelData[0], count: byteCount)
+    }
+
+    private func writeSourcePCM(_ data: Data) {
+        guard let sourceRTPInput,
+              sourceRTPProcess?.isRunning == true else {
+            return
+        }
+        do {
+            try sourceRTPInput.write(contentsOf: data)
+            sourcePCMBytesWritten += data.count
+            if sourcePCMBytesWritten == data.count || sourcePCMBytesWritten % 96_000 < data.count {
+                DiagnosticsLog.info(
+                    "phonerelay.mac.source_microphone_pcm_write bytes=\(data.count) total=\(sourcePCMBytesWritten)"
+                )
+            }
+        } catch {
+            DiagnosticsLog.warn("phonerelay.mac.source_microphone_pcm_write_failed error=\(error)")
+            stopSourceRTP(reason: "microphone_pcm_write_failed")
+        }
+    }
+
+    private func stopSourceMicrophoneCapture(reason: String) {
+        let engine = sourceAudioEngine
+        let hadEngine = engine != nil
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        sourceAudioEngine = nil
+        sourceAudioConverter = nil
+        sourcePCMBytesWritten = 0
+        if hadEngine {
+            DiagnosticsLog.info("phonerelay.mac.source_microphone_stop reason=\(reason)")
         }
     }
 
@@ -804,9 +994,14 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func stopSourceRTP(reason: String) {
-        let hadSource = sourceRTPConnection != nil || sourceRTPProcess != nil
+        let hadSource = sourceRTPConnection != nil || sourceRTPProcess != nil || sourceAudioEngine != nil
+        stopSourceMicrophoneCapture(reason: reason)
+        try? sourceRTPInput?.close()
+        sourceRTPInput = nil
         sourceRTPOutput?.readabilityHandler = nil
+        try? sourceRTPOutput?.close()
         sourceRTPOutput = nil
+        try? sourceRTPDevNull?.close()
         sourceRTPDevNull = nil
         let process = sourceRTPProcess
         sourceRTPProcess = nil
@@ -820,6 +1015,7 @@ final class MiLinkPhoneRelayProbe {
         sourceRTPSequenceNumber = 0
         sourceRTPTimestamp = 0
         sourceRTPPacketsSent = 0
+        sourcePCMBytesWritten = 0
         if hadSource {
             DiagnosticsLog.info("phonerelay.mac.source_rtp_stop reason=\(reason)")
         }
@@ -827,6 +1023,10 @@ final class MiLinkPhoneRelayProbe {
 
     private var sourceRTPTestEnabled: Bool {
         UserDefaults.standard.object(forKey: "phoneRelayProbeSourceRTPEnabled") as? Bool ?? false
+    }
+
+    private var sourceRTPAudioMode: SourceRTPAudioMode {
+        SourceRTPAudioMode(defaultsValue: UserDefaults.standard.string(forKey: "phoneRelayProbeSourceAudioMode"))
     }
 
     private func ffmpegExecutableURL() -> URL? {
@@ -1414,8 +1614,33 @@ final class MiLinkPhoneRelayProbe {
 
     private static let peerSourceRetryDelayMilliseconds = 2_000
     private static let sourceRTPSSRC: UInt32 = 0xed9e_1101
+    private static let sourcePCMSampleRate: Double = 48_000
+    private static let sourcePCMChannels: AVAudioChannelCount = 1
+    private static let sourcePCMFramesPerBuffer: AVAudioFrameCount = 960
+    private static var sourcePCMFormat: AVAudioFormat? {
+        AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: sourcePCMSampleRate,
+            channels: sourcePCMChannels,
+            interleaved: false
+        )
+    }
     private static let mpegTSCaptureLimitBytes = 8 * 1024 * 1024
     private static let mpegTSCapturePath = "/private/tmp/edgelink-phonerelay.ts"
+}
+
+private enum SourceRTPAudioMode: String {
+    case silent
+    case microphone
+
+    init(defaultsValue: String?) {
+        switch defaultsValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "mic", "microphone", "input", "mac_microphone", "mac-microphone":
+            self = .microphone
+        default:
+            self = .silent
+        }
+    }
 }
 
 private struct TCPConnectionState {

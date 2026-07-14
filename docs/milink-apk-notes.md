@@ -516,15 +516,23 @@ defaults write com.edgelink.mac phoneRelayProbeSourceHost <mac-ip>
 
 When the phone sink sends `SETUP`, the Mac records the sink `client_port` from the `Transport`
 header and replies with `server_port=19002-19003`. On `PLAY`, the Mac can start an experimental
-silent AAC/MPEG-TS RTP source from local UDP `19002` to the phone sink port. This is intentionally
-off by default while real-call behavior is still being verified:
+AAC/MPEG-TS RTP source from local UDP `19002` to the phone sink port. This is intentionally off by
+default while real-call behavior is still being verified:
 
 ```text
 defaults write com.edgelink.mac phoneRelayProbeSourceRTPEnabled -bool true
 ```
 
-Leave this disabled for normal call-control testing. With it disabled, the phone mic remains the
-real phone mic path and the Mac only answers the RTSP negotiation.
+The source audio mode defaults to generated silence. For a real Mac-microphone uplink probe, set:
+
+```text
+defaults write com.edgelink.mac phoneRelayProbeSourceAudioMode microphone
+```
+
+In microphone mode, EdgeLinkMac captures the Mac input through AVAudioEngine, converts it to
+48 kHz mono signed 16-bit PCM, pipes that into `ffmpeg`, muxes AAC-LC into MPEG-TS, and packetizes
+that TS as RTP payload type `33`. Leave source RTP disabled for normal call-control testing. With it
+disabled, the phone mic remains the real phone mic path and the Mac only answers the RTSP negotiation.
 
 For the least-bad real-call standby setup, do not leave the dry-run in `offhook`. Set:
 
