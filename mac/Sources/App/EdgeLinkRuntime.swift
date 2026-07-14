@@ -28,6 +28,8 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
     @Published private(set) var phoneMicrophoneRelayEnabled = false
+    @Published private(set) var phoneRelayProbeEnabled = false
+    @Published private(set) var phoneRelayProbeStatus = ""
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -44,6 +46,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
+    private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
     private var localIdentity: LocalIdentity?
@@ -68,6 +71,7 @@ final class EdgeLinkRuntime: ObservableObject {
         macNotificationSyncEnabled = UserDefaults.standard.object(forKey: Self.macNotificationSyncDefaultsKey) as? Bool ?? true
         verificationCodeSystemBridgeEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeSystemBridgeDefaultsKey) as? Bool ?? true
         verificationCodeAutoCopyEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeAutoCopyDefaultsKey) as? Bool ?? true
+        phoneRelayProbeEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayProbeDefaultsKey) as? Bool ?? false
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -87,8 +91,16 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.isPhoneScreenSessionActive = active
             }
         }
+        phoneRelayProbe.onStatusChanged = { [weak self] status in
+            Task { @MainActor in
+                self?.phoneRelayProbeStatus = status
+            }
+        }
         observeSystemSleepWake()
         verificationCodeBridge.warmObservers()
+        if phoneRelayProbeEnabled {
+            startPhoneRelayProbe()
+        }
         task = Task { await run() }
     }
 
@@ -97,6 +109,7 @@ final class EdgeLinkRuntime: ObservableObject {
         pairingTask?.cancel()
         connectionTask?.cancel()
         currentChannel?.close()
+        phoneRelayProbe.stop()
         screenSession.closeWindow(sendRemoteStop: false)
     }
 
@@ -315,6 +328,33 @@ final class EdgeLinkRuntime: ObservableObject {
                 isPhoneScreenViewerVisible = true
                 hasViewedPhoneScreen = true
             }
+        }
+    }
+
+    func setPhoneRelayProbeEnabled(_ enabled: Bool) {
+        guard phoneRelayProbeEnabled != enabled else {
+            return
+        }
+        phoneRelayProbeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.phoneRelayProbeDefaultsKey)
+        DiagnosticsLog.info("phonerelay.mac.probe_enabled enabled=\(enabled)")
+        if enabled {
+            startPhoneRelayProbe()
+        } else {
+            phoneRelayProbe.stop()
+            phoneRelayProbeStatus = ""
+        }
+    }
+
+    private func startPhoneRelayProbe() {
+        do {
+            try phoneRelayProbe.start(port: Self.phoneRelayProbePort)
+            phoneRelayProbeStatus = "PHONERELAY TCP/UDP \(Self.phoneRelayProbePort)"
+        } catch {
+            phoneRelayProbeEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.phoneRelayProbeDefaultsKey)
+            phoneRelayProbeStatus = "PHONERELAY 啟動失敗"
+            DiagnosticsLog.error("phonerelay.mac.probe_start_failed port=\(Self.phoneRelayProbePort)", error)
         }
     }
 
@@ -931,6 +971,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"
     private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
+    private static let phoneRelayProbeDefaultsKey = "phoneRelayProbeEnabled"
+    private static let phoneRelayProbePort: UInt16 = 7102
 }
 
 enum EdgeLinkConfig {

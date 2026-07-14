@@ -439,6 +439,14 @@ This has been verified with Mac `10.5.50.154` and phone route source `10.5.51.78
 then blocked `onCallStart` reports
 `strings=12:m:10.5.51.78,13:n:10.5.50.154 ints=11:l:320,14:o:7102,15:p:7102,16:q:0 byteArrays=17:r:32b`.
 
+On macOS, `MiLinkPhoneRelayProbe` is a disabled-by-default listener for the next protocol step. It
+binds TCP and UDP on port `7102`, logs incoming connections/datagrams to diagnostics with byte count,
+fingerprint, and a short hex prefix, and deliberately does not decode or reply to packets yet. Local
+verification has confirmed both protocols are bound by `EdgeLinkMac` and produce
+`phonerelay.mac.probe_packet` logs for TCP/UDP loopback packets. The next Android-side probe should
+start Mirror audio source/sink through a narrower control point than full `onCallStart`, so we can
+observe the native PHONERELAY handshake without also toggling call active/microphone mute state.
+
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 
 - Mac sends `phone.action` with `action = dial | answer | hangup`.

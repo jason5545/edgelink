@@ -262,6 +262,20 @@ private struct PhoneControlPanel: View {
             }
             .disabled(!runtime.isConnected)
 
+            Toggle(isOn: Binding(
+                get: { runtime.phoneRelayProbeEnabled },
+                set: { runtime.setPhoneRelayProbeEnabled($0) }
+            )) {
+                Label("PHONERELAY 探針", systemImage: runtime.phoneRelayProbeEnabled ? "dot.radiowaves.left.and.right" : "waveform")
+            }
+
+            if !runtime.phoneRelayProbeStatus.isEmpty {
+                Text(runtime.phoneRelayProbeStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
             if !runtime.phoneCallStatus.isEmpty {
                 Text(runtime.phoneCallStatus)
                     .font(.caption)
