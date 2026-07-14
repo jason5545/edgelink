@@ -62,6 +62,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
+    private var androidMicRelayArmed = false
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -220,6 +221,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.clearSender()
         screenSession.setMicrophoneRelayEnabled(false)
         phoneRelayProbe.disarmSourceRTP(reason: "disconnect", stopActive: true)
+        androidMicRelayArmed = false
         isConnected = false
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
@@ -578,6 +580,8 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannelGeneration = nil
         currentSession = nil
         screenSession.clearSender()
+        phoneRelayProbe.disarmSourceRTP(reason: "start_connection", stopActive: true)
+        androidMicRelayArmed = false
         if reason == "manual" {
             connectionStatus = "Reconnecting"
         }
@@ -645,6 +649,11 @@ final class EdgeLinkRuntime: ObservableObject {
                     onPhoneActionResult: { [weak self] result in
                         Task { @MainActor in
                             self?.handlePhoneActionResult(result)
+                        }
+                    },
+                    onAndroidMicStatus: { [weak self] status in
+                        Task { @MainActor in
+                            self?.handleAndroidMicStatus(status)
                         }
                     },
                     onMiLinkStatus: { [weak self] status in
@@ -726,6 +735,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 currentSession = nil
                 screenSession.clearSender()
                 screenSession.handleTransportInterrupted()
+                phoneRelayProbe.disarmSourceRTP(reason: "transport_interrupted", stopActive: true)
+                androidMicRelayArmed = false
                 connectionStatus = "Disconnected"
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay = min(retryDelay * 2, 30_000_000_000)
@@ -964,6 +975,24 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.warn(
                 "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=false error=\(result.error ?? "unknown")"
             )
+        }
+    }
+
+    private func handleAndroidMicStatus(_ status: AndroidMicStatusBody) {
+        let source = status.sourceName ?? status.source.map(String.init) ?? "unknown"
+        if status.active {
+            androidMicRelayArmed = true
+            phoneRelayProbe.armSourceRTP(reason: "android_mic_\(source)")
+            DiagnosticsLog.info(
+                "mic.mac.android_active source=\(source) count=\(status.activeRecordingCount) " +
+                    "session=\(status.sessionId.map(String.init) ?? "none") reason=\(status.reason)"
+            )
+        } else {
+            if androidMicRelayArmed {
+                phoneRelayProbe.disarmSourceRTP(reason: "android_mic_inactive", stopActive: true)
+            }
+            androidMicRelayArmed = false
+            DiagnosticsLog.info("mic.mac.android_inactive reason=\(status.reason)")
         }
     }
 

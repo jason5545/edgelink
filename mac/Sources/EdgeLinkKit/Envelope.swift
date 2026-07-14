@@ -41,6 +41,7 @@ public enum EnvelopeType {
     public static let phoneActionResult = "phone.action.result"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
+    public static let androidMicStatus = "android.mic.status"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -303,6 +304,37 @@ public struct PhoneActionResultBody: Codable, Equatable, Sendable {
         self.action = action
         self.success = success
         self.error = error
+        self.ts = ts
+    }
+}
+
+public struct AndroidMicStatusBody: Codable, Equatable, Sendable {
+    public let active: Bool
+    public let source: Int?
+    public let sourceName: String?
+    public let sessionId: Int?
+    public let silenced: Bool?
+    public let activeRecordingCount: Int
+    public let reason: String
+    public let ts: Int64
+
+    public init(
+        active: Bool,
+        source: Int? = nil,
+        sourceName: String? = nil,
+        sessionId: Int? = nil,
+        silenced: Bool? = nil,
+        activeRecordingCount: Int = 0,
+        reason: String,
+        ts: Int64
+    ) {
+        self.active = active
+        self.source = source
+        self.sourceName = sourceName
+        self.sessionId = sessionId
+        self.silenced = silenced
+        self.activeRecordingCount = activeRecordingCount
+        self.reason = reason
         self.ts = ts
     }
 }

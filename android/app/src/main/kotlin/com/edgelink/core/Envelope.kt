@@ -40,6 +40,7 @@ object EnvelopeTypes {
     const val PHONE_ACTION_RESULT = "phone.action.result"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
+    const val ANDROID_MIC_STATUS = "android.mic.status"
 }
 
 object EnvelopeCodec {
@@ -196,6 +197,18 @@ data class PhoneActionResultBody(
     val action: String,
     val success: Boolean,
     val error: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class AndroidMicStatusBody(
+    val active: Boolean,
+    val source: Int? = null,
+    val sourceName: String? = null,
+    val sessionId: Int? = null,
+    val silenced: Boolean? = null,
+    val activeRecordingCount: Int = 0,
+    val reason: String,
     val ts: Long
 )
 

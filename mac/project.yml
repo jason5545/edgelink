@@ -87,7 +87,7 @@ targets:
         LSUIElement: true
         NSUserActivityTypes:
           - INSendMessageIntent
-        NSMicrophoneUsageDescription: EdgeLink uses the microphone only when a relayed phone call requests microphone audio.
+        NSMicrophoneUsageDescription: EdgeLink uses the microphone only when Android requests relayed microphone audio.
         NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
   EdgeLinkKitTests:
     type: bundle.unit-test

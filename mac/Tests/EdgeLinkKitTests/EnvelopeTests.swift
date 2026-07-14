@@ -114,6 +114,26 @@ final class EnvelopeTests: XCTestCase {
         let phoneResult = try decoder.decode(Envelope<PhoneActionResultBody>.self, from: phoneResultData)
         XCTAssertEqual(phoneResult.t, "phone.action.result")
         XCTAssertTrue(phoneResult.b.success)
+
+        let micStatusData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.androidMicStatus,
+                b: AndroidMicStatusBody(
+                    active: true,
+                    source: 6,
+                    sourceName: "voice_recognition",
+                    sessionId: 42,
+                    silenced: false,
+                    activeRecordingCount: 1,
+                    reason: "callback",
+                    ts: 1_783_510_256
+                )
+            )
+        )
+        let micStatus = try decoder.decode(Envelope<AndroidMicStatusBody>.self, from: micStatusData)
+        XCTAssertEqual(micStatus.t, "android.mic.status")
+        XCTAssertTrue(micStatus.b.active)
+        XCTAssertEqual(micStatus.b.sourceName, "voice_recognition")
     }
 
     func testNotificationBodyRoundTripsAndroidAppIcon() throws {

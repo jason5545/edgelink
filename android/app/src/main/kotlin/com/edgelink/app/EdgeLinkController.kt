@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
+import com.edgelink.core.AndroidMicStatusBody
 import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
@@ -105,6 +106,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
+    private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
+        sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
+    }
     private val screenSession = AndroidScreenSession(
         context = appContext,
         sendPlaintext = ::sendPlaintext,
@@ -205,6 +209,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
         Shizuku.addRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(::handleScreenControlDataChannel)
+        micActivityMonitor.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
         }.onFailure { error ->
@@ -222,6 +227,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(null)
+        micActivityMonitor.stop()
         screenSession.shutdown()
         session?.close()
         scope.cancel()
@@ -1051,6 +1057,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
                 session = nextSession
                 sendLatestMiLinkStatus(nextSession, identity)
+                micActivityMonitor.sendCurrent("session_connected")
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
                 stateFlow.update {
