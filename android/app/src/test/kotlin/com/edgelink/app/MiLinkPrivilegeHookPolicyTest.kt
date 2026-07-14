@@ -111,6 +111,35 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun hooksAndroidPhoneMainProcessForRelayDeviceState() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHook(
+                packageName = "com.android.phone",
+                processName = "com.android.phone"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookAndroidPhone(
+                packageName = "com.android.phone",
+                processName = "com.android.phone"
+            )
+        )
+
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookAndroidPhone(
+                packageName = "com.android.phone",
+                processName = "com.android.phone:remote"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookAndroidPhone(
+                packageName = "com.android.incallui",
+                processName = "com.android.incallui"
+            )
+        )
+    }
+
+    @Test
     fun allowsOnlyKnownMirrorPhoneProviderMethods() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("getCallRelayService"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("queryRemoteDevices"))
