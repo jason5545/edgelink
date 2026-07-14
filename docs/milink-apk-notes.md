@@ -387,6 +387,11 @@ spoof:
   `MirrorCallService.F(fakePadTerminal)` when the fake pad is prepared. This verifies the official
   phone-to-pad flow's `onOppositeTerminalConnected` gate without directly starting
   `MirrorControlAudioSource`/`MirrorControlAudioSink`.
+- `debug.edgelink.mirror_fake_remote_key=true` additionally injects a fake peer event-23 `KeyData`
+  through `MirrorCallService.D(strValue)` after the fake pad is attached. This exercises Mirror's
+  own ECDH parser and should only log whether `mKey` becomes ready. While this key probe is enabled,
+  the module blocks `onCallStart`, `startAudioSource`, and `startAudioSink` unless
+  `debug.edgelink.mirror_fake_remote_audio=allow` is explicitly set.
 - `debug.edgelink.mirror_fake_remote=car` injects the same id as `AndroidPadCar` for the separate
   car media-relay path.
 - Any empty or unknown value leaves the spoof fully off.
@@ -395,7 +400,10 @@ On the current Xiaomi.eu device, `pad` mode has been verified through logcat: `q
 returns one `AndroidPad` candidate for `all`, `xiaomi`, and `androidPad`, while `androidPadCar`
 stays at zero. With `debug.edgelink.mirror_fake_remote_attach=true`, the attach probe reaches
 `MirrorCallService.F(fakePadTerminal)` and logs
-`attached=true oppositeId=edgelink-mac-mi-pad`.
+`attached=true oppositeId=edgelink-mac-mi-pad`. With
+`debug.edgelink.mirror_fake_remote_key=true`, the key probe reaches
+`MirrorCallService.D(strValue)` and logs `keyReady=true sharedKeyBytes=32`; audio startup remained
+blocked by the default guard.
 
 EdgeLink's first phone-control path is separate from Mirror audio relay:
 

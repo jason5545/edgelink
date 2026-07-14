@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.ContentProvider
 import android.os.Binder
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Parcelable
 import android.os.SystemClock
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -23,6 +25,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
+    const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
+    const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val FAKE_MIRROR_REMOTE_ID = "edgelink-mac-mi-pad"
     const val FAKE_MIRROR_REMOTE_NAME = "EdgeLink Mac"
 
@@ -74,6 +78,18 @@ internal object MiLinkPrivilegeHookPolicy {
             else -> false
         }
 
+    fun mirrorFakeRemoteKeyEnabled(rawValue: String?): Boolean =
+        when (rawValue?.trim()?.lowercase()) {
+            "1", "true", "yes", "on", "key", "probe" -> true
+            else -> false
+        }
+
+    fun mirrorFakeRemoteAudioAllowed(rawValue: String?): Boolean =
+        when (rawValue?.trim()?.lowercase()) {
+            "1", "true", "yes", "on", "allow", "audio" -> true
+            else -> false
+        }
+
     fun fakeMirrorRemotePlatform(mode: String): String =
         if (mode == "car") "AndroidPadCar" else "AndroidPad"
 
@@ -95,6 +111,7 @@ internal object MiLinkPrivilegeHookPolicy {
 
 class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorAttachUptimeMs: Long = 0L
+    private var lastFakeMirrorKeyUptimeMs: Long = 0L
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
@@ -216,6 +233,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorRemoteProviderResults(classLoader)
         hookMirrorTerminalLookup(classLoader)
         hookMirrorDeviceTypeChecks(classLoader)
+        hookMirrorAudioStartGuard(classLoader)
     }
 
     private fun hookMirrorRemoteProviderResults(classLoader: ClassLoader) {
@@ -392,14 +410,156 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             val relayService = relayClass.getMethod("q").invoke(null) ?: return@runCatching
             relayClass.getMethod("F", terminalClass).invoke(relayService, terminal)
             val oppositeId = findAttachedFakeMirrorTerminalId(relayClass, terminalClass, relayService)
+            val attached = oppositeId == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID
             log(
                 "mirror fake pad call flow attach attempted " +
-                    "attached=${oppositeId == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID} " +
+                    "attached=$attached " +
                     "oppositeId=${oppositeId.orEmpty()}"
             )
+            if (attached) {
+                maybeInjectFakeMirrorKeyData(classLoader, mode, relayClass, relayService)
+            }
         }.onFailure { error ->
             log("failed to attach fake pad call flow: ${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    private fun hookMirrorAudioStartGuard(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CALL_SERVICE,
+                classLoader,
+                "C",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        blockFakeMirrorAudioStart("onCallStart", param)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror onCallStart guard: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CALL_SERVICE,
+                classLoader,
+                "X",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        blockFakeMirrorAudioStart("startAudioSource", param)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror audio source guard: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CALL_SERVICE,
+                classLoader,
+                "W",
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        blockFakeMirrorAudioStart("startAudioSink", param)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror audio sink guard: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun blockFakeMirrorAudioStart(label: String, param: XC_MethodHook.MethodHookParam) {
+        if (shouldBlockFakeMirrorAudioStart()) {
+            param.setResult(null)
+            log("blocked mirror fake pad audio path label=$label")
+        }
+    }
+
+    private fun shouldBlockFakeMirrorAudioStart(): Boolean =
+        currentFakeMirrorRemoteMode() == "pad" &&
+            currentFakeMirrorRemoteKeyEnabled() &&
+            !currentFakeMirrorRemoteAudioAllowed()
+
+    private fun maybeInjectFakeMirrorKeyData(
+        classLoader: ClassLoader,
+        mode: String,
+        relayClass: Class<*>,
+        relayService: Any
+    ) {
+        if (mode != "pad" || !currentFakeMirrorRemoteKeyEnabled()) {
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFakeMirrorKeyUptimeMs < FAKE_MIRROR_KEY_THROTTLE_MS) {
+            return
+        }
+        lastFakeMirrorKeyUptimeMs = now
+        runCatching {
+            val keyDataValue = createFakePeerKeyDataValue(classLoader)
+            relayClass.getMethod("D", String::class.java).invoke(relayService, keyDataValue.strValue)
+            log(
+                "mirror fake pad key data queued " +
+                    "peerIp=$FAKE_MIRROR_KEY_PEER_IP " +
+                    "peerPort=$FAKE_MIRROR_KEY_PEER_PORT " +
+                    "peerPublicKeyBytes=${keyDataValue.publicKeySize}"
+            )
+            Handler(Looper.getMainLooper()).postDelayed(
+                {
+                    val sharedKeySize = findMirrorSharedKeySize(relayClass, relayService)
+                    log(
+                        "mirror fake pad key data status " +
+                            "keyReady=${sharedKeySize >= MIRROR_SHARED_KEY_MIN_BYTES} " +
+                            "sharedKeyBytes=$sharedKeySize"
+                    )
+                },
+                FAKE_MIRROR_KEY_STATUS_DELAY_MS
+            )
+        }.onFailure { error ->
+            log("failed to inject fake pad key data: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private data class FakePeerKeyDataValue(
+        val strValue: String,
+        val publicKeySize: Int
+    )
+
+    private fun createFakePeerKeyDataValue(classLoader: ClassLoader): FakePeerKeyDataValue {
+        val ecdhClass = findFirstTargetClass(
+            classLoader,
+            XIAOMI_MIRROR_ECDH_HELPER,
+            XIAOMI_MIRROR_ECDH_HELPER_JADX_NAME
+        )
+        val keyDataClass = findTargetClass(classLoader, XIAOMI_MIRROR_KEY_DATA)
+        val codecClass = findTargetClass(classLoader, XIAOMI_JSON_CODEC)
+        val ecdh = ecdhClass.getDeclaredConstructor().newInstance()
+        ecdhClass.getMethod("d").invoke(ecdh)
+        val publicKey = ecdhClass.getMethod("b").invoke(ecdh) as ByteArray
+        val keyData = keyDataClass.getDeclaredConstructor().newInstance()
+        keyDataClass.getField("keyBytes").set(keyData, publicKey)
+        keyDataClass.getField("p2pIp").set(keyData, FAKE_MIRROR_KEY_PEER_IP)
+        keyDataClass.getField("port").setInt(keyData, FAKE_MIRROR_KEY_PEER_PORT)
+        val codec = codecClass.getDeclaredConstructor().newInstance()
+        val strValue = codecClass.getMethod("u", Any::class.java).invoke(codec, keyData) as String
+        return FakePeerKeyDataValue(strValue = strValue, publicKeySize = publicKey.size)
+    }
+
+    private fun findMirrorSharedKeySize(relayClass: Class<*>, relayService: Any): Int {
+        for (field in relayClass.declaredFields) {
+            if (field.type != ByteArray::class.java) {
+                continue
+            }
+            val value = runCatching {
+                field.isAccessible = true
+                field.get(relayService) as? ByteArray
+            }.getOrNull() ?: continue
+            if (value.size >= MIRROR_SHARED_KEY_MIN_BYTES) {
+                return value.size
+            }
+        }
+        return 0
     }
 
     private fun findAttachedFakeMirrorTerminalId(
@@ -498,6 +658,18 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun findTargetClass(classLoader: ClassLoader, className: String): Class<*> =
         Class.forName(className, false, classLoader)
 
+    private fun findFirstTargetClass(classLoader: ClassLoader, vararg classNames: String): Class<*> {
+        var lastError: Throwable? = null
+        for (className in classNames) {
+            val result = runCatching { findTargetClass(classLoader, className) }
+            if (result.isSuccess) {
+                return result.getOrThrow()
+            }
+            lastError = result.exceptionOrNull()
+        }
+        throw ClassNotFoundException(classNames.joinToString(","), lastError)
+    }
+
     private fun callTargetMethod(target: Any, methodName: String): Any? =
         target.javaClass.getMethod(methodName).invoke(target)
 
@@ -523,6 +695,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY)
         )
 
+    private fun currentFakeMirrorRemoteKeyEnabled(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY)
+        )
+
+    private fun currentFakeMirrorRemoteAudioAllowed(): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PROPERTY)
+        )
+
     private fun readSystemProperty(name: String): String =
         runCatching {
             Class.forName("android.os.SystemProperties")
@@ -543,6 +725,15 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_REMOTE_DEVICE_INFO = "com.xiaomi.mirror.RemoteDeviceInfo"
         private const val XIAOMI_MIRROR_TERMINAL = "com.xiaomi.mirror.g0"
         private const val XIAOMI_MIRROR_CALL_SERVICE = "com.xiaomi.mirror.relay.G"
+        private const val XIAOMI_MIRROR_ECDH_HELPER = "com.xiaomi.mirror.relay.n"
+        private const val XIAOMI_MIRROR_ECDH_HELPER_JADX_NAME = "com.xiaomi.mirror.relay.C0761n"
+        private const val XIAOMI_MIRROR_KEY_DATA = "com.xiaomi.mirror.relay.KeyData"
+        private const val XIAOMI_JSON_CODEC = "C0.d"
         private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
+        private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L
+        private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
+        private const val FAKE_MIRROR_KEY_PEER_IP = "127.0.0.1"
+        private const val FAKE_MIRROR_KEY_PEER_PORT = 7102
+        private const val MIRROR_SHARED_KEY_MIN_BYTES = 16
     }
 }

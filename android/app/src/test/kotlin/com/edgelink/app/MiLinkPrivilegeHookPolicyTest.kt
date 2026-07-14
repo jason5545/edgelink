@@ -129,6 +129,32 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteKeyProbeFlag() {
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("1"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("true"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("key"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("PROBE"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("0"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled("false"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled(""))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteKeyEnabled(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteAudioAllowFlag() {
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("1"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("true"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("allow"))
+        assertTrue(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("AUDIO"))
+
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("0"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed("false"))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed(""))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteAudioAllowed(null))
+    }
+
+    @Test
     fun filtersFakeMirrorRemoteByQuery() {
         assertTrue(
             MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
