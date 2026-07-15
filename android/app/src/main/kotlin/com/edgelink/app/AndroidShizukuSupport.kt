@@ -413,6 +413,12 @@ object AndroidShizukuSupport {
 
     private suspend fun ensurePhoneCallCompanionApp(context: Context): ShizukuOperationResult =
         withService(context) { service ->
+            val appOpsResult = service.runCommandResult(
+                arrayOf("cmd", "appops", "set", context.packageName, "MANAGE_ONGOING_CALLS", "allow")
+            )
+            val removeResult = service.runCommandResult(
+                arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", context.packageName, "0")
+            )
             val addResult = service.runCommandResult(
                 arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", context.packageName, "1")
             )
@@ -421,10 +427,16 @@ object AndroidShizukuSupport {
                 arrayOf("cmd", "telecom", "is-non-ui-in-call-service-bound", context.packageName)
             )
             val boundText = boundResult.stdout.trim().ifBlank { boundResult.stderr.trim() }
+            val telecomManager = context.getSystemService(TelecomManager::class.java)
+            val hasManageOngoingCalls = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                runCatching {
+                    telecomManager?.hasManageOngoingCallsPermission() == true
+                }.getOrDefault(false)
             ShizukuOperationResult(
-                success = addResult.success && waitResult.success,
-                message = "phone:companion add=${addResult.exitCode} wait=${waitResult.exitCode} " +
-                    "bound=${boundText.forSingleLineLog()}"
+                success = addResult.success && waitResult.success && hasManageOngoingCalls,
+                message = "phone:companion appops=${appOpsResult.exitCode} " +
+                    "remove=${removeResult.exitCode} add=${addResult.exitCode} wait=${waitResult.exitCode} " +
+                    "manage=$hasManageOngoingCalls bound=${boundText.forSingleLineLog()}"
             )
         }
 

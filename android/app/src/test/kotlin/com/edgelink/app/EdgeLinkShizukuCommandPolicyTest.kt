@@ -122,6 +122,11 @@ class EdgeLinkShizukuCommandPolicyTest {
         )
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "com.edgelink.app", "MANAGE_ONGOING_CALLS", "allow")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("input", "keyevent", "KEYCODE_HEADSETHOOK")
             )
         )

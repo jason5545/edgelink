@@ -242,7 +242,8 @@ internal object EdgeLinkShizukuCommandPolicy {
     private val allowedAppOps = setOf(
             "PROJECT_MEDIA",
             "SYSTEM_ALERT_WINDOW",
-            "WRITE_SETTINGS"
+            "WRITE_SETTINGS",
+            "MANAGE_ONGOING_CALLS"
     )
     private val allowedRuntimePermissions = setOf(
             "android.permission.POST_NOTIFICATIONS",
