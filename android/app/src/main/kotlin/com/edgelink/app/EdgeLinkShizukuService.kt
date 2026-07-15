@@ -165,13 +165,28 @@ internal object EdgeLinkShizukuCommandPolicy {
     }
 
     private fun isAllowedPhoneCommand(command: Array<String>): Boolean =
-        isAllowedPhoneKeyCommand(command)
+        isAllowedPhoneKeyCommand(command) || isAllowedPhoneTelecomCommand(command)
 
     private fun isAllowedPhoneKeyCommand(command: Array<String>): Boolean =
         command.size == 3 &&
             command[0] == "input" &&
             command[1] == "keyevent" &&
             command[2] in allowedPhoneKeyEvents
+
+    private fun isAllowedPhoneTelecomCommand(command: Array<String>): Boolean {
+        if (command.size < 3 || command[0] != "cmd" || command[1] != "telecom") {
+            return false
+        }
+        return when (command[2]) {
+            "add-or-remove-call-companion-app" ->
+                command.size == 5 && command[3] == EDGE_LINK_PACKAGE_NAME && command[4] == "1"
+            "wait-on-handlers" ->
+                command.size == 3
+            "is-non-ui-in-call-service-bound" ->
+                command.size == 4 && command[3] == EDGE_LINK_PACKAGE_NAME
+            else -> false
+        }
+    }
 
     private fun isAllowedSystemPropertyCommand(command: Array<String>): Boolean {
         if (command.size != 3 || command[0] != "setprop") {

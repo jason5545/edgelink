@@ -58,6 +58,21 @@
       android:exported="false"
       android:foregroundServiceType="dataSync" />
     <service
+      android:name=".EdgeLinkInCallService"
+      android:exported="true"
+      android:label="EdgeLink"
+      android:permission="android.permission.BIND_INCALL_SERVICE">
+      <intent-filter>
+        <action android:name="android.telecom.InCallService" />
+      </intent-filter>
+      <meta-data
+        android:name="android.telecom.IN_CALL_SERVICE_UI"
+        android:value="false" />
+      <meta-data
+        android:name="android.telecom.IN_CALL_SERVICE_RINGING"
+        android:value="false" />
+    </service>
+    <service
       android:name=".RemoteInputService"
       android:exported="true"
       android:label="@string/remote_input_service_label"

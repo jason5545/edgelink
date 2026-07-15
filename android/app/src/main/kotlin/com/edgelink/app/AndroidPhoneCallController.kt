@@ -8,6 +8,7 @@ import java.time.Instant
 private const val PHONE_ACTION_DIAL = "dial"
 private const val PHONE_ACTION_ANSWER = "answer"
 private const val PHONE_ACTION_HANGUP = "hangup"
+private const val PHONE_ACTION_DTMF = "dtmf"
 private const val PHONE_CALL_RELAY_LATCH_TTL_MS = 30_000L
 
 class AndroidPhoneCallController(context: Context) {
@@ -19,6 +20,7 @@ class AndroidPhoneCallController(context: Context) {
             PHONE_ACTION_DIAL -> dial(body, now)
             PHONE_ACTION_ANSWER -> pressKey(body, "KEYCODE_HEADSETHOOK", now)
             PHONE_ACTION_HANGUP -> pressKey(body, "KEYCODE_ENDCALL", now)
+            PHONE_ACTION_DTMF -> sendDtmf(body, now)
             else -> PhoneActionResultBody(
                 requestId = body.requestId,
                 action = body.action,
@@ -62,6 +64,47 @@ class AndroidPhoneCallController(context: Context) {
                 clearPhoneRelayLatch("dial_exception")
                 EdgeLinkLog.error(
                     "phone.android.action_failed action=dial numberFp=${AndroidSmsSync.fingerprint(number)}",
+                    error
+                )
+                PhoneActionResultBody(
+                    requestId = body.requestId,
+                    action = body.action,
+                    success = false,
+                    error = error.phoneActionErrorMessage(),
+                    ts = now
+                )
+            }
+        )
+    }
+
+    private suspend fun sendDtmf(body: PhoneActionBody, now: Long): PhoneActionResultBody {
+        val sequence = PhoneDtmfKeyMapper.sanitizeSequence(body.number.orEmpty())
+            ?: return PhoneActionResultBody(
+                requestId = body.requestId,
+                action = body.action,
+                success = false,
+                error = "invalid_dtmf",
+                ts = now
+            )
+        return runCatching {
+            AndroidShizukuSupport.sendPhoneDtmfSequence(appContext, sequence)
+        }.fold(
+            onSuccess = { result ->
+                EdgeLinkLog.info(
+                    "phone.android.action_result action=dtmf success=${result.success} " +
+                        "sequenceFp=${AndroidSmsSync.fingerprint(sequence)}"
+                )
+                PhoneActionResultBody(
+                    requestId = body.requestId,
+                    action = body.action,
+                    success = result.success,
+                    error = result.message.takeUnless { result.success },
+                    ts = now
+                )
+            },
+            onFailure = { error ->
+                EdgeLinkLog.error(
+                    "phone.android.action_failed action=dtmf sequenceFp=${AndroidSmsSync.fingerprint(sequence)}",
                     error
                 )
                 PhoneActionResultBody(
@@ -204,4 +247,39 @@ class AndroidPhoneCallController(context: Context) {
         return listOfNotNull(this::class.java.simpleName, detail)
             .joinToString(":")
     }
+}
+
+internal object PhoneDtmfKeyMapper {
+    fun sanitizeSequence(raw: String): String? {
+        val builder = StringBuilder()
+        for (char in raw.trim()) {
+            if (char.isIgnoredSeparator()) {
+                continue
+            }
+            builder.append(normalizeChar(char) ?: return null)
+        }
+        val normalized = builder.toString()
+        if (normalized.isBlank() || normalized.length > 32) {
+            return null
+        }
+        return normalized.takeIf { value ->
+            value.any { it.isToneChar() } && value.all { it.isToneChar() || it == ',' }
+        }
+    }
+
+    private fun normalizeChar(char: Char): Char? =
+        when (char) {
+            in '0'..'9', '*', '#', ',' -> char
+            '＊' -> '*'
+            '＃' -> '#'
+            '，' -> ','
+            'p', 'P' -> ','
+            else -> null
+        }
+
+    private fun Char.isIgnoredSeparator(): Boolean = isWhitespace() || this == '-'
+
+    fun isTone(char: Char): Boolean = char in '0'..'9' || char == '*' || char == '#'
+
+    private fun Char.isToneChar(): Boolean = isTone(this)
 }

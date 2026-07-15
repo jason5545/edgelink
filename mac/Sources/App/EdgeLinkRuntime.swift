@@ -28,6 +28,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
     @Published private(set) var lastDialedPhoneNumber: String
+    @Published private(set) var isPhoneCallActive = false
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -229,6 +230,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
         androidMicRelayArmed = false
+        isPhoneCallActive = false
         isConnected = false
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
@@ -327,6 +329,19 @@ final class EdgeLinkRuntime: ObservableObject {
     @discardableResult
     func hangUpPhoneCall() -> String? {
         sendPhoneAction(action: "hangup")
+    }
+
+    @discardableResult
+    func sendPhoneDTMF(sequence rawSequence: String) -> String? {
+        guard isPhoneCallActive else {
+            phoneCallStatus = "通話中才能送按鍵"
+            return nil
+        }
+        guard let sequence = Self.sanitizeDTMFSequence(rawSequence) else {
+            phoneCallStatus = "請輸入客服按鍵"
+            return nil
+        }
+        return sendPhoneAction(action: "dtmf", number: sequence)
     }
 
     func runPhoneRelayDebugCall(number rawNumber: String = "800", timeoutSeconds rawTimeout: TimeInterval = 30) {
@@ -725,6 +740,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.clearSender()
         stopPhoneRelayProbe(reason: "start_connection")
         androidMicRelayArmed = false
+        isPhoneCallActive = false
         if reason == "manual" {
             connectionStatus = "Reconnecting"
         }
@@ -880,6 +896,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 screenSession.handleTransportInterrupted()
                 stopPhoneRelayProbe(reason: "transport_interrupted")
                 androidMicRelayArmed = false
+                isPhoneCallActive = false
                 connectionStatus = "Disconnected"
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay = min(retryDelay * 2, 30_000_000_000)
@@ -1111,11 +1128,18 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         let action = Self.localizedPhoneAction(result.action)
         if result.success {
+            if result.action == "dial" || result.action == "answer" {
+                isPhoneCallActive = true
+            }
+            if result.action == "hangup" {
+                isPhoneCallActive = false
+            }
             phoneCallStatus = "\(action)已送出"
             DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
         } else {
             if result.action == "dial" || result.action == "answer" {
                 stopPhoneRelayProbe(reason: "phone_action_failed_\(result.action)")
+                isPhoneCallActive = false
             }
             phoneCallStatus = "\(action)失敗：\(result.error ?? "未知錯誤")"
             DiagnosticsLog.warn(
@@ -1151,9 +1175,38 @@ final class EdgeLinkRuntime: ObservableObject {
             return "接聽"
         case "hangup":
             return "掛斷"
+        case "dtmf":
+            return "按鍵"
         default:
             return "電話操作"
         }
+    }
+
+    private static func sanitizeDTMFSequence(_ raw: String) -> String? {
+        var normalized = ""
+        for character in raw.trimmingCharacters(in: .whitespacesAndNewlines) {
+            switch character {
+            case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#", ",":
+                normalized.append(character)
+            case "＊":
+                normalized.append("*")
+            case "＃":
+                normalized.append("#")
+            case "，", "p", "P":
+                normalized.append(",")
+            case " ", "\t", "\n", "\r", "-":
+                continue
+            default:
+                return nil
+            }
+        }
+        guard !normalized.isEmpty,
+              normalized.count <= 32,
+              normalized.contains(where: { $0.isNumber || $0 == "*" || $0 == "#" }),
+              normalized.allSatisfy({ $0.isNumber || $0 == "*" || $0 == "#" || $0 == "," }) else {
+            return nil
+        }
+        return normalized
     }
 
     private static func fingerprint(_ value: String) -> String {

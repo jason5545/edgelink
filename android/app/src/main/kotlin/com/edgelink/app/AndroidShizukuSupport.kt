@@ -30,6 +30,7 @@ private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 private const val PHONE_RELAY_DEFAULT_PORT = 7_102
+private const val PHONE_DTMF_KEY_DELAY_MS = 120L
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -342,6 +343,17 @@ object AndroidShizukuSupport {
             if (!permissionResult.success) {
                 return@withContext permissionResult
             }
+            runCatching {
+                ensurePhoneCallCompanionApp(appContext)
+            }.onSuccess { result ->
+                if (result.success) {
+                    EdgeLinkLog.info("phone.android.companion_registered message=${result.message}")
+                } else {
+                    EdgeLinkLog.warn("phone.android.companion_register_failed message=${result.message}")
+                }
+            }.onFailure { error ->
+                EdgeLinkLog.warn("phone.android.companion_register_failed", error)
+            }
             val telecomManager = appContext.getSystemService(TelecomManager::class.java)
                 ?: return@withContext ShizukuOperationResult(
                     success = false,
@@ -369,6 +381,51 @@ object AndroidShizukuSupport {
         withService(context) { service ->
             val result = service.runCommandResult(arrayOf("input", "keyevent", keyCode))
             listOf(result).toOperationResult("phone:keyevent:$keyCode")
+        }
+
+    suspend fun sendPhoneDtmfSequence(context: Context, sequence: String): ShizukuOperationResult =
+        withContext(Dispatchers.IO) {
+            val directResult = EdgeLinkInCallService.sendDtmfSequence(sequence)
+            if (directResult.success) {
+                return@withContext directResult
+            }
+
+            val companionResult = runCatching {
+                ensurePhoneCallCompanionApp(context.applicationContext)
+            }.getOrElse { error ->
+                ShizukuOperationResult(
+                    success = false,
+                    message = "phone:companion exception=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
+            Thread.sleep(PHONE_DTMF_KEY_DELAY_MS)
+
+            val retryResult = EdgeLinkInCallService.sendDtmfSequence(sequence)
+            if (retryResult.success) {
+                retryResult.copy(message = "${retryResult.message} after_companion")
+            } else {
+                ShizukuOperationResult(
+                    success = false,
+                    message = "${retryResult.message}; companion=${companionResult.message}"
+                )
+            }
+        }
+
+    private suspend fun ensurePhoneCallCompanionApp(context: Context): ShizukuOperationResult =
+        withService(context) { service ->
+            val addResult = service.runCommandResult(
+                arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", context.packageName, "1")
+            )
+            val waitResult = service.runCommandResult(arrayOf("cmd", "telecom", "wait-on-handlers"))
+            val boundResult = service.runCommandResult(
+                arrayOf("cmd", "telecom", "is-non-ui-in-call-service-bound", context.packageName)
+            )
+            val boundText = boundResult.stdout.trim().ifBlank { boundResult.stderr.trim() }
+            ShizukuOperationResult(
+                success = addResult.success && waitResult.success,
+                message = "phone:companion add=${addResult.exitCode} wait=${waitResult.exitCode} " +
+                    "bound=${boundText.forSingleLineLog()}"
+            )
         }
 
     private suspend fun ensurePhoneCallPermission(context: Context): ShizukuOperationResult {

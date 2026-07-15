@@ -229,27 +229,47 @@ private struct PhoneControlPanel: View {
         phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func submitPhoneInput() {
+        if runtime.isPhoneCallActive {
+            if runtime.sendPhoneDTMF(sequence: trimmedPhoneNumber) != nil {
+                phoneNumber = ""
+            }
+        } else if runtime.dialPhone(number: trimmedPhoneNumber) != nil {
+            phoneNumber = ""
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                TextField("電話號碼", text: $phoneNumber)
+                TextField(runtime.isPhoneCallActive ? "客服按鍵" : "電話號碼", text: $phoneNumber)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        submitPhoneInput()
+                    }
 
                 Button {
-                    runtime.dialPhone(number: trimmedPhoneNumber)
+                    submitPhoneInput()
                 } label: {
-                    Label("撥號", systemImage: "phone.arrow.up.right")
+                    if runtime.isPhoneCallActive {
+                        Label("送按鍵", systemImage: "keypad")
+                    } else {
+                        Label("撥號", systemImage: "phone.arrow.up.right")
+                    }
                 }
                 .disabled(!runtime.isConnected || trimmedPhoneNumber.isEmpty)
 
-                Button {
-                    runtime.redialLastPhoneNumber()
-                    phoneNumber = runtime.lastDialedPhoneNumber
-                } label: {
-                    Label("重撥", systemImage: "phone.arrow.up.right.circle")
+                if !runtime.isPhoneCallActive {
+                    Button {
+                        if runtime.redialLastPhoneNumber() != nil {
+                            phoneNumber = ""
+                        }
+                    } label: {
+                        Label("重撥", systemImage: "phone.arrow.up.right.circle")
+                    }
+                    .disabled(!runtime.isConnected || runtime.lastDialedPhoneNumber.isEmpty)
+                    .help("重撥上一個由 EdgeLink 撥出的號碼")
                 }
-                .disabled(!runtime.isConnected || runtime.lastDialedPhoneNumber.isEmpty)
-                .help("重撥上一個由 EdgeLink 撥出的號碼")
             }
 
             HStack(spacing: 8) {
@@ -276,8 +296,13 @@ private struct PhoneControlPanel: View {
             }
         }
         .onAppear {
-            if phoneNumber.isEmpty {
+            if phoneNumber.isEmpty && !runtime.isPhoneCallActive {
                 phoneNumber = runtime.lastDialedPhoneNumber
+            }
+        }
+        .onChange(of: runtime.isPhoneCallActive) { isActive in
+            if isActive && phoneNumber == runtime.lastDialedPhoneNumber {
+                phoneNumber = ""
             }
         }
     }

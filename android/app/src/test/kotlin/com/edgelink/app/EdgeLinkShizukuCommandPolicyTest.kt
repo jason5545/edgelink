@@ -130,6 +130,45 @@ class EdgeLinkShizukuCommandPolicyTest {
                 arrayOf("input", "keyevent", "KEYCODE_ENDCALL")
             )
         )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("input", "keyevent", "KEYCODE_1")
+            )
+        )
+    }
+
+    @Test
+    fun allowsOnlyScopedTelecomCompanionCommands() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", "com.edgelink.app", "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "wait-on-handlers")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "is-non-ui-in-call-service-bound", "com.edgelink.app")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", "com.other.app", "1")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "add-or-remove-call-companion-app", "com.edgelink.app", "0")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "telecom", "set-default-dialer", "com.edgelink.app")
+            )
+        )
     }
 
     @Test
