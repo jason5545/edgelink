@@ -46,6 +46,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
     private let turnCredentialClient: TurnCredentialClient
+    private let callRelayGatewayClient: CallRelayGatewayClient
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
@@ -87,6 +88,10 @@ final class EdgeLinkRuntime: ObservableObject {
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
         turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
+        callRelayGatewayClient = CallRelayGatewayClient(
+            host: EdgeLinkConfig.callRelayGatewayHost,
+            port: EdgeLinkConfig.callRelayGatewayControlPort
+        )
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
@@ -107,6 +112,14 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.handlePhoneRelayPCMStats(stats)
             }
         }
+        callRelayGatewayClient.onSourceStart = { [weak self] reason in
+            self?.phoneRelayProbe.startExternalSourceRTP(reason: "gateway_\(reason)") { [weak self] packet in
+                self?.callRelayGatewayClient.sendSourceRTPPacket(packet)
+            }
+        }
+        callRelayGatewayClient.onSourceStop = { [weak self] reason in
+            self?.phoneRelayProbe.stopExternalSourceRTP(reason: "gateway_\(reason)")
+        }
         EdgeLinkURLRouter.shared.setHandler { [weak self] url in
             Task { @MainActor in
                 self?.handleExternalURL(url)
@@ -125,6 +138,7 @@ final class EdgeLinkRuntime: ObservableObject {
         turnCredentialTask?.cancel()
         currentChannel?.close()
         phoneRelayProbe.stop()
+        callRelayGatewayClient.close(reason: "runtime_deinit")
         screenSession.closeWindow(sendRemoteStop: false)
     }
 
@@ -244,6 +258,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setIceServerConfigs([])
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
+        callRelayGatewayClient.close(reason: "disconnect")
         androidMicRelayArmed = false
         isPhoneCallActive = false
         isConnected = false
@@ -591,55 +606,100 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         let requestId = UUID().uuidString
-        let relayHost = Self.phoneRelayAdvertisedHost()
-        let body = PhoneActionBody(
-            requestId: requestId,
-            action: action,
-            number: number,
-            relayHost: relayHost,
-            relayPort: Int(Self.phoneRelayProbePort)
-        )
-        pendingPhoneActions[requestId] = body
         phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
         if action == "dial" || action == "answer" {
-            Task { [weak self] in
-                let credential = await self?.ensureTurnCredentials(reason: "phone_action_\(action)")
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+                let credential = await self.ensureTurnCredentials(reason: "phone_action_\(action)")
                 if credential != nil {
                     DiagnosticsLog.info("phone.mac.turn_credentials_ready action=\(action)")
                 } else {
                     DiagnosticsLog.warn("phone.mac.turn_credentials_missing action=\(action)")
                 }
+                let endpoint = await self.preparePhoneRelayEndpoint(action: action)
+                let body = PhoneActionBody(
+                    requestId: requestId,
+                    action: action,
+                    number: number,
+                    relayHost: endpoint.host,
+                    relayPort: endpoint.port
+                )
+                self.pendingPhoneActions[requestId] = body
+                await self.sendPhoneActionBody(body, session: session)
             }
-            ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)")
-            phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)")
-            DiagnosticsLog.info(
-                "phone.mac.relay_endpoint action=\(action) " +
-                    "host=\(relayHost ?? "none") port=\(Self.phoneRelayProbePort)"
-            )
-        }
-        if action == "hangup" {
-            stopPhoneRelayProbe(reason: "phone_action_hangup")
+            return requestId
         }
 
-        Task {
-            do {
-                let data = try encoder.encode(Envelope(t: EnvelopeType.phoneAction, b: body))
-                try await session.sendPlaintext(data)
-                DiagnosticsLog.info(
-                    "phone.mac.action_requested requestId=\(requestId) action=\(action) numberFp=\(number.map(Self.fingerprint) ?? "none")"
-                )
-            } catch {
-                await MainActor.run {
-                    self.pendingPhoneActions.removeValue(forKey: requestId)
-                    if action == "dial" || action == "answer" {
-                        self.stopPhoneRelayProbe(reason: "phone_action_send_failed_\(action)")
-                    }
-                    self.phoneCallStatus = "\(Self.localizedPhoneAction(action))失敗"
-                }
-                DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(requestId) action=\(action)", error)
-            }
+        let body = PhoneActionBody(
+            requestId: requestId,
+            action: action,
+            number: number,
+            relayHost: nil,
+            relayPort: nil
+        )
+        pendingPhoneActions[requestId] = body
+        if action == "hangup" {
+            stopPhoneRelayProbe(reason: "phone_action_hangup")
+            phoneRelayProbe.stopExternalSourceRTP(reason: "phone_action_hangup")
+            callRelayGatewayClient.close(reason: "phone_action_hangup")
+        }
+
+        Task { @MainActor [weak self] in
+            await self?.sendPhoneActionBody(body, session: session)
         }
         return requestId
+    }
+
+    private func preparePhoneRelayEndpoint(action: String) async -> PhoneRelayEndpoint {
+        guard let identity = localIdentity else {
+            return localPhoneRelayEndpoint(action: action, reason: "no_identity")
+        }
+        do {
+            let gatewaySession = try await callRelayGatewayClient.startSession(identity: identity)
+            DiagnosticsLog.info(
+                "phone.mac.relay_endpoint action=\(action) mode=gateway " +
+                    "host=\(gatewaySession.relayHost) port=\(gatewaySession.relayPort) " +
+                    "sessionId=\(gatewaySession.sessionId)"
+            )
+            return PhoneRelayEndpoint(host: gatewaySession.relayHost, port: gatewaySession.relayPort)
+        } catch {
+            DiagnosticsLog.error("phone.mac.gateway_endpoint_failed action=\(action)", error)
+            return localPhoneRelayEndpoint(action: action, reason: "gateway_failed")
+        }
+    }
+
+    private func localPhoneRelayEndpoint(action: String, reason: String) -> PhoneRelayEndpoint {
+        let relayHost = Self.phoneRelayAdvertisedHost()
+        ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)_\(reason)")
+        phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)_\(reason)")
+        DiagnosticsLog.info(
+            "phone.mac.relay_endpoint action=\(action) mode=lan_fallback " +
+                "host=\(relayHost ?? "none") port=\(Self.phoneRelayProbePort) reason=\(reason)"
+        )
+        return PhoneRelayEndpoint(host: relayHost, port: Int(Self.phoneRelayProbePort))
+    }
+
+    private func sendPhoneActionBody(_ body: PhoneActionBody, session: SecureSessionHost) async {
+        do {
+            let data = try encoder.encode(Envelope(t: EnvelopeType.phoneAction, b: body))
+            try await session.sendPlaintext(data)
+            DiagnosticsLog.info(
+                "phone.mac.action_requested requestId=\(body.requestId) action=\(body.action) " +
+                    "numberFp=\(body.number.map(Self.fingerprint) ?? "none") " +
+                    "relay=\(body.relayHost ?? "none"):\(body.relayPort.map(String.init) ?? "none")"
+            )
+        } catch {
+            pendingPhoneActions.removeValue(forKey: body.requestId)
+            if body.action == "dial" || body.action == "answer" {
+                stopPhoneRelayProbe(reason: "phone_action_send_failed_\(body.action)")
+                phoneRelayProbe.stopExternalSourceRTP(reason: "phone_action_send_failed_\(body.action)")
+                callRelayGatewayClient.close(reason: "phone_action_send_failed_\(body.action)")
+            }
+            phoneCallStatus = "\(Self.localizedPhoneAction(body.action))失敗"
+            DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(body.requestId) action=\(body.action)", error)
+        }
     }
 
     private func run() async {
@@ -1330,6 +1390,13 @@ enum EdgeLinkConfig {
     static let workerBaseURL = URL(string: "https://edgelink-worker.black-hill-f944.workers.dev")!
     static let relayURL = URL(string: "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect")!
     static let pairingWebSocketURL = URL(string: "wss://edgelink-worker.black-hill-f944.workers.dev/v1/pair/ws")!
+    static let callRelayGatewayHost = "172.238.24.219"
+    static let callRelayGatewayControlPort: UInt16 = 17104
+}
+
+private struct PhoneRelayEndpoint {
+    let host: String?
+    let port: Int
 }
 
 private struct MacPendingPairing {

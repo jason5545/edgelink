@@ -642,8 +642,14 @@ credential 到期前 app 可以重取；永久 TURN shared secret 只存在 cotu
   `RTCPeerConnection` 時把 Worker 回傳的 `iceServers` 放進 `RTCConfiguration`，並保留 STUN
   fallback。
 - Phone continuity / MiLink call relay：Mac 與 Android 會在 dial/answer 路徑預取同一份 TURN
-  credential，但 MiLink hook 目前吃的是 raw `relayHost` / `relayPort`。跨網路通話音訊還需要一層
-  Android local UDP proxy 或 WebRTC bridge，不能直接把 TURN URL 塞進既有 MiLink endpoint。
+  credential。MiLink hook 仍然吃 raw `relayHost` / `relayPort`，所以跨網路通話目前走
+  `edgelink-call-relayd`：Mac 用既有 device identity 向 gateway control port 註冊，gateway
+  配一組短命 MiLink-compatible RTSP/RTP session port，再把 public `relayHost` / `relayPort`
+  放進 `PhoneActionBody` 給 Android。Android 不需要再跑 local UDP proxy。
+- `edgelink-call-relayd` 不是 TURN server，也不把 TURN credential 暴露給 app。它只包 MiLink
+  這層 raw RTSP/RTP 相容協定：phone downlink RTP 轉回 Mac 播放，Mac mic uplink 先沿用既有
+  MPEG-TS/RTP packetizer，透過 gateway control channel 送回 phone 的 source RTP endpoint。若延遲
+  或 jitter 太大，再把 uplink 從 JSON control channel 換成 binary/UDP 資料面。
 
 ### LAN
 

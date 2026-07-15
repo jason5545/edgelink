@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "vectors": "node tools/generate-test-vectors.mjs",
+    "call-relayd:check": "node --check call-relayd/server.mjs",
     "worker:typecheck": "npm --prefix worker run typecheck"
   }
 }

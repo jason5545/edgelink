@@ -58,6 +58,7 @@ final class MiLinkPhoneRelayProbe {
     private var peerSourceRetryAttempt = 0
     private var sourceRTPConnection: NWConnection?
     private var sourceRTPConnectionID: UUID?
+    private var sourceRTPPacketHandler: ((Data) -> Void)?
     private var sourceRTPProcess: Process?
     private var sourceRTPInput: FileHandle?
     private var sourceRTPOutput: FileHandle?
@@ -135,6 +136,21 @@ final class MiLinkPhoneRelayProbe {
     func disarmSourceRTP(reason: String, stopActive: Bool) {
         queue.async {
             self.disarmSourceRTPOnQueue(reason: reason, stopActive: stopActive)
+        }
+    }
+
+    func startExternalSourceRTP(reason: String, packetHandler: @escaping (Data) -> Void) {
+        queue.async {
+            self.startExternalSourceRTPOnQueue(reason: reason, packetHandler: packetHandler)
+        }
+    }
+
+    func stopExternalSourceRTP(reason: String) {
+        queue.async {
+            guard self.sourceRTPPacketHandler != nil else {
+                return
+            }
+            self.stopSourceRTP(reason: "external_\(reason)")
         }
     }
 
@@ -913,6 +929,22 @@ final class MiLinkPhoneRelayProbe {
         startSourceMPEGTSProcess(id: id, reason: reason)
     }
 
+    private func startExternalSourceRTPOnQueue(reason: String, packetHandler: @escaping (Data) -> Void) {
+        if sourceRTPPacketHandler != nil, sourceRTPProcess?.isRunning == true {
+            return
+        }
+        stopSourceRTP(reason: "external_restart")
+        let id = UUID()
+        sourceRTPPacketHandler = packetHandler
+        sourceRTPConnectionID = id
+        sourceRTPSequenceNumber = 0
+        sourceRTPTimestamp = UInt32.random(in: 0..<UInt32.max)
+        sourceRTPPacketsSent = 0
+        sourceRTPBuffer.removeAll(keepingCapacity: true)
+        DiagnosticsLog.info("phonerelay.mac.source_rtp_external_ready id=\(id.uuidString) reason=\(reason)")
+        startSourceMPEGTSProcess(id: id, reason: "external_\(reason)")
+    }
+
     private func startSourceMPEGTSProcess(id: UUID, reason: String) {
         guard let ffmpegURL = ffmpegExecutableURL() else {
             DiagnosticsLog.warn("phonerelay.mac.source_mpegts_unavailable id=\(id.uuidString) reason=\(reason)")
@@ -1318,9 +1350,6 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func sendSourceRTPPayload(_ payload: Data) {
-        guard let connection = sourceRTPConnection else {
-            return
-        }
         var packet = Data(capacity: 12 + payload.count)
         packet.append(0x80)
         packet.append(0x80 | 33)
@@ -1334,11 +1363,17 @@ final class MiLinkPhoneRelayProbe {
         sourceRTPTimestamp &+= 1_800
         sourceRTPPacketsSent += 1
         let count = sourceRTPPacketsSent
-        connection.send(content: packet, completion: .contentProcessed { error in
-            if let error {
-                DiagnosticsLog.warn("phonerelay.mac.source_rtp_send_failed seq=\(sequenceNumber) error=\(error)")
-            }
-        })
+        if let sourceRTPPacketHandler {
+            sourceRTPPacketHandler(packet)
+        } else if let connection = sourceRTPConnection {
+            connection.send(content: packet, completion: .contentProcessed { error in
+                if let error {
+                    DiagnosticsLog.warn("phonerelay.mac.source_rtp_send_failed seq=\(sequenceNumber) error=\(error)")
+                }
+            })
+        } else {
+            return
+        }
         if count <= 12 || count % 50 == 0 {
             DiagnosticsLog.info(
                 "phonerelay.mac.source_rtp_packet count=\(count) seq=\(sequenceNumber) ts=\(timestamp) " +
@@ -1356,7 +1391,7 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func stopSourceRTP(reason: String) {
-        let hadSource = sourceRTPConnection != nil || sourceRTPProcess != nil || sourceAudioEngine != nil
+        let hadSource = sourceRTPConnection != nil || sourceRTPPacketHandler != nil || sourceRTPProcess != nil || sourceAudioEngine != nil
         stopSourceMicrophoneCapture(reason: reason)
         try? sourceRTPInput?.close()
         sourceRTPInput = nil
@@ -1373,6 +1408,7 @@ final class MiLinkPhoneRelayProbe {
         sourceRTPConnection?.cancel()
         sourceRTPConnection = nil
         sourceRTPConnectionID = nil
+        sourceRTPPacketHandler = nil
         sourceRTPBuffer.removeAll(keepingCapacity: true)
         sourceRTPSequenceNumber = 0
         sourceRTPTimestamp = 0
