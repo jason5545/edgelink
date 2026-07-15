@@ -184,6 +184,11 @@ class EdgeLinkShizukuCommandPolicyTest {
         )
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY, "1")
             )
         )
