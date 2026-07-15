@@ -515,8 +515,11 @@ final class MiLinkPhoneRelayProbe {
             return
         }
         let path = Self.mpegTSCapturePath
-        FileManager.default.createFile(atPath: path, contents: nil)
         do {
+            if FileManager.default.fileExists(atPath: path) {
+                try FileManager.default.removeItem(atPath: path)
+            }
+            FileManager.default.createFile(atPath: path, contents: nil)
             mpegTSCaptureHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
             mpegTSCaptureBytes = 0
             mpegTSCaptureLimitLogged = false

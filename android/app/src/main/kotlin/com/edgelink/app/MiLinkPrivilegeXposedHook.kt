@@ -202,6 +202,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
     private var lastFakeMirrorAudioParamsUptimeMs: Long = 0L
     private var lastFakeMirrorAudioStartProbeUptimeMs: Long = 0L
+    private var lastFakeMirrorAudioSourceStartUptimeMs: Long = 0L
+    private var lastFakeMirrorAudioSinkStartUptimeMs: Long = 0L
     private var lastInCallUiRelayAnswerUptimeMs: Long = 0L
     private var fakeMirrorAudioStartProbeDepth: Int = 0
 
@@ -873,7 +875,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             if (!shouldForceFakeMirrorPlainAudioRelay()) {
                                 return
                             }
-                            disableMirrorAudioEncryptionFlag(param.thisObject, "source")
+                            lastFakeMirrorAudioSourceStartUptimeMs = SystemClock.uptimeMillis()
+                            log("mirror fake pad plain audio source start")
                         }
                     }
                 )
@@ -900,6 +903,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!shouldForceFakeMirrorPlainAudioRelay()) {
                             return
                         }
+                        lastFakeMirrorAudioSinkStartUptimeMs = SystemClock.uptimeMillis()
                         disableMirrorAudioEncryptionFlag(param.thisObject, "sink")
                     }
                 }
@@ -922,7 +926,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         }
                         val option = param.args.getOrNull(1) as? Int ?: return
                         val forcedValue = plainAudioOptionValue(option) ?: return
-                        val direction = mirrorAudioStartStackDirection() ?: return
+                        val direction = mirrorAudioStartStackDirection()
+                            ?: recentMirrorAudioStartDirection()
+                            ?: "call_relay"
                         val oldValue = param.args.getOrNull(2)
                         if (oldValue != forcedValue) {
                             param.args[2] = forcedValue
@@ -936,6 +942,64 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook mirror plain audio options: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL,
+                classLoader,
+                "enableEncrypt",
+                java.lang.Long.TYPE,
+                java.lang.Boolean.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceFakeMirrorPlainAudioRelay()) {
+                            return
+                        }
+                        val oldValue = param.args.getOrNull(1) as? Boolean ?: return
+                        if (oldValue) {
+                            param.args[1] = false
+                            val direction = mirrorAudioStartStackDirection()
+                                ?: recentMirrorAudioStartDirection()
+                                ?: "call_relay"
+                            log("mirror fake pad plain audio $direction enableEncrypt value=true->false")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror plain audio encryption switch: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL,
+                classLoader,
+                "setEncryptKey",
+                java.lang.Long.TYPE,
+                ByteArray::class.java,
+                ByteArray::class.java,
+                ByteArray::class.java,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                java.lang.Boolean.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceFakeMirrorPlainAudioRelay()) {
+                            return
+                        }
+                        val direction = mirrorAudioStartStackDirection()
+                            ?: recentMirrorAudioStartDirection()
+                            ?: "call_relay"
+                        log(
+                            "mirror fake pad plain audio $direction setEncryptKey blocked " +
+                                "lengths=${param.args.getOrNull(4)},${param.args.getOrNull(5)},${param.args.getOrNull(6)}"
+                        )
+                        param.setResult(null)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror plain audio encryption key: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -988,6 +1052,20 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             return "sink"
         }
         return null
+    }
+
+    private fun recentMirrorAudioStartDirection(): String? {
+        val now = SystemClock.uptimeMillis()
+        val sourceAge = now - lastFakeMirrorAudioSourceStartUptimeMs
+        val sinkAge = now - lastFakeMirrorAudioSinkStartUptimeMs
+        val sourceRecent = sourceAge in 0..MIRROR_AUDIO_START_OPTION_WINDOW_MS
+        val sinkRecent = sinkAge in 0..MIRROR_AUDIO_START_OPTION_WINDOW_MS
+        return when {
+            sourceRecent && sinkRecent -> if (sourceAge <= sinkAge) "source_window" else "sink_window"
+            sourceRecent -> "source_window"
+            sinkRecent -> "sink_window"
+            else -> null
+        }
     }
 
     private fun blockFakeMirrorAudioStart(label: String, param: XC_MethodHook.MethodHookParam) {
@@ -1719,6 +1797,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
         private const val INCALLUI_RELAY_ANSWER_THROTTLE_MS = 750L
+        private const val MIRROR_AUDIO_START_OPTION_WINDOW_MS = 2_000L
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
         private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102
         private const val MIRROR_RELAY_FIELD_LOCAL_IP = "m"
