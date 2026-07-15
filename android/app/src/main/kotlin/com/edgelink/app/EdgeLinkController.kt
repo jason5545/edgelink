@@ -1,7 +1,6 @@
 package com.edgelink.app
 
 import android.content.Context
-import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -725,12 +724,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     fun isNotificationListenerEnabled(): Boolean {
-        val componentName = ComponentName(appContext, AndroidNotificationListenerService::class.java)
-        val enabledListeners = Settings.Secure.getString(
-            appContext.contentResolver,
-            "enabled_notification_listeners"
-        ).orEmpty()
-        return enabledListeners.split(':').any { it == componentName.flattenToString() }
+        return AndroidNotificationListenerService.isConnected()
     }
 
     fun onLocalNotificationPosted(body: NotificationPostBody) {

@@ -6,6 +6,65 @@ import org.junit.Test
 
 class EdgeLinkShizukuCommandPolicyTest {
     @Test
+    fun allowsOnlyExactNotificationListenerApproval() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "cmd",
+                    "notification",
+                    "allow_listener",
+                    "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService",
+                    "0"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "cmd",
+                    "notification",
+                    "allow_listener",
+                    "com.other.app/.NotificationListener",
+                    "0"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "cmd",
+                    "notification",
+                    "disallow_listener",
+                    "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService",
+                    "0"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "cmd",
+                    "notification",
+                    "allow_listener",
+                    "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService",
+                    "-1"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "settings",
+                    "put",
+                    "secure",
+                    "enabled_notification_listeners",
+                    "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
+                )
+            )
+        )
+    }
+
+    @Test
     fun allowsExactScreenShareProtectionCommands() {
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(

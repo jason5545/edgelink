@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.DeadObjectException
 import android.os.IBinder
+import android.os.Process
 import android.os.RemoteException
 import android.telecom.TelecomManager
 import kotlinx.coroutines.Dispatchers
@@ -25,9 +26,10 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 5
+private const val SHIZUKU_USER_SERVICE_VERSION = 6
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
+private const val ANDROID_UIDS_PER_USER = 100_000
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 private const val PHONE_RELAY_DEFAULT_PORT = 7_102
 private const val PHONE_DTMF_KEY_DELAY_MS = 120L
@@ -135,11 +137,14 @@ object AndroidShizukuSupport {
                 )
             }
             val component = ComponentName(context, AndroidNotificationListenerService::class.java).flattenToString()
-            appendSecureComponent(
-                service = service,
-                key = "enabled_notification_listeners",
-                component = component,
-                results = results
+            results += service.runCommandResult(
+                arrayOf(
+                    "cmd",
+                    "notification",
+                    "allow_listener",
+                    component,
+                    (Process.myUid() / ANDROID_UIDS_PER_USER).toString()
+                )
             )
             results.toOperationResult("notification")
         }

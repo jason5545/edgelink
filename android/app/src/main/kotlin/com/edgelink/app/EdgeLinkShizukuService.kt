@@ -10,6 +10,8 @@ import kotlin.math.min
 private const val COMMAND_TIMEOUT_SECONDS = 10L
 private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
+private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
+    "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
 
 class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
     override fun destroy() {
@@ -87,6 +89,9 @@ internal object EdgeLinkShizukuCommandPolicy {
         if (isAllowedAppOpsCommand(command)) {
             return true
         }
+        if (isAllowedNotificationCommand(command)) {
+            return true
+        }
         if (isAllowedMiLinkProbeCommand(command)) {
             return true
         }
@@ -97,6 +102,18 @@ internal object EdgeLinkShizukuCommandPolicy {
             return true
         }
         return isAllowedPermissionGrantCommand(command)
+    }
+
+    private fun isAllowedNotificationCommand(command: Array<String>): Boolean {
+        if (command.size != 5) {
+            return false
+        }
+        val userId = command[4].toIntOrNull() ?: return false
+        return command[0] == "cmd" &&
+            command[1] == "notification" &&
+            command[2] == "allow_listener" &&
+            command[3] == EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT &&
+            userId in 0..99_999
     }
 
     private fun isAllowedSettingsCommand(command: Array<String>): Boolean {
@@ -233,7 +250,6 @@ internal object EdgeLinkShizukuCommandPolicy {
         "secure" to setOf(
             "accessibility_enabled",
             "enabled_accessibility_services",
-            "enabled_notification_listeners",
             "screensaver_enabled",
             XIAOMI_SCREEN_PROJECT_PRIVATE_ON
         ),

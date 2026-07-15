@@ -45,10 +45,10 @@ class AndroidNotificationListenerService : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         EdgeLinkLog.info("notification.android.listener_disconnected")
-        EdgeLinkRuntimeHolder.existing()?.refreshNotificationAccess()
         if (activeService === this) {
             activeService = null
         }
+        EdgeLinkRuntimeHolder.existing()?.refreshNotificationAccess()
         stopScreenSharePolling()
     }
 
@@ -56,6 +56,7 @@ class AndroidNotificationListenerService : NotificationListenerService() {
         if (activeService === this) {
             activeService = null
         }
+        EdgeLinkRuntimeHolder.existing()?.refreshNotificationAccess()
         stopScreenSharePolling()
         super.onDestroy()
     }
@@ -241,6 +242,8 @@ class AndroidNotificationListenerService : NotificationListenerService() {
         private var activeService: AndroidNotificationListenerService? = null
         @Volatile
         private var screenSharingActive = false
+
+        fun isConnected(): Boolean = activeService != null
 
         fun onScreenSharingStarted(context: Context) {
             screenSharingActive = true
