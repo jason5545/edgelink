@@ -140,6 +140,41 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun hooksTelecomSystemForRelayCallState() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHook(
+                packageName = "android",
+                processName = "android"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
+                packageName = "android",
+                processName = "system_server"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
+                packageName = "system",
+                processName = "system"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
+                packageName = "com.android.server.telecom",
+                processName = "system_server"
+            )
+        )
+
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
+                packageName = "com.android.incallui",
+                processName = "com.android.incallui"
+            )
+        )
+    }
+
+    @Test
     fun allowsOnlyKnownMirrorPhoneProviderMethods() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("getCallRelayService"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("queryRemoteDevices"))
