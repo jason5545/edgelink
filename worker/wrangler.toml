@@ -2,6 +2,11 @@ name = "edgelink-worker"
 main = "src/index.ts"
 compatibility_date = "2026-07-08"
 
+[vars]
+TURN_REALM = "edgelink-turn-tokyo"
+TURN_URLS = "turn:172.238.24.219:3478?transport=udp"
+TURN_TTL_SECONDS = "600"
+
 [[durable_objects.bindings]]
 name = "REGISTRY"
 class_name = "RegistryDO"

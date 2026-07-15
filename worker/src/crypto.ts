@@ -23,8 +23,28 @@ export const base64ToBytes = (value: string): Uint8Array | null => {
   }
 };
 
+export const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+};
+
 export const isBase64Bytes = (value: string, expectedLength: number): boolean =>
   base64ToBytes(value)?.byteLength === expectedLength;
+
+export const hmacSha1Base64 = async (secret: string, message: string): Promise<string> => {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secret),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(message));
+  return bytesToBase64(new Uint8Array(signature));
+};
 
 export const verifyEd25519 = async (publicKeyBase64: string, signatureBase64: string, message: Uint8Array): Promise<boolean> => {
   const publicKey = base64ToBytes(publicKeyBase64);

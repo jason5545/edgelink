@@ -43,6 +43,18 @@ export default {
       return env.RELAY.get(id).fetch(request);
     }
 
+    if (url.pathname === "/v1/turn/credentials") {
+      const body = request.method === "POST"
+        ? await request.clone().json().catch(() => null) as { hostId?: string } | null
+        : null;
+      const hostId = url.searchParams.get("hostId") ?? body?.hostId;
+      if (!hostId) {
+        return badRequest("missing_host_id");
+      }
+      const id = env.RELAY.idFromName(hostId);
+      return env.RELAY.get(id).fetch(request);
+    }
+
     return notFound();
   }
 };

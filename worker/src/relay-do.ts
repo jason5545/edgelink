@@ -1,5 +1,9 @@
 import { badRequest, json, type Env, type PairingRecord, type RelaySocketAttachment } from "./types";
+import { hmacSha1Base64 } from "./crypto";
 import { isDeviceId, parseJson } from "./validation";
+
+const DEFAULT_TURN_TTL_SECONDS = 10 * 60;
+const MAX_TURN_TTL_SECONDS = 60 * 60;
 
 export class RelayDO implements DurableObject {
   constructor(
@@ -17,6 +21,10 @@ export class RelayDO implements DurableObject {
       }
       await this.state.storage.put(`pair:${body.clientId}`, body);
       return json({ ok: true });
+    }
+
+    if (url.pathname === "/v1/turn/credentials" && request.method === "POST") {
+      return this.issueTurnCredentials(request);
     }
 
     if (request.headers.get("upgrade") !== "websocket") {
@@ -90,6 +98,53 @@ export class RelayDO implements DurableObject {
     sender.send(JSON.stringify({ t: "relay.ready", b: { role } }));
   }
 
+  private async issueTurnCredentials(request: Request): Promise<Response> {
+    const body = await parseJson<{
+      hostId?: string;
+      deviceId?: string;
+      ts?: number;
+      sig?: string;
+    }>(request);
+
+    if (!body || !isDeviceId(body.hostId) || !isDeviceId(body.deviceId) || typeof body.ts !== "number" || !body.sig) {
+      return badRequest("invalid_turn_auth");
+    }
+
+    const role = await this.authorize(body.hostId, body.deviceId, body.ts, body.sig);
+    if (!role) {
+      return json({ error: "turn_auth_failed" }, { status: 401 });
+    }
+
+    const config = readTurnConfig(this.env);
+    if (!config) {
+      return json({ error: "turn_not_configured" }, { status: 503 });
+    }
+
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const expiresAt = issuedAt + config.ttlSeconds;
+    const username = `${expiresAt}:${body.deviceId}:${body.hostId}`;
+    const credential = await hmacSha1Base64(config.staticAuthSecret, username);
+    const iceServers = [{
+      urls: config.urls,
+      username,
+      credential,
+      credentialType: "password" as const
+    }];
+
+    return json({
+      urls: config.urls,
+      username,
+      credential,
+      credentialType: "password",
+      ttlSeconds: config.ttlSeconds,
+      issuedAt,
+      expiresAt,
+      realm: config.realm,
+      role,
+      iceServers
+    });
+  }
+
   private closeReplacedHostSockets(sender: WebSocket, deviceId: string): void {
     for (const socket of this.state.getWebSockets()) {
       if (socket === sender) {
@@ -140,6 +195,34 @@ const shouldForward = (sender: RelaySocketAttachment, target: RelaySocketAttachm
     return target.role === "client";
   }
   return target.role === "host";
+};
+
+const readTurnConfig = (env: Env): {
+  urls: string[];
+  realm: string;
+  ttlSeconds: number;
+  staticAuthSecret: string;
+} | null => {
+  const staticAuthSecret = env.TURN_STATIC_AUTH_SECRET?.trim();
+  const urls = env.TURN_URLS?.split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0) ?? [];
+  const realm = env.TURN_REALM?.trim() || "edgelink-turn-tokyo";
+  const requestedTtl = Number(env.TURN_TTL_SECONDS ?? DEFAULT_TURN_TTL_SECONDS);
+  const ttlSeconds = Number.isFinite(requestedTtl)
+    ? Math.min(Math.max(Math.floor(requestedTtl), 60), MAX_TURN_TTL_SECONDS)
+    : DEFAULT_TURN_TTL_SECONDS;
+
+  if (!staticAuthSecret || urls.length === 0) {
+    return null;
+  }
+
+  return {
+    urls,
+    realm,
+    ttlSeconds,
+    staticAuthSecret
+  };
 };
 
 const isPairingRecord = (value: PairingRecord | null): value is PairingRecord =>

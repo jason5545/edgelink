@@ -2,6 +2,10 @@ export interface Env {
   REGISTRY: DurableObjectNamespace;
   PAIRING: DurableObjectNamespace;
   RELAY: DurableObjectNamespace;
+  TURN_REALM?: string;
+  TURN_URLS?: string;
+  TURN_TTL_SECONDS?: string;
+  TURN_STATIC_AUTH_SECRET?: string;
 }
 
 export type Platform = "macos" | "android" | "ios" | "windows" | "linux";

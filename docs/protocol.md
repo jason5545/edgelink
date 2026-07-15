@@ -587,6 +587,55 @@ Hibernatable WebSockets API：`state.acceptWebSocket()`、`serializeAttachment()
 `status.ping` / `status.pong` 做端到端 keepalive。任一端超過 15 秒沒有收到
 secure pong，應主動關閉目前 channel，交由 reconnect loop 建新連線與新 handshake。
 
+### TURN Credentials
+
+媒體層需要跨網路時，app 不持有 TURN server 的永久 shared secret。兩端用跟 relay WebSocket
+相同的 Ed25519 身分簽章向 Worker 換短效 credential：
+
+`POST /v1/turn/credentials`
+
+```json
+{
+  "hostId": "949758990",
+  "deviceId": "949758990",
+  "ts": 1751941000,
+  "sig": "<base64 Ed25519 signature>"
+}
+```
+
+`sig` 的輸入仍是：
+
+```text
+utf8("EdgeLink relay auth v1\n" || deviceId || "\n" || ts)
+```
+
+Worker 會把 request route 到 `RelayDO(idFromName(hostId))`，只有 host 本身或已配對的 client
+可以取得 TURN credential。回傳內容可直接塞給 WebRTC `RTCConfiguration.iceServers`：
+
+```json
+{
+  "urls": ["turn:172.238.24.219:3478?transport=udp"],
+  "username": "1751941600:949758990:949758990",
+  "credential": "<base64 HMAC-SHA1 password>",
+  "credentialType": "password",
+  "ttlSeconds": 600,
+  "issuedAt": 1751941000,
+  "expiresAt": 1751941600,
+  "realm": "edgelink-turn-tokyo",
+  "role": "host",
+  "iceServers": [
+    {
+      "urls": ["turn:172.238.24.219:3478?transport=udp"],
+      "username": "1751941600:949758990:949758990",
+      "credential": "<base64 HMAC-SHA1 password>",
+      "credentialType": "password"
+    }
+  ]
+}
+```
+
+credential 到期前 app 可以重取；永久 TURN shared secret 只存在 coturn 與 Worker secret store。
+
 ### LAN
 
 M5 再做。Mac 使用 `_edgelink._tcp` Bonjour；Android 使用 `NsdManager`，並提供手動 IP
