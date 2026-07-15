@@ -1544,7 +1544,7 @@ final class MiLinkPhoneRelayProbe {
             if bodyText.localizedCaseInsensitiveContains("wfd_trigger_method: TEARDOWN") {
                 stopMPEGTSPlayer(reason: "trigger_teardown")
                 stopMPEGTSFileCapture(reason: "trigger_teardown")
-                disarmSourceRTPOnQueue(reason: "trigger_teardown", stopActive: true)
+                stopSourceRTPIfOwned(by: id, reason: "trigger_teardown")
             }
         case "SETUP":
             recordSourceRTPDestination(from: headerText, connection: connection, id: id)
@@ -1567,7 +1567,7 @@ final class MiLinkPhoneRelayProbe {
             stopSourceRTPIfOwned(by: id, reason: "pause_request")
         case "TEARDOWN":
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
-            disarmSourceRTPOnQueue(reason: "teardown_request", stopActive: true)
+            stopSourceRTPIfOwned(by: id, reason: "teardown_request")
         default:
             sendRTSPResponse(connection: connection, id: id, cseq: cseq, firstLine: firstLine)
         }
