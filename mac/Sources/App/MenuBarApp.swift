@@ -266,40 +266,10 @@ private struct PhoneControlPanel: View {
                     Label("掛斷", systemImage: "phone.down")
                 }
                 .disabled(!runtime.isConnected)
-
-                Button {
-                    runtime.runPhoneRelayDebugCall()
-                    phoneNumber = "800"
-                } label: {
-                    Label("Debug 800", systemImage: "waveform.path.ecg")
-                }
-                .disabled(!runtime.isConnected)
-                .help("撥 800，最多 30 秒；收到有效 PHONERELAY PCM 後自動掛斷")
-            }
-
-            Toggle(isOn: Binding(
-                get: { runtime.phoneRelayProbeEnabled },
-                set: { runtime.setPhoneRelayProbeEnabled($0) }
-            )) {
-                Label("PHONERELAY 探針", systemImage: runtime.phoneRelayProbeEnabled ? "dot.radiowaves.left.and.right" : "waveform")
-            }
-
-            if !runtime.phoneRelayProbeStatus.isEmpty {
-                Text(runtime.phoneRelayProbeStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
 
             if !runtime.phoneCallStatus.isEmpty {
                 Text(runtime.phoneCallStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            if !runtime.phoneRelayDebugStatus.isEmpty {
-                Text(runtime.phoneRelayDebugStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)

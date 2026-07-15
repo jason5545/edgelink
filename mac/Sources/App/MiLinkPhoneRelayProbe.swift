@@ -27,7 +27,6 @@ struct MiLinkPhoneRelayPCMStats: Equatable {
 }
 
 final class MiLinkPhoneRelayProbe {
-    var onStatusChanged: ((String) -> Void)?
     var onSinkPCMStats: ((MiLinkPhoneRelayPCMStats) -> Void)?
 
     private let queue = DispatchQueue(label: "EdgeLink.MiLinkPhoneRelayProbe")
@@ -116,7 +115,6 @@ final class MiLinkPhoneRelayProbe {
         }
 
         DiagnosticsLog.info("phonerelay.mac.probe_start port=\(port) rtpPorts=\(rtpProbePorts.map(String.init).joined(separator: ","))")
-        onStatusChanged?("PHONERELAY RTSP \(port) RTP \(sinkRTPPort)-\(sinkRTPPort + 1)")
         tcp.start(queue: queue)
         udp.start(queue: queue)
         for listener in rtpListeners.values {
@@ -188,7 +186,6 @@ final class MiLinkPhoneRelayProbe {
         stopSourceRTP(reason: "probe_stop")
         if hadActiveProbe {
             DiagnosticsLog.info("phonerelay.mac.probe_stop port=\(activePort)")
-            onStatusChanged?("")
         }
     }
 
@@ -229,7 +226,6 @@ final class MiLinkPhoneRelayProbe {
             DiagnosticsLog.info("phonerelay.mac.probe_listener_ready proto=\(proto) port=\(listenerPortText)")
         case .failed(let error):
             DiagnosticsLog.warn("phonerelay.mac.probe_listener_failed proto=\(proto) port=\(listenerPortText) error=\(error)")
-            onStatusChanged?("PHONERELAY \(proto) failed")
         case .cancelled:
             DiagnosticsLog.info("phonerelay.mac.probe_listener_cancelled proto=\(proto) port=\(listenerPortText)")
         default:
