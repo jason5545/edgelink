@@ -911,6 +911,30 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook mirror plain audio sink: ${error.javaClass.simpleName}: ${error.message}")
         }
+        hookMirrorPlainAudioIntOptions(
+            classLoader = classLoader,
+            className = XIAOMI_MIRROR_CONTROL_AUDIO_SOURCE,
+            methodName = "setAudioSourceOption",
+            direction = "source"
+        )
+        hookMirrorPlainAudioByteOptions(
+            classLoader = classLoader,
+            className = XIAOMI_MIRROR_CONTROL_AUDIO_SOURCE,
+            methodName = "setAudioSourceOption",
+            direction = "source"
+        )
+        hookMirrorPlainAudioIntOptions(
+            classLoader = classLoader,
+            className = XIAOMI_MIRROR_CONTROL_AUDIO_SINK,
+            methodName = "setAudioSinkOption",
+            direction = "sink"
+        )
+        hookMirrorPlainAudioByteOptions(
+            classLoader = classLoader,
+            className = XIAOMI_MIRROR_CONTROL_AUDIO_SINK,
+            methodName = "setAudioSinkOption",
+            direction = "sink"
+        )
         runCatching {
             XposedHelpers.findAndHookMethod(
                 XIAOMI_MIRROR_CONTROL,
@@ -947,59 +971,120 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(
                 XIAOMI_MIRROR_CONTROL,
                 classLoader,
-                "enableEncrypt",
+                "setMirrorOptionByte",
                 java.lang.Long.TYPE,
-                java.lang.Boolean.TYPE,
+                Integer.TYPE,
+                ByteArray::class.java,
+                Integer.TYPE,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (!shouldForceFakeMirrorPlainAudioRelay()) {
                             return
                         }
-                        val oldValue = param.args.getOrNull(1) as? Boolean ?: return
-                        if (oldValue) {
-                            param.args[1] = false
-                            val direction = mirrorAudioStartStackDirection()
-                                ?: recentMirrorAudioStartDirection()
-                                ?: "call_relay"
-                            log("mirror fake pad plain audio $direction enableEncrypt value=true->false")
-                        }
-                    }
-                }
-            )
-        }.onFailure { error ->
-            log("failed to hook mirror plain audio encryption switch: ${error.javaClass.simpleName}: ${error.message}")
-        }
-        runCatching {
-            XposedHelpers.findAndHookMethod(
-                XIAOMI_MIRROR_CONTROL,
-                classLoader,
-                "setEncryptKey",
-                java.lang.Long.TYPE,
-                ByteArray::class.java,
-                ByteArray::class.java,
-                ByteArray::class.java,
-                Integer.TYPE,
-                Integer.TYPE,
-                Integer.TYPE,
-                java.lang.Boolean.TYPE,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!shouldForceFakeMirrorPlainAudioRelay()) {
+                        val option = param.args.getOrNull(1) as? Int ?: return
+                        if (!plainAudioByteOptionBlocked(option)) {
                             return
                         }
                         val direction = mirrorAudioStartStackDirection()
                             ?: recentMirrorAudioStartDirection()
                             ?: "call_relay"
+                        val bytes = param.args.getOrNull(2) as? ByteArray
                         log(
-                            "mirror fake pad plain audio $direction setEncryptKey blocked " +
-                                "lengths=${param.args.getOrNull(4)},${param.args.getOrNull(5)},${param.args.getOrNull(6)}"
+                            "mirror fake pad plain audio $direction byte option blocked " +
+                                "option=$option bytes=${bytes?.size ?: -1} len=${param.args.getOrNull(3)}"
                         )
-                        param.setResult(null)
+                        param.setResult(false)
                     }
                 }
             )
         }.onFailure { error ->
-            log("failed to hook mirror plain audio encryption key: ${error.javaClass.simpleName}: ${error.message}")
+            log("failed to hook mirror plain audio byte options: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorPlainAudioIntOptions(
+        classLoader: ClassLoader,
+        className: String,
+        methodName: String,
+        direction: String
+    ) {
+        runCatching {
+            val targetClass = findTargetClass(classLoader, className)
+            val methods = targetClass.declaredMethods.filter { method ->
+                method.name == methodName &&
+                    method.parameterTypes.contentEquals(arrayOf(Integer.TYPE, Integer.TYPE))
+            }
+            methods.forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceFakeMirrorPlainAudioRelay()) {
+                                return
+                            }
+                            val option = param.args.getOrNull(0) as? Int ?: return
+                            val forcedValue = plainAudioOptionValue(option) ?: return
+                            val oldValue = param.args.getOrNull(1)
+                            if (oldValue != forcedValue) {
+                                param.args[1] = forcedValue
+                                log(
+                                    "mirror fake pad plain audio $direction wrapper option " +
+                                        "option=$option value=$oldValue->$forcedValue"
+                                )
+                            }
+                        }
+                    }
+                )
+            }
+            log("mirror plain audio $direction wrapper int option hooks installed count=${methods.size}")
+        }.onFailure { error ->
+            log(
+                "failed to hook mirror plain audio $direction wrapper int options: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    private fun hookMirrorPlainAudioByteOptions(
+        classLoader: ClassLoader,
+        className: String,
+        methodName: String,
+        direction: String
+    ) {
+        runCatching {
+            val targetClass = findTargetClass(classLoader, className)
+            val methods = targetClass.declaredMethods.filter { method ->
+                method.name == methodName &&
+                    method.parameterTypes.contentEquals(arrayOf(Integer.TYPE, ByteArray::class.java, Integer.TYPE))
+            }
+            methods.forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceFakeMirrorPlainAudioRelay()) {
+                                return
+                            }
+                            val option = param.args.getOrNull(0) as? Int ?: return
+                            if (!plainAudioByteOptionBlocked(option)) {
+                                return
+                            }
+                            val bytes = param.args.getOrNull(1) as? ByteArray
+                            log(
+                                "mirror fake pad plain audio $direction wrapper byte option blocked " +
+                                    "option=$option bytes=${bytes?.size ?: -1} len=${param.args.getOrNull(2)}"
+                            )
+                            param.setResult(null)
+                        }
+                    }
+                )
+            }
+            log("mirror plain audio $direction wrapper byte option hooks installed count=${methods.size}")
+        }.onFailure { error ->
+            log(
+                "failed to hook mirror plain audio $direction wrapper byte options: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
         }
     }
 
@@ -1027,13 +1112,23 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun plainAudioOptionValue(option: Int): Int? =
         when (option) {
+            MIRROR_OPTION_ENCRYPT_TRANS_BY_MIPLAY,
+            MIRROR_OPTION_ENCRYPT_LEVEL,
+            MIRROR_OPTION_ENCRYPT_TRANS_LEVEL,
             MIRROR_OPTION_ENCRYPT_TYPE,
             MIRROR_OPTION_ENCRYPT_DATA_LEN,
             MIRROR_OPTION_ENCRYPT_DATA_FORMAT,
             MIRROR_OPTION_DATA_INTEGRITY_ENABLE,
-            MIRROR_OPTION_DATA_INTEGRITY_LEVEL -> 0
+            MIRROR_OPTION_DATA_INTEGRITY_LEVEL,
+            MIRROR_OPTION_ENCRYPT_ENABLE,
+            MIRROR_OPTION_ENCRYPT_AUTH_TYPE -> 0
             else -> null
         }
+
+    private fun plainAudioByteOptionBlocked(option: Int): Boolean =
+        option == MIRROR_OPTION_ENCRYPT_AES_KEY ||
+            option == MIRROR_OPTION_ENCRYPT_AES_IV ||
+            option == MIRROR_OPTION_ENCRYPT_AUTH_KEY
 
     private fun mirrorAudioStartStackDirection(): String? {
         val stack = Thread.currentThread().stackTrace
@@ -1808,11 +1903,19 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val MIRROR_RELAY_FIELD_AUDIO_SOURCE_OPEN = "i"
         private const val MIRROR_RELAY_FIELD_AUDIO_SINK_OPEN = "j"
         private const val MIRROR_AUDIO_FIELD_ENCRYPT_ENABLE = "mEncryptEnable"
+        private const val MIRROR_OPTION_ENCRYPT_AES_KEY = 7
+        private const val MIRROR_OPTION_ENCRYPT_AES_IV = 8
+        private const val MIRROR_OPTION_ENCRYPT_TRANS_BY_MIPLAY = 9
+        private const val MIRROR_OPTION_ENCRYPT_LEVEL = 10
+        private const val MIRROR_OPTION_ENCRYPT_TRANS_LEVEL = 11
         private const val MIRROR_OPTION_ENCRYPT_TYPE = 12
         private const val MIRROR_OPTION_ENCRYPT_DATA_LEN = 13
         private const val MIRROR_OPTION_ENCRYPT_DATA_FORMAT = 14
         private const val MIRROR_OPTION_DATA_INTEGRITY_ENABLE = 15
         private const val MIRROR_OPTION_DATA_INTEGRITY_LEVEL = 16
+        private const val MIRROR_OPTION_ENCRYPT_ENABLE = 23
+        private const val MIRROR_OPTION_ENCRYPT_AUTH_KEY = 41
+        private const val MIRROR_OPTION_ENCRYPT_AUTH_TYPE = 43
         private const val MIRROR_SHARED_KEY_MIN_BYTES = 16
         private const val MAX_MIRROR_AUDIO_PARAM_FIELDS = 12
         private const val MAX_MIRROR_FIELD_VALUE_CHARS = 80
