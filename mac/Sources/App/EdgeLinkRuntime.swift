@@ -30,6 +30,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var lastDialedPhoneNumber: String
     @Published private(set) var phoneRelayProbeEnabled = false
     @Published private(set) var phoneRelayProbeStatus = ""
+    @Published private(set) var phoneRelayDebugStatus = ""
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -63,6 +64,12 @@ final class EdgeLinkRuntime: ObservableObject {
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
     private var androidMicRelayArmed = false
+    private var phoneRelayDebugTask: Task<Void, Never>?
+    private var phoneRelayDebugSessionID: UUID?
+    private var phoneRelayDebugDialRequestID: String?
+    private var phoneRelayDebugDialError: String?
+    private var phoneRelayDebugLastStats: MiLinkPhoneRelayPCMStats?
+    private var phoneRelayDebugValidStats: MiLinkPhoneRelayPCMStats?
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -98,6 +105,16 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.phoneRelayProbeStatus = status
             }
         }
+        phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
+            Task { @MainActor in
+                self?.handlePhoneRelayPCMStats(stats)
+            }
+        }
+        EdgeLinkURLRouter.shared.setHandler { [weak self] url in
+            Task { @MainActor in
+                self?.handleExternalURL(url)
+            }
+        }
         observeSystemSleepWake()
         verificationCodeBridge.warmObservers()
         if phoneRelayProbeEnabled {
@@ -110,6 +127,7 @@ final class EdgeLinkRuntime: ObservableObject {
         task?.cancel()
         pairingTask?.cancel()
         connectionTask?.cancel()
+        phoneRelayDebugTask?.cancel()
         currentChannel?.close()
         phoneRelayProbe.stop()
         screenSession.closeWindow(sendRemoteStop: false)
@@ -296,26 +314,149 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    func dialPhone(number rawNumber: String) {
+    @discardableResult
+    func dialPhone(number rawNumber: String) -> String? {
         let number = rawNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !number.isEmpty else {
             phoneCallStatus = "請填電話號碼"
-            return
+            return nil
         }
         rememberDialedPhoneNumber(number)
-        sendPhoneAction(action: "dial", number: number)
+        return sendPhoneAction(action: "dial", number: number)
     }
 
-    func redialLastPhoneNumber() {
+    @discardableResult
+    func redialLastPhoneNumber() -> String? {
         dialPhone(number: lastDialedPhoneNumber)
     }
 
-    func answerPhoneCall() {
+    @discardableResult
+    func answerPhoneCall() -> String? {
         sendPhoneAction(action: "answer")
     }
 
-    func hangUpPhoneCall() {
+    @discardableResult
+    func hangUpPhoneCall() -> String? {
         sendPhoneAction(action: "hangup")
+    }
+
+    func runPhoneRelayDebugCall(number rawNumber: String = "800", timeoutSeconds rawTimeout: TimeInterval = 30) {
+        let number = rawNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? Self.phoneRelayDebugDefaultNumber
+            : rawNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        let timeoutSeconds = min(max(rawTimeout, 1), Self.phoneRelayDebugMaxTimeoutSeconds)
+        phoneRelayDebugTask?.cancel()
+        phoneRelayDebugTask = Task { [weak self] in
+            await self?.runPhoneRelayDebugCallTask(number: number, timeoutSeconds: timeoutSeconds)
+        }
+    }
+
+    private func runPhoneRelayDebugCallTask(number: String, timeoutSeconds: TimeInterval) async {
+        guard isConnected else {
+            phoneRelayDebugStatus = "Debug 失敗：Android 未連線"
+            DiagnosticsLog.warn("phonerelay.mac.debug_call_ignored numberFp=\(Self.fingerprint(number)) not_connected")
+            phoneRelayDebugTask = nil
+            return
+        }
+
+        let sessionID = phoneRelayProbe.resetSinkPCMValidation(reason: "debug_call_start")
+        phoneRelayDebugSessionID = sessionID
+        phoneRelayDebugDialRequestID = nil
+        phoneRelayDebugDialError = nil
+        phoneRelayDebugLastStats = nil
+        phoneRelayDebugValidStats = nil
+        phoneRelayDebugStatus = "Debug 撥 \(number)，等待音訊"
+        DiagnosticsLog.info(
+            "phonerelay.mac.debug_call_start session=\(sessionID.uuidString) " +
+                "numberFp=\(Self.fingerprint(number)) timeoutMs=\(Int(timeoutSeconds * 1000))"
+        )
+
+        guard let dialRequestID = dialPhone(number: number) else {
+            phoneRelayDebugStatus = "Debug 失敗：撥號沒有送出"
+            DiagnosticsLog.warn("phonerelay.mac.debug_call_dial_not_sent session=\(sessionID.uuidString)")
+            phoneRelayDebugTask = nil
+            return
+        }
+        phoneRelayDebugDialRequestID = dialRequestID
+
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !Task.isCancelled && Date() < deadline {
+            if let dialError = phoneRelayDebugDialError {
+                phoneRelayDebugStatus = "Debug 失敗：\(dialError)"
+                DiagnosticsLog.warn(
+                    "phonerelay.mac.debug_call_dial_failed session=\(sessionID.uuidString) " +
+                        "requestId=\(dialRequestID) error=\(dialError)"
+                )
+                phoneRelayDebugTask = nil
+                return
+            }
+            if let stats = phoneRelayDebugValidStats,
+               stats.sessionID == sessionID,
+               stats.hasValidStream {
+                phoneRelayDebugStatus = "Debug 成功：收到有效音訊，已掛斷"
+                DiagnosticsLog.info("phonerelay.mac.debug_call_valid_stream \(stats.diagnosticSummary)")
+                hangUpPhoneCall()
+                phoneRelayDebugTask = nil
+                return
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+
+        if Task.isCancelled {
+            phoneRelayDebugStatus = "Debug 已取消"
+            DiagnosticsLog.info("phonerelay.mac.debug_call_cancelled session=\(sessionID.uuidString)")
+        } else {
+            let lastStats = phoneRelayDebugLastStats?.diagnosticSummary ?? "none"
+            phoneRelayDebugStatus = "Debug timeout，已掛斷"
+            DiagnosticsLog.warn(
+                "phonerelay.mac.debug_call_timeout session=\(sessionID.uuidString) " +
+                    "timeoutMs=\(Int(timeoutSeconds * 1000)) lastStats=\(lastStats)"
+            )
+            hangUpPhoneCall()
+        }
+        phoneRelayDebugTask = nil
+    }
+
+    private func handlePhoneRelayPCMStats(_ stats: MiLinkPhoneRelayPCMStats) {
+        guard stats.sessionID == phoneRelayDebugSessionID else {
+            return
+        }
+        phoneRelayDebugLastStats = stats
+        if stats.hasValidStream {
+            phoneRelayDebugValidStats = stats
+        }
+    }
+
+    private func handleExternalURL(_ url: URL) {
+        guard url.scheme?.lowercased() == "edgelink" else {
+            DiagnosticsLog.warn("runtime.mac.url_ignored scheme=\(url.scheme ?? "none")")
+            return
+        }
+        let command = Self.externalURLCommand(url)
+        guard command == "debug-phone-relay" || command == "phone-relay-debug" else {
+            DiagnosticsLog.warn("runtime.mac.url_ignored command=\(command)")
+            return
+        }
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let queryItems = components?.queryItems ?? []
+        let number = queryItems.first { $0.name == "number" }?.value ?? Self.phoneRelayDebugDefaultNumber
+        let timeout = queryItems.first { $0.name == "timeout" || $0.name == "timeoutSeconds" }?.value
+            .flatMap(TimeInterval.init) ?? Self.phoneRelayDebugMaxTimeoutSeconds
+        DiagnosticsLog.info(
+            "runtime.mac.url_debug_phone_relay numberFp=\(Self.fingerprint(number)) " +
+                "timeoutMs=\(Int(min(max(timeout, 1), Self.phoneRelayDebugMaxTimeoutSeconds) * 1000))"
+        )
+        runPhoneRelayDebugCall(number: number, timeoutSeconds: timeout)
+    }
+
+    private static func externalURLCommand(_ url: URL) -> String {
+        if let host = url.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !host.isEmpty {
+            return host.lowercased()
+        }
+        return url.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .lowercased()
     }
 
     private func rememberDialedPhoneNumber(_ number: String) {
@@ -374,11 +515,12 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    private func sendPhoneAction(action: String, number: String? = nil) {
+    @discardableResult
+    private func sendPhoneAction(action: String, number: String? = nil) -> String? {
         guard let session = currentSession, isConnected else {
             phoneCallStatus = "電話目前不可用"
             DiagnosticsLog.warn("phone.mac.action_ignored action=\(action) not_connected")
-            return
+            return nil
         }
 
         let requestId = UUID().uuidString
@@ -422,6 +564,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(requestId) action=\(action)", error)
             }
         }
+        return requestId
     }
 
     private func run() async {
@@ -985,6 +1128,9 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
         pendingPhoneActions.removeValue(forKey: result.requestId)
+        if result.requestId == phoneRelayDebugDialRequestID && !result.success {
+            phoneRelayDebugDialError = result.error ?? "unknown"
+        }
         let action = Self.localizedPhoneAction(result.action)
         if result.success {
             phoneCallStatus = "\(action)已送出"
@@ -1044,6 +1190,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102
+    private static let phoneRelayDebugDefaultNumber = "800"
+    private static let phoneRelayDebugMaxTimeoutSeconds: TimeInterval = 30
 
     private static func phoneRelayProbePeerPort() -> UInt16 {
         let value = UserDefaults.standard.integer(forKey: phoneRelayProbePeerPortDefaultsKey)

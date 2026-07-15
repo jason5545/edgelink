@@ -3,8 +3,32 @@ import AVFoundation
 import Darwin
 import Network
 
+struct MiLinkPhoneRelayPCMStats: Equatable {
+    let sessionID: UUID
+    let pcmBytes: Int
+    let totalPCMBytes: Int
+    let pesPacketCount: Int
+    let samples: Int
+    let nonzeroSamples: Int
+    let maxAbs: Int
+    let averageAbs: Int
+    let fingerprint: String
+    let prefix: String
+
+    var hasValidStream: Bool {
+        nonzeroSamples > 0 && maxAbs > 0
+    }
+
+    var diagnosticSummary: String {
+        "session=\(sessionID.uuidString) pcmBytes=\(pcmBytes) pcmTotal=\(totalPCMBytes) " +
+            "pes=\(pesPacketCount) samples=\(samples) nonzero=\(nonzeroSamples) " +
+            "maxAbs=\(maxAbs) avgAbs=\(averageAbs) fp=\(fingerprint)"
+    }
+}
+
 final class MiLinkPhoneRelayProbe {
     var onStatusChanged: ((String) -> Void)?
+    var onSinkPCMStats: ((MiLinkPhoneRelayPCMStats) -> Void)?
 
     private let queue = DispatchQueue(label: "EdgeLink.MiLinkPhoneRelayProbe")
     private var tcpListener: NWListener?
@@ -19,7 +43,12 @@ final class MiLinkPhoneRelayProbe {
     private var mpegTSPlayerErrorOutput: FileHandle?
     private var mpegTSPlayerDevNull: FileHandle?
     private var mpegTSBytesWritten = 0
+    private var mpegTSPCMBytesWritten = 0
+    private var mpegTSPCMPESPacketCount = 0
     private var mpegTSPlayerStderrBytesLogged = 0
+    private var sinkPCMValidationSessionID = UUID()
+    private var sinkPCMValidStreamReported = false
+    private var latestSinkPCMStats: MiLinkPhoneRelayPCMStats?
     private var mpegTSCaptureHandle: FileHandle?
     private var mpegTSCaptureBytes = 0
     private var mpegTSCaptureLimitLogged = false
@@ -108,6 +137,24 @@ final class MiLinkPhoneRelayProbe {
     func disarmSourceRTP(reason: String, stopActive: Bool) {
         queue.async {
             self.disarmSourceRTPOnQueue(reason: reason, stopActive: stopActive)
+        }
+    }
+
+    func resetSinkPCMValidation(reason: String) -> UUID {
+        queue.sync {
+            sinkPCMValidationSessionID = UUID()
+            sinkPCMValidStreamReported = false
+            latestSinkPCMStats = nil
+            DiagnosticsLog.info(
+                "phonerelay.mac.sink_pcm_validation_reset session=\(sinkPCMValidationSessionID.uuidString) reason=\(reason)"
+            )
+            return sinkPCMValidationSessionID
+        }
+    }
+
+    func currentSinkPCMStats() -> MiLinkPhoneRelayPCMStats? {
+        queue.sync {
+            latestSinkPCMStats
         }
     }
 
@@ -467,23 +514,133 @@ final class MiLinkPhoneRelayProbe {
             return
         }
         writeMPEGTSFileCapture(payload)
-        startMPEGTSPlayerIfNeeded(reason: "rtp_mpegts")
+        let pcmPayload = extractPhoneRelayPCM(fromMPEGTS: payload)
+        guard !pcmPayload.isEmpty else {
+            return
+        }
+        startMPEGTSPlayerIfNeeded(reason: "rtp_mpegts_pcm")
         guard let mpegTSPlayerInput else {
             return
         }
         do {
-            try mpegTSPlayerInput.write(contentsOf: payload)
+            let previousPCMTotal = mpegTSPCMBytesWritten
+            try mpegTSPlayerInput.write(contentsOf: pcmPayload)
             mpegTSBytesWritten += payload.count
-            if mpegTSBytesWritten == payload.count || mpegTSBytesWritten % (188 * 500) < payload.count {
+            mpegTSPCMBytesWritten += pcmPayload.count
+            let sampleStats = pcmS16LEStats(pcmPayload)
+            let stats = MiLinkPhoneRelayPCMStats(
+                sessionID: sinkPCMValidationSessionID,
+                pcmBytes: pcmPayload.count,
+                totalPCMBytes: mpegTSPCMBytesWritten,
+                pesPacketCount: mpegTSPCMPESPacketCount,
+                samples: sampleStats.samples,
+                nonzeroSamples: sampleStats.nonzeroSamples,
+                maxAbs: sampleStats.maxAbs,
+                averageAbs: sampleStats.averageAbs,
+                fingerprint: DiagnosticsLog.fingerprint(pcmPayload),
+                prefix: hexPrefix(pcmPayload)
+            )
+            latestSinkPCMStats = stats
+            let isFirstValidStream = stats.hasValidStream && !sinkPCMValidStreamReported
+            if isFirstValidStream {
+                sinkPCMValidStreamReported = true
+                DiagnosticsLog.info("phonerelay.mac.sink_pcm_valid \(stats.diagnosticSummary)")
+            }
+            let shouldLogStats = previousPCMTotal == 0 ||
+                mpegTSPCMBytesWritten % 64_000 < pcmPayload.count ||
+                isFirstValidStream
+            if shouldLogStats || isFirstValidStream {
+                onSinkPCMStats?(stats)
+            }
+            if shouldLogStats {
                 DiagnosticsLog.info(
-                    "phonerelay.mac.mpegts_playback_write bytes=\(payload.count) total=\(mpegTSBytesWritten) " +
-                        "fp=\(DiagnosticsLog.fingerprint(payload)) prefix=\(hexPrefix(payload))"
+                    "phonerelay.mac.mpegts_pcm_playback_write tsBytes=\(payload.count) " +
+                        "pcmBytes=\(stats.pcmBytes) pcmTotal=\(stats.totalPCMBytes) " +
+                        "pes=\(stats.pesPacketCount) samples=\(stats.samples) " +
+                        "nonzero=\(stats.nonzeroSamples) maxAbs=\(stats.maxAbs) avgAbs=\(stats.averageAbs) " +
+                        "fp=\(stats.fingerprint) prefix=\(stats.prefix)"
                 )
             }
         } catch {
-            DiagnosticsLog.warn("phonerelay.mac.mpegts_playback_write_failed error=\(error)")
+            DiagnosticsLog.warn("phonerelay.mac.mpegts_pcm_playback_write_failed error=\(error)")
             stopMPEGTSPlayer(reason: "write_failed")
         }
+    }
+
+    private func extractPhoneRelayPCM(fromMPEGTS payload: Data) -> Data {
+        let bytes = Array(payload)
+        var output = Data()
+        var offset = 0
+        while offset + Self.mpegTSPacketSize <= bytes.count {
+            guard bytes[offset] == 0x47 else {
+                offset += 1
+                continue
+            }
+            let packetStart = offset
+            let packetEnd = offset + Self.mpegTSPacketSize
+            let payloadUnitStart = (bytes[packetStart + 1] & 0x40) != 0
+            let pid = (UInt16(bytes[packetStart + 1] & 0x1f) << 8) | UInt16(bytes[packetStart + 2])
+            let adaptationFieldControl = (bytes[packetStart + 3] >> 4) & 0x03
+            var payloadStart = packetStart + 4
+
+            if adaptationFieldControl == 2 || adaptationFieldControl == 3 {
+                guard payloadStart < packetEnd else {
+                    offset = packetEnd
+                    continue
+                }
+                payloadStart += 1 + Int(bytes[payloadStart])
+            }
+            guard (adaptationFieldControl == 1 || adaptationFieldControl == 3),
+                  pid == Self.phoneRelayAudioTSPID,
+                  payloadStart < packetEnd else {
+                offset = packetEnd
+                continue
+            }
+
+            if payloadUnitStart,
+               payloadStart + 9 <= packetEnd,
+               bytes[payloadStart] == 0x00,
+               bytes[payloadStart + 1] == 0x00,
+               bytes[payloadStart + 2] == 0x01 {
+                let headerLength = Int(bytes[payloadStart + 8])
+                let pcmStart = payloadStart + 9 + headerLength
+                if pcmStart < packetEnd {
+                    output.append(contentsOf: bytes[pcmStart..<packetEnd])
+                    mpegTSPCMPESPacketCount += 1
+                }
+            } else {
+                output.append(contentsOf: bytes[payloadStart..<packetEnd])
+            }
+            offset = packetEnd
+        }
+        return output
+    }
+
+    private func pcmS16LEStats(_ data: Data) -> (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int) {
+        let bytes = Array(data)
+        var sampleCount = 0
+        var nonzeroSamples = 0
+        var maxAbs = 0
+        var absTotal = 0
+        var index = 0
+        while index + 1 < bytes.count {
+            let raw = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+            let sample = Int(Int16(bitPattern: raw))
+            let magnitude = abs(sample)
+            sampleCount += 1
+            if sample != 0 {
+                nonzeroSamples += 1
+            }
+            maxAbs = max(maxAbs, magnitude)
+            absTotal += magnitude
+            index += 2
+        }
+        return (
+            samples: sampleCount,
+            nonzeroSamples: nonzeroSamples,
+            maxAbs: maxAbs,
+            averageAbs: sampleCount > 0 ? absTotal / sampleCount : 0
+        )
     }
 
     private func writeMPEGTSFileCapture(_ payload: Data) {
@@ -577,9 +734,9 @@ final class MiLinkPhoneRelayProbe {
             "-nostats",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
-            "-probesize", "262144",
-            "-analyzeduration", "1000000",
-            "-f", "mpegts",
+            "-f", "s16le",
+            "-ar", "8000",
+            "-ch_layout", "mono",
             "-i", "pipe:0"
         ]
         process.standardInput = inputPipe
@@ -613,6 +770,8 @@ final class MiLinkPhoneRelayProbe {
                 self?.mpegTSPlayerErrorOutput = nil
                 self?.mpegTSPlayerDevNull = nil
                 self?.mpegTSBytesWritten = 0
+                self?.mpegTSPCMBytesWritten = 0
+                self?.mpegTSPCMPESPacketCount = 0
                 self?.mpegTSPlayerStderrBytesLogged = 0
             }
         }
@@ -623,8 +782,13 @@ final class MiLinkPhoneRelayProbe {
             mpegTSPlayerErrorOutput = errorOutput
             mpegTSPlayerDevNull = devNull
             mpegTSBytesWritten = 0
+            mpegTSPCMBytesWritten = 0
+            mpegTSPCMPESPacketCount = 0
             mpegTSPlayerStderrBytesLogged = 0
-            DiagnosticsLog.info("phonerelay.mac.mpegts_playback_start path=\(ffplayURL.path) reason=\(reason)")
+            DiagnosticsLog.info(
+                "phonerelay.mac.mpegts_pcm_playback_start path=\(ffplayURL.path) " +
+                    "format=s16le sampleRate=8000 channelLayout=mono reason=\(reason)"
+            )
         } catch {
             errorOutput.readabilityHandler = nil
             try? errorOutput.close()
@@ -634,6 +798,8 @@ final class MiLinkPhoneRelayProbe {
             mpegTSPlayerErrorOutput = nil
             mpegTSPlayerDevNull = nil
             mpegTSBytesWritten = 0
+            mpegTSPCMBytesWritten = 0
+            mpegTSPCMPESPacketCount = 0
             mpegTSPlayerStderrBytesLogged = 0
         }
     }
@@ -663,6 +829,8 @@ final class MiLinkPhoneRelayProbe {
         mpegTSPlayerDevNull = nil
         mpegTSPlayerProcess = nil
         mpegTSBytesWritten = 0
+        mpegTSPCMBytesWritten = 0
+        mpegTSPCMPESPacketCount = 0
         mpegTSPlayerStderrBytesLogged = 0
         if let process, process.isRunning {
             process.terminate()
@@ -2011,6 +2179,8 @@ final class MiLinkPhoneRelayProbe {
     private static let mpegTSCaptureLimitBytes = 8 * 1024 * 1024
     private static let mpegTSPlayerStderrLogLimitBytes = 4 * 1024
     private static let mpegTSCapturePath = "/private/tmp/edgelink-phonerelay.ts"
+    private static let mpegTSPacketSize = 188
+    private static let phoneRelayAudioTSPID: UInt16 = 0x1100
     private static let armDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

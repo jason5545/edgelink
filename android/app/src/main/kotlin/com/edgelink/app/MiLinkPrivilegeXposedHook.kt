@@ -1194,7 +1194,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             !currentFakeMirrorRemoteAudioAllowed()
 
     private fun maybeProbeFakeMirrorAudioStart(label: String, relayService: Any?) {
-        if (label != "onCallStart" || relayService == null) {
+        if (relayService == null || label != "onCallStart" && label != "callState") {
             return
         }
         val startMode = currentFakeMirrorRemoteAudioStartMode() ?: return
@@ -1206,6 +1206,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         val relayClass = relayService.javaClass
         log(
             "mirror fake pad audio start probe invoking " +
+                "label=$label " +
                 "mode=$startMode " +
                 "sinkArg=${currentFakeMirrorRemoteAudioSinkArg()?.toString() ?: "<unset>"}"
         )
@@ -1561,6 +1562,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             relayClass.getMethod("s", Integer.TYPE).invoke(relayService, callState)
             if (callState == 0) {
                 forceStopFakeMirrorAudioRelay(relayClass, relayService)
+            } else if (currentFakeMirrorRemoteAudioStartMode() != null) {
+                maybeLogFakeMirrorAudioParams("callState", relayService)
+                forceStopFakeMirrorAudioRelay(relayClass, relayService)
+                maybeProbeFakeMirrorAudioStart("callState", relayService)
             }
         }.onFailure { error ->
             log("failed to probe fake pad call state: ${error.javaClass.simpleName}: ${error.message}")

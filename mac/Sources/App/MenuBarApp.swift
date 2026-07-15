@@ -2,9 +2,14 @@ import AppKit
 import EdgeLinkKit
 import SwiftUI
 
+@MainActor
 private final class EdgeLinkAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        EdgeLinkURLRouter.shared.open(urls)
     }
 }
 
@@ -261,6 +266,15 @@ private struct PhoneControlPanel: View {
                     Label("掛斷", systemImage: "phone.down")
                 }
                 .disabled(!runtime.isConnected)
+
+                Button {
+                    runtime.runPhoneRelayDebugCall()
+                    phoneNumber = "800"
+                } label: {
+                    Label("Debug 800", systemImage: "waveform.path.ecg")
+                }
+                .disabled(!runtime.isConnected)
+                .help("撥 800，最多 30 秒；收到有效 PHONERELAY PCM 後自動掛斷")
             }
 
             Toggle(isOn: Binding(
@@ -279,6 +293,13 @@ private struct PhoneControlPanel: View {
 
             if !runtime.phoneCallStatus.isEmpty {
                 Text(runtime.phoneCallStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            if !runtime.phoneRelayDebugStatus.isEmpty {
+                Text(runtime.phoneRelayDebugStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
