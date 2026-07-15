@@ -102,7 +102,9 @@ final class EnvelopeTests: XCTestCase {
                     action: "dial",
                     number: "+886912345678",
                     relayHost: "10.0.0.42",
-                    relayPort: 7102
+                    relayPort: 7102,
+                    relaySessionId: "session-1",
+                    relayControlPort: 17104
                 )
             )
         )
@@ -112,6 +114,8 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(phoneAction.b.number, "+886912345678")
         XCTAssertEqual(phoneAction.b.relayHost, "10.0.0.42")
         XCTAssertEqual(phoneAction.b.relayPort, 7102)
+        XCTAssertEqual(phoneAction.b.relaySessionId, "session-1")
+        XCTAssertEqual(phoneAction.b.relayControlPort, 17104)
 
         let phoneResultData = try encoder.encode(
             Envelope(

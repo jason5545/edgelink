@@ -28,9 +28,6 @@ internal object MiLinkPrivilegeHookPolicy {
     const val INCALLUI_PROCESS = "com.android.incallui"
     const val ANDROID_PHONE_PACKAGE = "com.android.phone"
     const val ANDROID_PHONE_PROCESS = "com.android.phone"
-    const val SYSTEM_FRAMEWORK_PACKAGE = "android"
-    const val SYSTEM_FRAMEWORK_ALT_PACKAGE = "system"
-    const val SYSTEM_FRAMEWORK_PROCESS = "android"
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val TELECOM_PACKAGE = "com.android.server.telecom"
@@ -88,16 +85,12 @@ internal object MiLinkPrivilegeHookPolicy {
         packageName == ANDROID_PHONE_PACKAGE && processName == ANDROID_PHONE_PROCESS
 
     fun shouldHookTelecomSystem(packageName: String?, processName: String?): Boolean {
-        val frameworkPackage = packageName == SYSTEM_FRAMEWORK_PACKAGE ||
-            packageName == SYSTEM_FRAMEWORK_ALT_PACKAGE
-        val frameworkProcess = processName == SYSTEM_FRAMEWORK_PROCESS ||
-            processName == SYSTEM_SERVER_PROCESS ||
-            processName == SYSTEM_PROCESS
         val telecomPackage = packageName == TELECOM_PACKAGE
-        val telecomProcess = processName == TELECOM_PACKAGE ||
+        val telecomProcess = processName == null ||
+            processName == TELECOM_PACKAGE ||
             processName == SYSTEM_SERVER_PROCESS ||
             processName == SYSTEM_PROCESS
-        return (frameworkPackage && frameworkProcess) || (telecomPackage && telecomProcess)
+        return telecomPackage && telecomProcess
     }
 
     fun isAllowedCallerPackage(packageName: String?): Boolean =
@@ -227,6 +220,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastInCallUiRelayAnswerUptimeMs: Long = 0L
     private var lastTelecomRelayForceLogUptimeMs: Long = 0L
     private var fakeMirrorAudioStartProbeDepth: Int = 0
+    private var telecomRelayFeaturesInstalled: Boolean = false
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
@@ -252,7 +246,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             hookAndroidPhoneRelayServices(lpparam.classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(lpparam.packageName, lpparam.processName)) {
-            hookTelecomRelayFeatures(lpparam.classLoader)
+            hookTelecomRelayFeatures(lpparam.classLoader, "handleLoadPackage")
         }
     }
 
@@ -633,15 +627,22 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun hookTelecomRelayFeatures(classLoader: ClassLoader) {
-        hookTelecomRelayBooleanMethod(classLoader, "isRelayCall")
-        hookTelecomRelayBooleanMethod(classLoader, "isRelayCallForPhone")
+    private fun hookTelecomRelayFeatures(classLoader: ClassLoader, source: String) {
+        if (telecomRelayFeaturesInstalled) {
+            return
+        }
+        val relayInstalled = hookTelecomRelayBooleanMethod(classLoader, "isRelayCall")
+        val relayForPhoneInstalled = hookTelecomRelayBooleanMethod(classLoader, "isRelayCallForPhone")
+        telecomRelayFeaturesInstalled = relayInstalled && relayForPhoneInstalled
+        if (telecomRelayFeaturesInstalled) {
+            log("Telecom relay feature hooks installed source=$source")
+        }
     }
 
     private fun hookTelecomRelayBooleanMethod(
         classLoader: ClassLoader,
         methodName: String
-    ) {
+    ): Boolean =
         runCatching {
             XposedHelpers.findAndHookMethod(
                 TELECOM_SIMPLE_FEATURES,
@@ -659,10 +660,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 }
             )
             log("Telecom relay feature hook installed method=$methodName")
-        }.onFailure { error ->
+            true
+        }.getOrElse { error ->
             log("failed to hook Telecom $methodName: ${error.javaClass.simpleName}: ${error.message}")
+            false
         }
-    }
 
     private fun logTelecomRelayForced(methodName: String) {
         val now = SystemClock.uptimeMillis()

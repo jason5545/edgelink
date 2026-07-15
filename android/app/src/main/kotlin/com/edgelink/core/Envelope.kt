@@ -190,7 +190,9 @@ data class PhoneActionBody(
     val action: String,
     val number: String? = null,
     val relayHost: String? = null,
-    val relayPort: Int? = null
+    val relayPort: Int? = null,
+    val relaySessionId: String? = null,
+    val relayControlPort: Int? = null
 )
 
 @Serializable

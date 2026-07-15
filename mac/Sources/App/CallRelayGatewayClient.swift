@@ -16,9 +16,34 @@ struct CallRelayGatewaySession: Equatable {
     }
 }
 
+struct CallRelayGatewayPlaybackStats: Equatable {
+    let rtpPackets: Int
+    let tsBytes: Int
+    let pcmBytes: Int
+    let totalPCMBytes: Int
+    let pesPacketCount: Int
+    let samples: Int
+    let nonzeroSamples: Int
+    let maxAbs: Int
+    let averageAbs: Int
+    let fingerprint: String
+    let prefix: String
+
+    var hasValidStream: Bool {
+        totalPCMBytes >= 16_000 && nonzeroSamples > 0 && maxAbs >= 256
+    }
+
+    var diagnosticSummary: String {
+        "rtpPackets=\(rtpPackets) tsBytes=\(tsBytes) pcmBytes=\(pcmBytes) pcmTotal=\(totalPCMBytes) " +
+            "pes=\(pesPacketCount) samples=\(samples) nonzero=\(nonzeroSamples) " +
+            "maxAbs=\(maxAbs) avgAbs=\(averageAbs) fp=\(fingerprint)"
+    }
+}
+
 final class CallRelayGatewayClient: @unchecked Sendable {
     var onSourceStart: ((String) -> Void)?
     var onSourceStop: ((String) -> Void)?
+    var onPlaybackStats: ((CallRelayGatewayPlaybackStats) -> Void)?
 
     private let host: NWEndpoint.Host
     private let port: NWEndpoint.Port
@@ -240,7 +265,9 @@ final class CallRelayGatewayClient: @unchecked Sendable {
               let packet = Data(base64Encoded: dataText) else {
             return
         }
-        player.writeRTPPacket(packet)
+        if let stats = player.writeRTPPacket(packet) {
+            onPlaybackStats?(stats)
+        }
     }
 
     private func sendJSON(_ object: [String: Any]) throws {
@@ -288,45 +315,93 @@ final class CallRelayGatewayClient: @unchecked Sendable {
 private final class CallRelayMPEGTSPlayer {
     private var process: Process?
     private var input: FileHandle?
+    private var errorOutput: FileHandle?
     private var devNull: FileHandle?
-    private var packets = 0
-    private var payloadBytes = 0
+    private var rtpPackets = 0
+    private var tsBytes = 0
+    private var pcmBytes = 0
+    private var pesPacketCount = 0
+    private var stderrBytesLogged = 0
+    private var validStreamReported = false
 
-    func writeRTPPacket(_ packet: Data) {
-        guard let payload = rtpPayload(in: packet), !payload.isEmpty else {
-            return
+    func writeRTPPacket(_ packet: Data) -> CallRelayGatewayPlaybackStats? {
+        guard let payload = rtpPayload(in: packet),
+              payload.first == 0x47 else {
+            return nil
+        }
+        rtpPackets += 1
+        tsBytes += payload.count
+        let pcmPayload = extractPhoneRelayPCM(fromMPEGTS: payload)
+        guard !pcmPayload.isEmpty else {
+            return nil
         }
         if process?.isRunning != true {
             start()
         }
         guard let input else {
-            return
+            return nil
         }
         do {
-            try input.write(contentsOf: payload)
-            packets += 1
-            payloadBytes += payload.count
-            if packets == 1 || packets % 100 == 0 {
-                DiagnosticsLog.info("callrelay.mac.gateway_rtp_playback packets=\(packets) payloadBytes=\(payloadBytes)")
+            let previousPCMTotal = pcmBytes
+            try input.write(contentsOf: pcmPayload)
+            pcmBytes += pcmPayload.count
+            let sampleStats = pcmS16LEStats(pcmPayload)
+            let stats = CallRelayGatewayPlaybackStats(
+                rtpPackets: rtpPackets,
+                tsBytes: tsBytes,
+                pcmBytes: pcmPayload.count,
+                totalPCMBytes: pcmBytes,
+                pesPacketCount: pesPacketCount,
+                samples: sampleStats.samples,
+                nonzeroSamples: sampleStats.nonzeroSamples,
+                maxAbs: sampleStats.maxAbs,
+                averageAbs: sampleStats.averageAbs,
+                fingerprint: DiagnosticsLog.fingerprint(pcmPayload),
+                prefix: hexPrefix(pcmPayload)
+            )
+            let isFirstValidStream = stats.hasValidStream && !validStreamReported
+            if isFirstValidStream {
+                validStreamReported = true
+                DiagnosticsLog.info("callrelay.mac.gateway_pcm_valid \(stats.diagnosticSummary)")
             }
+            let shouldLogStats = previousPCMTotal == 0 ||
+                pcmBytes % 64_000 < pcmPayload.count ||
+                isFirstValidStream
+            if shouldLogStats {
+                DiagnosticsLog.info(
+                    "callrelay.mac.gateway_pcm_playback_write \(stats.diagnosticSummary) prefix=\(stats.prefix)"
+                )
+            }
+            return stats
         } catch {
             DiagnosticsLog.error("callrelay.mac.gateway_rtp_write_failed", error)
             stop(reason: "write_failed")
+            return nil
         }
     }
 
     func stop(reason: String) {
         if process != nil || input != nil {
-            DiagnosticsLog.info("callrelay.mac.gateway_player_stop reason=\(reason) packets=\(packets) payloadBytes=\(payloadBytes)")
+            DiagnosticsLog.info(
+                "callrelay.mac.gateway_player_stop reason=\(reason) " +
+                    "rtpPackets=\(rtpPackets) tsBytes=\(tsBytes) pcmBytes=\(pcmBytes)"
+            )
         }
         try? input?.close()
         input = nil
+        errorOutput?.readabilityHandler = nil
+        try? errorOutput?.close()
+        errorOutput = nil
         process?.terminate()
         process = nil
         try? devNull?.close()
         devNull = nil
-        packets = 0
-        payloadBytes = 0
+        rtpPackets = 0
+        tsBytes = 0
+        pcmBytes = 0
+        pesPacketCount = 0
+        stderrBytesLogged = 0
+        validStreamReported = false
     }
 
     private func start() {
@@ -335,32 +410,159 @@ private final class CallRelayMPEGTSPlayer {
             return
         }
         let inputPipe = Pipe()
+        let errorPipe = Pipe()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffplay)
         process.arguments = [
             "-nodisp",
+            "-loglevel", "warning",
+            "-nostats",
             "-autoexit",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
-            "-probesize", "32",
-            "-analyzeduration", "0",
-            "-f", "mpegts",
-            "-"
+            "-f", "s16le",
+            "-ar", "8000",
+            "-ch_layout", "mono",
+            "-i", "pipe:0"
         ]
         process.standardInput = inputPipe
+        process.standardError = errorPipe
         if let devNull = FileHandle(forWritingAtPath: "/dev/null") {
             self.devNull = devNull
             process.standardOutput = devNull
-            process.standardError = devNull
+        }
+        let output = errorPipe.fileHandleForReading
+        output.readabilityHandler = { [weak self, weak output] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                return
+            }
+            guard let self, let output, self.errorOutput === output else {
+                return
+            }
+            self.logPlayerStderr(data)
+        }
+        process.terminationHandler = { [weak self] terminatedProcess in
+            guard self?.process === terminatedProcess else {
+                return
+            }
+            DiagnosticsLog.info("callrelay.mac.gateway_player_exit status=\(terminatedProcess.terminationStatus)")
+            self?.errorOutput?.readabilityHandler = nil
         }
         do {
             try process.run()
             self.process = process
             input = inputPipe.fileHandleForWriting
-            DiagnosticsLog.info("callrelay.mac.gateway_player_start ffplay=\(ffplay)")
+            errorOutput = output
+            DiagnosticsLog.info(
+                "callrelay.mac.gateway_player_start ffplay=\(ffplay) " +
+                    "format=s16le sampleRate=8000 channelLayout=mono"
+            )
         } catch {
+            output.readabilityHandler = nil
+            try? output.close()
             DiagnosticsLog.error("callrelay.mac.gateway_player_start_failed", error)
         }
+    }
+
+    private func extractPhoneRelayPCM(fromMPEGTS payload: Data) -> Data {
+        let bytes = Array(payload)
+        var output = Data()
+        var offset = 0
+        while offset + Self.mpegTSPacketSize <= bytes.count {
+            guard bytes[offset] == 0x47 else {
+                offset += 1
+                continue
+            }
+            let packetStart = offset
+            let packetEnd = offset + Self.mpegTSPacketSize
+            let payloadUnitStart = (bytes[packetStart + 1] & 0x40) != 0
+            let pid = (UInt16(bytes[packetStart + 1] & 0x1f) << 8) | UInt16(bytes[packetStart + 2])
+            let adaptationFieldControl = (bytes[packetStart + 3] >> 4) & 0x03
+            var payloadStart = packetStart + 4
+
+            if adaptationFieldControl == 2 || adaptationFieldControl == 3 {
+                guard payloadStart < packetEnd else {
+                    offset = packetEnd
+                    continue
+                }
+                payloadStart += 1 + Int(bytes[payloadStart])
+            }
+            guard (adaptationFieldControl == 1 || adaptationFieldControl == 3),
+                  pid == Self.phoneRelayAudioTSPID,
+                  payloadStart < packetEnd else {
+                offset = packetEnd
+                continue
+            }
+
+            if payloadUnitStart,
+               payloadStart + 9 <= packetEnd,
+               bytes[payloadStart] == 0x00,
+               bytes[payloadStart + 1] == 0x00,
+               bytes[payloadStart + 2] == 0x01 {
+                let headerLength = Int(bytes[payloadStart + 8])
+                let pcmStart = payloadStart + 9 + headerLength
+                if pcmStart < packetEnd {
+                    output.append(contentsOf: bytes[pcmStart..<packetEnd])
+                    pesPacketCount += 1
+                }
+            } else {
+                output.append(contentsOf: bytes[payloadStart..<packetEnd])
+            }
+            offset = packetEnd
+        }
+        return output
+    }
+
+    private func pcmS16LEStats(_ data: Data) -> (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int) {
+        let bytes = Array(data)
+        var sampleCount = 0
+        var nonzeroSamples = 0
+        var maxAbs = 0
+        var absTotal = 0
+        var index = 0
+        while index + 1 < bytes.count {
+            let raw = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+            let sample = Int(Int16(bitPattern: raw))
+            let magnitude = abs(sample)
+            sampleCount += 1
+            if sample != 0 {
+                nonzeroSamples += 1
+            }
+            maxAbs = max(maxAbs, magnitude)
+            absTotal += magnitude
+            index += 2
+        }
+        return (
+            samples: sampleCount,
+            nonzeroSamples: nonzeroSamples,
+            maxAbs: maxAbs,
+            averageAbs: sampleCount > 0 ? absTotal / sampleCount : 0
+        )
+    }
+
+    private func hexPrefix(_ data: Data, count: Int = 16) -> String {
+        data.prefix(count).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func logPlayerStderr(_ data: Data) {
+        guard stderrBytesLogged < Self.stderrLogLimitBytes else {
+            return
+        }
+        let remaining = Self.stderrLogLimitBytes - stderrBytesLogged
+        let chunk = data.prefix(remaining)
+        stderrBytesLogged += chunk.count
+        let text = String(decoding: chunk, as: UTF8.self)
+        DiagnosticsLog.warn("callrelay.mac.gateway_player_stderr preview=\(sanitizeLogValue(text))")
+        if stderrBytesLogged >= Self.stderrLogLimitBytes {
+            DiagnosticsLog.warn("callrelay.mac.gateway_player_stderr_truncated bytes=\(stderrBytesLogged)")
+        }
+    }
+
+    private func sanitizeLogValue(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
     }
 
     private func rtpPayload(in packet: Data) -> Data? {
@@ -396,6 +598,10 @@ private final class CallRelayMPEGTSPlayer {
             FileManager.default.isExecutableFile(atPath: $0)
         }
     }
+
+    private static let mpegTSPacketSize = 188
+    private static let phoneRelayAudioTSPID: UInt16 = 0x1100
+    private static let stderrLogLimitBytes = 4 * 1024
 }
 
 private enum CallRelayGatewayError: Error, CustomStringConvertible {

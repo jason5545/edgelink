@@ -16,7 +16,7 @@ struct MiLinkPhoneRelayPCMStats: Equatable {
     let prefix: String
 
     var hasValidStream: Bool {
-        nonzeroSamples > 0 && maxAbs > 0
+        totalPCMBytes >= 16_000 && nonzeroSamples > 0 && maxAbs >= 256
     }
 
     var diagnosticSummary: String {

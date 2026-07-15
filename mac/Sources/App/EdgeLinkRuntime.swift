@@ -71,6 +71,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var phoneRelayDebugDialError: String?
     private var phoneRelayDebugLastStats: MiLinkPhoneRelayPCMStats?
     private var phoneRelayDebugValidStats: MiLinkPhoneRelayPCMStats?
+    private var phoneRelayDebugLastGatewayStats: CallRelayGatewayPlaybackStats?
+    private var phoneRelayDebugValidGatewayStats: CallRelayGatewayPlaybackStats?
     private var latestTurnCredential: TurnCredentialSnapshot?
     private var turnCredentialTask: Task<TurnCredentialSnapshot?, Never>?
 
@@ -119,6 +121,11 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         callRelayGatewayClient.onSourceStop = { [weak self] reason in
             self?.phoneRelayProbe.stopExternalSourceRTP(reason: "gateway_\(reason)")
+        }
+        callRelayGatewayClient.onPlaybackStats = { [weak self] stats in
+            Task { @MainActor in
+                self?.handleCallRelayGatewayPlaybackStats(stats)
+            }
         }
         EdgeLinkURLRouter.shared.setHandler { [weak self] url in
             Task { @MainActor in
@@ -398,6 +405,8 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayDebugDialError = nil
         phoneRelayDebugLastStats = nil
         phoneRelayDebugValidStats = nil
+        phoneRelayDebugLastGatewayStats = nil
+        phoneRelayDebugValidGatewayStats = nil
         DiagnosticsLog.info(
             "phonerelay.mac.debug_call_start session=\(sessionID.uuidString) " +
                 "numberFp=\(Self.fingerprint(number)) timeoutMs=\(Int(timeoutSeconds * 1000))"
@@ -420,6 +429,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 phoneRelayDebugTask = nil
                 return
             }
+            if let gatewayStats = phoneRelayDebugValidGatewayStats,
+               gatewayStats.hasValidStream {
+                DiagnosticsLog.info("phonerelay.mac.debug_call_valid_gateway_stream \(gatewayStats.diagnosticSummary)")
+                hangUpPhoneCall()
+                phoneRelayDebugTask = nil
+                return
+            }
             if let stats = phoneRelayDebugValidStats,
                stats.sessionID == sessionID,
                stats.hasValidStream {
@@ -435,9 +451,11 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.info("phonerelay.mac.debug_call_cancelled session=\(sessionID.uuidString)")
         } else {
             let lastStats = phoneRelayDebugLastStats?.diagnosticSummary ?? "none"
+            let lastGatewayStats = phoneRelayDebugLastGatewayStats?.diagnosticSummary ?? "none"
             DiagnosticsLog.warn(
                 "phonerelay.mac.debug_call_timeout session=\(sessionID.uuidString) " +
-                    "timeoutMs=\(Int(timeoutSeconds * 1000)) lastStats=\(lastStats)"
+                    "timeoutMs=\(Int(timeoutSeconds * 1000)) lastStats=\(lastStats) " +
+                    "lastGatewayStats=\(lastGatewayStats)"
             )
             hangUpPhoneCall()
         }
@@ -451,6 +469,16 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayDebugLastStats = stats
         if stats.hasValidStream {
             phoneRelayDebugValidStats = stats
+        }
+    }
+
+    private func handleCallRelayGatewayPlaybackStats(_ stats: CallRelayGatewayPlaybackStats) {
+        guard phoneRelayDebugSessionID != nil else {
+            return
+        }
+        phoneRelayDebugLastGatewayStats = stats
+        if stats.hasValidStream {
+            phoneRelayDebugValidGatewayStats = stats
         }
     }
 
@@ -624,7 +652,9 @@ final class EdgeLinkRuntime: ObservableObject {
                     action: action,
                     number: number,
                     relayHost: endpoint.host,
-                    relayPort: endpoint.port
+                    relayPort: endpoint.port,
+                    relaySessionId: endpoint.sessionId,
+                    relayControlPort: endpoint.controlPort
                 )
                 self.pendingPhoneActions[requestId] = body
                 await self.sendPhoneActionBody(body, session: session)
@@ -663,7 +693,12 @@ final class EdgeLinkRuntime: ObservableObject {
                     "host=\(gatewaySession.relayHost) port=\(gatewaySession.relayPort) " +
                     "sessionId=\(gatewaySession.sessionId)"
             )
-            return PhoneRelayEndpoint(host: gatewaySession.relayHost, port: gatewaySession.relayPort)
+            return PhoneRelayEndpoint(
+                host: gatewaySession.relayHost,
+                port: gatewaySession.relayPort,
+                sessionId: gatewaySession.sessionId,
+                controlPort: Int(EdgeLinkConfig.callRelayGatewayControlPort)
+            )
         } catch {
             DiagnosticsLog.error("phone.mac.gateway_endpoint_failed action=\(action)", error)
             return localPhoneRelayEndpoint(action: action, reason: "gateway_failed")
@@ -1397,6 +1432,15 @@ enum EdgeLinkConfig {
 private struct PhoneRelayEndpoint {
     let host: String?
     let port: Int
+    let sessionId: String?
+    let controlPort: Int?
+
+    init(host: String?, port: Int, sessionId: String? = nil, controlPort: Int? = nil) {
+        self.host = host
+        self.port = port
+        self.sessionId = sessionId
+        self.controlPort = controlPort
+    }
 }
 
 private struct MacPendingPairing {

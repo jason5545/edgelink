@@ -53,6 +53,7 @@ class ControlConnection {
     this.socket = socket;
     this.buffer = "";
     this.session = null;
+    this.role = "owner";
     this.remote = `${socket.remoteAddress}:${socket.remotePort}`;
   }
 
@@ -97,6 +98,12 @@ class ControlConnection {
       case "source.rtp":
         this.session?.sendSourceRTP(envelope.b);
         break;
+      case "bridge.rtp":
+        this.session?.receiveBridgeRTP(envelope.b, this);
+        break;
+      case "bridge.status":
+        log("info", "bridge.status", { remote: this.remote, sessionId: this.session?.sessionId, ...safeLogBody(envelope.b) });
+        break;
       case "session.close":
         this.close("client_close");
         break;
@@ -110,11 +117,17 @@ class ControlConnection {
       this.send("error", { error: "session_already_started" });
       return;
     }
+    const role = body?.role === "android.bridge" || typeof body?.sessionId === "string" ? "android.bridge" : "owner";
     const auth = await verifyRelayAuth(body).catch((error) => ({ ok: false, error: error.message }));
     if (!auth.ok) {
       log("warn", "control.auth_failed", { remote: this.remote, error: auth.error });
       this.send("error", { error: "auth_failed", detail: auth.error });
       this.socket.end();
+      return;
+    }
+
+    if (role === "android.bridge") {
+      this.handleBridgeHello(body);
       return;
     }
 
@@ -133,6 +146,7 @@ class ControlConnection {
       portBase: config.portBase + slot * PORTS_PER_SESSION
     });
     this.session = session;
+    this.role = "owner";
     activeSessions.set(session.sessionId, session);
 
     try {
@@ -146,6 +160,19 @@ class ControlConnection {
     }
   }
 
+  handleBridgeHello(body) {
+    const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
+    const session = activeSessions.get(sessionId);
+    if (!session || session.closed) {
+      this.send("error", { error: "session_not_found", sessionId });
+      this.socket.end();
+      return;
+    }
+    this.session = session;
+    this.role = "android.bridge";
+    session.attachBridge(this, body);
+  }
+
   send(type, body) {
     if (this.socket.destroyed) {
       return;
@@ -155,7 +182,11 @@ class ControlConnection {
 
   close(reason) {
     if (this.session) {
-      this.session.close(reason);
+      if (this.role === "android.bridge") {
+        this.session.detachBridge(this, reason);
+      } else {
+        this.session.close(reason);
+      }
       this.session = null;
     }
   }
@@ -176,7 +207,12 @@ class RelaySession {
     this.rtspServer = null;
     this.udpSockets = new Map();
     this.rtspConnections = new Set();
+    this.bridgeControls = new Set();
     this.sourceDestination = null;
+    this.sinkRtpPacketCount = 0;
+    this.sourceRtpPacketCount = 0;
+    this.bridgeSinkRtpPacketCount = 0;
+    this.bridgeSourceRtpPacketCount = 0;
     this.closed = false;
     this.expiresAt = Date.now() + SESSION_TTL_MS;
     this.ttlTimer = setTimeout(() => this.close("ttl_expired"), SESSION_TTL_MS).unref();
@@ -205,10 +241,30 @@ class RelaySession {
       sessionId: this.sessionId,
       relayHost: this.publicHost,
       relayPort: this.rtspPort,
+      relayControlPort: config.controlPort,
       sinkRtpPort: this.sinkRtpPort,
       sourceRtpPort: this.sourceRtpPort,
       expiresAt: Math.floor(this.expiresAt / 1000)
     };
+  }
+
+  attachBridge(control, body) {
+    this.bridgeControls.add(control);
+    log("info", "bridge.attached", {
+      sessionId: this.sessionId,
+      remote: control.remote,
+      deviceId: body?.deviceId,
+      localRtspHost: body?.localRtspHost,
+      localRtspPort: body?.localRtspPort
+    });
+    control.send("bridge.ready", this.publicDescriptor());
+  }
+
+  detachBridge(control, reason) {
+    if (!this.bridgeControls.delete(control)) {
+      return;
+    }
+    log("info", "bridge.detached", { sessionId: this.sessionId, remote: control.remote, reason });
   }
 
   bindUDP(port) {
@@ -229,6 +285,15 @@ class RelaySession {
   handleUDP(port, message, rinfo) {
     const from = `${rinfo.address}:${rinfo.port}`;
     if (port === this.sinkRtpPort) {
+      this.sinkRtpPacketCount += 1;
+      if (this.sinkRtpPacketCount === 1 || this.sinkRtpPacketCount % 100 === 0) {
+        log("info", "session.sink_rtp_in", {
+          sessionId: this.sessionId,
+          count: this.sinkRtpPacketCount,
+          from,
+          bytes: message.length
+        });
+      }
       this.control.send("rtp.in", {
         port,
         from,
@@ -255,12 +320,23 @@ class RelaySession {
 
   sendSourceRTP(body) {
     if (!this.sourceDestination || typeof body?.data !== "string") {
+      this.sendSourceRTPToBridge(body);
       return;
     }
     const packet = Buffer.from(body.data, "base64");
     const socket = this.udpSockets.get(this.sourceRtpPort);
     if (!socket) {
       return;
+    }
+    this.sourceRtpPacketCount += 1;
+    if (this.sourceRtpPacketCount === 1 || this.sourceRtpPacketCount % 100 === 0) {
+      log("info", "session.source_rtp_out", {
+        sessionId: this.sessionId,
+        count: this.sourceRtpPacketCount,
+        host: this.sourceDestination.host,
+        port: this.sourceDestination.port,
+        bytes: packet.length
+      });
     }
     socket.send(packet, this.sourceDestination.port, this.sourceDestination.host, (error) => {
       if (error) {
@@ -269,6 +345,48 @@ class RelaySession {
           error: error.message
         });
       }
+    });
+    this.sendSourceRTPToBridge(body);
+  }
+
+  sendSourceRTPToBridge(body) {
+    if (this.bridgeControls.size === 0 || typeof body?.data !== "string") {
+      return;
+    }
+    const bytes = typeof body.bytes === "number" ? body.bytes : Buffer.byteLength(body.data, "base64");
+    this.bridgeSourceRtpPacketCount += 1;
+    if (this.bridgeSourceRtpPacketCount === 1 || this.bridgeSourceRtpPacketCount % 100 === 0) {
+      log("info", "session.source_rtp_bridge_out", {
+        sessionId: this.sessionId,
+        count: this.bridgeSourceRtpPacketCount,
+        bridgeCount: this.bridgeControls.size,
+        bytes
+      });
+    }
+    for (const bridge of this.bridgeControls) {
+      bridge.send("source.rtp.in", { bytes, data: body.data });
+    }
+  }
+
+  receiveBridgeRTP(body, control) {
+    if (!body || typeof body.data !== "string") {
+      return;
+    }
+    const bytes = typeof body.bytes === "number" ? body.bytes : Buffer.byteLength(body.data, "base64");
+    this.bridgeSinkRtpPacketCount += 1;
+    if (this.bridgeSinkRtpPacketCount === 1 || this.bridgeSinkRtpPacketCount % 100 === 0) {
+      log("info", "session.bridge_sink_rtp_in", {
+        sessionId: this.sessionId,
+        count: this.bridgeSinkRtpPacketCount,
+        remote: control.remote,
+        bytes
+      });
+    }
+    this.control.send("rtp.in", {
+      port: this.sinkRtpPort,
+      from: `android.bridge/${control.remote}`,
+      bytes,
+      data: body.data
     });
   }
 
@@ -284,6 +402,12 @@ class RelaySession {
       connection.close(reason);
     }
     this.rtspConnections.clear();
+    for (const bridge of this.bridgeControls) {
+      bridge.session = null;
+      bridge.send("session.closed", { sessionId: this.sessionId, reason });
+      bridge.socket.end();
+    }
+    this.bridgeControls.clear();
     this.rtspServer?.close();
     this.rtspServer = null;
     for (const socket of this.udpSockets.values()) {
@@ -412,26 +536,58 @@ class RTSPConnection {
   }
 
   handleResponse(firstLine, headerText, bodyText, cseq) {
-    const requestMethod = this.pendingRequests.get(cseq);
+    const pendingRequest = this.pendingRequests.get(cseq);
     this.pendingRequests.delete(cseq);
+    const requestMethod = pendingRequest?.method;
+    const requestLabel = pendingRequest?.label || requestMethod || "unknown";
+    const statusCode = rtspStatusCode(firstLine);
+    const success = statusCode == null || statusCode < 300;
     const session = rtspHeader("Session", headerText)?.split(";")[0]?.trim();
     if (session) {
       this.sessionHeader = session;
     }
 
+    if (!success) {
+      log("warn", "rtsp.response_non_success", {
+        sessionId: this.session.sessionId,
+        cseq,
+        requestMethod,
+        requestLabel,
+        statusCode,
+        firstLine
+      });
+    }
+
     switch (requestMethod) {
       case "GET_PARAMETER":
+        if (!success) {
+          break;
+        }
         this.recordSourceRTPDestinationFromWFD(bodyText, "get_parameter_response");
         this.sendSourceSETParameterIfNeeded("get_parameter_response");
         break;
       case "SET_PARAMETER":
+        if (!success) {
+          break;
+        }
+        this.sendSinkSETUPIfNeeded("set_parameter_response");
         this.sendSourceSETUPIfNeeded("set_parameter_response");
         break;
       case "SETUP":
-        this.sendSourcePLAYIfNeeded("setup_response");
+        if (requestLabel.startsWith("sink_setup_")) {
+          if (success) {
+            this.sendPLAYIfNeeded("setup_response");
+          }
+          break;
+        }
+        if (requestLabel.startsWith("source_setup_")) {
+          this.sendSourcePLAYIfNeeded("setup_response");
+        }
         break;
       case "PLAY":
-        this.session.control.send("source.start", { reason: "play_response" });
+        if (requestLabel.startsWith("source_play_")) {
+          this.session.control.send("source.start", { reason: success ? "play_response" : "play_response_non_success" });
+        }
         break;
       default:
         break;
@@ -522,7 +678,7 @@ class RTSPConnection {
       return;
     }
     this.sentSinkSETUP = true;
-    const uri = this.presentationURL || this.sourcePresentationURL();
+    const uri = this.presentationURL || "rtsp://localhost/wfd1.0/streamid=0";
     this.sendRequest(
       "SETUP",
       uri,
@@ -555,7 +711,7 @@ class RTSPConnection {
 
   sendRequest(method, uri, headers = [], body = null, label = method.toLowerCase()) {
     const cseq = `${this.nextCSeq++}`;
-    this.pendingRequests.set(cseq, method);
+    this.pendingRequests.set(cseq, { method, label });
     this.sendRTSP(buildRTSPMessage(`${method} ${uri} RTSP/1.0`, [
       ["Date", new Date().toUTCString()],
       ["Server", "EdgeLinkCallRelayD"],
@@ -736,6 +892,15 @@ function rtspRequestMethod(firstLine) {
   return firstLine.split(" ")[0]?.toUpperCase() || null;
 }
 
+function rtspStatusCode(firstLine) {
+  const match = /^RTSP\/\d(?:\.\d)?\s+(\d{3})(?:\s|$)/i.exec(firstLine.trim());
+  if (!match) {
+    return null;
+  }
+  const status = Number(match[1]);
+  return Number.isInteger(status) ? status : null;
+}
+
 function rtspHeader(name, headerText) {
   const prefix = `${name.toLowerCase()}:`;
   for (const line of headerText.split("\r\n")) {
@@ -785,6 +950,19 @@ function hashString(value) {
 function intEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function safeLogBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return {};
+  }
+  const output = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output[key] = key.toLowerCase().includes("data") || key.toLowerCase().includes("sig") ? `<${String(value).length}>` : value;
+    }
+  }
+  return output;
 }
 
 function log(level, event, fields) {

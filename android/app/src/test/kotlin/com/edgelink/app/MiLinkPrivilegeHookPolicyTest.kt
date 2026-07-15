@@ -141,19 +141,13 @@ class MiLinkPrivilegeHookPolicyTest {
 
     @Test
     fun hooksTelecomSystemForRelayCallState() {
-        assertTrue(
-            MiLinkPrivilegeHookPolicy.shouldHook(
-                packageName = "android",
-                processName = "android"
-            )
-        )
-        assertTrue(
+        assertFalse(
             MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
                 packageName = "android",
                 processName = "system_server"
             )
         )
-        assertTrue(
+        assertFalse(
             MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
                 packageName = "system",
                 processName = "system"
@@ -163,6 +157,12 @@ class MiLinkPrivilegeHookPolicyTest {
             MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
                 packageName = "com.android.server.telecom",
                 processName = "system_server"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(
+                packageName = "com.android.server.telecom",
+                processName = null
             )
         )
 

@@ -80,6 +80,8 @@ private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
+private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
+private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
 
 private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
     (endedAtNanos - startedAtNanos) / 1_000_000L
@@ -187,8 +189,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             if (body.action == "dial" || body.action == "answer") {
                 refreshTurnCredentials("phone_action_${body.action}")
             }
+            if (body.action == "hangup") {
+                pendingCallRelayBridgeJob?.cancel()
+                pendingCallRelayBridgeJob = null
+                AndroidCallRelayBridge.stop("phone_action_hangup")
+            }
         },
-        onPhoneActionResult = { result ->
+        onPhoneActionResult = { body, result ->
+            handlePhoneActionRelayBridgeResult(body, result)
             sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
         }
     )
@@ -204,6 +212,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var smsPendingDrainJob: Job? = null
     private var shizukuAutoRepairJob: Job? = null
     private var turnCredentialJob: Job? = null
+    private var pendingCallRelayBridgeJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private var pendingShizukuAction: PendingShizukuAction? = null
     @Volatile
@@ -275,9 +284,49 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         micActivityMonitor.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
+        pendingCallRelayBridgeJob?.cancel()
+        pendingCallRelayBridgeJob = null
         latestTurnCredentials = null
         session?.close()
         scope.cancel()
+    }
+
+    private fun handlePhoneActionRelayBridgeResult(body: PhoneActionBody, result: PhoneActionResultBody) {
+        when (body.action) {
+            "dial", "answer" -> {
+                if (result.success) {
+                    scheduleCallRelayBridgeStart(body)
+                } else {
+                    pendingCallRelayBridgeJob?.cancel()
+                    pendingCallRelayBridgeJob = null
+                    AndroidCallRelayBridge.stop("phone_action_failed_${body.action}")
+                }
+            }
+            "hangup" -> {
+                pendingCallRelayBridgeJob?.cancel()
+                pendingCallRelayBridgeJob = null
+                AndroidCallRelayBridge.stop("phone_action_hangup_result")
+            }
+        }
+    }
+
+    private fun scheduleCallRelayBridgeStart(body: PhoneActionBody) {
+        val identity = localIdentity
+        if (identity == null) {
+            EdgeLinkLog.warn("callrelay.android.bridge_start_skipped action=${body.action} no_identity")
+            return
+        }
+        pendingCallRelayBridgeJob?.cancel()
+        val delayMs = when (body.action) {
+            "answer" -> CALL_RELAY_BRIDGE_ANSWER_DELAY_MS
+            else -> CALL_RELAY_BRIDGE_DIAL_DELAY_MS
+        }
+        pendingCallRelayBridgeJob = scope.launch {
+            EdgeLinkLog.info("callrelay.android.bridge_start_delayed action=${body.action} delayMs=$delayMs")
+            delay(delayMs)
+            AndroidCallRelayBridge.start(identity, body, reason = "phone_action_result_${body.action}")
+            pendingCallRelayBridgeJob = null
+        }
     }
 
     override fun onPointer(body: InputPointerBody) {
@@ -1522,7 +1571,7 @@ private class AndroidCommandDispatcher(
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
-    private val onPhoneActionResult: (PhoneActionResultBody) -> Unit
+    private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -1554,7 +1603,8 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.PHONE_ACTION -> {
                 val envelope = EnvelopeCodec.decode<PhoneActionBody>(plaintext)
                 onPhoneActionReceived(envelope.b)
-                onPhoneActionResult(phoneCallController.handle(envelope.b))
+                val result = phoneCallController.handle(envelope.b)
+                onPhoneActionResult(envelope.b, result)
                 null
             }
             EnvelopeTypes.SCREEN_START -> {
@@ -1632,6 +1682,8 @@ object EdgeLinkConfig {
     const val workerBaseUrl = "https://edgelink-worker.black-hill-f944.workers.dev"
     const val relayUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect"
     const val pairingWebSocketUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/pair/ws"
+    const val callRelayGatewayHost = "172.238.24.219"
+    const val callRelayGatewayControlPort = 17104
 }
 
 private data class PendingPairing(

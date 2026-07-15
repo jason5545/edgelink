@@ -286,19 +286,25 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
     public let number: String?
     public let relayHost: String?
     public let relayPort: Int?
+    public let relaySessionId: String?
+    public let relayControlPort: Int?
 
     public init(
         requestId: String,
         action: String,
         number: String? = nil,
         relayHost: String? = nil,
-        relayPort: Int? = nil
+        relayPort: Int? = nil,
+        relaySessionId: String? = nil,
+        relayControlPort: Int? = nil
     ) {
         self.requestId = requestId
         self.action = action
         self.number = number
         self.relayHost = relayHost
         self.relayPort = relayPort
+        self.relaySessionId = relaySessionId
+        self.relayControlPort = relayControlPort
     }
 }
 
