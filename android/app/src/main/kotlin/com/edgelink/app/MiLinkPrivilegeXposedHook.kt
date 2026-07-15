@@ -1089,9 +1089,24 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun shouldForceFakeMirrorPlainAudioRelay(): Boolean =
-        shouldForceMirrorCallRelay() &&
+        currentFakeMirrorRemoteMode() == "pad" &&
+            currentFakeMirrorRemoteUsingPadEnabled() &&
             currentFakeMirrorRemoteKeyEnabled() &&
-            currentFakeMirrorRemotePlainRtpEnabled()
+            currentFakeMirrorRemotePlainRtpEnabled() &&
+            (currentFakeMirrorRemoteCallRelayActive() || recentFakeMirrorPlainAudioSession())
+
+    private fun recentFakeMirrorPlainAudioSession(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        return recentlyUpdated(lastFakeMirrorAttachUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS) ||
+            recentlyUpdated(lastFakeMirrorKeyUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS) ||
+            recentlyUpdated(lastFakeMirrorAudioParamsUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS) ||
+            recentlyUpdated(lastFakeMirrorAudioStartProbeUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS) ||
+            recentlyUpdated(lastFakeMirrorAudioSourceStartUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS) ||
+            recentlyUpdated(lastFakeMirrorAudioSinkStartUptimeMs, now, FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS)
+    }
+
+    private fun recentlyUpdated(timestampUptimeMs: Long, nowUptimeMs: Long, windowMs: Long): Boolean =
+        timestampUptimeMs > 0L && nowUptimeMs - timestampUptimeMs in 0..windowMs
 
     private fun disableMirrorAudioEncryptionFlag(target: Any?, direction: String) {
         if (target == null) {
@@ -1891,6 +1906,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_AUDIO_PARAMS_THROTTLE_MS = 1_000L
         private const val FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
+        private const val FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS = 120_000L
         private const val INCALLUI_RELAY_ANSWER_THROTTLE_MS = 750L
         private const val MIRROR_AUDIO_START_OPTION_WINDOW_MS = 2_000L
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"

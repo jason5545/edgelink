@@ -16,8 +16,10 @@ final class MiLinkPhoneRelayProbe {
     private var rtpPacketCounts: [UInt16: Int] = [:]
     private var mpegTSPlayerProcess: Process?
     private var mpegTSPlayerInput: FileHandle?
+    private var mpegTSPlayerErrorOutput: FileHandle?
     private var mpegTSPlayerDevNull: FileHandle?
     private var mpegTSBytesWritten = 0
+    private var mpegTSPlayerStderrBytesLogged = 0
     private var mpegTSCaptureHandle: FileHandle?
     private var mpegTSCaptureBytes = 0
     private var mpegTSCaptureLimitLogged = false
@@ -485,14 +487,18 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func writeMPEGTSFileCapture(_ payload: Data) {
-        guard mpegTSCaptureEnabled, mpegTSCaptureBytes < Self.mpegTSCaptureLimitBytes else {
-            if !mpegTSCaptureLimitLogged, mpegTSCaptureBytes >= Self.mpegTSCaptureLimitBytes {
+        guard mpegTSCaptureEnabled else {
+            return
+        }
+        if mpegTSCaptureBytes >= Self.mpegTSCaptureLimitBytes ||
+            mpegTSCaptureBytes + payload.count > Self.mpegTSCaptureLimitBytes {
+            if !mpegTSCaptureLimitLogged {
                 mpegTSCaptureLimitLogged = true
                 DiagnosticsLog.info(
                     "phonerelay.mac.mpegts_capture_limit path=\(Self.mpegTSCapturePath) bytes=\(mpegTSCaptureBytes)"
                 )
             }
-            return
+            stopMPEGTSFileCapture(reason: "limit")
         }
         startMPEGTSFileCaptureIfNeeded()
         guard let mpegTSCaptureHandle else {
@@ -511,10 +517,14 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func startMPEGTSFileCaptureIfNeeded() {
-        guard mpegTSCaptureHandle == nil else {
-            return
-        }
         let path = Self.mpegTSCapturePath
+        if mpegTSCaptureHandle != nil {
+            if FileManager.default.fileExists(atPath: path) {
+                return
+            }
+            DiagnosticsLog.warn("phonerelay.mac.mpegts_capture_missing path=\(path)")
+            stopMPEGTSFileCapture(reason: "missing_file")
+        }
         do {
             if FileManager.default.fileExists(atPath: path) {
                 try FileManager.default.removeItem(atPath: path)
@@ -558,24 +568,37 @@ final class MiLinkPhoneRelayProbe {
         }
         let process = Process()
         let inputPipe = Pipe()
+        let errorPipe = Pipe()
         let devNull = FileHandle(forWritingAtPath: "/dev/null")
         process.executableURL = ffplayURL
         process.arguments = [
             "-nodisp",
-            "-autoexit",
-            "-loglevel", "error",
+            "-loglevel", "warning",
             "-nostats",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
-            "-probesize", "32768",
-            "-analyzeduration", "0",
+            "-probesize", "262144",
+            "-analyzeduration", "1000000",
             "-f", "mpegts",
             "-i", "pipe:0"
         ]
         process.standardInput = inputPipe
+        process.standardError = errorPipe
         if let devNull {
             process.standardOutput = devNull
-            process.standardError = devNull
+        }
+        let errorOutput = errorPipe.fileHandleForReading
+        errorOutput.readabilityHandler = { [weak self, weak errorOutput] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                return
+            }
+            self?.queue.async {
+                guard let self, let errorOutput, self.mpegTSPlayerErrorOutput === errorOutput else {
+                    return
+                }
+                self.logMPEGTSPlayerStderr(data)
+            }
         }
         process.terminationHandler = { [weak self] terminatedProcess in
             self?.queue.async {
@@ -583,25 +606,49 @@ final class MiLinkPhoneRelayProbe {
                     return
                 }
                 DiagnosticsLog.info("phonerelay.mac.mpegts_playback_exit status=\(terminatedProcess.terminationStatus)")
+                self?.mpegTSPlayerErrorOutput?.readabilityHandler = nil
+                try? self?.mpegTSPlayerErrorOutput?.close()
                 self?.mpegTSPlayerProcess = nil
                 self?.mpegTSPlayerInput = nil
+                self?.mpegTSPlayerErrorOutput = nil
                 self?.mpegTSPlayerDevNull = nil
                 self?.mpegTSBytesWritten = 0
+                self?.mpegTSPlayerStderrBytesLogged = 0
             }
         }
         do {
             try process.run()
             mpegTSPlayerProcess = process
             mpegTSPlayerInput = inputPipe.fileHandleForWriting
+            mpegTSPlayerErrorOutput = errorOutput
             mpegTSPlayerDevNull = devNull
             mpegTSBytesWritten = 0
+            mpegTSPlayerStderrBytesLogged = 0
             DiagnosticsLog.info("phonerelay.mac.mpegts_playback_start path=\(ffplayURL.path) reason=\(reason)")
         } catch {
+            errorOutput.readabilityHandler = nil
+            try? errorOutput.close()
             DiagnosticsLog.warn("phonerelay.mac.mpegts_playback_start_failed path=\(ffplayURL.path) error=\(error)")
             mpegTSPlayerProcess = nil
             mpegTSPlayerInput = nil
+            mpegTSPlayerErrorOutput = nil
             mpegTSPlayerDevNull = nil
             mpegTSBytesWritten = 0
+            mpegTSPlayerStderrBytesLogged = 0
+        }
+    }
+
+    private func logMPEGTSPlayerStderr(_ data: Data) {
+        guard mpegTSPlayerStderrBytesLogged < Self.mpegTSPlayerStderrLogLimitBytes else {
+            return
+        }
+        let remainingBytes = Self.mpegTSPlayerStderrLogLimitBytes - mpegTSPlayerStderrBytesLogged
+        let chunk = data.prefix(remainingBytes)
+        mpegTSPlayerStderrBytesLogged += chunk.count
+        let text = String(decoding: chunk, as: UTF8.self)
+        DiagnosticsLog.warn("phonerelay.mac.mpegts_playback_stderr preview=\(sanitizeRTSPLogValue(text))")
+        if mpegTSPlayerStderrBytesLogged >= Self.mpegTSPlayerStderrLogLimitBytes {
+            DiagnosticsLog.warn("phonerelay.mac.mpegts_playback_stderr_truncated bytes=\(mpegTSPlayerStderrBytesLogged)")
         }
     }
 
@@ -610,9 +657,13 @@ final class MiLinkPhoneRelayProbe {
         let hadProcess = process != nil
         try? mpegTSPlayerInput?.close()
         mpegTSPlayerInput = nil
+        mpegTSPlayerErrorOutput?.readabilityHandler = nil
+        try? mpegTSPlayerErrorOutput?.close()
+        mpegTSPlayerErrorOutput = nil
         mpegTSPlayerDevNull = nil
         mpegTSPlayerProcess = nil
         mpegTSBytesWritten = 0
+        mpegTSPlayerStderrBytesLogged = 0
         if let process, process.isRunning {
             process.terminate()
         }
@@ -1958,6 +2009,7 @@ final class MiLinkPhoneRelayProbe {
         )
     }
     private static let mpegTSCaptureLimitBytes = 8 * 1024 * 1024
+    private static let mpegTSPlayerStderrLogLimitBytes = 4 * 1024
     private static let mpegTSCapturePath = "/private/tmp/edgelink-phonerelay.ts"
     private static let armDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
