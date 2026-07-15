@@ -97,13 +97,21 @@ final class EnvelopeTests: XCTestCase {
         let phoneActionData = try encoder.encode(
             Envelope(
                 t: EnvelopeType.phoneAction,
-                b: PhoneActionBody(requestId: "call-1", action: "dial", number: "+886912345678")
+                b: PhoneActionBody(
+                    requestId: "call-1",
+                    action: "dial",
+                    number: "+886912345678",
+                    relayHost: "10.0.0.42",
+                    relayPort: 7102
+                )
             )
         )
         let phoneAction = try decoder.decode(Envelope<PhoneActionBody>.self, from: phoneActionData)
         XCTAssertEqual(phoneAction.t, "phone.action")
         XCTAssertEqual(phoneAction.b.action, "dial")
         XCTAssertEqual(phoneAction.b.number, "+886912345678")
+        XCTAssertEqual(phoneAction.b.relayHost, "10.0.0.42")
+        XCTAssertEqual(phoneAction.b.relayPort, 7102)
 
         let phoneResultData = try encoder.encode(
             Envelope(

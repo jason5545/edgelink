@@ -19,6 +19,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -27,6 +29,7 @@ private const val SHIZUKU_USER_SERVICE_VERSION = 5
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
+private const val PHONE_RELAY_DEFAULT_PORT = 7_102
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -277,12 +280,59 @@ object AndroidShizukuSupport {
     }
 
     suspend fun clearPhoneCallRelay(context: Context): ShizukuOperationResult =
-        writeDebugProperty(
-            context = context,
-            key = MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
-            value = "0",
-            name = "phone:relay_latch_clear"
+        withService(context) { service ->
+            val results = listOf(
+                service.runCommandResult(
+                    arrayOf(
+                        "setprop",
+                        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
+                        "0"
+                    )
+                ),
+                service.runCommandResult(
+                    arrayOf(
+                        "setprop",
+                        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY,
+                        "idle"
+                    )
+                )
+            )
+            results.toOperationResult("phone:relay_latch_clear")
+        }
+
+    suspend fun configurePhoneCallRelayHooks(
+        context: Context,
+        relayHost: String?,
+        relayPort: Int?
+    ): ShizukuOperationResult = withService(context) { service ->
+        val endpointPort = relayPort?.takeIf { it in 1..65_535 } ?: PHONE_RELAY_DEFAULT_PORT
+        val peerHost = MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(relayHost)
+        val localHost = preferredLocalIPv4Address()
+        val commands = mutableListOf<Array<String>>()
+
+        fun setProp(key: String, value: String) {
+            commands += arrayOf("setprop", key, value)
+        }
+
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY, "pad")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY, "1")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY, "1")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY, "1")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY, "offhook")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY, "1")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY, "both")
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY, endpointPort.toString())
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY, "1")
+        peerHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY, it) }
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY, endpointPort.toString())
+        localHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY, it) }
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY, endpointPort.toString())
+
+        val results = commands.map { command -> service.runCommandResult(command) }
+        results.toOperationResult(
+            "phone:relay_hooks peer=${peerHost ?: "default"}:$endpointPort local=${localHost ?: "default"}"
         )
+    }
 
     suspend fun placePhoneCall(context: Context, telUri: String): ShizukuOperationResult =
         withContext(Dispatchers.IO) {
@@ -354,6 +404,32 @@ object AndroidShizukuSupport {
         val result = service.runCommandResult(arrayOf("setprop", key, value))
         listOf(result).toOperationResult(name)
     }
+
+    private fun preferredLocalIPv4Address(): String? =
+        runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            var fallback: String? = null
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+                if (!networkInterface.isUp || networkInterface.isLoopback) {
+                    continue
+                }
+                val addresses = networkInterface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is Inet4Address && !address.isLoopbackAddress) {
+                        val host = address.hostAddress
+                        if (networkInterface.name == "wlan0") {
+                            return@runCatching host
+                        }
+                        if (fallback == null) {
+                            fallback = host
+                        }
+                    }
+                }
+            }
+            fallback
+        }.getOrNull()
 
     private suspend fun <T> withService(
         context: Context,

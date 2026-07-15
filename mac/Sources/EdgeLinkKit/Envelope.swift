@@ -284,11 +284,21 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
     public let requestId: String
     public let action: String
     public let number: String?
+    public let relayHost: String?
+    public let relayPort: Int?
 
-    public init(requestId: String, action: String, number: String? = nil) {
+    public init(
+        requestId: String,
+        action: String,
+        number: String? = nil,
+        relayHost: String? = nil,
+        relayPort: Int? = nil
+    ) {
         self.requestId = requestId
         self.action = action
         self.number = number
+        self.relayHost = relayHost
+        self.relayPort = relayPort
     }
 }
 

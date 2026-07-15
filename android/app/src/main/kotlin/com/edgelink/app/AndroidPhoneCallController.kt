@@ -39,7 +39,7 @@ class AndroidPhoneCallController(context: Context) {
                 ts = now
             )
         val telUri = "tel:$number"
-        armPhoneRelayLatch(PHONE_ACTION_DIAL)
+        armPhoneRelayLatch(PHONE_ACTION_DIAL, body)
         return runCatching {
             AndroidShizukuSupport.placePhoneCall(appContext, telUri)
         }.fold(
@@ -77,7 +77,7 @@ class AndroidPhoneCallController(context: Context) {
 
     private suspend fun pressKey(body: PhoneActionBody, keyCode: String, now: Long): PhoneActionResultBody {
         if (body.action == PHONE_ACTION_ANSWER) {
-            armPhoneRelayLatch(PHONE_ACTION_ANSWER)
+            armPhoneRelayLatch(PHONE_ACTION_ANSWER, body)
         }
         return runCatching {
             AndroidShizukuSupport.pressPhoneKey(appContext, keyCode)
@@ -117,10 +117,27 @@ class AndroidPhoneCallController(context: Context) {
         )
     }
 
-    private suspend fun armPhoneRelayLatch(action: String) {
+    private suspend fun armPhoneRelayLatch(action: String, body: PhoneActionBody) {
         runCatching {
-            AndroidShizukuSupport.armPhoneCallRelay(appContext, PHONE_CALL_RELAY_LATCH_TTL_MS)
+            AndroidShizukuSupport.configurePhoneCallRelayHooks(
+                appContext,
+                relayHost = body.relayHost,
+                relayPort = body.relayPort
+            )
         }.onSuccess { result ->
+            if (result.success) {
+                EdgeLinkLog.info("phone.android.relay_hooks_configured action=$action message=${result.message}")
+            } else {
+                EdgeLinkLog.warn("phone.android.relay_hooks_configure_failed action=$action message=${result.message}")
+            }
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.relay_hooks_configure_failed action=$action", error)
+        }
+
+        val latchResult = runCatching {
+            AndroidShizukuSupport.armPhoneCallRelay(appContext, PHONE_CALL_RELAY_LATCH_TTL_MS)
+        }
+        latchResult.onSuccess { result ->
             if (result.success) {
                 EdgeLinkLog.info("phone.android.relay_latch_armed action=$action ttlMs=$PHONE_CALL_RELAY_LATCH_TTL_MS")
             } else {
@@ -128,6 +145,23 @@ class AndroidPhoneCallController(context: Context) {
             }
         }.onFailure { error ->
             EdgeLinkLog.warn("phone.android.relay_latch_arm_failed action=$action", error)
+        }
+        if (latchResult.getOrNull()?.success == true) {
+            pokePhoneContinuityRelay(action)
+        }
+    }
+
+    private suspend fun pokePhoneContinuityRelay(action: String) {
+        runCatching {
+            AndroidMiLinkPhoneContinuityBridge.probe(appContext)
+        }.onSuccess { result ->
+            EdgeLinkLog.info(
+                "phone.android.relay_continuity_poked action=$action " +
+                    "success=${result.success} remoteDevices=${result.remoteDeviceCount} " +
+                    "mediaRelayCandidates=${result.mediaRelayCandidateCount}"
+            )
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.relay_continuity_poke_failed action=$action", error)
         }
     }
 

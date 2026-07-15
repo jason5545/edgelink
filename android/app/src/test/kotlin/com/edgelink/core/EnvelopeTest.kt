@@ -98,12 +98,20 @@ class EnvelopeTest {
 
         val phoneActionBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_ACTION,
-            PhoneActionBody(requestId = "call-1", action = "dial", number = "+886912345678")
+            PhoneActionBody(
+                requestId = "call-1",
+                action = "dial",
+                number = "+886912345678",
+                relayHost = "10.0.0.42",
+                relayPort = 7102
+            )
         )
         val phoneAction = EnvelopeCodec.decode<PhoneActionBody>(phoneActionBytes)
         assertEquals(EnvelopeTypes.PHONE_ACTION, phoneAction.t)
         assertEquals("dial", phoneAction.b.action)
         assertEquals("+886912345678", phoneAction.b.number)
+        assertEquals("10.0.0.42", phoneAction.b.relayHost)
+        assertEquals(7102, phoneAction.b.relayPort)
 
         val phoneResultBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_ACTION_RESULT,

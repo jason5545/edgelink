@@ -1814,7 +1814,7 @@ final class MiLinkPhoneRelayProbe {
         "rtsp://\(sourcePresentationHost())/wfd1.0/streamid=0"
     }
 
-    private static func preferredLocalIPv4Address() -> String? {
+    static func preferredLocalIPv4Address() -> String? {
         var addresses: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addresses) == 0, let firstAddress = addresses else {
             return nil

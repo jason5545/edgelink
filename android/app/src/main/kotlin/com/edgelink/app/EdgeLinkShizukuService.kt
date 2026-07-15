@@ -179,10 +179,35 @@ internal object EdgeLinkShizukuCommandPolicy {
         }
         val key = command[1]
         val value = command[2]
-        return key in allowedDebugProperties &&
-            value.length in 1..16 &&
-            value.all { it in '0'..'9' }
+        return when (key) {
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY ->
+                value.length in 1..16 && value.all { it in '0'..'9' }
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY ->
+                value == "pad"
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY ->
+                value == "1"
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY ->
+                value == "offhook" || value == "idle"
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY ->
+                value == "source" || value == "sink" || value == "both"
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY ->
+                MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(value) != null
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY,
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY ->
+                isAllowedRelayEndpointHostValue(value)
+            else -> false
+        }
     }
+
+    private fun isAllowedRelayEndpointHostValue(value: String): Boolean =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(value) == value &&
+            value.all { char -> char.isLetterOrDigit() || char == '.' || char == '-' || char == ':' }
 
     private fun isScreenShareProtectionKey(namespace: String, key: String): Boolean =
         namespace == "global" && key == GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS ||
@@ -214,9 +239,6 @@ internal object EdgeLinkShizukuCommandPolicy {
     private val allowedPhoneKeyEvents = setOf(
         "KEYCODE_HEADSETHOOK",
         "KEYCODE_ENDCALL"
-    )
-    private val allowedDebugProperties = setOf(
-        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY
     )
     private val allowedMiLinkContentCalls = mapOf(
         ("content://com.milink.service.circulate" to "check_permission") to setOf(

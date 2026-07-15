@@ -618,7 +618,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 Bundle::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val mode = currentFakeMirrorRemoteMode() ?: return
+                        val mode = currentFakeMirrorCallRelayMode() ?: return
                         val method = param.args.getOrNull(0) as? String ?: return
                         if (method == "queryRemoteDevices" || method == "queryRemoteDevice") {
                             val terminal = prepareFakeMirrorTerminal(classLoader, mode)
@@ -627,7 +627,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val mode = currentFakeMirrorRemoteMode() ?: return
+                        val mode = currentFakeMirrorCallRelayMode() ?: return
                         val method = param.args.getOrNull(0) as? String ?: return
                         val extras = param.args.getOrNull(2) as? Bundle
                         when (method) {
@@ -706,7 +706,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (param.getResult() != null) {
                             return
                         }
-                        val mode = currentFakeMirrorRemoteMode() ?: return
+                        val mode = currentFakeMirrorCallRelayMode() ?: return
                         val deviceId = param.args.getOrNull(0) as? String
                         if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             return
@@ -732,7 +732,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 String::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val mode = currentFakeMirrorRemoteMode() ?: return
+                        val mode = currentFakeMirrorCallRelayMode() ?: return
                         val deviceId = param.args.getOrNull(0) as? String
                         if (mode == "pad" && MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             param.setResult(true)
@@ -752,7 +752,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 String::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val mode = currentFakeMirrorRemoteMode() ?: return
+                        val mode = currentFakeMirrorCallRelayMode() ?: return
                         val deviceId = param.args.getOrNull(0) as? String
                         if (mode == "car" && MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             param.setResult(true)
@@ -1508,6 +1508,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY),
             System.currentTimeMillis()
         )
+
+    private fun currentFakeMirrorCallRelayMode(): String? =
+        currentFakeMirrorRemoteMode()?.takeIf { currentFakeMirrorRemoteCallRelayActive() }
 
     private fun currentFakeMirrorRemoteCallState(): Int? =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(

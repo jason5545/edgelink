@@ -188,7 +188,9 @@ data class SmsSendResultBody(
 data class PhoneActionBody(
     val requestId: String,
     val action: String,
-    val number: String? = null
+    val number: String? = null,
+    val relayHost: String? = null,
+    val relayPort: Int? = null
 )
 
 @Serializable

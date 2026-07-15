@@ -341,6 +341,16 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    private func ensurePhoneRelayProbeEnabled(reason: String) {
+        guard !phoneRelayProbeEnabled else {
+            return
+        }
+        phoneRelayProbeEnabled = true
+        UserDefaults.standard.set(true, forKey: Self.phoneRelayProbeDefaultsKey)
+        DiagnosticsLog.info("phonerelay.mac.probe_auto_enabled reason=\(reason)")
+        startPhoneRelayProbe()
+    }
+
     private func startPhoneRelayProbe() {
         do {
             let peerHost = UserDefaults.standard.string(forKey: Self.phoneRelayProbePeerHostDefaultsKey)?
@@ -372,11 +382,23 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         let requestId = UUID().uuidString
-        let body = PhoneActionBody(requestId: requestId, action: action, number: number)
+        let relayHost = Self.phoneRelayAdvertisedHost()
+        let body = PhoneActionBody(
+            requestId: requestId,
+            action: action,
+            number: number,
+            relayHost: relayHost,
+            relayPort: Int(Self.phoneRelayProbePort)
+        )
         pendingPhoneActions[requestId] = body
         phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
         if action == "dial" || action == "answer" {
+            ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)")
             phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)")
+            DiagnosticsLog.info(
+                "phone.mac.relay_endpoint action=\(action) " +
+                    "host=\(relayHost ?? "none") port=\(Self.phoneRelayProbePort)"
+            )
         }
         if action == "hangup" {
             phoneRelayProbe.disarmSourceRTP(reason: "phone_action_hangup", stopActive: true)
@@ -982,6 +1004,7 @@ final class EdgeLinkRuntime: ObservableObject {
         let source = status.sourceName ?? status.source.map(String.init) ?? "unknown"
         if status.active {
             androidMicRelayArmed = true
+            ensurePhoneRelayProbeEnabled(reason: "android_mic_\(source)")
             phoneRelayProbe.armSourceRTP(reason: "android_mic_\(source)")
             DiagnosticsLog.info(
                 "mic.mac.android_active source=\(source) count=\(status.activeRecordingCount) " +
@@ -1028,6 +1051,15 @@ final class EdgeLinkRuntime: ObservableObject {
             return phoneRelayProbePort
         }
         return UInt16(value)
+    }
+
+    private static func phoneRelayAdvertisedHost() -> String? {
+        if let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            return override
+        }
+        return MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
     }
 }
 

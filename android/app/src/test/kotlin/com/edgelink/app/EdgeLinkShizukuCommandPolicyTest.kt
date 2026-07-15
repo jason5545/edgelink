@@ -133,7 +133,7 @@ class EdgeLinkShizukuCommandPolicyTest {
     }
 
     @Test
-    fun allowsOnlyCallRelayLatchPropertyWrites() {
+    fun allowsOnlyBoundedPhoneRelayPropertyWrites() {
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf(
@@ -152,10 +152,90 @@ class EdgeLinkShizukuCommandPolicyTest {
                 )
             )
         )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY, "pad")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY, "offhook")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY, "idle")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY, "both")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY, "7102")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY, "1")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY, "10.0.0.42")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY, "fd00::1234")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY, "7102")
+            )
+        )
 
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("setprop", "debug.edgelink.mirror_fake_remote_using_pad", "true")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY, "car")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY, "10.0.0.42;id")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY, "allow")
             )
         )
         assertFalse(
