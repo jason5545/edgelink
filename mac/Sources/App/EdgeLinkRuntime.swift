@@ -45,6 +45,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
+    private let turnCredentialClient: TurnCredentialClient
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
@@ -69,6 +70,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var phoneRelayDebugDialError: String?
     private var phoneRelayDebugLastStats: MiLinkPhoneRelayPCMStats?
     private var phoneRelayDebugValidStats: MiLinkPhoneRelayPCMStats?
+    private var latestTurnCredential: TurnCredentialSnapshot?
+    private var turnCredentialTask: Task<TurnCredentialSnapshot?, Never>?
 
     init(
         workerBaseURL: URL = EdgeLinkConfig.workerBaseURL,
@@ -83,6 +86,7 @@ final class EdgeLinkRuntime: ObservableObject {
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
+        turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
@@ -118,6 +122,7 @@ final class EdgeLinkRuntime: ObservableObject {
         pairingTask?.cancel()
         connectionTask?.cancel()
         phoneRelayDebugTask?.cancel()
+        turnCredentialTask?.cancel()
         currentChannel?.close()
         phoneRelayProbe.stop()
         screenSession.closeWindow(sendRemoteStop: false)
@@ -192,10 +197,16 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.warn("screen.mac.start_ignored not_connected")
             return
         }
-        screenSession.openAndStart()
-        isPhoneScreenSessionActive = true
-        isPhoneScreenViewerVisible = true
-        hasViewedPhoneScreen = true
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            _ = await self.ensureTurnCredentials(reason: "screen_start")
+            self.screenSession.openAndStart()
+            self.isPhoneScreenSessionActive = true
+            self.isPhoneScreenViewerVisible = true
+            self.hasViewedPhoneScreen = true
+        }
     }
 
     func showPhoneScreen() {
@@ -219,6 +230,9 @@ final class EdgeLinkRuntime: ObservableObject {
         canDisconnect = false
         connectionTask?.cancel()
         connectionTask = nil
+        turnCredentialTask?.cancel()
+        turnCredentialTask = nil
+        latestTurnCredential = nil
 
         let shouldSendRemoteStop = isConnected
         screenSession.hideWindowAndStop(sendRemoteStop: shouldSendRemoteStop)
@@ -227,6 +241,7 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannelGeneration = nil
         currentSession = nil
         screenSession.clearSender()
+        screenSession.setIceServerConfigs([])
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
         androidMicRelayArmed = false
@@ -508,6 +523,65 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info("phonerelay.mac.probe_auto_stopped reason=\(reason)")
     }
 
+    private func freshTurnCredential() -> TurnCredentialSnapshot? {
+        guard let latestTurnCredential, latestTurnCredential.isFresh() else {
+            return nil
+        }
+        screenSession.setIceServerConfigs(latestTurnCredential.iceServers)
+        return latestTurnCredential
+    }
+
+    @discardableResult
+    private func ensureTurnCredentials(reason: String) async -> TurnCredentialSnapshot? {
+        if let credential = freshTurnCredential() {
+            DiagnosticsLog.info("turn.mac.credentials_reuse reason=\(reason) \(credential.diagnosticSummary)")
+            return credential
+        }
+        guard let identity = localIdentity else {
+            DiagnosticsLog.warn("turn.mac.credentials_ignored reason=\(reason) no_identity")
+            return nil
+        }
+        let connectionGeneration = currentConnectionGeneration
+        let hostId = identity.deviceId
+
+        if let turnCredentialTask {
+            DiagnosticsLog.info("turn.mac.credentials_join_inflight reason=\(reason) hostId=\(hostId)")
+            let credential = await turnCredentialTask.value
+            if let credential, currentConnectionGeneration == connectionGeneration {
+                latestTurnCredential = credential
+                screenSession.setIceServerConfigs(credential.iceServers)
+            }
+            return credential
+        }
+
+        DiagnosticsLog.info("turn.mac.credentials_fetch_start reason=\(reason) hostId=\(hostId)")
+        let client = turnCredentialClient
+        let task = Task { () -> TurnCredentialSnapshot? in
+            do {
+                return try await client.fetch(hostId: hostId, identity: identity)
+            } catch {
+                DiagnosticsLog.error("turn.mac.credentials_fetch_failed reason=\(reason) hostId=\(hostId)", error)
+                return nil
+            }
+        }
+        turnCredentialTask = task
+        let credential = await task.value
+        turnCredentialTask = nil
+
+        guard currentConnectionGeneration == connectionGeneration else {
+            DiagnosticsLog.warn("turn.mac.credentials_discarded_stale reason=\(reason) hostId=\(hostId)")
+            return nil
+        }
+        guard let credential else {
+            screenSession.setIceServerConfigs([])
+            return nil
+        }
+        latestTurnCredential = credential
+        screenSession.setIceServerConfigs(credential.iceServers)
+        DiagnosticsLog.info("turn.mac.credentials_ready reason=\(reason) hostId=\(hostId) \(credential.diagnosticSummary)")
+        return credential
+    }
+
     @discardableResult
     private func sendPhoneAction(action: String, number: String? = nil) -> String? {
         guard let session = currentSession, isConnected else {
@@ -528,6 +602,14 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingPhoneActions[requestId] = body
         phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
         if action == "dial" || action == "answer" {
+            Task { [weak self] in
+                let credential = await self?.ensureTurnCredentials(reason: "phone_action_\(action)")
+                if credential != nil {
+                    DiagnosticsLog.info("phone.mac.turn_credentials_ready action=\(action)")
+                } else {
+                    DiagnosticsLog.warn("phone.mac.turn_credentials_missing action=\(action)")
+                }
+            }
             ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)")
             phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)")
             DiagnosticsLog.info(
@@ -842,6 +924,9 @@ final class EdgeLinkRuntime: ObservableObject {
                 DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
                 lastSecurePongAt = Date()
+                Task { [weak self] in
+                    _ = await self?.ensureTurnCredentials(reason: "relay_connected")
+                }
                 screenSession.setSender { data in
                     Task {
                         do {

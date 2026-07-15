@@ -46,6 +46,8 @@ import com.edgelink.transport.ByteChannel
 import com.edgelink.transport.PairingTransport
 import com.edgelink.transport.RelayTransport
 import com.edgelink.transport.SecureSessionClient
+import com.edgelink.transport.TurnCredentialTransport
+import com.edgelink.transport.TurnCredentialsResponse
 import com.edgelink.ui.ConnectionPhase
 import com.edgelink.ui.EdgeLinkActions
 import com.edgelink.ui.EdgeLinkUiState
@@ -123,6 +125,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val settingsStore = SharedPreferencesSettingsStore(appContext)
     private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
     private val relayTransport = RelayTransport(crypto = crypto)
+    private val turnCredentialTransport = TurnCredentialTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
@@ -134,7 +137,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val screenSession = AndroidScreenSession(
         context = appContext,
         sendPlaintext = ::sendPlaintext,
-        screenSharePrivacyEnabled = settingsStore::screenSharePrivacyEnabled
+        screenSharePrivacyEnabled = settingsStore::screenSharePrivacyEnabled,
+        iceServerProvider = ::currentScreenIceServerConfigs
     )
     private val initialShizukuState = AndroidShizukuSupport.currentState()
     @Volatile
@@ -176,6 +180,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onSmsSendResult = { result ->
             sendEnvelope(EnvelopeTypes.SMS_SEND_RESULT, result)
         },
+        onScreenStartReceived = {
+            ensureTurnCredentials("screen_start")
+        },
+        onPhoneActionReceived = { body ->
+            if (body.action == "dial" || body.action == "answer") {
+                refreshTurnCredentials("phone_action_${body.action}")
+            }
+        },
         onPhoneActionResult = { result ->
             sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
         }
@@ -191,10 +203,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var pairingJob: Job? = null
     private var smsPendingDrainJob: Job? = null
     private var shizukuAutoRepairJob: Job? = null
+    private var turnCredentialJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private var pendingShizukuAction: PendingShizukuAction? = null
     @Volatile
     private var latestMiLinkStatus: MiLinkStatusBody? = null
+    @Volatile
+    private var latestTurnCredentials: TurnCredentialsResponse? = null
     private var miLinkRootProbeAttempted = false
     @Volatile
     private var manuallyDisconnected = false
@@ -259,6 +274,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         screenSession.setControlDataChannelHandler(null)
         micActivityMonitor.stop()
         screenSession.shutdown()
+        turnCredentialJob?.cancel()
+        latestTurnCredentials = null
         session?.close()
         scope.cancel()
     }
@@ -368,6 +385,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         connectionGeneration.incrementAndGet()
         connectionJob?.cancel()
         connectionJob = null
+        turnCredentialJob?.cancel()
+        turnCredentialJob = null
+        latestTurnCredentials = null
         session?.close()
         session = null
         screenSession.stop()
@@ -1142,6 +1162,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
                 session = nextSession
+                refreshTurnCredentials("relay_connected")
                 sendLatestMiLinkStatus(nextSession, identity)
                 micActivityMonitor.sendCurrent("session_connected")
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
@@ -1220,6 +1241,94 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         } == true
         EdgeLinkLog.info("relay.android.auto_reconnect_wait_done delayMs=$delayMs woke=$woke")
         return stateFlow.value.autoReconnectEnabled
+    }
+
+    private fun currentScreenIceServerConfigs(): List<AndroidScreenIceServerConfig> {
+        val credentials = latestTurnCredentials ?: return emptyList()
+        if (!credentials.isFresh()) {
+            return emptyList()
+        }
+        val iceServers = credentials.iceServers
+            .takeIf { it.isNotEmpty() }
+            ?.map { server ->
+                AndroidScreenIceServerConfig(
+                    urls = server.urls,
+                    username = server.username,
+                    credential = server.credential
+                )
+            }
+            ?: listOf(
+                AndroidScreenIceServerConfig(
+                    urls = credentials.urls,
+                    username = credentials.username,
+                    credential = credentials.credential
+                )
+            )
+        return iceServers.filter { it.urls.isNotEmpty() }
+    }
+
+    private suspend fun ensureTurnCredentials(reason: String): TurnCredentialsResponse? {
+        latestTurnCredentials?.takeIf { it.isFresh() }?.let { credentials ->
+            EdgeLinkLog.info("turn.android.credentials_reuse reason=$reason ${credentials.diagnosticSummary()}")
+            return credentials
+        }
+        val activeJob = turnCredentialJob
+        if (activeJob?.isActive == true) {
+            EdgeLinkLog.info("turn.android.credentials_join_inflight reason=$reason")
+            activeJob.join()
+            latestTurnCredentials?.takeIf { it.isFresh() }?.let { credentials ->
+                EdgeLinkLog.info("turn.android.credentials_reuse_after_join reason=$reason ${credentials.diagnosticSummary()}")
+                return credentials
+            }
+        }
+        return fetchAndStoreTurnCredentials(reason)
+    }
+
+    private suspend fun fetchAndStoreTurnCredentials(reason: String): TurnCredentialsResponse? {
+        val identity = localIdentity
+        val peer = currentPeer
+        if (identity == null || peer == null) {
+            EdgeLinkLog.warn("turn.android.credentials_ignored reason=$reason hasIdentity=${identity != null} hasPeer=${peer != null}")
+            return null
+        }
+        val generation = connectionGeneration.get()
+        EdgeLinkLog.info("turn.android.credentials_fetch_start reason=$reason hostId=${peer.deviceId}")
+        val result = runCatching {
+            turnCredentialTransport.fetch(
+                workerBaseUrl = EdgeLinkConfig.workerBaseUrl,
+                hostId = peer.deviceId,
+                identity = identity
+            )
+        }
+        if (connectionGeneration.get() != generation) {
+            EdgeLinkLog.warn("turn.android.credentials_discarded_stale reason=$reason hostId=${peer.deviceId}")
+            return null
+        }
+        return result
+            .onSuccess { credentials ->
+                latestTurnCredentials = credentials
+                EdgeLinkLog.info("turn.android.credentials_ready reason=$reason hostId=${peer.deviceId} ${credentials.diagnosticSummary()}")
+            }
+            .onFailure { error ->
+                latestTurnCredentials = null
+                EdgeLinkLog.error("turn.android.credentials_fetch_failed reason=$reason hostId=${peer.deviceId}", error)
+            }
+            .getOrNull()
+    }
+
+    private fun refreshTurnCredentials(reason: String) {
+        latestTurnCredentials?.takeIf { it.isFresh() }?.let { credentials ->
+            EdgeLinkLog.info("turn.android.credentials_reuse reason=$reason ${credentials.diagnosticSummary()}")
+            return
+        }
+        if (turnCredentialJob?.isActive == true) {
+            EdgeLinkLog.info("turn.android.credentials_join_inflight reason=$reason")
+            return
+        }
+        turnCredentialJob = scope.launch {
+            fetchAndStoreTurnCredentials(reason)
+            turnCredentialJob = null
+        }
     }
 
     private fun signalAutoReconnect(reason: String) {
@@ -1411,6 +1520,8 @@ private class AndroidCommandDispatcher(
     private val phoneCallController: AndroidPhoneCallController,
     private val onPong: () -> Unit,
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
+    private val onScreenStartReceived: suspend () -> Unit,
+    private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
     private val onPhoneActionResult: (PhoneActionResultBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
@@ -1442,10 +1553,12 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.PHONE_ACTION -> {
                 val envelope = EnvelopeCodec.decode<PhoneActionBody>(plaintext)
+                onPhoneActionReceived(envelope.b)
                 onPhoneActionResult(phoneCallController.handle(envelope.b))
                 null
             }
             EnvelopeTypes.SCREEN_START -> {
+                onScreenStartReceived()
                 screenSession.requestStart()
                 null
             }

@@ -56,10 +56,17 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+data class AndroidScreenIceServerConfig(
+    val urls: List<String>,
+    val username: String? = null,
+    val credential: String? = null
+)
+
 class AndroidScreenSession(
     private val context: Context,
     private val sendPlaintext: (ByteArray) -> Unit,
-    private val screenSharePrivacyEnabled: () -> Boolean
+    private val screenSharePrivacyEnabled: () -> Boolean,
+    private val iceServerProvider: () -> List<AndroidScreenIceServerConfig> = { emptyList() }
 ) {
     private val appContext = context.applicationContext
     private var eglBase: EglBase? = null
@@ -562,9 +569,23 @@ class AndroidScreenSession(
     }
 
     private fun createPeerConnection(localFactory: PeerConnectionFactory): PeerConnection {
-        val config = PeerConnection.RTCConfiguration(
-            listOf(PeerConnection.IceServer.builder(STUN_SERVER).createIceServer())
-        ).apply {
+        val configuredIceServers = iceServerProvider()
+            .filter { it.urls.isNotEmpty() }
+            .map { server ->
+                val builder = PeerConnection.IceServer.builder(server.urls)
+                if (!server.username.isNullOrBlank() && !server.credential.isNullOrBlank()) {
+                    builder.setUsername(server.username)
+                    builder.setPassword(server.credential)
+                }
+                builder.createIceServer()
+            }
+        val iceServers = configuredIceServers +
+            PeerConnection.IceServer.builder(STUN_SERVER).createIceServer()
+        EdgeLinkLog.info(
+            "screen.android.peer_connection_config iceServers=${iceServers.size} " +
+                "turn=${configuredIceServers.count { server -> server.urls.any { it.startsWith("turn:") || it.startsWith("turns:") } }}"
+        )
+        val config = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
         return localFactory.createPeerConnection(config, peerObserver())

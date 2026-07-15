@@ -27,6 +27,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var localMicrophoneTrack: RTCAudioTrack?
     private var localMicrophoneSender: RTCRtpSender?
     private var controlDataChannel: RTCDataChannel?
+    private var iceServerConfigs: [ScreenIceServerConfig] = []
     private var didInitializeSSL = false
     private var isClosingWindow = false
     private var isStopping = false
@@ -64,6 +65,14 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     func clearSender() {
         sendPlaintext = nil
+    }
+
+    func setIceServerConfigs(_ configs: [ScreenIceServerConfig]) {
+        iceServerConfigs = configs.filter { !$0.urls.isEmpty }
+        DiagnosticsLog.info(
+            "screen.mac.ice_servers_updated count=\(iceServerConfigs.count) " +
+                "turn=\(iceServerConfigs.contains { config in config.urls.contains { $0.hasPrefix("turn:") || $0.hasPrefix("turns:") } })"
+        )
     }
 
     func setMicrophoneRelayEnabled(_ enabled: Bool) {
@@ -396,7 +405,11 @@ final class MacScreenSession: NSObject, ObservableObject {
         self.factory = factory
 
         let config = RTCConfiguration()
-        config.iceServers = [RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])]
+        config.iceServers = makeIceServers()
+        DiagnosticsLog.info(
+            "screen.mac.peer_connection_config iceServers=\(config.iceServers.count) " +
+                "turn=\(iceServerConfigs.count)"
+        )
         config.sdpSemantics = .unifiedPlan
 
         let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
@@ -411,6 +424,16 @@ final class MacScreenSession: NSObject, ObservableObject {
         addLocalMicrophoneTrackIfNeeded(to: peerConnection, factory: factory)
         startStatsLogging(on: peerConnection)
         return peerConnection
+    }
+
+    private func makeIceServers() -> [RTCIceServer] {
+        let configured = iceServerConfigs.map { config in
+            if let username = config.username, let credential = config.credential {
+                return RTCIceServer(urlStrings: config.urls, username: username, credential: credential)
+            }
+            return RTCIceServer(urlStrings: config.urls)
+        }
+        return configured + [RTCIceServer(urlStrings: [Self.fallbackStunServerURL])]
     }
 
     private func createAnswer(on peerConnection: RTCPeerConnection) {
@@ -893,6 +916,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private static let controlChannelLabel = "edgelink-control"
     private static let mediaStreamId = "edgelink-screen"
     private static let microphoneTrackId = "edgelink-mac-microphone"
+    private static let fallbackStunServerURL = "stun:stun.l.google.com:19302"
 }
 
 extension MacScreenSession: NSWindowDelegate {
