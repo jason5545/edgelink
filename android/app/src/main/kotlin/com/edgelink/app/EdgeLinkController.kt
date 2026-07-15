@@ -91,6 +91,29 @@ private enum class PendingShizukuAction {
     MiLinkProbe
 }
 
+internal enum class ShizukuAutoRepairTarget {
+    Notification,
+    RemoteInput,
+    Screen,
+    Sms
+}
+
+internal fun shizukuAutoRepairTargets(state: EdgeLinkUiState): List<ShizukuAutoRepairTarget> =
+    buildList {
+        if (state.notificationSyncEnabled && (!state.notificationAccessGranted || !state.notificationPostGranted)) {
+            add(ShizukuAutoRepairTarget.Notification)
+        }
+        if (!state.remoteInputAccessGranted) {
+            add(ShizukuAutoRepairTarget.RemoteInput)
+        }
+        if (!state.screenDimmingAccessGranted) {
+            add(ShizukuAutoRepairTarget.Screen)
+        }
+        if (!state.smsAccessGranted) {
+            add(ShizukuAutoRepairTarget.Sms)
+        }
+    }
+
 class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -168,6 +191,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var connectionJob: Job? = null
     private var pairingJob: Job? = null
     private var smsPendingDrainJob: Job? = null
+    private var shizukuAutoRepairJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private var pendingShizukuAction: PendingShizukuAction? = null
     @Volatile
@@ -196,7 +220,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             }
             EdgeLinkLog.info("shizuku.android.permission_result granted=${grantResult == PackageManager.PERMISSION_GRANTED}")
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                runPendingShizukuAction()
+                val shizukuState = AndroidShizukuSupport.currentState()
+                if (shizukuState.uid == 0) {
+                    pendingShizukuAction = null
+                    runShizukuAutoRepairIfReady("permission_granted")
+                } else {
+                    runPendingShizukuAction()
+                }
             } else {
                 pendingShizukuAction = null
                 refreshNotificationAccess()
@@ -218,6 +248,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         scope.launch {
             run()
         }
+        runShizukuAutoRepairIfReady("init")
         runMiLinkRootProbeIfReady("init")
     }
 
@@ -590,7 +621,68 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         refreshNotificationAccess()
         if (AndroidShizukuSupport.hasPermission()) {
             runPendingShizukuAction()
+            runShizukuAutoRepairIfReady(reason)
             runMiLinkRootProbeIfReady(reason)
+        }
+    }
+
+    private fun runShizukuAutoRepairIfReady(reason: String) {
+        val shizukuState = AndroidShizukuSupport.currentState()
+        if (!shizukuState.canUse || shizukuState.uid != 0) {
+            EdgeLinkLog.info(
+                "shizuku.android.auto_repair_skip reason=$reason canUse=${shizukuState.canUse} uid=${shizukuState.uid}"
+            )
+            return
+        }
+        if (shizukuAutoRepairJob?.isActive == true) {
+            EdgeLinkLog.info("shizuku.android.auto_repair_skip reason=$reason already_running=true")
+            return
+        }
+
+        refreshNotificationAccess()
+        val targets = shizukuAutoRepairTargets(stateFlow.value)
+        if (targets.isEmpty()) {
+            EdgeLinkLog.info("shizuku.android.auto_repair_skip reason=$reason missing=none")
+            return
+        }
+
+        shizukuAutoRepairJob = scope.launch {
+            EdgeLinkLog.info(
+                "shizuku.android.auto_repair_start reason=$reason targets=${targets.joinToString()}"
+            )
+            val results = targets.map { target ->
+                val result = runCatching {
+                    when (target) {
+                        ShizukuAutoRepairTarget.Notification ->
+                            AndroidShizukuSupport.enableNotificationAccess(appContext)
+                        ShizukuAutoRepairTarget.RemoteInput ->
+                            AndroidShizukuSupport.enableRemoteInput(appContext)
+                        ShizukuAutoRepairTarget.Screen ->
+                            AndroidShizukuSupport.prepareScreenAccess(appContext)
+                        ShizukuAutoRepairTarget.Sms ->
+                            AndroidShizukuSupport.grantSmsPermissions(appContext)
+                    }
+                }.getOrElse { error ->
+                    EdgeLinkLog.warn("shizuku.android.auto_repair_exception target=$target", error)
+                    ShizukuOperationResult(success = false, message = error.message.orEmpty())
+                }
+                target to result
+            }
+
+            refreshNotificationAccess()
+            val remaining = shizukuAutoRepairTargets(stateFlow.value)
+            val failures = results.filterNot { (_, result) -> result.success }
+            if (failures.isEmpty() && remaining.isEmpty()) {
+                EdgeLinkLog.info(
+                    "shizuku.android.auto_repair_ok reason=$reason repaired=${targets.joinToString()}"
+                )
+            } else {
+                EdgeLinkLog.warn(
+                    "shizuku.android.auto_repair_incomplete reason=$reason " +
+                        "failed=${failures.joinToString { (target, result) -> "$target:${result.message}" }} " +
+                        "remaining=${remaining.joinToString()}"
+                )
+            }
         }
     }
 
