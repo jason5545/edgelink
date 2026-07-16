@@ -1,13 +1,25 @@
 import Foundation
 
 public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
+    public static let deviceTypePhone: UInt8 = 0x01
+    public static let deviceTypeMacBook: UInt8 = 0x0e
+    private static let currentSameAccountProfileSuffix: [UInt8] = [
+        0x00, 0x05, 0x19, 0x3f, 0x17, 0x0e,
+        0x07, 0x0a, 0x03, 0x01, 0xb4, 0xde, 0x01, 0x01,
+        0x20, 0x23, 0x00, 0x23, 0x02, 0xb1, 0x45, 0x02
+    ]
+
     public let rawData: Data
     public let deviceIdHex: String?
+    public let deviceType: UInt8?
+    public let accountIdHex: String?
     public let displayName: String?
 
     public init(data: Data) {
         rawData = data
         deviceIdHex = Self.parseDeviceIdHex(from: data)
+        deviceType = Self.parseDeviceType(from: data)
+        accountIdHex = Self.parseAccountIdHex(from: data)
         displayName = Self.parseDisplayName(from: data)
     }
 
@@ -22,8 +34,14 @@ public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
         rawData.base64EncodedString()
     }
 
-    public static func build(deviceIdHex: String, displayName: String) throws -> Data {
+    public static func build(
+        deviceIdHex: String,
+        displayName: String,
+        deviceType: UInt8 = Self.deviceTypeMacBook,
+        accountIdHex: String = "581F"
+    ) throws -> Data {
         let deviceIdBytes = try parseDeviceIdBytes(deviceIdHex)
+        let accountIdBytes = try parseHexBytes(accountIdHex, expectedByteCount: 2)
         let nameBytes = Array(displayName.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         guard !nameBytes.isEmpty else {
             throw XiaomiMiShareDiscoveryPayloadError.emptyDisplayName
@@ -32,26 +50,38 @@ public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
             throw XiaomiMiShareDiscoveryPayloadError.displayNameTooLong
         }
 
-        // Captured from the phone's MiShare/Lyra mDNS AppData shape.
-        // The fields between device id and display name are still opaque Xiaomi
-        // continuity metadata; keeping a real phone-compatible template gives us
-        // a stable discovery foothold while transfer-channel work continues.
+        // Captured from the phone's current same-account MiShare/Lyra mDNS
+        // AppData shape, then adapted with device_type=0x0e so EdgeLink
+        // publishes as a MacBook peer instead of another phone peer.
         var bytes: [UInt8] = [
-            0x02, 0x41, 0x01
+            0x02, 0x41, deviceType
         ]
         bytes.append(contentsOf: deviceIdBytes)
-        bytes.append(contentsOf: [
-            0x58, 0x1f, 0x00, 0x05, 0x19, 0x2f, 0x17, 0x1a,
-            0x03, 0x0a, 0x03, 0x01, 0x8f, 0xb3, 0x01, 0x01,
-            0x20, 0x23, 0x00, 0x23, 0x02, 0x54, 0x9a, 0x02
-        ])
+        bytes.append(contentsOf: accountIdBytes)
+        bytes.append(contentsOf: currentSameAccountProfileSuffix)
         bytes.append(UInt8(nameBytes.count))
         bytes.append(contentsOf: nameBytes)
         return Data(bytes)
     }
 
-    public static func buildBase64(deviceIdHex: String, displayName: String) throws -> String {
-        try build(deviceIdHex: deviceIdHex, displayName: displayName).base64EncodedString()
+    public static func buildBase64(
+        deviceIdHex: String,
+        displayName: String,
+        accountIdHex: String = "581F"
+    ) throws -> String {
+        try build(
+            deviceIdHex: deviceIdHex,
+            displayName: displayName,
+            accountIdHex: accountIdHex
+        ).base64EncodedString()
+    }
+
+    private static func parseDeviceType(from data: Data) -> UInt8? {
+        let bytes = Array(data)
+        guard bytes.count >= 3 else {
+            return nil
+        }
+        return bytes[2]
     }
 
     private static func parseDeviceIdHex(from data: Data) -> String? {
@@ -60,6 +90,14 @@ public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
             return nil
         }
         return bytes[3..<7].map { String(format: "%02X", $0) }.joined()
+    }
+
+    private static func parseAccountIdHex(from data: Data) -> String? {
+        let bytes = Array(data)
+        guard bytes.count >= 9 else {
+            return nil
+        }
+        return bytes[7..<9].map { String(format: "%02X", $0) }.joined()
     }
 
     private static func parseDisplayName(from data: Data) -> String? {
@@ -88,11 +126,15 @@ public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
     }
 
     private static func parseDeviceIdBytes(_ deviceIdHex: String) throws -> [UInt8] {
-        let cleaned = deviceIdHex
+        try parseHexBytes(deviceIdHex, expectedByteCount: 4)
+    }
+
+    private static func parseHexBytes(_ hexString: String, expectedByteCount: Int) throws -> [UInt8] {
+        let cleaned = hexString
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .uppercased()
         let allowed = CharacterSet(charactersIn: "0123456789ABCDEF")
-        guard cleaned.count == 8,
+        guard cleaned.count == expectedByteCount * 2,
               cleaned.unicodeScalars.allSatisfy({ allowed.contains($0) })
         else {
             throw XiaomiMiShareDiscoveryPayloadError.invalidDeviceId

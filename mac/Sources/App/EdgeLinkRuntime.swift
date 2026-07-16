@@ -8,6 +8,7 @@ import Foundation
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
+    private static let allowXiaomiScreenPrimaryRoute = false
 
     @Published private(set) var localDeviceId = "Registering..."
     @Published private(set) var peerName = "No paired Android"
@@ -271,6 +272,19 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         let preferredScreenRoute = latestMiLinkStatus?.preferredRoutes?["screen"]
         if preferredScreenRoute?.hasPrefix("xiaomi.") == true {
+            guard Self.allowXiaomiScreenPrimaryRoute else {
+                xiaomiMiLinkCommandStatus = "小米鏡像仍在診斷，改用 EdgeLink 畫面"
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_route_skipped route=\(preferredScreenRoute ?? "unknown") " +
+                        "reason=self_contained_endpoint_unverified " +
+                        "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
+                        "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
+                        "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) " +
+                        "xiaomiMirrorDeviceIdSource=hyperconnect_cache"
+                )
+                startEdgeLinkPhoneScreen(reason: "xiaomi_self_contained_unverified")
+                return
+            }
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.phoneRelayAdvertisedHost()
@@ -555,6 +569,14 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
+    @discardableResult
+    func probePhoneMiShareNsdDiscovery(timeoutMs: Int = 5_000) -> String? {
+        sendMiLinkCommand(
+            command: "xiaomi.mishare.nsdDiscover",
+            args: ["timeoutMs": String(timeoutMs)]
+        )
+    }
+
     func restartXiaomiMiShareDiscovery() {
         guard let localIdentity else {
             xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：identity 尚未就緒"
@@ -729,6 +751,9 @@ final class EdgeLinkRuntime: ObservableObject {
         case "xiaomi-mishare-discover", "mishare-discover":
             DiagnosticsLog.info("runtime.mac.url_xiaomi_mishare_discover")
             probePhoneMiShareDiscovery()
+        case "xiaomi-mishare-nsd-discover", "mishare-nsd-discover":
+            DiagnosticsLog.info("runtime.mac.url_xiaomi_mishare_nsd_discover")
+            probePhoneMiShareNsdDiscovery()
         default:
             DiagnosticsLog.warn("runtime.mac.url_ignored command=\(command)")
         }

@@ -608,3 +608,25 @@ media/cast commands.
 `ClientV2PublicService` still calls `BaseClientService.b()`, which rejects non-whitelisted caller
 UIDs with `Uid <uid> is not allowed to call MiLinkCast.` EdgeLink's module hooks that check only in
 the MiLink main process and only for caller packages containing `com.edgelink.app`.
+
+### MiShare / Lyra endpoint status
+
+EdgeLinkMac now publishes an experimental `_lyra-mdns._udp.local.` endpoint named `721572C3` with
+an official-shaped `AppData` TXT record. Android system NSD can see and resolve this endpoint from
+the phone:
+
+- service: `721572C3`
+- host: `10.0.0.153`
+- port: `5353`
+- TXT: `AppData=AkEOchVyw2HyAAUZPxcOBwoDAbTeAQEgIwAjArFFAgtNYWNCb29rIFBybw==`
+
+This proves the Bonjour/mDNS layer is reachable from the phone. It does not prove Xiaomi MiShare /
+Lyra accepts EdgeLink as a trusted business endpoint. The phone's MiShare binder still reports the
+official cached Mac device `1780C740` with service id `00270525`, and the private MiShare log does
+not emit `onDeviceFound()` for `721572C3`.
+
+Treat Xiaomi screen/mirror/file-transfer routes as diagnostics until EdgeLink has a self-contained
+Lyra service registration path. The Mac UI should not use the official HyperConnect cached device id
+as the primary "view phone screen" path; doing so can leave the user stuck at "Xiaomi service
+starting" while no EdgeLink-owned session exists. The primary screen route is EdgeLink's own secure
+screen session until the Xiaomi endpoint is verified end-to-end.

@@ -35,6 +35,7 @@ class AndroidMiLinkCommandBridge(
                 when (body.command) {
                     COMMAND_MISHARE_OPEN_SETTINGS -> openMiShareSettings()
                     COMMAND_MISHARE_DISCOVER -> discoverMiShareDevices(body)
+                    COMMAND_MISHARE_NSD_DISCOVER -> discoverMiShareNsdDevices(body)
                     COMMAND_MIRROR_QUERY_REMOTE_DEVICES -> queryMirrorRemoteDevices(body)
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
@@ -128,6 +129,27 @@ class AndroidMiLinkCommandBridge(
                 "sample" to sample,
                 "macSample" to macSample,
                 "details" to details
+            )
+        )
+    }
+
+    private suspend fun discoverMiShareNsdDevices(body: MiLinkCommandBody): CommandResult {
+        val timeoutMs = body.args["timeoutMs"]
+            ?.toLongOrNull()
+            ?.coerceIn(1_000L, 12_000L)
+            ?: 5_000L
+        val result = AndroidLyraNsdDiscovery(appContext).discover(timeoutMs)
+        val edgeLinkMatches = result.services.filter { it.serviceName.equals("721572C3", ignoreCase = true) }
+        val sample = result.services.take(8).joinToString("|") { it.compactSummary() }
+        return CommandResult(
+            success = true,
+            route = "android.nsd",
+            message = "nsd services=${result.services.size} edgeLink=${edgeLinkMatches.size}",
+            data = mapOf(
+                "services" to result.services.size.toString(),
+                "edgeLink" to edgeLinkMatches.size.toString(),
+                "sample" to sample,
+                "events" to result.events.takeLast(16).joinToString("|")
             )
         )
     }
@@ -1132,6 +1154,7 @@ class AndroidMiLinkCommandBridge(
     private companion object {
         const val COMMAND_MISHARE_OPEN_SETTINGS = "xiaomi.mishare.openSettings"
         const val COMMAND_MISHARE_DISCOVER = "xiaomi.mishare.discover"
+        const val COMMAND_MISHARE_NSD_DISCOVER = "xiaomi.mishare.nsdDiscover"
         const val COMMAND_MIRROR_QUERY_REMOTE_DEVICES = "xiaomi.mirror.queryRemoteDevices"
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"

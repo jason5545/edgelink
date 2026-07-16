@@ -38,7 +38,7 @@ final class XiaomiMiShareDiscovery: NSObject {
     var onSnapshotChanged: ((XiaomiMiShareDiscoverySnapshot) -> Void)?
 
     private let browser = NetServiceBrowser()
-    private var publishedService: NetService?
+    private var lyraPublisher: XiaomiLyraMDNSPublisher?
     private var discoveredServices: [String: NetService] = [:]
     private var peersByServiceName: [String: XiaomiMiShareDiscoveredPeer] = [:]
     private var isBrowsing = false
@@ -74,13 +74,12 @@ final class XiaomiMiShareDiscovery: NSObject {
 
     private func stop(emitsSnapshot: Bool) {
         browser.stop()
-        publishedService?.stop()
-        publishedService?.delegate = nil
+        lyraPublisher?.stop()
         for service in discoveredServices.values {
             service.delegate = nil
             service.stop()
         }
-        publishedService = nil
+        lyraPublisher = nil
         discoveredServices.removeAll()
         peersByServiceName.removeAll()
         isBrowsing = false
@@ -94,44 +93,22 @@ final class XiaomiMiShareDiscovery: NSObject {
         do {
             let appData = try XiaomiMiShareDiscoveryAppData.buildBase64(
                 deviceIdHex: deviceIdHex,
-                displayName: displayName
+                displayName: displayName,
+                accountIdHex: "61F2"
             )
-            let service = NetService(
-                domain: Self.serviceDomain,
-                type: Self.serviceType,
-                name: deviceIdHex,
-                port: 5353
-            )
-            service.delegate = self
-            let txt = Self.publisherTXTRecord(appData: appData)
-            service.setTXTRecord(NetService.data(fromTXTRecord: txt))
-            publishedService = service
-            service.publish()
+            let publisher = XiaomiLyraMDNSPublisher(deviceIdHex: deviceIdHex, appDataBase64: appData)
+            try publisher.start()
+            lyraPublisher = publisher
+            isPublishing = true
             DiagnosticsLog.info(
-                "xiaomi.mishare.discovery_publish_requested deviceId=\(deviceIdHex) displayName=\(displayName)"
+                "xiaomi.mishare.discovery_published deviceId=\(deviceIdHex) displayName=\(displayName) " +
+                    "mode=dnssd_records host=\(publisher.hostFQDN) appDataChars=\(appData.utf8.count)"
             )
         } catch {
-            lastError = "AppData 組合失敗"
+            isPublishing = false
+            lastError = "Lyra mDNS 廣播失敗"
             DiagnosticsLog.error("xiaomi.mishare.discovery_publish_payload_failed deviceId=\(deviceIdHex)", error)
         }
-    }
-
-    private static func publisherTXTRecord(appData: String) -> [String: Data] {
-        let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
-        let localIPv4 = MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
-        let debugInfo: String
-        if let localIPv4 {
-            debugInfo = "{msg:hello, ifname:en0, v4:\(localIPv4)}"
-        } else {
-            debugInfo = "{msg:hello, ifname:en0}"
-        }
-        return [
-            "AppData": Data(appData.utf8),
-            "MediumType": Data("256".utf8),
-            "CH": Data("56".utf8),
-            "DebugInfo": Data(debugInfo.utf8),
-            "TS": Data(timestamp.utf8)
-        ]
     }
 
     private static func deviceIdHex(identitySeed: String) -> String {
@@ -160,7 +137,7 @@ final class XiaomiMiShareDiscovery: NSObject {
     }
 
     private func handleResolvedService(_ service: NetService) {
-        guard service.name != publishedService?.name else {
+        guard service.name != publishedDeviceIdHex else {
             return
         }
         guard let txtData = service.txtRecordData() else {
@@ -207,7 +184,7 @@ final class XiaomiMiShareDiscovery: NSObject {
             XiaomiMiShareDiscoverySnapshot(
                 isBrowsing: isBrowsing,
                 isPublishing: isPublishing,
-                publishedServiceName: publishedService?.name,
+                publishedServiceName: lyraPublisher?.serviceName,
                 publishedDeviceIdHex: publishedDeviceIdHex,
                 publishedDisplayName: publishedDisplayName,
                 peers: peers,
@@ -236,7 +213,7 @@ extension XiaomiMiShareDiscovery: NetServiceBrowserDelegate {
         didFind service: NetService,
         moreComing: Bool
     ) {
-        guard service.name != publishedService?.name else {
+        guard service.name != publishedDeviceIdHex else {
             return
         }
         discoveredServices[service.name] = service
@@ -258,28 +235,6 @@ extension XiaomiMiShareDiscovery: NetServiceBrowserDelegate {
 }
 
 extension XiaomiMiShareDiscovery: NetServiceDelegate {
-    func netServiceDidPublish(_ sender: NetService) {
-        guard let publishedService, sender === publishedService else {
-            return
-        }
-        isPublishing = true
-        lastError = nil
-        DiagnosticsLog.info(
-            "xiaomi.mishare.discovery_published service=\(sender.name) deviceId=\(publishedDeviceIdHex ?? "unknown")"
-        )
-        emitSnapshot()
-    }
-
-    func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
-        guard let publishedService, sender === publishedService else {
-            return
-        }
-        isPublishing = false
-        lastError = "Bonjour 廣播失敗 \(errorDict)"
-        DiagnosticsLog.warn("xiaomi.mishare.discovery_publish_failed service=\(sender.name) error=\(errorDict)")
-        emitSnapshot()
-    }
-
     func netServiceDidResolveAddress(_ sender: NetService) {
         handleResolvedService(sender)
     }
@@ -290,9 +245,6 @@ extension XiaomiMiShareDiscovery: NetServiceDelegate {
     }
 
     func netServiceDidStop(_ sender: NetService) {
-        if let publishedService, sender === publishedService {
-            isPublishing = false
-        }
         emitSnapshot()
     }
 }

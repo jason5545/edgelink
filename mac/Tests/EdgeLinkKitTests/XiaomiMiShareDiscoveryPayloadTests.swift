@@ -10,6 +10,8 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         )
 
         XCTAssertEqual(payload.deviceIdHex, "8BC54B63")
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypePhone)
+        XCTAssertEqual(payload.accountIdHex, "61F2")
         XCTAssertEqual(payload.displayName, "簡瑞成的POCO F8 Ultra")
     }
 
@@ -21,6 +23,8 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         )
 
         XCTAssertEqual(payload.deviceIdHex, "26D853EB")
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypePhone)
+        XCTAssertEqual(payload.accountIdHex, "581F")
         XCTAssertEqual(payload.displayName, "POCO F8 Ultra")
     }
 
@@ -32,6 +36,8 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         let payload = XiaomiMiShareDiscoveryAppData(data: data)
 
         XCTAssertEqual(payload.deviceIdHex, "A1B2C3D4")
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeMacBook)
+        XCTAssertEqual(payload.accountIdHex, "581F")
         XCTAssertEqual(payload.displayName, "EdgeLink Mac")
         XCTAssertEqual(
             try XiaomiMiShareDiscoveryAppData.buildBase64(
@@ -42,6 +48,20 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         )
     }
 
+    func testBuildsMacDiscoveryAppDataWithObservedAccountHash() throws {
+        let data = try XiaomiMiShareDiscoveryAppData.build(
+            deviceIdHex: "721572C3",
+            displayName: "MacBook Pro",
+            accountIdHex: "61F2"
+        )
+        let payload = XiaomiMiShareDiscoveryAppData(data: data)
+
+        XCTAssertEqual(payload.deviceIdHex, "721572C3")
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeMacBook)
+        XCTAssertEqual(payload.accountIdHex, "61F2")
+        XCTAssertEqual(payload.displayName, "MacBook Pro")
+    }
+
     func testRejectsInvalidPublisherInputs() {
         XCTAssertThrowsError(
             try XiaomiMiShareDiscoveryAppData.build(deviceIdHex: "not-id", displayName: "EdgeLink Mac")
@@ -49,5 +69,29 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         XCTAssertThrowsError(
             try XiaomiMiShareDiscoveryAppData.build(deviceIdHex: "A1B2C3D4", displayName: " ")
         )
+    }
+
+    func testEncodesLyraMDNSSRVRecordWithDeviceIdHostTarget() throws {
+        let srv = try XiaomiLyraMDNSRecordEncoder.srvRecord(
+            port: 5353,
+            targetFQDN: "721572C3.local."
+        )
+        let target = try XiaomiLyraMDNSRecordEncoder.dnsName("721572C3.local.")
+
+        XCTAssertEqual(Array(srv.prefix(6)), [0x00, 0x00, 0x00, 0x00, 0x14, 0xe9])
+        XCTAssertEqual(Data(srv.dropFirst(6)), target)
+    }
+
+    func testEncodesOfficialMacShapedSingleTXTRecord() throws {
+        let appData = try XiaomiMiShareDiscoveryAppData.buildBase64(
+            deviceIdHex: "721572C3",
+            displayName: "MacBook Pro"
+        )
+        let txt = try XiaomiLyraMDNSRecordEncoder.txtRecord(entries: [("AppData", appData)])
+        let entry = "AppData=\(appData)"
+
+        XCTAssertEqual(txt.first, UInt8(entry.utf8.count))
+        XCTAssertEqual(String(data: txt.dropFirst(), encoding: .utf8), entry)
+        XCTAssertEqual(entry.utf8.count, 68)
     }
 }

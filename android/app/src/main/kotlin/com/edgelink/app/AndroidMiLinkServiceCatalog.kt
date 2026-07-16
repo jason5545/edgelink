@@ -69,6 +69,7 @@ object AndroidMiLinkServiceCatalog {
             val recentAppsAvailable = mirrorInstalled && castServiceOk && mirrorRemoteAvailable
             val synergyAvailable = mirrorInstalled && mirrorSynergyService && synergyBind.success && mirrorRemoteAvailable
             val distAudioAvailable = audioInstalled && distAudioService && distAudioBind.success
+            val officialXiaomiPreferred = false
 
             val services = listOf(
                 MiLinkServiceCapabilityBody(
@@ -101,8 +102,8 @@ object AndroidMiLinkServiceCatalog {
                     category = "screen",
                     route = "xiaomi.mirror",
                     available = mirrorScreenAvailable,
-                    preferred = mirrorScreenAvailable && !synergyAvailable,
-                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount remoteArm=realDevice"
+                    preferred = officialXiaomiPreferred,
+                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount remoteArm=realDevice diagnosticOnly=true"
                 ),
                 MiLinkServiceCapabilityBody(
                     id = "xiaomi.mirror.synergy",
@@ -112,9 +113,9 @@ object AndroidMiLinkServiceCatalog {
                     category = "screen",
                     route = "xiaomi.mirror",
                     available = synergyAvailable,
-                    preferred = synergyAvailable,
+                    preferred = officialXiaomiPreferred,
                     bindAction = mirrorSynergyAction,
-                    evidence = "package=${mirrorInstalled.step()} service=${mirrorSynergyService.step()} bind=${synergyBind.message} remoteDevices=$mirrorRemoteDeviceCount"
+                    evidence = "package=${mirrorInstalled.step()} service=${mirrorSynergyService.step()} bind=${synergyBind.message} remoteDevices=$mirrorRemoteDeviceCount diagnosticOnly=true"
                 ),
                 MiLinkServiceCapabilityBody(
                     id = "xiaomi.mirror.RecentApps",
@@ -124,8 +125,8 @@ object AndroidMiLinkServiceCatalog {
                     category = "recentApps",
                     route = "xiaomi.mirror",
                     available = recentAppsAvailable,
-                    preferred = recentAppsAvailable,
-                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount serverChannel=mirror-owned"
+                    preferred = officialXiaomiPreferred,
+                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount serverChannel=mirror-owned diagnosticOnly=true"
                 ),
                 MiLinkServiceCapabilityBody(
                     id = "xiaomi.audiomonitor.DistAudioService",
@@ -135,9 +136,9 @@ object AndroidMiLinkServiceCatalog {
                     category = "audio",
                     route = "xiaomi.distAudio",
                     available = distAudioAvailable,
-                    preferred = distAudioAvailable,
+                    preferred = officialXiaomiPreferred,
                     bindAction = distAudioAction,
-                    evidence = "package=${audioInstalled.step()} service=${distAudioService.step()} bind=${distAudioBind.message}"
+                    evidence = "package=${audioInstalled.step()} service=${distAudioService.step()} bind=${distAudioBind.message} diagnosticOnly=true"
                 )
             )
 
