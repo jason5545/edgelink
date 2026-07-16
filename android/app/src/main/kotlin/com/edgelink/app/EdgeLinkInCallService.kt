@@ -41,6 +41,9 @@ class EdgeLinkInCallService : InCallService() {
 
         fun diagnosticState(): String =
             EdgeLinkInCallCallStore.diagnosticState()
+
+        fun hasOngoingCall(): Boolean =
+            EdgeLinkInCallCallStore.hasOngoingCall()
     }
 }
 
@@ -133,6 +136,20 @@ private object EdgeLinkInCallCallStore {
     }
 
     fun diagnosticState(): String = "states=${callStatesSummary()}"
+
+    fun hasOngoingCall(): Boolean {
+        val snapshot = synchronized(lock) { calls.keys.toList() }
+        return snapshot.any { call ->
+            when (call.state) {
+                Call.STATE_ACTIVE,
+                Call.STATE_DIALING,
+                Call.STATE_CONNECTING,
+                Call.STATE_RINGING,
+                Call.STATE_HOLDING -> true
+                else -> false
+            }
+        }
+    }
 
     private fun activeCall(): Call? {
         val snapshot = synchronized(lock) { calls.keys.toList() }

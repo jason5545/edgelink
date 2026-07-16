@@ -33,6 +33,8 @@ import com.edgelink.core.PairingTypes
 import com.edgelink.core.PairingWire
 import com.edgelink.core.PhoneActionBody
 import com.edgelink.core.PhoneActionResultBody
+import com.edgelink.core.PhoneRelayEndpointBody
+import com.edgelink.core.PhoneRelayStartRequestBody
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
@@ -72,6 +74,7 @@ import rikka.shizuku.Shizuku
 import kotlin.coroutines.coroutineContext
 import java.time.Instant
 import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val HANDSHAKE_TIMEOUT_MS = 4_000L
@@ -82,6 +85,8 @@ private const val PONG_TIMEOUT_MS = 15_000L
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
 private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
+private const val CALL_RELAY_SELECTION_LATCH_TTL_MS = 30_000L
+private const val CALL_RELAY_SELECTION_REQUEST_TIMEOUT_MS = 10_000L
 
 private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
     (endedAtNanos - startedAtNanos) / 1_000_000L
@@ -199,6 +204,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onPhoneActionResult = { body, result ->
             handlePhoneActionRelayBridgeResult(body, result)
             sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
+        },
+        onPhoneRelayEndpoint = { body ->
+            handlePhoneRelayEndpoint(body)
         }
     )
 
@@ -214,6 +222,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var shizukuAutoRepairJob: Job? = null
     private var turnCredentialJob: Job? = null
     private var pendingCallRelayBridgeJob: Job? = null
+    private var pendingPhoneRelaySelectionRequestId: String? = null
+    private var pendingPhoneRelaySelectionTimeoutJob: Job? = null
     private var pendingPairing: PendingPairing? = null
     private var pendingShizukuAction: PendingShizukuAction? = null
     @Volatile
@@ -294,7 +304,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         screenSession.shutdown()
         turnCredentialJob?.cancel()
         pendingCallRelayBridgeJob?.cancel()
+        pendingPhoneRelaySelectionTimeoutJob?.cancel()
         pendingCallRelayBridgeJob = null
+        pendingPhoneRelaySelectionRequestId = null
+        pendingPhoneRelaySelectionTimeoutJob = null
         latestTurnCredentials = null
         session?.close()
         scope.cancel()
@@ -352,6 +365,159 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkLog.info("phone.android.remote_hangup_detected reason=$reason requestId=${result.requestId}")
         sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
     }
+
+    fun onPhoneRelaySelectedFromInCallUi(reason: String) {
+        val callState = EdgeLinkInCallService.diagnosticState()
+        if (!EdgeLinkInCallService.hasOngoingCall()) {
+            EdgeLinkLog.warn("phone.android.relay_selection_ignored reason=$reason no_ongoing_call $callState")
+            return
+        }
+        if (session == null || !stateFlow.value.isConnected) {
+            EdgeLinkLog.warn("phone.android.relay_selection_ignored reason=$reason not_connected $callState")
+            return
+        }
+        val pendingRequestId = pendingPhoneRelaySelectionRequestId
+        if (pendingRequestId != null) {
+            EdgeLinkLog.info(
+                "phone.android.relay_selection_ignored reason=$reason pendingRequestId=$pendingRequestId $callState"
+            )
+            return
+        }
+
+        val requestId = UUID.randomUUID().toString()
+        pendingPhoneRelaySelectionRequestId = requestId
+        pendingPhoneRelaySelectionTimeoutJob?.cancel()
+        pendingPhoneRelaySelectionTimeoutJob = scope.launch {
+            delay(CALL_RELAY_SELECTION_REQUEST_TIMEOUT_MS)
+            if (pendingPhoneRelaySelectionRequestId == requestId) {
+                pendingPhoneRelaySelectionRequestId = null
+                EdgeLinkLog.warn("phone.android.relay_selection_timeout requestId=$requestId reason=$reason")
+            }
+        }
+
+        val body = PhoneRelayStartRequestBody(
+            requestId = requestId,
+            reason = reason,
+            ts = Instant.now().epochSecond
+        )
+        EdgeLinkLog.info("phone.android.relay_selection_requested requestId=$requestId reason=$reason $callState")
+        sendEnvelope(EnvelopeTypes.PHONE_RELAY_START, body)
+    }
+
+    private suspend fun handlePhoneRelayEndpoint(body: PhoneRelayEndpointBody) {
+        val pendingRequestId = pendingPhoneRelaySelectionRequestId
+        if (pendingRequestId != body.requestId) {
+            EdgeLinkLog.warn(
+                "phone.android.relay_endpoint_ignored requestId=${body.requestId} pendingRequestId=${pendingRequestId ?: "none"}"
+            )
+            return
+        }
+        pendingPhoneRelaySelectionRequestId = null
+        pendingPhoneRelaySelectionTimeoutJob?.cancel()
+        pendingPhoneRelaySelectionTimeoutJob = null
+
+        if (!body.success) {
+            EdgeLinkLog.warn(
+                "phone.android.relay_endpoint_failed requestId=${body.requestId} error=${body.error ?: "unknown"}"
+            )
+            return
+        }
+        val relayPort = body.relayPort?.takeIf { it in 1..65_535 }
+        if (relayPort == null) {
+            notifyPhoneRelaySelectionFailed(body.requestId, "invalid_relay_port")
+            return
+        }
+        val identity = localIdentity
+        if (identity == null) {
+            notifyPhoneRelaySelectionFailed(body.requestId, "no_identity")
+            return
+        }
+        if (!EdgeLinkInCallService.hasOngoingCall()) {
+            notifyPhoneRelaySelectionFailed(body.requestId, "call_ended_before_relay")
+            return
+        }
+
+        val configureResult = runCatching {
+            AndroidShizukuSupport.configurePhoneCallRelayHooks(
+                appContext,
+                relayHost = body.relayHost,
+                relayPort = relayPort
+            )
+        }.getOrElse { error ->
+            EdgeLinkLog.warn("phone.android.relay_selection_configure_failed requestId=${body.requestId}", error)
+            notifyPhoneRelaySelectionFailed(body.requestId, relaySelectionErrorMessage(error))
+            return
+        }
+        if (!configureResult.success) {
+            notifyPhoneRelaySelectionFailed(body.requestId, configureResult.message)
+            return
+        }
+
+        val latchResult = runCatching {
+            AndroidShizukuSupport.armPhoneCallRelay(appContext, CALL_RELAY_SELECTION_LATCH_TTL_MS)
+        }.getOrElse { error ->
+            EdgeLinkLog.warn("phone.android.relay_selection_latch_failed requestId=${body.requestId}", error)
+            notifyPhoneRelaySelectionFailed(body.requestId, relaySelectionErrorMessage(error))
+            return
+        }
+        if (!latchResult.success) {
+            notifyPhoneRelaySelectionFailed(body.requestId, latchResult.message)
+            return
+        }
+
+        phoneRelayCallSessionActive = true
+        pendingCallRelayBridgeJob?.cancel()
+        pendingCallRelayBridgeJob = null
+        val relayBody = PhoneActionBody(
+            requestId = body.requestId,
+            action = "answer",
+            relayHost = body.relayHost,
+            relayPort = relayPort,
+            relaySessionId = body.relaySessionId,
+            relayControlPort = body.relayControlPort
+        )
+        AndroidCallRelayBridge.start(identity, relayBody, reason = "incallui_relay_selected")
+        pokePhoneContinuityRelaySelection(body.requestId)
+        EdgeLinkLog.info(
+            "phone.android.relay_selection_active requestId=${body.requestId} " +
+                "relay=${body.relayHost ?: "none"}:$relayPort sessionId=${body.relaySessionId ?: "none"}"
+        )
+    }
+
+    private fun notifyPhoneRelaySelectionFailed(requestId: String, error: String) {
+        phoneRelayCallSessionActive = false
+        pendingCallRelayBridgeJob?.cancel()
+        pendingCallRelayBridgeJob = null
+        AndroidCallRelayBridge.stop("incallui_relay_selection_failed")
+        EdgeLinkLog.warn("phone.android.relay_selection_failed requestId=$requestId error=$error")
+        sendEnvelope(
+            EnvelopeTypes.PHONE_ACTION_RESULT,
+            PhoneActionResultBody(
+                requestId = requestId,
+                action = "answer",
+                success = false,
+                error = error,
+                ts = Instant.now().epochSecond
+            )
+        )
+    }
+
+    private suspend fun pokePhoneContinuityRelaySelection(requestId: String) {
+        runCatching {
+            AndroidMiLinkPhoneContinuityBridge.probe(appContext)
+        }.onSuccess { result ->
+            EdgeLinkLog.info(
+                "phone.android.relay_selection_continuity_poked requestId=$requestId " +
+                    "success=${result.success} remoteDevices=${result.remoteDeviceCount} " +
+                    "mediaRelayCandidates=${result.mediaRelayCandidateCount}"
+            )
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.relay_selection_continuity_poke_failed requestId=$requestId", error)
+        }
+    }
+
+    private fun relaySelectionErrorMessage(error: Throwable): String =
+        "${error.javaClass.simpleName}:${error.message.orEmpty()}"
 
     private fun scheduleCallRelayBridgeStart(body: PhoneActionBody) {
         val identity = localIdentity
@@ -1614,7 +1780,8 @@ private class AndroidCommandDispatcher(
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
-    private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit
+    private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit,
+    private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -1648,6 +1815,11 @@ private class AndroidCommandDispatcher(
                 onPhoneActionReceived(envelope.b)
                 val result = phoneCallController.handle(envelope.b)
                 onPhoneActionResult(envelope.b, result)
+                null
+            }
+            EnvelopeTypes.PHONE_RELAY_ENDPOINT -> {
+                val envelope = EnvelopeCodec.decode<PhoneRelayEndpointBody>(plaintext)
+                onPhoneRelayEndpoint(envelope.b)
                 null
             }
             EnvelopeTypes.SCREEN_START -> {

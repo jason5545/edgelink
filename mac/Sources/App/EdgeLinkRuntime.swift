@@ -737,6 +737,63 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    private func handlePhoneRelayStartRequest(_ request: PhoneRelayStartRequestBody) {
+        guard let session = currentSession, isConnected else {
+            DiagnosticsLog.warn("phone.mac.relay_start_ignored requestId=\(request.requestId) reason=\(request.reason) not_connected")
+            return
+        }
+
+        phoneCallStatus = "手機通話接到 Mac 中"
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            let credential = await self.ensureTurnCredentials(reason: "phone_relay_start")
+            if credential != nil {
+                DiagnosticsLog.info("phone.mac.turn_credentials_ready action=phone_relay_start")
+            } else {
+                DiagnosticsLog.warn("phone.mac.turn_credentials_missing action=phone_relay_start")
+            }
+            let endpoint = await self.preparePhoneRelayEndpoint(action: "phone_relay_start")
+            let success = endpoint.host != nil
+            let body = PhoneRelayEndpointBody(
+                requestId: request.requestId,
+                relayHost: endpoint.host,
+                relayPort: endpoint.port,
+                relaySessionId: endpoint.sessionId,
+                relayControlPort: endpoint.controlPort,
+                success: success,
+                error: success ? nil : "relay_endpoint_unavailable",
+                ts: Int64(Date().timeIntervalSince1970)
+            )
+            if success {
+                self.isPhoneCallActive = true
+                self.phoneCallStatus = "手機通話已接到 Mac"
+            } else {
+                self.stopPhoneCallRelayAudio(reason: "phone_relay_endpoint_unavailable")
+                self.phoneCallStatus = "接手機通話失敗"
+            }
+            await self.sendPhoneRelayEndpoint(body, session: session)
+        }
+    }
+
+    private func sendPhoneRelayEndpoint(_ body: PhoneRelayEndpointBody, session: SecureSessionHost) async {
+        do {
+            let data = try encoder.encode(Envelope(t: EnvelopeType.phoneRelayEndpoint, b: body))
+            try await session.sendPlaintext(data)
+            DiagnosticsLog.info(
+                "phone.mac.relay_endpoint_sent requestId=\(body.requestId) success=\(body.success) " +
+                    "relay=\(body.relayHost ?? "none"):\(body.relayPort.map(String.init) ?? "none") " +
+                    "sessionId=\(body.relaySessionId ?? "none")"
+            )
+        } catch {
+            stopPhoneCallRelayAudio(reason: "phone_relay_endpoint_send_failed")
+            isPhoneCallActive = false
+            phoneCallStatus = "接手機通話失敗"
+            DiagnosticsLog.error("phone.mac.relay_endpoint_send_failed requestId=\(body.requestId)", error)
+        }
+    }
+
     private func run() async {
         do {
             connectionStatus = "Registering"
@@ -985,6 +1042,11 @@ final class EdgeLinkRuntime: ObservableObject {
                     onPhoneActionResult: { [weak self] result in
                         Task { @MainActor in
                             self?.handlePhoneActionResult(result)
+                        }
+                    },
+                    onPhoneRelayStartRequest: { [weak self] request in
+                        Task { @MainActor in
+                            self?.handlePhoneRelayStartRequest(request)
                         }
                     },
                     onAndroidMicStatus: { [weak self] status in

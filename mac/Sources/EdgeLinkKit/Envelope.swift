@@ -39,6 +39,8 @@ public enum EnvelopeType {
     public static let smsSendResult = "sms.send.result"
     public static let phoneAction = "phone.action"
     public static let phoneActionResult = "phone.action.result"
+    public static let phoneRelayStart = "phone.relay.start"
+    public static let phoneRelayEndpoint = "phone.relay.endpoint"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
     public static let androidMicStatus = "android.mic.status"
@@ -318,6 +320,49 @@ public struct PhoneActionResultBody: Codable, Equatable, Sendable {
     public init(requestId: String, action: String, success: Bool, error: String? = nil, ts: Int64) {
         self.requestId = requestId
         self.action = action
+        self.success = success
+        self.error = error
+        self.ts = ts
+    }
+}
+
+public struct PhoneRelayStartRequestBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let reason: String
+    public let ts: Int64
+
+    public init(requestId: String, reason: String, ts: Int64) {
+        self.requestId = requestId
+        self.reason = reason
+        self.ts = ts
+    }
+}
+
+public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let relayHost: String?
+    public let relayPort: Int?
+    public let relaySessionId: String?
+    public let relayControlPort: Int?
+    public let success: Bool
+    public let error: String?
+    public let ts: Int64
+
+    public init(
+        requestId: String,
+        relayHost: String? = nil,
+        relayPort: Int? = nil,
+        relaySessionId: String? = nil,
+        relayControlPort: Int? = nil,
+        success: Bool = true,
+        error: String? = nil,
+        ts: Int64
+    ) {
+        self.requestId = requestId
+        self.relayHost = relayHost
+        self.relayPort = relayPort
+        self.relaySessionId = relaySessionId
+        self.relayControlPort = relayControlPort
         self.success = success
         self.error = error
         self.ts = ts

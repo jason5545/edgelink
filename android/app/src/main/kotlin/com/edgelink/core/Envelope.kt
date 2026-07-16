@@ -38,6 +38,8 @@ object EnvelopeTypes {
     const val SMS_SEND_RESULT = "sms.send.result"
     const val PHONE_ACTION = "phone.action"
     const val PHONE_ACTION_RESULT = "phone.action.result"
+    const val PHONE_RELAY_START = "phone.relay.start"
+    const val PHONE_RELAY_ENDPOINT = "phone.relay.endpoint"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
     const val ANDROID_MIC_STATUS = "android.mic.status"
@@ -200,6 +202,25 @@ data class PhoneActionResultBody(
     val requestId: String,
     val action: String,
     val success: Boolean,
+    val error: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class PhoneRelayStartRequestBody(
+    val requestId: String,
+    val reason: String,
+    val ts: Long
+)
+
+@Serializable
+data class PhoneRelayEndpointBody(
+    val requestId: String,
+    val relayHost: String? = null,
+    val relayPort: Int? = null,
+    val relaySessionId: String? = null,
+    val relayControlPort: Int? = null,
+    val success: Boolean = true,
     val error: String? = null,
     val ts: Long
 )

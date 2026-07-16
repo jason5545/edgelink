@@ -124,6 +124,32 @@ class EnvelopeTest {
         val phoneResult = EnvelopeCodec.decode<PhoneActionResultBody>(phoneResultBytes)
         assertEquals(EnvelopeTypes.PHONE_ACTION_RESULT, phoneResult.t)
         assertEquals(true, phoneResult.b.success)
+
+        val relayStartBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_RELAY_START,
+            PhoneRelayStartRequestBody(requestId = "relay-1", reason = "incallui_relayAnswer", ts = 1783510256)
+        )
+        val relayStart = EnvelopeCodec.decode<PhoneRelayStartRequestBody>(relayStartBytes)
+        assertEquals(EnvelopeTypes.PHONE_RELAY_START, relayStart.t)
+        assertEquals("incallui_relayAnswer", relayStart.b.reason)
+
+        val relayEndpointBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_RELAY_ENDPOINT,
+            PhoneRelayEndpointBody(
+                requestId = "relay-1",
+                relayHost = "172.238.24.219",
+                relayPort = 17104,
+                relaySessionId = "gateway-session-1",
+                relayControlPort = 17104,
+                success = true,
+                ts = 1783510257
+            )
+        )
+        val relayEndpoint = EnvelopeCodec.decode<PhoneRelayEndpointBody>(relayEndpointBytes)
+        assertEquals(EnvelopeTypes.PHONE_RELAY_ENDPOINT, relayEndpoint.t)
+        assertEquals("172.238.24.219", relayEndpoint.b.relayHost)
+        assertEquals(17104, relayEndpoint.b.relayPort)
+        assertEquals("gateway-session-1", relayEndpoint.b.relaySessionId)
     }
 
     @Test

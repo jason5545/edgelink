@@ -2,6 +2,7 @@ package com.edgelink.app
 
 import android.content.Context
 import android.content.ContentProvider
+import android.content.Intent
 import android.os.Binder
 import android.os.Bundle
 import android.os.Handler
@@ -31,6 +32,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val TELECOM_PACKAGE = "com.android.server.telecom"
+    const val PHONE_RELAY_SELECTED_ACTION = "com.edgelink.app.PHONE_RELAY_SELECTED"
+    const val PHONE_RELAY_SELECTED_REASON_EXTRA = "reason"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
@@ -218,6 +221,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorAudioSourceStartUptimeMs: Long = 0L
     private var lastFakeMirrorAudioSinkStartUptimeMs: Long = 0L
     private var lastInCallUiRelayAnswerUptimeMs: Long = 0L
+    private var lastInCallUiRelaySelectionUptimeMs: Long = 0L
     private var lastTelecomRelayForceLogUptimeMs: Long = 0L
     private var fakeMirrorAudioStartProbeDepth: Int = 0
     private var telecomRelayFeaturesInstalled: Boolean = false
@@ -360,7 +364,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookInCallUiCallRelayExtras(classLoader)
         hookInCallUiRelayHelpers(classLoader)
         hookInCallUiRelayDeviceList(classLoader)
-        hookInCallUiRelayForeground(classLoader)
+        hookInCallUiRelaySelection(classLoader)
     }
 
     private fun hookInCallUiCallRelayExtras(classLoader: ClassLoader) {
@@ -510,7 +514,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 "getDeviceIdLists",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!shouldForceInCallUiRelay()) {
+                        if (!shouldOfferInCallUiRelay()) {
                             return
                         }
                         val updated = fakeRelayDeviceIdList(param.result as? List<*>)
@@ -521,6 +525,28 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook InCallUI relay device list: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookInCallUiRelaySelection(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_RELAY_PRESENTER,
+                classLoader,
+                "relayAnswer",
+                java.lang.Boolean.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val relaySelected = param.args.getOrNull(0) as? Boolean ?: return
+                        if (!relaySelected || !shouldOfferInCallUiRelay() || shouldForceInCallUiRelay()) {
+                            return
+                        }
+                        notifyEdgeLinkRelaySelected("incallui_relayAnswer", param.thisObject)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook InCallUI relay selection: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -613,7 +639,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 methodName,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!shouldForceAndroidPhoneRelay()) {
+                        if (!shouldOfferAndroidPhoneRelay()) {
                             return
                         }
                         val updated = fakeRelayDeviceIdList(param.result as? List<*>)
@@ -1869,8 +1895,18 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             currentFakeMirrorRemoteUsingPadEnabled() &&
             currentFakeMirrorRemoteCallRelayActive()
 
+    private fun shouldOfferMirrorCallRelay(): Boolean =
+        currentFakeMirrorRemoteMode() == "pad" &&
+            currentFakeMirrorRemoteUsingPadEnabled()
+
+    private fun shouldOfferInCallUiRelay(): Boolean =
+        shouldOfferMirrorCallRelay()
+
     private fun shouldForceInCallUiRelay(): Boolean =
         shouldForceMirrorCallRelay()
+
+    private fun shouldOfferAndroidPhoneRelay(): Boolean =
+        shouldOfferMirrorCallRelay()
 
     private fun shouldForceAndroidPhoneRelay(): Boolean =
         shouldForceMirrorCallRelay()
@@ -1908,6 +1944,54 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         bundle.putString(INCALLUI_EXTRA_RELAY_DEVICE_ID, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
         bundle.putString(INCALLUI_EXTRA_RELAY_DEVICE_NAME, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
         return bundle
+    }
+
+    private fun notifyEdgeLinkRelaySelected(source: String, owner: Any?) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastInCallUiRelaySelectionUptimeMs < INCALLUI_RELAY_SELECTION_THROTTLE_MS) {
+            return
+        }
+        lastInCallUiRelaySelectionUptimeMs = now
+        val context = currentApplicationContext() ?: contextFromObject(owner)
+        if (context == null) {
+            log("InCallUI relay selection ignored source=$source no_context")
+            return
+        }
+        runCatching {
+            val intent = Intent(MiLinkPrivilegeHookPolicy.PHONE_RELAY_SELECTED_ACTION)
+                .setPackage(MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE)
+                .setClassName(
+                    MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE,
+                    "${MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE}.EdgeLinkPhoneRelaySelectionReceiver"
+                )
+                .putExtra(MiLinkPrivilegeHookPolicy.PHONE_RELAY_SELECTED_REASON_EXTRA, source)
+                .putExtra("ts", System.currentTimeMillis())
+            context.sendBroadcast(intent)
+            log("InCallUI relay selection broadcast source=$source")
+        }.onFailure { error ->
+            log("failed to broadcast InCallUI relay selection source=$source: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun currentApplicationContext(): Context? =
+        runCatching {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? Context
+        }.getOrNull()?.applicationContext
+
+    private fun contextFromObject(owner: Any?): Context? {
+        if (owner is Context) {
+            return owner.applicationContext
+        }
+        return listOf("mContext", "context")
+            .firstNotNullOfOrNull { fieldName ->
+                runCatching {
+                    val field = owner?.javaClass?.getDeclaredField(fieldName) ?: return@runCatching null
+                    field.isAccessible = true
+                    (field.get(owner) as? Context)?.applicationContext
+                }.getOrNull()
+            }
     }
 
     private fun forceInCallUiRelayAnswer(inCallPresenter: Any?, source: String) {
@@ -1984,6 +2068,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
         private const val FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS = 120_000L
         private const val INCALLUI_RELAY_ANSWER_THROTTLE_MS = 750L
+        private const val INCALLUI_RELAY_SELECTION_THROTTLE_MS = 1_000L
         private const val TELECOM_RELAY_FORCE_LOG_THROTTLE_MS = 2_000L
         private const val MIRROR_AUDIO_START_OPTION_WINDOW_MS = 2_000L
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"

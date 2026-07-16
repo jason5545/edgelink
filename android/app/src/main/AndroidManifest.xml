@@ -102,6 +102,13 @@
         <action android:name="android.provider.Telephony.SMS_RECEIVED" />
       </intent-filter>
     </receiver>
+    <receiver
+      android:name=".EdgeLinkPhoneRelaySelectionReceiver"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="com.edgelink.app.PHONE_RELAY_SELECTED" />
+      </intent-filter>
+    </receiver>
     <provider
       android:name="rikka.shizuku.ShizukuProvider"
       android:authorities="${applicationId}.shizuku"

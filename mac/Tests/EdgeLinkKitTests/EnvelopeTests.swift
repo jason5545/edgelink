@@ -127,6 +127,40 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(phoneResult.t, "phone.action.result")
         XCTAssertTrue(phoneResult.b.success)
 
+        let relayStartData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneRelayStart,
+                b: PhoneRelayStartRequestBody(
+                    requestId: "relay-1",
+                    reason: "incallui_relayAnswer",
+                    ts: 1_783_510_256
+                )
+            )
+        )
+        let relayStart = try decoder.decode(Envelope<PhoneRelayStartRequestBody>.self, from: relayStartData)
+        XCTAssertEqual(relayStart.t, "phone.relay.start")
+        XCTAssertEqual(relayStart.b.reason, "incallui_relayAnswer")
+
+        let relayEndpointData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneRelayEndpoint,
+                b: PhoneRelayEndpointBody(
+                    requestId: "relay-1",
+                    relayHost: "172.238.24.219",
+                    relayPort: 17104,
+                    relaySessionId: "gateway-session-1",
+                    relayControlPort: 17104,
+                    success: true,
+                    ts: 1_783_510_257
+                )
+            )
+        )
+        let relayEndpoint = try decoder.decode(Envelope<PhoneRelayEndpointBody>.self, from: relayEndpointData)
+        XCTAssertEqual(relayEndpoint.t, "phone.relay.endpoint")
+        XCTAssertEqual(relayEndpoint.b.relayHost, "172.238.24.219")
+        XCTAssertEqual(relayEndpoint.b.relayPort, 17104)
+        XCTAssertEqual(relayEndpoint.b.relaySessionId, "gateway-session-1")
+
         let micStatusData = try encoder.encode(
             Envelope(
                 t: EnvelopeType.androidMicStatus,
