@@ -1302,7 +1302,7 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
-        pendingPhoneActions.removeValue(forKey: result.requestId)
+        let pendingAction = pendingPhoneActions.removeValue(forKey: result.requestId)
         if result.requestId == phoneRelayDebugDialRequestID && !result.success {
             phoneRelayDebugDialError = result.error ?? "unknown"
         }
@@ -1312,13 +1312,21 @@ final class EdgeLinkRuntime: ObservableObject {
                 isPhoneCallActive = true
             }
             if result.action == "hangup" {
+                let isRemoteHangup = pendingAction == nil
+                stopPhoneCallRelayAudio(reason: isRemoteHangup ? "remote_phone_hangup" : "phone_action_result_hangup")
                 isPhoneCallActive = false
+                phoneCallStatus = isRemoteHangup ? "通話已結束" : "\(action)已送出"
+                DiagnosticsLog.info(
+                    "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) " +
+                        "success=true remoteHangup=\(isRemoteHangup)"
+                )
+                return
             }
             phoneCallStatus = "\(action)已送出"
             DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
         } else {
             if result.action == "dial" || result.action == "answer" {
-                stopPhoneRelayProbe(reason: "phone_action_failed_\(result.action)")
+                stopPhoneCallRelayAudio(reason: "phone_action_failed_\(result.action)")
                 isPhoneCallActive = false
             }
             phoneCallStatus = "\(action)失敗：\(result.error ?? "未知錯誤")"
@@ -1326,6 +1334,12 @@ final class EdgeLinkRuntime: ObservableObject {
                 "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=false error=\(result.error ?? "unknown")"
             )
         }
+    }
+
+    private func stopPhoneCallRelayAudio(reason: String) {
+        stopPhoneRelayProbe(reason: reason)
+        phoneRelayProbe.stopExternalSourceRTP(reason: reason)
+        callRelayGatewayClient.close(reason: reason)
     }
 
     private func handleAndroidMicStatus(_ status: AndroidMicStatusBody) {

@@ -190,6 +190,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 refreshTurnCredentials("phone_action_${body.action}")
             }
             if (body.action == "hangup") {
+                phoneRelayCallSessionActive = false
                 pendingCallRelayBridgeJob?.cancel()
                 pendingCallRelayBridgeJob = null
                 AndroidCallRelayBridge.stop("phone_action_hangup")
@@ -219,6 +220,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var latestMiLinkStatus: MiLinkStatusBody? = null
     @Volatile
     private var latestTurnCredentials: TurnCredentialsResponse? = null
+    @Volatile
+    private var phoneRelayCallSessionActive = false
     private var miLinkRootProbeAttempted = false
     @Volatile
     private var manuallyDisconnected = false
@@ -262,6 +265,11 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
         Shizuku.addRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(::handleScreenControlDataChannel)
+        EdgeLinkInCallService.setCallsIdleListener { reason ->
+            scope.launch {
+                handleInCallServiceCallsIdle(reason)
+            }
+        }
         micActivityMonitor.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -281,6 +289,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(null)
+        EdgeLinkInCallService.setCallsIdleListener(null)
         micActivityMonitor.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
@@ -295,19 +304,53 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         when (body.action) {
             "dial", "answer" -> {
                 if (result.success) {
+                    phoneRelayCallSessionActive = true
                     scheduleCallRelayBridgeStart(body)
                 } else {
+                    phoneRelayCallSessionActive = false
                     pendingCallRelayBridgeJob?.cancel()
                     pendingCallRelayBridgeJob = null
                     AndroidCallRelayBridge.stop("phone_action_failed_${body.action}")
                 }
             }
             "hangup" -> {
+                phoneRelayCallSessionActive = false
                 pendingCallRelayBridgeJob?.cancel()
                 pendingCallRelayBridgeJob = null
                 AndroidCallRelayBridge.stop("phone_action_hangup_result")
             }
         }
+    }
+
+    private fun handleInCallServiceCallsIdle(reason: String) {
+        if (!phoneRelayCallSessionActive) {
+            EdgeLinkLog.info("phone.android.remote_hangup_ignored reason=$reason inactive_relay_call")
+            return
+        }
+        phoneRelayCallSessionActive = false
+        pendingCallRelayBridgeJob?.cancel()
+        pendingCallRelayBridgeJob = null
+        AndroidCallRelayBridge.stop("incall_service_idle_$reason")
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                AndroidShizukuSupport.clearPhoneCallRelay(appContext)
+            }.onSuccess { result ->
+                EdgeLinkLog.info(
+                    "phone.android.relay_latch_clear_after_remote_end " +
+                        "success=${result.success} message=${result.message}"
+                )
+            }.onFailure { error ->
+                EdgeLinkLog.warn("phone.android.relay_latch_clear_after_remote_end_failed", error)
+            }
+        }
+        val result = PhoneActionResultBody(
+            requestId = "remote-ended-${SystemClock.elapsedRealtime()}",
+            action = "hangup",
+            success = true,
+            ts = Instant.now().epochSecond
+        )
+        EdgeLinkLog.info("phone.android.remote_hangup_detected reason=$reason requestId=${result.requestId}")
+        sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
     }
 
     private fun scheduleCallRelayBridgeStart(body: PhoneActionBody) {

@@ -25,6 +25,17 @@ class EdgeLinkInCallService : InCallService() {
     }
 
     companion object {
+        @Volatile
+        private var callsIdleListener: ((String) -> Unit)? = null
+
+        fun setCallsIdleListener(listener: ((String) -> Unit)?) {
+            callsIdleListener = listener
+        }
+
+        internal fun notifyCallsIdle(reason: String) {
+            callsIdleListener?.invoke(reason)
+        }
+
         fun sendDtmfSequence(sequence: String): ShizukuOperationResult =
             EdgeLinkInCallCallStore.sendDtmfSequence(sequence)
 
@@ -58,11 +69,14 @@ private object EdgeLinkInCallCallStore {
     }
 
     fun remove(call: Call, reason: String) {
-        val callback = synchronized(lock) {
-            calls.remove(call)
+        val (callback, emptyAfterRemove) = synchronized(lock) {
+            calls.remove(call) to calls.isEmpty()
         }
         callback?.let { runCatching { call.unregisterCallback(it) } }
         EdgeLinkLog.info("phone.android.incall_service call_removed reason=$reason calls=${callStatesSummary()}")
+        if (callback != null && emptyAfterRemove) {
+            EdgeLinkInCallService.notifyCallsIdle(reason)
+        }
     }
 
     fun clear() {
