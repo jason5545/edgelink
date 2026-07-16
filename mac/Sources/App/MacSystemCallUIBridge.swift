@@ -61,6 +61,46 @@ final class MacSystemCallUIBridge {
         }
     }
 
+    static func startInstalledHelper(reason: String) {
+        _ = launchHelperIfNeeded(reason: reason)
+    }
+
+    static func stopInstalledHelper(reason: String) {
+        let runningHelpers = NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == Self.helperBundleIdentifier
+        }
+        guard !runningHelpers.isEmpty else {
+            DiagnosticsLog.info("phone.mac.system_callui_helper_stop_ignored reason=\(reason) not_running")
+            return
+        }
+        DistributedNotificationCenter.default().postNotificationName(
+            Self.endAllName,
+            object: Self.commandObject,
+            userInfo: ["reason": EndReason.remoteEnded.rawValue],
+            deliverImmediately: true
+        )
+        for helper in runningHelpers {
+            if helper.terminate() {
+                DiagnosticsLog.info("phone.mac.system_callui_helper_terminate reason=\(reason) pid=\(helper.processIdentifier)")
+            } else if helper.forceTerminate() {
+                DiagnosticsLog.warn("phone.mac.system_callui_helper_force_terminate reason=\(reason) pid=\(helper.processIdentifier)")
+            } else {
+                DiagnosticsLog.warn("phone.mac.system_callui_helper_terminate_failed reason=\(reason) pid=\(helper.processIdentifier)")
+            }
+        }
+        let deadline = Date().addingTimeInterval(Self.helperTerminationGraceSeconds)
+        while Date() < deadline && runningHelpers.contains(where: { !$0.isTerminated }) {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        for helper in runningHelpers where !helper.isTerminated {
+            if helper.forceTerminate() {
+                DiagnosticsLog.warn("phone.mac.system_callui_helper_force_terminate_after_grace reason=\(reason) pid=\(helper.processIdentifier)")
+            } else {
+                DiagnosticsLog.warn("phone.mac.system_callui_helper_force_terminate_failed reason=\(reason) pid=\(helper.processIdentifier)")
+            }
+        }
+    }
+
     func reportIncomingCall(_ status: PhoneCallStatusBody) {
         let payload = callPayload(status)
         postHelperCommand(Self.reportIncomingName, payload: payload)
@@ -100,7 +140,7 @@ final class MacSystemCallUIBridge {
     }
 
     private func postHelperCommand(_ name: Notification.Name, payload: [String: Any]) {
-        launchHelperIfNeeded()
+        _ = Self.launchHelperIfNeeded(reason: "command_\(name.rawValue)")
         center.postNotificationName(
             name,
             object: Self.commandObject,
@@ -109,14 +149,16 @@ final class MacSystemCallUIBridge {
         )
     }
 
-    private func launchHelperIfNeeded() {
+    @discardableResult
+    private static func launchHelperIfNeeded(reason: String) -> Bool {
         if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == Self.helperBundleIdentifier }) {
-            return
+            DiagnosticsLog.info("phone.mac.system_callui_helper_running reason=\(reason)")
+            return true
         }
         let helperURL = URL(fileURLWithPath: Self.installedHelperPath)
         guard FileManager.default.fileExists(atPath: helperURL.path) else {
             DiagnosticsLog.warn("phone.mac.system_callui_helper_missing path=\(helperURL.path)")
-            return
+            return false
         }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
@@ -124,9 +166,10 @@ final class MacSystemCallUIBridge {
             if let error {
                 DiagnosticsLog.error("phone.mac.system_callui_helper_launch_failed", error)
             } else {
-                DiagnosticsLog.info("phone.mac.system_callui_helper_launched")
+                DiagnosticsLog.info("phone.mac.system_callui_helper_launched reason=\(reason)")
             }
         }
+        return true
     }
 
     private func callPayload(_ status: PhoneCallStatusBody) -> [String: Any] {
@@ -162,6 +205,7 @@ final class MacSystemCallUIBridge {
     private static let helperBundleIdentifier = "com.edgelink.callui"
     private static let installedHelperPath = "/Applications/EdgeLinkCallUI.app"
     private static let commandObject = "com.edgelink.mac"
+    private static let helperTerminationGraceSeconds: TimeInterval = 0.8
 
     private static let reportIncomingName = Notification.Name("com.edgelink.callui.command.reportIncoming")
     private static let endCallName = Notification.Name("com.edgelink.callui.command.endCall")
