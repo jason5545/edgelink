@@ -273,13 +273,6 @@ private struct PhoneControlPanel: View {
             }
 
             HStack(spacing: 8) {
-                Button {
-                    runtime.answerPhoneCall()
-                } label: {
-                    Label("接聽來電", systemImage: "phone")
-                }
-                .disabled(!runtime.isConnected)
-
                 Button(role: .destructive) {
                     runtime.hangUpPhoneCall()
                 } label: {
