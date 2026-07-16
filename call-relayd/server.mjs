@@ -9,14 +9,18 @@ const DEFAULT_WORKER_BASE_URL = "https://edgelink-worker.black-hill-f944.workers
 const DEFAULT_PORT_BASE = 18000;
 const DEFAULT_SLOT_COUNT = 20;
 const PORTS_PER_SESSION = 8;
-const SESSION_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_SESSION_IDLE_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_SESSION_MAX_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_TOUCH_THROTTLE_MS = 10 * 1000;
 
 const config = {
   controlPort: intEnv("EDGELINK_CALL_RELAY_CONTROL_PORT", DEFAULT_CONTROL_PORT),
   publicHost: process.env.EDGELINK_CALL_RELAY_PUBLIC_HOST || DEFAULT_PUBLIC_HOST,
   workerBaseUrl: (process.env.EDGELINK_WORKER_BASE_URL || DEFAULT_WORKER_BASE_URL).replace(/\/$/, ""),
   portBase: intEnv("EDGELINK_CALL_RELAY_PORT_BASE", DEFAULT_PORT_BASE),
-  slotCount: intEnv("EDGELINK_CALL_RELAY_SLOT_COUNT", DEFAULT_SLOT_COUNT)
+  slotCount: intEnv("EDGELINK_CALL_RELAY_SLOT_COUNT", DEFAULT_SLOT_COUNT),
+  sessionIdleTtlMs: intEnv("EDGELINK_CALL_RELAY_SESSION_IDLE_TTL_MS", DEFAULT_SESSION_IDLE_TTL_MS),
+  sessionMaxTtlMs: intEnv("EDGELINK_CALL_RELAY_SESSION_MAX_TTL_MS", DEFAULT_SESSION_MAX_TTL_MS)
 };
 
 const activeSessions = new Map();
@@ -32,7 +36,9 @@ controlServer.listen(config.controlPort, "0.0.0.0", () => {
     port: config.controlPort,
     publicHost: config.publicHost,
     portBase: config.portBase,
-    slotCount: config.slotCount
+    slotCount: config.slotCount,
+    sessionIdleTtlMs: config.sessionIdleTtlMs,
+    sessionMaxTtlMs: config.sessionMaxTtlMs
   });
 });
 
@@ -214,8 +220,12 @@ class RelaySession {
     this.bridgeSinkRtpPacketCount = 0;
     this.bridgeSourceRtpPacketCount = 0;
     this.closed = false;
-    this.expiresAt = Date.now() + SESSION_TTL_MS;
-    this.ttlTimer = setTimeout(() => this.close("ttl_expired"), SESSION_TTL_MS).unref();
+    this.lastActivityAt = Date.now();
+    this.lastActivityLogAt = 0;
+    this.expiresAt = this.lastActivityAt + config.sessionIdleTtlMs;
+    this.idleTimer = null;
+    this.maxTimer = setTimeout(() => this.close("max_ttl_expired"), config.sessionMaxTtlMs).unref();
+    this.armIdleTimer();
   }
 
   async start() {
@@ -249,6 +259,7 @@ class RelaySession {
   }
 
   attachBridge(control, body) {
+    this.touchActivity("bridge_attached", true);
     this.bridgeControls.add(control);
     log("info", "bridge.attached", {
       sessionId: this.sessionId,
@@ -283,6 +294,7 @@ class RelaySession {
   }
 
   handleUDP(port, message, rinfo) {
+    this.touchActivity(`udp:${port}`);
     const from = `${rinfo.address}:${rinfo.port}`;
     if (port === this.sinkRtpPort) {
       this.sinkRtpPacketCount += 1;
@@ -313,12 +325,14 @@ class RelaySession {
   }
 
   updateSourceDestination(host, port, reason) {
+    this.touchActivity("source_destination", true);
     this.sourceDestination = { host, port };
     this.control.send("source.destination", { host, port, reason });
     log("info", "session.source_destination", { sessionId: this.sessionId, host, port, reason });
   }
 
   sendSourceRTP(body) {
+    this.touchActivity("source_rtp");
     if (!this.sourceDestination || typeof body?.data !== "string") {
       this.sendSourceRTPToBridge(body);
       return;
@@ -372,6 +386,7 @@ class RelaySession {
     if (!body || typeof body.data !== "string") {
       return;
     }
+    this.touchActivity("bridge_rtp");
     const bytes = typeof body.bytes === "number" ? body.bytes : Buffer.byteLength(body.data, "base64");
     this.bridgeSinkRtpPacketCount += 1;
     if (this.bridgeSinkRtpPacketCount === 1 || this.bridgeSinkRtpPacketCount % 100 === 0) {
@@ -395,7 +410,8 @@ class RelaySession {
       return;
     }
     this.closed = true;
-    clearTimeout(this.ttlTimer);
+    clearTimeout(this.idleTimer);
+    clearTimeout(this.maxTimer);
     activeSessions.delete(this.sessionId);
     occupiedSlots.delete(this.slot);
     for (const connection of this.rtspConnections) {
@@ -415,6 +431,30 @@ class RelaySession {
     }
     this.udpSockets.clear();
     log("info", "session.closed", { sessionId: this.sessionId, reason });
+  }
+
+  touchActivity(reason, forceLog = false) {
+    if (this.closed) {
+      return;
+    }
+    const now = Date.now();
+    this.lastActivityAt = now;
+    this.expiresAt = now + config.sessionIdleTtlMs;
+    this.armIdleTimer();
+    if (forceLog || now - this.lastActivityLogAt >= SESSION_TOUCH_THROTTLE_MS) {
+      this.lastActivityLogAt = now;
+      log("info", "session.activity", {
+        sessionId: this.sessionId,
+        reason,
+        idleExpiresAt: Math.floor(this.expiresAt / 1000)
+      });
+    }
+  }
+
+  armIdleTimer() {
+    clearTimeout(this.idleTimer);
+    const delay = Math.max(1_000, this.expiresAt - Date.now());
+    this.idleTimer = setTimeout(() => this.close("idle_ttl_expired"), delay).unref();
   }
 }
 
@@ -449,6 +489,7 @@ class RTSPConnection {
   }
 
   receive(data) {
+    this.session.touchActivity("rtsp_data");
     this.buffer = Buffer.concat([this.buffer, data]);
     while (true) {
       const headerEnd = this.buffer.indexOf("\r\n\r\n");
