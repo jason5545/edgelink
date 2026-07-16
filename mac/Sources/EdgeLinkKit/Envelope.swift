@@ -41,6 +41,7 @@ public enum EnvelopeType {
     public static let phoneActionResult = "phone.action.result"
     public static let phoneRelayStart = "phone.relay.start"
     public static let phoneRelayEndpoint = "phone.relay.endpoint"
+    public static let phoneCallStatus = "phone.call.status"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
     public static let androidMicStatus = "android.mic.status"
@@ -365,6 +366,43 @@ public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
         self.relayControlPort = relayControlPort
         self.success = success
         self.error = error
+        self.ts = ts
+    }
+}
+
+public struct PhoneCallStatusBody: Codable, Equatable, Sendable {
+    public let callId: String
+    public let state: String
+    public let handle: String?
+    public let displayName: String?
+    public let direction: String?
+    public let canAnswer: Bool
+    public let canHangUp: Bool
+    public let isActive: Bool
+    public let reason: String
+    public let ts: Int64
+
+    public init(
+        callId: String,
+        state: String,
+        handle: String? = nil,
+        displayName: String? = nil,
+        direction: String? = nil,
+        canAnswer: Bool = false,
+        canHangUp: Bool = false,
+        isActive: Bool = false,
+        reason: String,
+        ts: Int64
+    ) {
+        self.callId = callId
+        self.state = state
+        self.handle = handle
+        self.displayName = displayName
+        self.direction = direction
+        self.canAnswer = canAnswer
+        self.canHangUp = canHangUp
+        self.isActive = isActive
+        self.reason = reason
         self.ts = ts
     }
 }

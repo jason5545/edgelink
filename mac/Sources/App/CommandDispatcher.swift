@@ -11,6 +11,7 @@ final class CommandDispatcher {
     private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
     private let onPhoneActionResult: @Sendable (PhoneActionResultBody) -> Void
     private let onPhoneRelayStartRequest: @Sendable (PhoneRelayStartRequestBody) -> Void
+    private let onPhoneCallStatus: @Sendable (PhoneCallStatusBody) -> Void
     private let onAndroidMicStatus: @Sendable (AndroidMicStatusBody) -> Void
     private let onMiLinkStatus: @Sendable (MiLinkStatusBody) -> Void
     private let onMiLinkFrame: @Sendable (MiLinkFrameBody) -> Void
@@ -27,6 +28,7 @@ final class CommandDispatcher {
         onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in },
         onPhoneActionResult: @escaping @Sendable (PhoneActionResultBody) -> Void = { _ in },
         onPhoneRelayStartRequest: @escaping @Sendable (PhoneRelayStartRequestBody) -> Void = { _ in },
+        onPhoneCallStatus: @escaping @Sendable (PhoneCallStatusBody) -> Void = { _ in },
         onAndroidMicStatus: @escaping @Sendable (AndroidMicStatusBody) -> Void = { _ in },
         onMiLinkStatus: @escaping @Sendable (MiLinkStatusBody) -> Void = { _ in },
         onMiLinkFrame: @escaping @Sendable (MiLinkFrameBody) -> Void = { _ in }
@@ -40,6 +42,7 @@ final class CommandDispatcher {
         self.onSmsSendResult = onSmsSendResult
         self.onPhoneActionResult = onPhoneActionResult
         self.onPhoneRelayStartRequest = onPhoneRelayStartRequest
+        self.onPhoneCallStatus = onPhoneCallStatus
         self.onAndroidMicStatus = onAndroidMicStatus
         self.onMiLinkStatus = onMiLinkStatus
         self.onMiLinkFrame = onMiLinkFrame
@@ -92,6 +95,10 @@ final class CommandDispatcher {
         case EnvelopeType.phoneRelayStart:
             let envelope = try decoder.decode(Envelope<PhoneRelayStartRequestBody>.self, from: plaintext)
             onPhoneRelayStartRequest(envelope.b)
+            return nil
+        case EnvelopeType.phoneCallStatus:
+            let envelope = try decoder.decode(Envelope<PhoneCallStatusBody>.self, from: plaintext)
+            onPhoneCallStatus(envelope.b)
             return nil
         case EnvelopeType.androidMicStatus:
             let envelope = try decoder.decode(Envelope<AndroidMicStatusBody>.self, from: plaintext)

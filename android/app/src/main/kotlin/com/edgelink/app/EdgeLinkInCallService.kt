@@ -1,7 +1,10 @@
 package com.edgelink.app
 
+import android.os.Build
 import android.telecom.Call
 import android.telecom.InCallService
+import com.edgelink.core.PhoneCallStatusBody
+import java.time.Instant
 import java.util.IdentityHashMap
 
 private const val PHONE_DTMF_TONE_DURATION_MS = 180L
@@ -11,6 +14,12 @@ private const val PHONE_DTMF_SEQUENCE_PAUSE_MS = 650L
 class EdgeLinkInCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
+        EdgeLinkLog.configure(applicationContext)
+        runCatching {
+            EdgeLinkForegroundService.ensureStarted(applicationContext)
+        }.onFailure { error ->
+            EdgeLinkLog.warn("phone.android.incall_service_start_foreground_failed", error)
+        }
         EdgeLinkInCallCallStore.add(call)
     }
 
@@ -27,13 +36,23 @@ class EdgeLinkInCallService : InCallService() {
     companion object {
         @Volatile
         private var callsIdleListener: ((String) -> Unit)? = null
+        @Volatile
+        private var callStatusListener: ((PhoneCallStatusBody) -> Unit)? = null
 
         fun setCallsIdleListener(listener: ((String) -> Unit)?) {
             callsIdleListener = listener
         }
 
+        fun setCallStatusListener(listener: ((PhoneCallStatusBody) -> Unit)?) {
+            callStatusListener = listener
+        }
+
         internal fun notifyCallsIdle(reason: String) {
             callsIdleListener?.invoke(reason)
+        }
+
+        internal fun notifyCallStatus(status: PhoneCallStatusBody) {
+            callStatusListener?.invoke(status)
         }
 
         fun sendDtmfSequence(sequence: String): ShizukuOperationResult =
@@ -55,6 +74,7 @@ private object EdgeLinkInCallCallStore {
         val callback = object : Call.Callback() {
             override fun onStateChanged(call: Call, state: Int) {
                 EdgeLinkLog.info("phone.android.incall_service state=$state calls=${callStatesSummary()}")
+                EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "state_changed"))
                 if (state == Call.STATE_DISCONNECTED) {
                     remove(call, "disconnected")
                 }
@@ -62,6 +82,7 @@ private object EdgeLinkInCallCallStore {
 
             override fun onDetailsChanged(call: Call, details: Call.Details) {
                 EdgeLinkLog.info("phone.android.incall_service details state=${call.state} calls=${callStatesSummary()}")
+                EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "details_changed"))
             }
         }
         synchronized(lock) {
@@ -69,6 +90,7 @@ private object EdgeLinkInCallCallStore {
         }
         call.registerCallback(callback)
         EdgeLinkLog.info("phone.android.incall_service call_added state=${call.state} calls=${callStatesSummary()}")
+        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "added"))
     }
 
     fun remove(call: Call, reason: String) {
@@ -77,6 +99,7 @@ private object EdgeLinkInCallCallStore {
         }
         callback?.let { runCatching { call.unregisterCallback(it) } }
         EdgeLinkLog.info("phone.android.incall_service call_removed reason=$reason calls=${callStatesSummary()}")
+        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, reason, removed = true))
         if (callback != null && emptyAfterRemove) {
             EdgeLinkInCallService.notifyCallsIdle(reason)
         }
@@ -92,6 +115,14 @@ private object EdgeLinkInCallCallStore {
             runCatching { call.unregisterCallback(callback) }
         }
         EdgeLinkLog.info("phone.android.incall_service cleared")
+        EdgeLinkInCallService.notifyCallStatus(
+            PhoneCallStatusBody(
+                callId = "all",
+                state = "ended",
+                reason = "cleared",
+                ts = Instant.now().epochSecond
+            )
+        )
     }
 
     fun sendDtmfSequence(sequence: String): ShizukuOperationResult {
@@ -157,6 +188,52 @@ private object EdgeLinkInCallCallStore {
             ?: snapshot.firstOrNull { it.state == Call.STATE_DIALING || it.state == Call.STATE_CONNECTING }
     }
 
+    private fun callStatusBody(call: Call, reason: String, removed: Boolean = false): PhoneCallStatusBody {
+        val state = if (removed) "ended" else call.state.callStateName()
+        val details = call.details
+        val handle = details?.handle?.schemeSpecificPart
+            ?: details?.handle?.toString()?.takeIf { it.isNotBlank() }
+        val displayName = details?.callerDisplayName?.takeIf { it.isNotBlank() }
+        return PhoneCallStatusBody(
+            callId = "call-${System.identityHashCode(call).toString(16)}",
+            state = state,
+            handle = handle?.takeIf { it.length <= MAX_CALL_HANDLE_CHARS },
+            displayName = displayName?.takeIf { it.length <= MAX_CALL_DISPLAY_NAME_CHARS },
+            direction = details.callDirectionName(),
+            canAnswer = call.state == Call.STATE_RINGING,
+            canHangUp = !removed && call.state != Call.STATE_DISCONNECTED,
+            isActive = call.state == Call.STATE_ACTIVE,
+            reason = reason,
+            ts = Instant.now().epochSecond
+        )
+    }
+
+    private fun Int.callStateName(): String =
+        when (this) {
+            Call.STATE_NEW -> "new"
+            Call.STATE_RINGING -> "ringing"
+            Call.STATE_DIALING -> "dialing"
+            Call.STATE_CONNECTING -> "connecting"
+            Call.STATE_ACTIVE -> "active"
+            Call.STATE_HOLDING -> "held"
+            Call.STATE_DISCONNECTED -> "disconnected"
+            Call.STATE_DISCONNECTING -> "disconnecting"
+            Call.STATE_SELECT_PHONE_ACCOUNT -> "select_phone_account"
+            else -> "unknown_$this"
+        }
+
+    private fun Call.Details?.callDirectionName(): String? {
+        if (this == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return null
+        }
+        return when (callDirection) {
+            Call.Details.DIRECTION_INCOMING -> "incoming"
+            Call.Details.DIRECTION_OUTGOING -> "outgoing"
+            Call.Details.DIRECTION_UNKNOWN -> "unknown"
+            else -> "unknown_$callDirection"
+        }
+    }
+
     private fun callStatesSummary(): String {
         val states = synchronized(lock) { calls.keys.map { it.state } }
         return if (states.isEmpty()) {
@@ -165,4 +242,7 @@ private object EdgeLinkInCallCallStore {
             states.joinToString(",")
         }
     }
+
+    private const val MAX_CALL_HANDLE_CHARS = 80
+    private const val MAX_CALL_DISPLAY_NAME_CHARS = 120
 }

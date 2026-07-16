@@ -40,6 +40,7 @@ object EnvelopeTypes {
     const val PHONE_ACTION_RESULT = "phone.action.result"
     const val PHONE_RELAY_START = "phone.relay.start"
     const val PHONE_RELAY_ENDPOINT = "phone.relay.endpoint"
+    const val PHONE_CALL_STATUS = "phone.call.status"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
     const val ANDROID_MIC_STATUS = "android.mic.status"
@@ -222,6 +223,20 @@ data class PhoneRelayEndpointBody(
     val relayControlPort: Int? = null,
     val success: Boolean = true,
     val error: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class PhoneCallStatusBody(
+    val callId: String,
+    val state: String,
+    val handle: String? = null,
+    val displayName: String? = null,
+    val direction: String? = null,
+    val canAnswer: Boolean = false,
+    val canHangUp: Boolean = false,
+    val isActive: Boolean = false,
+    val reason: String,
     val ts: Long
 )
 

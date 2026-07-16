@@ -150,6 +150,27 @@ class EnvelopeTest {
         assertEquals("172.238.24.219", relayEndpoint.b.relayHost)
         assertEquals(17104, relayEndpoint.b.relayPort)
         assertEquals("gateway-session-1", relayEndpoint.b.relaySessionId)
+
+        val phoneStatusBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_CALL_STATUS,
+            PhoneCallStatusBody(
+                callId = "call-1",
+                state = "ringing",
+                handle = "+886912345678",
+                displayName = "客服",
+                direction = "incoming",
+                canAnswer = true,
+                canHangUp = true,
+                isActive = false,
+                reason = "added",
+                ts = 1783510258
+            )
+        )
+        val phoneStatus = EnvelopeCodec.decode<PhoneCallStatusBody>(phoneStatusBytes)
+        assertEquals(EnvelopeTypes.PHONE_CALL_STATUS, phoneStatus.t)
+        assertEquals("ringing", phoneStatus.b.state)
+        assertEquals(true, phoneStatus.b.canAnswer)
+        assertEquals("客服", phoneStatus.b.displayName)
     }
 
     @Test

@@ -27,6 +27,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var smsMessages: [SmsMessageBody] = []
     @Published private(set) var smsSendStatus = ""
     @Published private(set) var phoneCallStatus = ""
+    @Published private(set) var incomingPhoneCallLabel = ""
     @Published private(set) var lastDialedPhoneNumber: String
     @Published private(set) var isPhoneCallActive = false
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
@@ -63,6 +64,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
+    private var phoneCallStatuses: [String: PhoneCallStatusBody] = [:]
     private var androidMicRelayArmed = false
     private var phoneRelayProbeRunning = false
     private var phoneRelayDebugTask: Task<Void, Never>?
@@ -97,6 +99,16 @@ final class EdgeLinkRuntime: ObservableObject {
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
+            }
+        }
+        notificationPresenter.onAnswerPhoneCall = { [weak self] callId in
+            Task { @MainActor in
+                self?.handlePhoneNotificationAnswer(callId: callId)
+            }
+        }
+        notificationPresenter.onHangUpPhoneCall = { [weak self] callId in
+            Task { @MainActor in
+                self?.handlePhoneNotificationHangUp(callId: callId)
             }
         }
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
@@ -266,6 +278,9 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
         callRelayGatewayClient.close(reason: "disconnect")
+        phoneCallStatuses.keys.forEach { notificationPresenter.removePhoneCall(callId: $0) }
+        phoneCallStatuses.removeAll()
+        incomingPhoneCallLabel = ""
         androidMicRelayArmed = false
         isPhoneCallActive = false
         isConnected = false
@@ -1049,6 +1064,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handlePhoneRelayStartRequest(request)
                         }
                     },
+                    onPhoneCallStatus: { [weak self] status in
+                        Task { @MainActor in
+                            self?.handlePhoneCallStatus(status)
+                        }
+                    },
                     onAndroidMicStatus: { [weak self] status in
                         Task { @MainActor in
                             self?.handleAndroidMicStatus(status)
@@ -1363,6 +1383,71 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    private func handlePhoneCallStatus(_ status: PhoneCallStatusBody) {
+        if status.callId == "all" {
+            phoneCallStatuses.keys.forEach { notificationPresenter.removePhoneCall(callId: $0) }
+            phoneCallStatuses.removeAll()
+            incomingPhoneCallLabel = ""
+            if isPhoneCallActive {
+                stopPhoneCallRelayAudio(reason: "phone_call_status_all_ended")
+            }
+            isPhoneCallActive = false
+            phoneCallStatus = "通話已結束"
+            DiagnosticsLog.info("phone.mac.call_status_all reason=\(status.reason) state=\(status.state)")
+            return
+        }
+
+        let caller = Self.phoneCallCallerLabel(status)
+        switch status.state {
+        case "ringing":
+            phoneCallStatuses[status.callId] = status
+            incomingPhoneCallLabel = caller
+            phoneCallStatus = "手機來電：\(caller)"
+            notificationPresenter.showIncomingPhoneCall(status)
+        case "active", "dialing", "connecting", "held":
+            phoneCallStatuses[status.callId] = status
+            notificationPresenter.removePhoneCall(status)
+            incomingPhoneCallLabel = ""
+            isPhoneCallActive = true
+            phoneCallStatus = Self.localizedPhoneCallStatus(status, caller: caller)
+        case "disconnected", "disconnecting", "ended":
+            phoneCallStatuses.removeValue(forKey: status.callId)
+            notificationPresenter.removePhoneCall(status)
+            if incomingPhoneCallLabel == caller {
+                incomingPhoneCallLabel = ""
+            }
+            if phoneCallStatuses.isEmpty {
+                if isPhoneCallActive {
+                    stopPhoneCallRelayAudio(reason: "phone_call_status_\(status.state)")
+                }
+                isPhoneCallActive = false
+                phoneCallStatus = "通話已結束"
+            }
+        default:
+            phoneCallStatuses[status.callId] = status
+        }
+        DiagnosticsLog.info(
+            "phone.mac.call_status callId=\(status.callId) state=\(status.state) " +
+                "direction=\(status.direction ?? "unknown") canAnswer=\(status.canAnswer) reason=\(status.reason)"
+        )
+    }
+
+    private func handlePhoneNotificationAnswer(callId: String) {
+        notificationPresenter.removePhoneCall(callId: callId)
+        incomingPhoneCallLabel = ""
+        phoneCallStatus = "接聽手機來電中"
+        _ = answerPhoneCall()
+        DiagnosticsLog.info("phone.mac.notification_answer callId=\(callId)")
+    }
+
+    private func handlePhoneNotificationHangUp(callId: String) {
+        notificationPresenter.removePhoneCall(callId: callId)
+        incomingPhoneCallLabel = ""
+        phoneCallStatus = "拒接手機來電中"
+        _ = hangUpPhoneCall()
+        DiagnosticsLog.info("phone.mac.notification_hangup callId=\(callId)")
+    }
+
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
         let pendingAction = pendingPhoneActions.removeValue(forKey: result.requestId)
         if result.requestId == phoneRelayDebugDialRequestID && !result.success {
@@ -1435,6 +1520,33 @@ final class EdgeLinkRuntime: ObservableObject {
             return "按鍵"
         default:
             return "電話操作"
+        }
+    }
+
+    private static func phoneCallCallerLabel(_ status: PhoneCallStatusBody) -> String {
+        if let displayName = status.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !displayName.isEmpty {
+            return displayName
+        }
+        if let handle = status.handle?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !handle.isEmpty {
+            return handle
+        }
+        return "未知號碼"
+    }
+
+    private static func localizedPhoneCallStatus(_ status: PhoneCallStatusBody, caller: String) -> String {
+        switch status.state {
+        case "dialing":
+            return "手機撥號中：\(caller)"
+        case "connecting":
+            return "手機通話連線中：\(caller)"
+        case "held":
+            return "手機通話保留中：\(caller)"
+        case "active":
+            return "手機通話中：\(caller)"
+        default:
+            return "手機通話：\(caller)"
         }
     }
 

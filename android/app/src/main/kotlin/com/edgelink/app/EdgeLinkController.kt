@@ -33,6 +33,7 @@ import com.edgelink.core.PairingTypes
 import com.edgelink.core.PairingWire
 import com.edgelink.core.PhoneActionBody
 import com.edgelink.core.PhoneActionResultBody
+import com.edgelink.core.PhoneCallStatusBody
 import com.edgelink.core.PhoneRelayEndpointBody
 import com.edgelink.core.PhoneRelayStartRequestBody
 import com.edgelink.core.PinnedPeer
@@ -280,6 +281,11 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 handleInCallServiceCallsIdle(reason)
             }
         }
+        EdgeLinkInCallService.setCallStatusListener { status ->
+            scope.launch {
+                handlePhoneCallStatus(status)
+            }
+        }
         micActivityMonitor.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -300,6 +306,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
         screenSession.setControlDataChannelHandler(null)
         EdgeLinkInCallService.setCallsIdleListener(null)
+        EdgeLinkInCallService.setCallStatusListener(null)
         micActivityMonitor.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
@@ -364,6 +371,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         )
         EdgeLinkLog.info("phone.android.remote_hangup_detected reason=$reason requestId=${result.requestId}")
         sendEnvelope(EnvelopeTypes.PHONE_ACTION_RESULT, result)
+    }
+
+    private fun handlePhoneCallStatus(status: PhoneCallStatusBody) {
+        EdgeLinkLog.info(
+            "phone.android.call_status_out callId=${status.callId} state=${status.state} " +
+                "direction=${status.direction ?: "unknown"} canAnswer=${status.canAnswer} reason=${status.reason}"
+        )
+        sendEnvelope(EnvelopeTypes.PHONE_CALL_STATUS, status)
     }
 
     fun onPhoneRelaySelectedFromInCallUi(reason: String) {

@@ -161,6 +161,29 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(relayEndpoint.b.relayPort, 17104)
         XCTAssertEqual(relayEndpoint.b.relaySessionId, "gateway-session-1")
 
+        let phoneStatusData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneCallStatus,
+                b: PhoneCallStatusBody(
+                    callId: "call-1",
+                    state: "ringing",
+                    handle: "+886912345678",
+                    displayName: "客服",
+                    direction: "incoming",
+                    canAnswer: true,
+                    canHangUp: true,
+                    isActive: false,
+                    reason: "added",
+                    ts: 1_783_510_258
+                )
+            )
+        )
+        let phoneStatus = try decoder.decode(Envelope<PhoneCallStatusBody>.self, from: phoneStatusData)
+        XCTAssertEqual(phoneStatus.t, "phone.call.status")
+        XCTAssertEqual(phoneStatus.b.state, "ringing")
+        XCTAssertTrue(phoneStatus.b.canAnswer)
+        XCTAssertEqual(phoneStatus.b.displayName, "客服")
+
         let micStatusData = try encoder.encode(
             Envelope(
                 t: EnvelopeType.androidMicStatus,
