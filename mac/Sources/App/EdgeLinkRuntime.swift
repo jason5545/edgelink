@@ -43,6 +43,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
     private let notificationPresenter = MacNotificationPresenter()
+    private let systemCallUIBridge = MacSystemCallUIBridge()
     private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
@@ -101,14 +102,19 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.copyVerificationCode(code, reason: "notification_action")
             }
         }
-        notificationPresenter.onAnswerPhoneCall = { [weak self] callId in
+        systemCallUIBridge.onAnswerPhoneCall = { [weak self] callId in
             Task { @MainActor in
-                self?.handlePhoneNotificationAnswer(callId: callId)
+                self?.handleSystemCallUIAnswer(callId: callId)
             }
         }
-        notificationPresenter.onHangUpPhoneCall = { [weak self] callId in
+        systemCallUIBridge.onHangUpPhoneCall = { [weak self] callId in
             Task { @MainActor in
-                self?.handlePhoneNotificationHangUp(callId: callId)
+                self?.handleSystemCallUIHangUp(callId: callId)
+            }
+        }
+        systemCallUIBridge.onPlayDTMF = { [weak self] _, digits in
+            Task { @MainActor in
+                _ = self?.sendPhoneDTMF(sequence: digits)
             }
         }
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
@@ -278,7 +284,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
         callRelayGatewayClient.close(reason: "disconnect")
-        phoneCallStatuses.keys.forEach { notificationPresenter.removePhoneCall(callId: $0) }
+        systemCallUIBridge.endAll(reason: .failed)
         phoneCallStatuses.removeAll()
         incomingPhoneCallLabel = ""
         androidMicRelayArmed = false
@@ -1385,7 +1391,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handlePhoneCallStatus(_ status: PhoneCallStatusBody) {
         if status.callId == "all" {
-            phoneCallStatuses.keys.forEach { notificationPresenter.removePhoneCall(callId: $0) }
+            systemCallUIBridge.endAll(reason: .remoteEnded)
             phoneCallStatuses.removeAll()
             incomingPhoneCallLabel = ""
             if isPhoneCallActive {
@@ -1403,16 +1409,18 @@ final class EdgeLinkRuntime: ObservableObject {
             phoneCallStatuses[status.callId] = status
             incomingPhoneCallLabel = caller
             phoneCallStatus = "手機來電：\(caller)"
-            notificationPresenter.showIncomingPhoneCall(status)
+            systemCallUIBridge.reportIncomingCall(status)
         case "active", "dialing", "connecting", "held":
             phoneCallStatuses[status.callId] = status
-            notificationPresenter.removePhoneCall(status)
+            if status.state == "active", !systemCallUIBridge.wasAnsweredBySystemUI(callId: status.callId) {
+                systemCallUIBridge.endCall(status, reason: .answeredElsewhere)
+            }
             incomingPhoneCallLabel = ""
             isPhoneCallActive = true
             phoneCallStatus = Self.localizedPhoneCallStatus(status, caller: caller)
         case "disconnected", "disconnecting", "ended":
             phoneCallStatuses.removeValue(forKey: status.callId)
-            notificationPresenter.removePhoneCall(status)
+            systemCallUIBridge.endCall(status, reason: .remoteEnded)
             if incomingPhoneCallLabel == caller {
                 incomingPhoneCallLabel = ""
             }
@@ -1432,20 +1440,18 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
-    private func handlePhoneNotificationAnswer(callId: String) {
-        notificationPresenter.removePhoneCall(callId: callId)
+    private func handleSystemCallUIAnswer(callId: String) {
         incomingPhoneCallLabel = ""
         phoneCallStatus = "接聽手機來電中"
         _ = answerPhoneCall()
-        DiagnosticsLog.info("phone.mac.notification_answer callId=\(callId)")
+        DiagnosticsLog.info("phone.mac.system_callui_answer callId=\(callId)")
     }
 
-    private func handlePhoneNotificationHangUp(callId: String) {
-        notificationPresenter.removePhoneCall(callId: callId)
+    private func handleSystemCallUIHangUp(callId: String) {
         incomingPhoneCallLabel = ""
         phoneCallStatus = "拒接手機來電中"
         _ = hangUpPhoneCall()
-        DiagnosticsLog.info("phone.mac.notification_hangup callId=\(callId)")
+        DiagnosticsLog.info("phone.mac.system_callui_hangup callId=\(callId)")
     }
 
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {

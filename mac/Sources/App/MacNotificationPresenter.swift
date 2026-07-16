@@ -7,9 +7,6 @@ import UserNotifications
 final class MacNotificationPresenter: @unchecked Sendable {
     fileprivate static let verificationCodeCategoryIdentifier = "edgelink.verification-code"
     fileprivate static let copyVerificationCodeActionIdentifier = "edgelink.copy-verification-code"
-    fileprivate static let phoneCallCategoryIdentifier = "edgelink.phone-call"
-    fileprivate static let answerPhoneCallActionIdentifier = "edgelink.answer-phone-call"
-    fileprivate static let hangUpPhoneCallActionIdentifier = "edgelink.hang-up-phone-call"
 
     private let center: UNUserNotificationCenter?
     private let delegate = MacNotificationCenterDelegate()
@@ -17,14 +14,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
     var onCopyVerificationCode: (@Sendable (String) -> Void)? {
         get { delegate.onCopyVerificationCode }
         set { delegate.onCopyVerificationCode = newValue }
-    }
-    var onAnswerPhoneCall: (@Sendable (String) -> Void)? {
-        get { delegate.onAnswerPhoneCall }
-        set { delegate.onAnswerPhoneCall = newValue }
-    }
-    var onHangUpPhoneCall: (@Sendable (String) -> Void)? {
-        get { delegate.onHangUpPhoneCall }
-        set { delegate.onHangUpPhoneCall = newValue }
     }
 
     init() {
@@ -43,23 +32,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
                         identifier: Self.copyVerificationCodeActionIdentifier,
                         title: "複製",
                         options: []
-                    )
-                ],
-                intentIdentifiers: [],
-                options: []
-            ),
-            UNNotificationCategory(
-                identifier: Self.phoneCallCategoryIdentifier,
-                actions: [
-                    UNNotificationAction(
-                        identifier: Self.answerPhoneCallActionIdentifier,
-                        title: "接聽",
-                        options: []
-                    ),
-                    UNNotificationAction(
-                        identifier: Self.hangUpPhoneCallActionIdentifier,
-                        title: "拒接",
-                        options: [.destructive]
                     )
                 ],
                 intentIdentifiers: [],
@@ -146,61 +118,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
         DiagnosticsLog.info("notification.mac.remote_removed id=\(body.id)")
     }
 
-    func showIncomingPhoneCall(_ body: PhoneCallStatusBody) {
-        guard let center else {
-            DiagnosticsLog.warn("phone.mac.notification_unavailable callId=\(body.callId)")
-            return
-        }
-
-        Task {
-            do {
-                guard try await center.requestAuthorization(options: [.alert, .sound]) else {
-                    DiagnosticsLog.warn("phone.mac.notification_permission_denied callId=\(body.callId)")
-                    return
-                }
-
-                let caller = Self.phoneCallCallerLabel(body)
-                let content = UNMutableNotificationContent()
-                content.title = "手機來電"
-                content.subtitle = caller
-                content.body = "在 Mac 上接聽會自動把通話音訊接過來。"
-                content.sound = .default
-                content.interruptionLevel = .timeSensitive
-                content.categoryIdentifier = Self.phoneCallCategoryIdentifier
-                content.threadIdentifier = "edgelink.phone.\(body.callId)"
-                content.userInfo = [
-                    "edgelinkDoNotForward": true,
-                    "edgelinkPhoneCall": true,
-                    "edgelinkPhoneCallId": body.callId
-                ]
-
-                let request = UNNotificationRequest(
-                    identifier: phoneCallRequestIdentifier(callId: body.callId),
-                    content: content,
-                    trigger: nil
-                )
-                try await center.add(request)
-                DiagnosticsLog.info("phone.mac.notification_shown callId=\(body.callId) caller=\(Self.fingerprint(caller))")
-            } catch {
-                DiagnosticsLog.error("phone.mac.notification_show_failed callId=\(body.callId)", error)
-            }
-        }
-    }
-
-    func removePhoneCall(_ body: PhoneCallStatusBody) {
-        removePhoneCall(callId: body.callId)
-    }
-
-    func removePhoneCall(callId: String) {
-        guard let center else {
-            return
-        }
-        let identifier = phoneCallRequestIdentifier(callId: callId)
-        center.removePendingNotificationRequests(withIdentifiers: [identifier])
-        center.removeDeliveredNotifications(withIdentifiers: [identifier])
-        DiagnosticsLog.info("phone.mac.notification_removed callId=\(callId)")
-    }
-
     func showVerificationCode(_ candidate: VerificationCodeCandidate, message: SmsMessageBody) {
         guard let center else {
             DiagnosticsLog.warn("verification.mac.notification_unavailable id=\(candidate.id)")
@@ -249,22 +166,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
         return "edgelink.remote.\(digest)"
-    }
-
-    private func phoneCallRequestIdentifier(callId: String) -> String {
-        "edgelink.phone.\(callId)"
-    }
-
-    private static func phoneCallCallerLabel(_ body: PhoneCallStatusBody) -> String {
-        if let displayName = body.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !displayName.isEmpty {
-            return displayName
-        }
-        if let handle = body.handle?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !handle.isEmpty {
-            return handle
-        }
-        return "未知號碼"
     }
 
     private static func verificationNotificationBody(candidate: VerificationCodeCandidate, message: SmsMessageBody) -> String {
@@ -324,26 +225,15 @@ final class MacNotificationPresenter: @unchecked Sendable {
     private static let maximumIconPngBytes = 32 * 1024
     private static let pngSignature = Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
-    private static func fingerprint(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8))
-            .prefix(6)
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
 }
 
 private final class MacNotificationCenterDelegate: NSObject, UNUserNotificationCenterDelegate {
     var onCopyVerificationCode: (@Sendable (String) -> Void)?
-    var onAnswerPhoneCall: (@Sendable (String) -> Void)?
-    var onHangUpPhoneCall: (@Sendable (String) -> Void)?
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        if notification.request.content.userInfo["edgelinkPhoneCall"] as? Bool == true {
-            return [.banner, .list, .sound]
-        }
         if notification.request.content.userInfo["edgelinkRemoteNotification"] as? Bool == true {
             return [.list, .sound]
         }
@@ -354,18 +244,6 @@ private final class MacNotificationCenterDelegate: NSObject, UNUserNotificationC
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        if response.actionIdentifier == MacNotificationPresenter.answerPhoneCallActionIdentifier,
-           let callId = response.notification.request.content.userInfo["edgelinkPhoneCallId"] as? String,
-           !callId.isEmpty {
-            onAnswerPhoneCall?(callId)
-            return
-        }
-        if response.actionIdentifier == MacNotificationPresenter.hangUpPhoneCallActionIdentifier,
-           let callId = response.notification.request.content.userInfo["edgelinkPhoneCallId"] as? String,
-           !callId.isEmpty {
-            onHangUpPhoneCall?(callId)
-            return
-        }
         guard response.actionIdentifier == MacNotificationPresenter.copyVerificationCodeActionIdentifier,
               let code = response.notification.request.content.userInfo["edgelinkVerificationCode"] as? String,
               !code.isEmpty
