@@ -50,6 +50,14 @@ object AndroidMiLinkPhoneContinuityBridge {
             }
 
             val remoteDevicesById = linkedMapOf<String, RemoteDeviceInfo>()
+            val currentRemoteDevice = runProviderStep(steps, "remoteDevice:current") {
+                resolver.queryCurrentRemoteDevice()
+            }
+            if (currentRemoteDevice != null) {
+                steps += "remoteDevice:current:sample=${currentRemoteDevice.compactSummary()}"
+                remoteDevicesById[currentRemoteDevice.id ?: currentRemoteDevice.deviceId ?: currentRemoteDevice.compactSummary()] =
+                    currentRemoteDevice
+            }
             for (query in remoteDeviceQueries) {
                 val devices = runProviderStep(steps, "remoteDevices:${query.label}") {
                     resolver.queryRemoteDevices(
@@ -188,6 +196,13 @@ object AndroidMiLinkPhoneContinuityBridge {
                 putString("remoteDeviceId", deviceId)
             }
         ) ?: return null
+        result.classLoader = RemoteDeviceInfo::class.java.classLoader
+        @Suppress("DEPRECATION")
+        return result.getParcelable("remoteDevice")
+    }
+
+    private fun ContentResolver.queryCurrentRemoteDevice(): RemoteDeviceInfo? {
+        val result = callProvider("queryRemoteDevice", Bundle()) ?: return null
         result.classLoader = RemoteDeviceInfo::class.java.classLoader
         @Suppress("DEPRECATION")
         return result.getParcelable("remoteDevice")

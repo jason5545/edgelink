@@ -12,6 +12,18 @@ private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
 private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
     "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
+private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
+    "logcat",
+    "-d",
+    "-t",
+    "3000",
+    "-v",
+    "time",
+    "BluetoothRemoteDevices:D",
+    "HyperRemoteDevicesAdapter:D",
+    "ScanController:V",
+    "*:S"
+)
 
 class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
     override fun destroy() {
@@ -93,6 +105,12 @@ internal object EdgeLinkShizukuCommandPolicy {
             return true
         }
         if (isAllowedMiLinkProbeCommand(command)) {
+            return true
+        }
+        if (isAllowedMiShareStartCommand(command)) {
+            return true
+        }
+        if (isAllowedMirrorBluetoothLogcatCommand(command)) {
             return true
         }
         if (isAllowedPhoneCommand(command)) {
@@ -181,6 +199,18 @@ internal object EdgeLinkShizukuCommandPolicy {
         return arg in allowedMiLinkContentCalls[uri to method].orEmpty()
     }
 
+    private fun isAllowedMiShareStartCommand(command: Array<String>): Boolean =
+        command.size == 6 &&
+            command[0] == "am" &&
+            command[1] == "start" &&
+            command[2] == "-a" &&
+            command[3] == "com.miui.mishare.action.MiShareSettings" &&
+            command[4] == "-p" &&
+            command[5] == "com.miui.mishare.connectivity"
+
+    private fun isAllowedMirrorBluetoothLogcatCommand(command: Array<String>): Boolean =
+        command.contentEquals(MIRROR_BT_LOGCAT_COMMAND)
+
     private fun isAllowedPhoneCommand(command: Array<String>): Boolean =
         isAllowedPhoneKeyCommand(command) || isAllowedPhoneTelecomCommand(command)
 
@@ -214,7 +244,11 @@ internal object EdgeLinkShizukuCommandPolicy {
         return when (key) {
             MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY ->
                 value.length in 1..16 && value.all { it in '0'..'9' }
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY ->
+                value.length in 1..16 && value.all { it in '0'..'9' }
             MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY ->
+                value == "pad"
+            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY ->
                 value == "pad"
             MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY,
             MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY,

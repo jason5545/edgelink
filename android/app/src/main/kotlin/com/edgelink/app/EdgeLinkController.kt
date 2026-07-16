@@ -23,6 +23,7 @@ import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
+import com.edgelink.core.MiLinkCommandBody
 import com.edgelink.core.MiLinkFrameBody
 import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
@@ -139,6 +140,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
+    private val miLinkCommandBridge = AndroidMiLinkCommandBridge(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
     }
@@ -176,6 +178,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         screenSession = screenSession,
         smsSync = smsSync,
         phoneCallController = phoneCallController,
+        miLinkCommandBridge = miLinkCommandBridge,
         onPong = {
             lastPongElapsedMs = SystemClock.elapsedRealtime()
             stateFlow.update {
@@ -861,16 +864,27 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         val messengerTransportProbe = AndroidMiLinkMessengerTransport.probe(appContext)
         val castServiceProbe = AndroidMiLinkCastServiceBridge.probe(appContext)
         val phoneContinuityProbe = AndroidMiLinkPhoneContinuityBridge.probe(appContext)
+        val serviceCatalog = AndroidMiLinkServiceCatalog.probe(
+            appContext,
+            messengerTransportOk = messengerTransportProbe.success,
+            castServiceOk = castServiceProbe.success,
+            mirrorRemoteDeviceCount = phoneContinuityProbe.remoteDeviceCount
+        )
         val summary = "${rootProbe.message}; ${attributionProbe.message}; " +
             messengerTransportProbe.message +
-            "; ${castServiceProbe.message}; ${phoneContinuityProbe.message}"
+            "; ${castServiceProbe.message}; services=" +
+            serviceCatalog.services.count { it.available } +
+            "/" +
+            serviceCatalog.services.size +
+            "; ${phoneContinuityProbe.message}"
         return MiLinkStatusBody(
             sourceDeviceId = localIdentity?.deviceId,
             available = rootProbe.success ||
                 attributionProbe.success ||
                 messengerTransportProbe.success ||
                 castServiceProbe.success ||
-                phoneContinuityProbe.success,
+                phoneContinuityProbe.success ||
+                serviceCatalog.services.any { it.available },
             rootProbeOk = rootProbe.success,
             attributionProbeOk = attributionProbe.success,
             messengerTransportOk = messengerTransportProbe.success,
@@ -880,6 +894,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             phoneMediaRelayCallbackOk = phoneContinuityProbe.mediaRelayCallbackOk,
             phoneRemoteDeviceCount = phoneContinuityProbe.remoteDeviceCount,
             phoneMediaRelayCandidateCount = phoneContinuityProbe.mediaRelayCandidateCount,
+            services = serviceCatalog.services,
+            preferredRoutes = serviceCatalog.preferredRoutes,
             summary = summary,
             ts = System.currentTimeMillis() / 1_000L
         )
@@ -1452,6 +1468,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     val pingJob = launch { pingLoop(nextSession) }
                     val clipboardJob = launch { clipboardLoop(nextSession) }
                     val smsPendingJob = launch { drainPendingSms(nextSession, identity, reason = "connected") }
+                    val miLinkStatusJob = launch {
+                        refreshAndSendMiLinkStatus(nextSession, identity, reason = "connected")
+                    }
                     val miLinkMessengerJob = launch { miLinkMessengerLoop(nextSession, identity) }
                     try {
                         nextSession.receiveLoop(dispatcher::handle)
@@ -1459,6 +1478,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         pingJob.cancelAndJoin()
                         clipboardJob.cancelAndJoin()
                         smsPendingJob.cancelAndJoin()
+                        miLinkStatusJob.cancelAndJoin()
                         miLinkMessengerJob.cancelAndJoin()
                     }
                 }
@@ -1682,13 +1702,42 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     private suspend fun sendLatestMiLinkStatus(activeSession: SecureSessionClient, identity: LocalIdentity) {
         val status = latestMiLinkStatus ?: return
+        sendMiLinkStatus(activeSession, identity, status, reason = "cached")
+    }
+
+    private suspend fun refreshAndSendMiLinkStatus(
+        activeSession: SecureSessionClient,
+        identity: LocalIdentity,
+        reason: String
+    ) {
+        val status = runCatching {
+            probeMiLinkStatus()
+        }.getOrElse { error ->
+            EdgeLinkLog.warn("milink.android.status_refresh_failed reason=$reason", error)
+            return
+        }
+        latestMiLinkStatus = status
+        stateFlow.update {
+            it.copy(xiaomiMiLinkProbeStatus = status.summary)
+        }
+        sendMiLinkStatus(activeSession, identity, status, reason = reason)
+    }
+
+    private suspend fun sendMiLinkStatus(
+        activeSession: SecureSessionClient,
+        identity: LocalIdentity,
+        status: MiLinkStatusBody,
+        reason: String
+    ) {
         val sourcedStatus = status.copy(sourceDeviceId = identity.deviceId)
         latestMiLinkStatus = sourcedStatus
         runCatching {
             activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_STATUS, sourcedStatus))
             EdgeLinkLog.info(
-                "milink.android.status_sent available=${sourcedStatus.available} " +
+                "milink.android.status_sent reason=$reason available=${sourcedStatus.available} " +
                     "messenger=${sourcedStatus.messengerTransportOk} cast=${sourcedStatus.castServiceOk} " +
+                    "services=${sourcedStatus.services.count { it.available }}/${sourcedStatus.services.size} " +
+                    "preferredRoutes=${sourcedStatus.preferredRoutes} " +
                     "phoneContinuity=${sourcedStatus.phoneContinuityOk} " +
                     "callRelay=${sourcedStatus.phoneCallRelayServiceOk} " +
                     "mediaRelayCallback=${sourcedStatus.phoneMediaRelayCallbackOk} " +
@@ -1791,6 +1840,7 @@ private class AndroidCommandDispatcher(
     private val screenSession: AndroidScreenSession,
     private val smsSync: AndroidSmsSync,
     private val phoneCallController: AndroidPhoneCallController,
+    private val miLinkCommandBridge: AndroidMiLinkCommandBridge,
     private val onPong: () -> Unit,
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
@@ -1836,6 +1886,11 @@ private class AndroidCommandDispatcher(
                 val envelope = EnvelopeCodec.decode<PhoneRelayEndpointBody>(plaintext)
                 onPhoneRelayEndpoint(envelope.b)
                 null
+            }
+            EnvelopeTypes.MILINK_COMMAND -> {
+                val envelope = EnvelopeCodec.decode<MiLinkCommandBody>(plaintext)
+                val result = miLinkCommandBridge.handle(envelope.b)
+                EnvelopeCodec.encode(EnvelopeTypes.MILINK_COMMAND_RESULT, result)
             }
             EnvelopeTypes.SCREEN_START -> {
                 onScreenStartReceived()

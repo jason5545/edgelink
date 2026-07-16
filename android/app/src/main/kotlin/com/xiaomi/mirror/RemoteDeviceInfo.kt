@@ -33,6 +33,9 @@ class RemoteDeviceInfo() : Parcelable {
     val manufacturer: String?
         get() = bundle.getString(KEY_MANUFACTURER)
 
+    val address: String?
+        get() = bundle.getString(KEY_ADDRESS)
+
     val isMediaRelay: Int
         get() = bundle.getInt(KEY_IS_MEDIA_RELAY, MEDIA_RELAY_NOT_SUPPORT)
 

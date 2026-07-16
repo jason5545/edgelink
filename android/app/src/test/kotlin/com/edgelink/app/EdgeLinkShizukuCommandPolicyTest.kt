@@ -173,6 +173,101 @@ class EdgeLinkShizukuCommandPolicyTest {
     }
 
     @Test
+    fun allowsOnlyExactMiShareSettingsStartCommand() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "am",
+                    "start",
+                    "-a",
+                    "com.miui.mishare.action.MiShareSettings",
+                    "-p",
+                    "com.miui.mishare.connectivity"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "am",
+                    "start",
+                    "-a",
+                    "android.intent.action.VIEW",
+                    "-p",
+                    "com.miui.mishare.connectivity"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "am",
+                    "start",
+                    "-a",
+                    "com.miui.mishare.action.MiShareSettings",
+                    "-p",
+                    "com.android.settings"
+                )
+            )
+        )
+    }
+
+    @Test
+    fun allowsOnlyMirrorBluetoothLogcatProbe() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "logcat",
+                    "-d",
+                    "-t",
+                    "3000",
+                    "-v",
+                    "time",
+                    "BluetoothRemoteDevices:D",
+                    "HyperRemoteDevicesAdapter:D",
+                    "ScanController:V",
+                    "*:S"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("logcat", "-d")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "logcat",
+                    "-d",
+                    "-t",
+                    "5000",
+                    "-v",
+                    "time",
+                    "BluetoothRemoteDevices:D",
+                    "HyperRemoteDevicesAdapter:D",
+                    "ScanController:V",
+                    "*:S"
+                )
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "logcat",
+                    "-d",
+                    "-t",
+                    "3000",
+                    "-v",
+                    "time",
+                    "AndroidRuntime:E",
+                    "*:S"
+                )
+            )
+        )
+    }
+
+    @Test
     fun allowsExactPhoneCommands() {
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(
@@ -358,6 +453,39 @@ class EdgeLinkShizukuCommandPolicyTest {
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("getprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY)
+            )
+        )
+    }
+
+    @Test
+    fun allowsOnlyBoundedMirrorScreenPropertyWrites() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY, "pad")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY,
+                    "1790000000000"
+                )
+            )
+        )
+
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY, "car")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY,
+                    "1790000000000;id"
+                )
             )
         )
     }

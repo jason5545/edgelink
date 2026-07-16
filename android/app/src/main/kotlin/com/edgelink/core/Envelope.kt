@@ -43,6 +43,8 @@ object EnvelopeTypes {
     const val PHONE_CALL_STATUS = "phone.call.status"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
+    const val MILINK_COMMAND = "milink.command"
+    const val MILINK_COMMAND_RESULT = "milink.command.result"
     const val ANDROID_MIC_STATUS = "android.mic.status"
 }
 
@@ -253,6 +255,20 @@ data class AndroidMicStatusBody(
 )
 
 @Serializable
+data class MiLinkServiceCapabilityBody(
+    val id: String,
+    val packageName: String,
+    val appName: String,
+    val serviceName: String,
+    val category: String,
+    val route: String,
+    val available: Boolean,
+    val preferred: Boolean = false,
+    val bindAction: String? = null,
+    val evidence: String
+)
+
+@Serializable
 data class MiLinkStatusBody(
     val sourceDeviceId: String? = null,
     val sourcePlatform: String = "android",
@@ -268,6 +284,8 @@ data class MiLinkStatusBody(
     val phoneMediaRelayCallbackOk: Boolean = false,
     val phoneRemoteDeviceCount: Int = 0,
     val phoneMediaRelayCandidateCount: Int = 0,
+    val services: List<MiLinkServiceCapabilityBody> = emptyList(),
+    val preferredRoutes: Map<String, String> = emptyMap(),
     val summary: String,
     val ts: Long
 )
@@ -282,5 +300,24 @@ data class MiLinkFrameBody(
     val dataBase64: String,
     val bytes: Int,
     val hasNext: Boolean,
+    val ts: Long
+)
+
+@Serializable
+data class MiLinkCommandBody(
+    val requestId: String,
+    val command: String,
+    val args: Map<String, String> = emptyMap(),
+    val ts: Long
+)
+
+@Serializable
+data class MiLinkCommandResultBody(
+    val requestId: String,
+    val command: String,
+    val success: Boolean,
+    val route: String,
+    val message: String,
+    val data: Map<String, String> = emptyMap(),
     val ts: Long
 )

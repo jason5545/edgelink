@@ -178,10 +178,16 @@ class MiLinkPrivilegeHookPolicyTest {
     fun allowsOnlyKnownMirrorPhoneProviderMethods() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("getCallRelayService"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("queryRemoteDevices"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("openRemoteDeviceMirror"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("openRemoteDeviceMirrorByBtMac"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("performMirrorDeviceIconClick"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("startRemoteMainMirrorDisplay"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("showRelayData"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("syncRelayData"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("cancelRelayData"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("startMediaRelay"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("stopMediaRelay"))
 
-        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("openRemoteDeviceMirror"))
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("sendRemoteBroadcast"))
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod(null))
     }
@@ -268,6 +274,24 @@ class MiLinkPrivilegeHookPolicyTest {
         assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil("1790000000000;id"))
         assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil(""))
         assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallRelayUntil(null))
+    }
+
+    @Test
+    fun parsesMirrorFakeRemoteScreenLatch() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenActive(
+                rawValue = "1790000000000",
+                nowEpochMs = 1_780_000_000_000L
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenActive(
+                rawValue = "1790000000000",
+                nowEpochMs = 1_790_000_000_000L
+            )
+        )
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenActive("0", nowEpochMs = 1L))
+        assertFalse(MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenActive("1790000000000;id", nowEpochMs = 1L))
     }
 
     @Test

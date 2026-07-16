@@ -33,6 +33,19 @@ private const val ANDROID_UIDS_PER_USER = 100_000
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 private const val PHONE_RELAY_DEFAULT_PORT = 7_102
 private const val PHONE_DTMF_KEY_DELAY_MS = 120L
+private const val MIRROR_SCREEN_REMOTE_TTL_MS = 180_000L
+private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
+    "logcat",
+    "-d",
+    "-t",
+    "3000",
+    "-v",
+    "time",
+    "BluetoothRemoteDevices:D",
+    "HyperRemoteDevicesAdapter:D",
+    "ScanController:V",
+    "*:S"
+)
 
 data class AndroidShizukuState(
     val available: Boolean,
@@ -50,6 +63,12 @@ data class AndroidShizukuState(
 
 data class ShizukuOperationResult(
     val success: Boolean,
+    val message: String
+)
+
+data class MirrorBluetoothMacResult(
+    val btMac: String?,
+    val source: String,
     val message: String
 )
 
@@ -246,6 +265,95 @@ object AndroidShizukuSupport {
             ShizukuOperationResult(
                 success = successCount > 0,
                 message = "MiLink attribution probe $successCount/${results.size}"
+            )
+        }
+
+    suspend fun openMiShareSettings(context: Context): ShizukuOperationResult =
+        withService(context) { service ->
+            val result = service.runCommandResult(
+                arrayOf(
+                    "am",
+                    "start",
+                    "-a",
+                    "com.miui.mishare.action.MiShareSettings",
+                    "-p",
+                    "com.miui.mishare.connectivity"
+                )
+            )
+            listOf(result).toOperationResult("mishare:settings")
+        }
+
+    suspend fun armMirrorScreenRemote(
+        context: Context,
+        peerHost: String? = null,
+        peerPort: Int? = null
+    ): ShizukuOperationResult =
+        withService(context) { service ->
+            val untilEpochMs = System.currentTimeMillis() + MIRROR_SCREEN_REMOTE_TTL_MS
+            val sanitizedPeerHost = MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(peerHost)
+            val sanitizedPeerPort = peerPort?.takeIf { it in 1..65_535 }
+            val commands = mutableListOf(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY,
+                    "pad"
+                ),
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY,
+                    untilEpochMs.toString()
+                )
+            )
+            sanitizedPeerHost?.let {
+                commands += arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY,
+                    it
+                )
+            }
+            sanitizedPeerPort?.let {
+                commands += arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY,
+                    it.toString()
+                )
+            }
+            val results = commands.map { command -> service.runCommandResult(command) }
+            results.toOperationResult(
+                "mirror:screen_remote peer=${sanitizedPeerHost ?: "default"}:${sanitizedPeerPort ?: "default"}"
+            )
+        }
+
+    suspend fun recentMirrorBluetoothMac(context: Context): MirrorBluetoothMacResult =
+        withService(context) { service ->
+            val result = service.runCommandResult(
+                MIRROR_BT_LOGCAT_COMMAND
+            )
+            if (!result.success) {
+                EdgeLinkLog.warn(
+                    "xiaomi.mirror.bt_mac_probe_failed exit=${result.exitCode} " +
+                        "stderr=${result.stderr.forSingleLineLog()}"
+                )
+                return@withService MirrorBluetoothMacResult(
+                    btMac = null,
+                    source = "logcat",
+                    message = "logcat exit=${result.exitCode}"
+                )
+            }
+
+            val selected = mirrorBluetoothMacPatterns
+                .flatMap { (source, pattern) ->
+                    pattern.findAll(result.stdout).map { source to it.groupValues[1].uppercase() }
+                }
+                .lastOrNull()
+            EdgeLinkLog.info(
+                "xiaomi.mirror.bt_mac_probe found=${selected?.first ?: "none"} " +
+                    "bt=${selected?.second?.maskBluetoothMac() ?: "none"}"
+            )
+            MirrorBluetoothMacResult(
+                btMac = selected?.second,
+                source = selected?.first ?: "logcat",
+                message = if (selected == null) "bt mac not found" else "bt mac from ${selected.first}"
             )
         }
 
@@ -697,6 +805,14 @@ object AndroidShizukuSupport {
         replace(Regex("\\s+"), " ")
             .trim()
             .take(512)
+
+    private fun String.maskBluetoothMac(): String =
+        split(':').takeIf { it.size == 6 }?.let { "**:**:**:**:${it[4]}:${it[5]}" } ?: this
+
+    private val mirrorBluetoothMacPatterns = listOf(
+        "bt_property" to Regex("""BT_PROPERTY_TYPE_OF_DEVICE addr:([0-9A-Fa-f:]{17}) deviceType:3"""),
+        "hyper_remote" to Regex("""Remote device name is:.* type = 2 ([0-9A-Fa-f:]{17})""")
+    )
 
     private val ShizukuCommandResult.isProbeSuccess: Boolean
         get() = success && stderr.isBlank()

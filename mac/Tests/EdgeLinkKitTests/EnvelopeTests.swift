@@ -248,6 +248,21 @@ final class EnvelopeTests: XCTestCase {
                     phoneMediaRelayCallbackOk: false,
                     phoneRemoteDeviceCount: 2,
                     phoneMediaRelayCandidateCount: 1,
+                    services: [
+                        MiLinkServiceCapabilityBody(
+                            id: "xiaomi.mirror.synergy",
+                            packageName: "com.xiaomi.mirror",
+                            appName: "com.xiaomi.mirror",
+                            serviceName: "synergy",
+                            category: "screen",
+                            route: "xiaomi.mirror",
+                            available: true,
+                            preferred: true,
+                            bindAction: "com.xiaomi.mirror.ACTION_SYNERGY_SERVICE",
+                            evidence: "bind=ok"
+                        )
+                    ],
+                    preferredRoutes: ["screen": "xiaomi.mirror.synergy"],
                     summary: "MiLink messenger transport ok",
                     ts: 1_783_510_256
                 )
@@ -265,6 +280,8 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertFalse(decoded.b.phoneMediaRelayCallbackOk ?? true)
         XCTAssertEqual(decoded.b.phoneRemoteDeviceCount, 2)
         XCTAssertEqual(decoded.b.phoneMediaRelayCandidateCount, 1)
+        XCTAssertEqual(decoded.b.preferredRoutes?["screen"], "xiaomi.mirror.synergy")
+        XCTAssertEqual(decoded.b.services?.first?.serviceName, "synergy")
     }
 
     func testMiLinkFrameBodyRoundTrips() throws {
@@ -290,5 +307,43 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(decoded.b.sequence, 7)
         XCTAssertEqual(decoded.b.dataBase64, "AQIDBA==")
         XCTAssertEqual(decoded.b.bytes, 4)
+    }
+
+    func testMiLinkCommandBodiesRoundTrip() throws {
+        let commandData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.miLinkCommand,
+                b: MiLinkCommandBody(
+                    requestId: "req-1",
+                    command: "xiaomi.mirror.startMainDisplay",
+                    args: [:],
+                    ts: 1_783_510_258
+                )
+            )
+        )
+        let command = try decoder.decode(Envelope<MiLinkCommandBody>.self, from: commandData)
+        XCTAssertEqual(command.t, "milink.command")
+        XCTAssertEqual(command.b.command, "xiaomi.mirror.startMainDisplay")
+        XCTAssertNil(command.b.args["remoteDeviceId"])
+
+        let resultData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.miLinkCommandResult,
+                b: MiLinkCommandResultBody(
+                    requestId: "req-1",
+                    command: "xiaomi.mirror.startMainDisplay",
+                    success: true,
+                    route: "xiaomi.mirror",
+                    message: "value=0",
+                    data: ["value": "0"],
+                    ts: 1_783_510_259
+                )
+            )
+        )
+        let result = try decoder.decode(Envelope<MiLinkCommandResultBody>.self, from: resultData)
+        XCTAssertEqual(result.t, "milink.command.result")
+        XCTAssertTrue(result.b.success)
+        XCTAssertEqual(result.b.route, "xiaomi.mirror")
+        XCTAssertEqual(result.b.data["value"], "0")
     }
 }

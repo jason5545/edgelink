@@ -215,6 +215,21 @@ class EnvelopeTest {
                 phoneMediaRelayCallbackOk = false,
                 phoneRemoteDeviceCount = 2,
                 phoneMediaRelayCandidateCount = 1,
+                services = listOf(
+                    MiLinkServiceCapabilityBody(
+                        id = "xiaomi.mirror.synergy",
+                        packageName = "com.xiaomi.mirror",
+                        appName = "com.xiaomi.mirror",
+                        serviceName = "synergy",
+                        category = "screen",
+                        route = "xiaomi.mirror",
+                        available = true,
+                        preferred = true,
+                        bindAction = "com.xiaomi.mirror.ACTION_SYNERGY_SERVICE",
+                        evidence = "bind=ok"
+                    )
+                ),
+                preferredRoutes = mapOf("screen" to "xiaomi.mirror.synergy"),
                 summary = "MiLink messenger transport ok",
                 ts = 1_783_510_256
             )
@@ -231,6 +246,8 @@ class EnvelopeTest {
         assertEquals(false, decoded.b.phoneMediaRelayCallbackOk)
         assertEquals(2, decoded.b.phoneRemoteDeviceCount)
         assertEquals(1, decoded.b.phoneMediaRelayCandidateCount)
+        assertEquals("xiaomi.mirror.synergy", decoded.b.preferredRoutes["screen"])
+        assertEquals("synergy", decoded.b.services.single().serviceName)
     }
 
     @Test
@@ -255,5 +272,40 @@ class EnvelopeTest {
         assertEquals(7, decoded.b.sequence)
         assertEquals("AQIDBA==", decoded.b.dataBase64)
         assertEquals(4, decoded.b.bytes)
+    }
+
+    @Test
+    fun miLinkCommandBodiesRoundTrip() {
+        val commandBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.MILINK_COMMAND,
+            MiLinkCommandBody(
+                requestId = "req-1",
+                command = "xiaomi.mirror.startMainDisplay",
+                args = emptyMap(),
+                ts = 1_783_510_258
+            )
+        )
+        val command = EnvelopeCodec.decode<MiLinkCommandBody>(commandBytes)
+        assertEquals(EnvelopeTypes.MILINK_COMMAND, command.t)
+        assertEquals("xiaomi.mirror.startMainDisplay", command.b.command)
+        assertEquals(null, command.b.args["remoteDeviceId"])
+
+        val resultBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.MILINK_COMMAND_RESULT,
+            MiLinkCommandResultBody(
+                requestId = "req-1",
+                command = "xiaomi.mirror.startMainDisplay",
+                success = true,
+                route = "xiaomi.mirror",
+                message = "value=0",
+                data = mapOf("value" to "0"),
+                ts = 1_783_510_259
+            )
+        )
+        val result = EnvelopeCodec.decode<MiLinkCommandResultBody>(resultBytes)
+        assertEquals(EnvelopeTypes.MILINK_COMMAND_RESULT, result.t)
+        assertEquals(true, result.b.success)
+        assertEquals("xiaomi.mirror", result.b.route)
+        assertEquals("0", result.b.data["value"])
     }
 }

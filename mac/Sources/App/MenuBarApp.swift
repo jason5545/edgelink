@@ -125,6 +125,24 @@ private struct MenuBarPopover: View {
                     .disabled(!runtime.isConnected)
                 }
 
+                Divider()
+
+                XiaomiMiShareDiscoveryPanel(runtime: runtime)
+
+                Button {
+                    runtime.openPhoneMiShare()
+                } label: {
+                    Label("手機快傳入口", systemImage: "square.and.arrow.up")
+                }
+                .disabled(!runtime.isConnected)
+
+                if !runtime.xiaomiMiLinkCommandStatus.isEmpty {
+                    Text(runtime.xiaomiMiLinkCommandStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
                 Button {
                     openWindow(id: "sms")
                 } label: {
@@ -148,6 +166,49 @@ private struct MenuBarPopover: View {
         }
         .padding()
         .frame(width: 280)
+    }
+}
+
+private struct XiaomiMiShareDiscoveryPanel: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(runtime.xiaomiMiShareDiscoveryStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+
+            if !runtime.xiaomiMiShareDiscoveredPeers.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(runtime.xiaomiMiShareDiscoveredPeers.prefix(3)) { peer in
+                        Text(miSharePeerLine(peer))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            Button {
+                runtime.restartXiaomiMiShareDiscovery()
+            } label: {
+                Label("重新掃描小米快傳", systemImage: "dot.radiowaves.left.and.right")
+            }
+
+            Button {
+                runtime.probePhoneMiShareDiscovery()
+            } label: {
+                Label("手機 SDK 掃描 Mac", systemImage: "iphone.radiowaves.left.and.right")
+            }
+            .disabled(!runtime.isConnected)
+        }
+    }
+
+    private func miSharePeerLine(_ peer: XiaomiMiShareDiscoveredPeer) -> String {
+        let deviceId = peer.deviceIdHex.map { " \($0)" } ?? ""
+        let channel = peer.channel.map { " CH=\($0)" } ?? ""
+        return "手機 \(peer.displayLabel)\(deviceId)\(channel)"
     }
 }
 
@@ -203,6 +264,12 @@ private struct StatusSummary: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if let miLinkSummary = xiaomiMiLinkSummary(runtime.latestMiLinkStatus) {
+                Text(miLinkSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
         }
     }
@@ -502,4 +569,37 @@ private func localizedPairingStatus(_ status: String) -> String {
     default:
         return status
     }
+}
+
+private func xiaomiMiLinkSummary(_ status: MiLinkStatusBody?) -> String? {
+    guard let status else {
+        return nil
+    }
+    let services = status.services ?? []
+    let available = services.filter(\.available)
+    guard status.available || !available.isEmpty else {
+        return "Mi 優先：未就緒，使用 EdgeLink fallback"
+    }
+
+    let names = available
+        .filter(\.preferred)
+        .map { service in
+            switch service.category {
+            case "fileTransfer":
+                return "快傳"
+            case "screen":
+                return service.serviceName == "synergy" ? "妙享" : "鏡像"
+            case "recentApps":
+                return "RecentApps"
+            case "audio":
+                return "音訊"
+            default:
+                return service.serviceName
+            }
+        }
+    let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? names
+    if uniqueNames.isEmpty {
+        return "Mi 優先：探測中，使用 EdgeLink fallback"
+    }
+    return "Mi 優先：" + uniqueNames.joined(separator: " / ")
 }

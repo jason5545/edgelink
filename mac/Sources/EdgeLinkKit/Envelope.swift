@@ -44,6 +44,8 @@ public enum EnvelopeType {
     public static let phoneCallStatus = "phone.call.status"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
+    public static let miLinkCommand = "milink.command"
+    public static let miLinkCommandResult = "milink.command.result"
     public static let androidMicStatus = "android.mic.status"
 }
 
@@ -438,6 +440,43 @@ public struct AndroidMicStatusBody: Codable, Equatable, Sendable {
     }
 }
 
+public struct MiLinkServiceCapabilityBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let packageName: String
+    public let appName: String
+    public let serviceName: String
+    public let category: String
+    public let route: String
+    public let available: Bool
+    public let preferred: Bool
+    public let bindAction: String?
+    public let evidence: String
+
+    public init(
+        id: String,
+        packageName: String,
+        appName: String,
+        serviceName: String,
+        category: String,
+        route: String,
+        available: Bool,
+        preferred: Bool = false,
+        bindAction: String? = nil,
+        evidence: String
+    ) {
+        self.id = id
+        self.packageName = packageName
+        self.appName = appName
+        self.serviceName = serviceName
+        self.category = category
+        self.route = route
+        self.available = available
+        self.preferred = preferred
+        self.bindAction = bindAction
+        self.evidence = evidence
+    }
+}
+
 public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let sourceDeviceId: String?
     public let sourcePlatform: String
@@ -453,6 +492,8 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let phoneMediaRelayCallbackOk: Bool?
     public let phoneRemoteDeviceCount: Int?
     public let phoneMediaRelayCandidateCount: Int?
+    public let services: [MiLinkServiceCapabilityBody]?
+    public let preferredRoutes: [String: String]?
     public let summary: String
     public let ts: Int64
 
@@ -471,6 +512,8 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         phoneMediaRelayCallbackOk: Bool? = nil,
         phoneRemoteDeviceCount: Int? = nil,
         phoneMediaRelayCandidateCount: Int? = nil,
+        services: [MiLinkServiceCapabilityBody]? = nil,
+        preferredRoutes: [String: String]? = nil,
         summary: String,
         ts: Int64
     ) {
@@ -488,6 +531,8 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         self.phoneMediaRelayCallbackOk = phoneMediaRelayCallbackOk
         self.phoneRemoteDeviceCount = phoneRemoteDeviceCount
         self.phoneMediaRelayCandidateCount = phoneMediaRelayCandidateCount
+        self.services = services
+        self.preferredRoutes = preferredRoutes
         self.summary = summary
         self.ts = ts
     }
@@ -523,6 +568,53 @@ public struct MiLinkFrameBody: Codable, Equatable, Sendable {
         self.dataBase64 = dataBase64
         self.bytes = bytes
         self.hasNext = hasNext
+        self.ts = ts
+    }
+}
+
+public struct MiLinkCommandBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let command: String
+    public let args: [String: String]
+    public let ts: Int64
+
+    public init(
+        requestId: String,
+        command: String,
+        args: [String: String] = [:],
+        ts: Int64
+    ) {
+        self.requestId = requestId
+        self.command = command
+        self.args = args
+        self.ts = ts
+    }
+}
+
+public struct MiLinkCommandResultBody: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let command: String
+    public let success: Bool
+    public let route: String
+    public let message: String
+    public let data: [String: String]
+    public let ts: Int64
+
+    public init(
+        requestId: String,
+        command: String,
+        success: Bool,
+        route: String,
+        message: String,
+        data: [String: String] = [:],
+        ts: Int64
+    ) {
+        self.requestId = requestId
+        self.command = command
+        self.success = success
+        self.route = route
+        self.message = message
+        self.data = data
         self.ts = ts
     }
 }

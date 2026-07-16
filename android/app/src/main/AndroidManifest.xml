@@ -17,6 +17,8 @@
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
   <uses-permission android:name="android.permission.WRITE_SETTINGS" />
   <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+  <uses-permission android:name="com.miui.audiomonitor.permission.ACCESS_DIST_AUDIO_SERVICE" />
+  <uses-permission android:name="com.miui.mishare.PERMISSION.ALL" />
 
   <application
     android:allowBackup="false"
