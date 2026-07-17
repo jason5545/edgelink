@@ -8,7 +8,9 @@ import Foundation
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
-    private static let allowXiaomiScreenPrimaryRoute = false
+    private static var allowXiaomiScreenPrimaryRoute: Bool {
+        UserDefaults.standard.object(forKey: xiaomiScreenPrimaryRouteDefaultsKey) as? Bool ?? false
+    }
 
     @Published private(set) var localDeviceId = "Registering..."
     @Published private(set) var peerName = "No paired Android"
@@ -56,6 +58,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let turnCredentialClient: TurnCredentialClient
     private let callRelayGatewayClient: CallRelayGatewayClient
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
+    private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
@@ -185,6 +188,7 @@ final class EdgeLinkRuntime: ObservableObject {
         observeSystemSleepWake()
         verificationCodeBridge.warmObservers()
         task = Task { await run() }
+        startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded()
     }
 
     deinit {
@@ -196,6 +200,7 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         currentChannel?.close()
         phoneRelayProbe.stop()
+        xiaomiMirrorRTSPDiagnosticSource.stop(reason: "runtime_deinit")
         xiaomiMiShareDiscovery.stop()
         callRelayGatewayClient.close(reason: "runtime_deinit")
         screenSession.closeWindow(sendRemoteStop: false)
@@ -288,16 +293,22 @@ final class EdgeLinkRuntime: ObservableObject {
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.phoneRelayAdvertisedHost()
+            let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
+            startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
             let xiaomiMirrorDeviceId = XiaomiHyperConnectBridge.localDeviceId()
             DiagnosticsLog.info(
                 "xiaomi.mac.screen_route_selected command=\(command) route=\(preferredScreenRoute ?? "unknown") " +
                     "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
                     "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
                     "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) gatedByOfficialApp=false " +
-                    "peerHost=\(peerHost ?? "default") fakeRemote=false " +
+                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=false " +
                     "xiaomiMirrorDeviceId=\(xiaomiMirrorDeviceId ?? "none") timeoutMs=\(timeoutMs)"
             )
             var args: [String: String] = [:]
+            if let peerHost {
+                args["peerHost"] = peerHost
+            }
+            args["peerPort"] = String(peerPort)
             if let xiaomiMirrorDeviceId {
                 args["remoteDeviceId"] = xiaomiMirrorDeviceId
             }
@@ -337,6 +348,7 @@ final class EdgeLinkRuntime: ObservableObject {
                                 "elapsedMs=\(pending.elapsedMs) officialDiscoveryRequired=\(pending.officialDiscoveryRequired) " +
                                 "phoneDevices=\(pending.phoneDevices) hyperConnectInstalled=\(pending.hyperConnectInstalled)"
                         )
+                        self.stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_timeout")
                         self.startEdgeLinkPhoneScreen(reason: "xiaomi_timeout")
                     }
                 }
@@ -395,6 +407,7 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
         pendingXiaomiScreenFallback = nil
+        stopXiaomiMirrorRTSPDiagnosticSource(reason: "disconnect")
         didAutoBindXiaomiDistAudio = false
         didAutoQueryXiaomiMirrorDevices = false
 
@@ -577,6 +590,22 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
+    @discardableResult
+    func probePhoneMiConnectNetworking(args: [String: String] = [:]) -> String? {
+        sendMiLinkCommand(
+            command: "xiaomi.mi_connect.networkingProbe",
+            args: args
+        )
+    }
+
+    @discardableResult
+    func registerPhoneMiConnectLyraService(args: [String: String] = [:]) -> String? {
+        sendMiLinkCommand(
+            command: "xiaomi.mi_connect.registerLyraService",
+            args: args
+        )
+    }
+
     func restartXiaomiMiShareDiscovery() {
         guard let localIdentity else {
             xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：identity 尚未就緒"
@@ -745,6 +774,15 @@ final class EdgeLinkRuntime: ObservableObject {
         case "view-phone-screen", "phone-screen", "screen":
             DiagnosticsLog.info("runtime.mac.url_view_phone_screen")
             viewPhoneScreen()
+        case "xiaomi-mirror-rtsp", "xiaomi-mirror-rtsp-listener", "mirror-rtsp":
+            let args = Self.externalURLQueryArgs(url)
+            let requestedPeerHost = args["peerHost"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let peerHost = requestedPeerHost?.isEmpty == false ? requestedPeerHost : Self.phoneRelayAdvertisedHost()
+            DiagnosticsLog.info(
+                "runtime.mac.url_xiaomi_mirror_rtsp_listener peerHost=\(peerHost ?? "none") args=\(args)"
+            )
+            startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "url")
         case "xiaomi-mishare", "mishare":
             DiagnosticsLog.info("runtime.mac.url_xiaomi_mishare")
             openPhoneMiShare()
@@ -754,6 +792,14 @@ final class EdgeLinkRuntime: ObservableObject {
         case "xiaomi-mishare-nsd-discover", "mishare-nsd-discover":
             DiagnosticsLog.info("runtime.mac.url_xiaomi_mishare_nsd_discover")
             probePhoneMiShareNsdDiscovery()
+        case "xiaomi-networking-probe", "mi-connect-networking-probe", "miconnect-networking-probe":
+            let args = Self.externalURLQueryArgs(url)
+            DiagnosticsLog.info("runtime.mac.url_xiaomi_networking_probe args=\(args)")
+            probePhoneMiConnectNetworking(args: args)
+        case "xiaomi-networking-register", "mi-connect-networking-register", "miconnect-networking-register":
+            let args = Self.externalURLQueryArgs(url)
+            DiagnosticsLog.info("runtime.mac.url_xiaomi_networking_register args=\(args)")
+            registerPhoneMiConnectLyraService(args: args)
         default:
             DiagnosticsLog.warn("runtime.mac.url_ignored command=\(command)")
         }
@@ -767,6 +813,19 @@ final class EdgeLinkRuntime: ObservableObject {
         return url.path
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             .lowercased()
+    }
+
+    private static func externalURLQueryArgs(_ url: URL) -> [String: String] {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let items = components?.queryItems ?? []
+        var args: [String: String] = [:]
+        for item in items {
+            guard let value = item.value else {
+                continue
+            }
+            args[item.name] = value
+        }
+        return args
     }
 
     private func rememberDialedPhoneNumber(_ number: String) {
@@ -819,6 +878,53 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayProbeRunning = false
         phoneRelayProbe.stop()
         DiagnosticsLog.info("phonerelay.mac.probe_auto_stopped reason=\(reason)")
+    }
+
+    private func startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: String?, reason: String) {
+        guard Self.xiaomiMirrorRTSPDiagnosticEnabled() else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.listener_start_skipped reason=\(reason) disabled=true " +
+                    "defaultsKey=\(Self.xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey)"
+            )
+            return
+        }
+        guard !phoneRelayProbeRunning else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.listener_start_skipped reason=\(reason) phoneRelayProbeRunning=true " +
+                    "port=\(Self.xiaomiMirrorRTSPDiagnosticPort)"
+            )
+            return
+        }
+        do {
+            try xiaomiMirrorRTSPDiagnosticSource.start(
+                port: Self.xiaomiMirrorRTSPDiagnosticPort,
+                advertisedHost: peerHost,
+                lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds
+            )
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.listener_auto_started reason=\(reason) " +
+                    "port=\(Self.xiaomiMirrorRTSPDiagnosticPort) advertisedHost=\(peerHost ?? "none")"
+            )
+        } catch {
+            DiagnosticsLog.error(
+                "xiaomi.mirror.rtsp.listener_start_failed reason=\(reason) port=\(Self.xiaomiMirrorRTSPDiagnosticPort)",
+                error
+            )
+        }
+    }
+
+    private func stopXiaomiMirrorRTSPDiagnosticSource(reason: String) {
+        xiaomiMirrorRTSPDiagnosticSource.stop(reason: reason)
+    }
+
+    private func startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded() {
+        guard Self.allowXiaomiScreenPrimaryRoute else {
+            return
+        }
+        startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(
+            peerHost: Self.phoneRelayAdvertisedHost(),
+            reason: "runtime_launch"
+        )
     }
 
     private func freshTurnCredential() -> TurnCredentialSnapshot? {
@@ -1675,6 +1781,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     "route=\(pending.route) reason=pending elapsedMs=\(pending.elapsedMs) " +
                     "message=\(result.message) data=\(Self.formatDiagnosticsData(result.data))"
             )
+            stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_pending_fallback")
             startEdgeLinkPhoneScreen(reason: "xiaomi_pending")
             return
         }
@@ -1691,6 +1798,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     "route=\(pending.route) reason=result_failed elapsedMs=\(pending.elapsedMs) " +
                     "message=\(result.message) data=\(Self.formatDiagnosticsData(result.data))"
             )
+            stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_result_failed")
             startEdgeLinkPhoneScreen(reason: "xiaomi_result_failed")
         }
     }
@@ -1989,8 +2097,16 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102
+    private static let xiaomiScreenPrimaryRouteDefaultsKey = "xiaomiScreenPrimaryRouteEnabled"
+    private static let xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey = "xiaomiMirrorRTSPDiagnosticEnabled"
+    private static let xiaomiMirrorRTSPDiagnosticPort: UInt16 = 7102
+    private static let xiaomiMirrorRTSPDiagnosticLifetimeSeconds: TimeInterval = 45
     private static let phoneRelayDebugDefaultNumber = "800"
     private static let phoneRelayDebugMaxTimeoutSeconds: TimeInterval = 30
+
+    private static func xiaomiMirrorRTSPDiagnosticEnabled() -> Bool {
+        UserDefaults.standard.object(forKey: xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey) as? Bool ?? true
+    }
 
     private static func phoneRelayProbePeerPort() -> UInt16 {
         let value = UserDefaults.standard.integer(forKey: phoneRelayProbePeerPortDefaultsKey)

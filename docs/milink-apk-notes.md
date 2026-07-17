@@ -630,3 +630,31 @@ Lyra service registration path. The Mac UI should not use the official HyperConn
 as the primary "view phone screen" path; doing so can leave the user stuck at "Xiaomi service
 starting" while no EdgeLink-owned session exists. The primary screen route is EdgeLink's own secure
 screen session until the Xiaomi endpoint is verified end-to-end.
+
+The next boundary is MiConnectService's Networking API, not Bonjour. MiShare's Lyra helper registers
+`BusinessServiceInfo(serviceName = miLyraShare, service id = 00270525)` through
+`com.xiaomi.mi_connect_service/com.xiaomi.continuity.networking.service.NetworkingService`; the
+parcel payload is `serviceName`, `packageName`, and `serviceData`. Current MiShare code builds a
+9-byte `serviceData` value for `miLyraShare`.
+
+EdgeLink has a raw Binder diagnostic client for this service:
+
+- `edgelink://xiaomi-networking-probe`
+  - sends `xiaomi.mi_connect.networkingProbe`
+  - reads local trusted-device info, trusted-device list, and service info for `1780C740` and
+    `721572C3`
+- `edgelink://xiaomi-networking-register`
+  - sends `xiaomi.mi_connect.registerLyraService`
+  - additionally calls `addServiceInfo(miLyraShare)` with default data `000000001200000103`
+
+For Mirror diagnostics, the phone-side Mirror app has been observed registering
+`BusinessServiceInfo(serviceName = cast|synergy, packageName = com.xiaomi.mirror,
+serviceData = 0CDDFFFC)`. The debug command therefore accepts
+`profile=mirrorCast` or `profile=mirrorSynergy`, and an explicit `servicePackageName` override when
+we need to test that exact Mirror-shaped metadata. The default package remains `com.edgelink.app`
+so spoofing `com.xiaomi.mirror` is always visible in the command data.
+
+The Xposed module only relaxes `PermissionChecker.checkPermissions(...)` inside
+`com.xiaomi.mi_connect_service`, and only when the Binder caller resolves to `com.edgelink.app`.
+This keeps the probe bounded: it verifies whether EdgeLink can talk to MiConnectService's metadata
+layer without making the official Xiaomi Mac app part of the main flow.

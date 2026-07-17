@@ -36,6 +36,8 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MISHARE_OPEN_SETTINGS -> openMiShareSettings()
                     COMMAND_MISHARE_DISCOVER -> discoverMiShareDevices(body)
                     COMMAND_MISHARE_NSD_DISCOVER -> discoverMiShareNsdDevices(body)
+                    COMMAND_MI_CONNECT_NETWORKING_PROBE -> probeMiConnectNetworking(body, addServiceInfo = false)
+                    COMMAND_MI_CONNECT_NETWORKING_REGISTER -> probeMiConnectNetworking(body, addServiceInfo = true)
                     COMMAND_MIRROR_QUERY_REMOTE_DEVICES -> queryMirrorRemoteDevices(body)
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
@@ -154,6 +156,61 @@ class AndroidMiLinkCommandBridge(
         )
     }
 
+    private suspend fun probeMiConnectNetworking(
+        body: MiLinkCommandBody,
+        addServiceInfo: Boolean
+    ): CommandResult {
+        val requestedDeviceIds = listOfNotNull(
+            body.args["deviceId"],
+            body.args["deviceIds"]
+        )
+            .flatMap { value -> value.split(',', '|', ';') }
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val deviceIds = (requestedDeviceIds + listOf("1780C740", "721572C3"))
+            .distinct()
+            .take(8)
+        val profile = AndroidMiConnectNetworkingDefaults.serviceProfile(body.args["profile"])
+        val serviceData = AndroidMiConnectNetworkingDefaults.parseHex(body.args["serviceDataHex"])
+            ?: profile?.serviceData
+            ?: AndroidMiConnectNetworkingDefaults.defaultLyraShareServiceData()
+        val serviceName = body.args["serviceName"]
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: profile?.serviceName
+            ?: "miLyraShare"
+        val servicePackageName = body.args["servicePackageName"]
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: "com.edgelink.app"
+        val request = MiConnectNetworkingProbeRequest(
+            deviceIds = deviceIds,
+            addServiceInfo = addServiceInfo || body.args["addServiceInfo"].toBooleanOrDefault(false),
+            serviceName = serviceName,
+            servicePackageName = servicePackageName,
+            serviceData = serviceData
+        )
+        val result = AndroidMiConnectNetworkingClient(appContext).probe(request)
+        val success = result.hasAnySuccessfulMetadataRead &&
+            (!request.addServiceInfo || result.addServiceInfo?.ok == true)
+        return CommandResult(
+            success = success,
+            route = if (result.hasPermissionError) {
+                "xiaomi.mi_connect.permission"
+            } else {
+                "xiaomi.mi_connect.networking"
+            },
+            message = result.message(addRequested = request.addServiceInfo),
+            data = result.toCommandData() + mapOf(
+                "deviceIds" to deviceIds.joinToString(","),
+                "serviceName" to serviceName,
+                "servicePackageName" to servicePackageName,
+                "profile" to body.args["profile"].orEmpty(),
+                "addRequested" to request.addServiceInfo.toString()
+            )
+        )
+    }
+
     private fun queryMirrorRemoteDevices(body: MiLinkCommandBody): CommandResult {
         val result = appContext.contentResolver.callMirrorProvider(
             "queryRemoteDevices",
@@ -229,6 +286,10 @@ class AndroidMiLinkCommandBridge(
                 selection = selection,
                 requestedDeviceId = requestedDeviceId
             )
+        }
+
+        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(selection.deviceId)) {
+            return startFakeMirrorMainDisplay(body)
         }
 
         val startCall = callMirrorDeviceProviderWithDeadline(
@@ -1155,6 +1216,8 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MISHARE_OPEN_SETTINGS = "xiaomi.mishare.openSettings"
         const val COMMAND_MISHARE_DISCOVER = "xiaomi.mishare.discover"
         const val COMMAND_MISHARE_NSD_DISCOVER = "xiaomi.mishare.nsdDiscover"
+        const val COMMAND_MI_CONNECT_NETWORKING_PROBE = "xiaomi.mi_connect.networkingProbe"
+        const val COMMAND_MI_CONNECT_NETWORKING_REGISTER = "xiaomi.mi_connect.registerLyraService"
         const val COMMAND_MIRROR_QUERY_REMOTE_DEVICES = "xiaomi.mirror.queryRemoteDevices"
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"

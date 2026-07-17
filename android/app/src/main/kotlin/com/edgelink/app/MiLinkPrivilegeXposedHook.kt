@@ -3,6 +3,7 @@ package com.edgelink.app
 import android.content.Context
 import android.content.ContentProvider
 import android.content.Intent
+import android.graphics.SurfaceTexture
 import android.os.Binder
 import android.os.Bundle
 import android.os.Handler
@@ -10,6 +11,7 @@ import android.os.Looper
 import android.os.Parcelable
 import android.os.SystemClock
 import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.View
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -20,6 +22,7 @@ import java.lang.reflect.Modifier
 import java.net.InetAddress
 import java.util.ArrayList
 import java.util.HashMap
+import java.util.concurrent.ConcurrentHashMap
 
 internal object MiLinkPrivilegeHookPolicy {
     const val EDGE_LINK_PACKAGE = "com.edgelink.app"
@@ -28,6 +31,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MILINK_RUNTIME_PROCESS = "com.milink.runtime"
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
+    const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
+    const val XIAOMI_MI_CONNECT_PROCESS = "com.xiaomi.mi_connect_service"
     const val INCALLUI_PACKAGE = "com.android.incallui"
     const val INCALLUI_PROCESS = "com.android.incallui"
     const val ANDROID_PHONE_PACKAGE = "com.android.phone"
@@ -82,6 +87,7 @@ internal object MiLinkPrivilegeHookPolicy {
         shouldHookRuntime(packageName, processName) ||
             shouldHookMainService(packageName, processName) ||
             shouldHookXiaomiMirror(packageName, processName) ||
+            shouldHookMiConnectService(packageName, processName) ||
             shouldHookInCallUi(packageName, processName) ||
             shouldHookAndroidPhone(packageName, processName) ||
             shouldHookTelecomSystem(packageName, processName)
@@ -94,6 +100,9 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun shouldHookXiaomiMirror(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MIRROR_PACKAGE && processName == XIAOMI_MIRROR_PROCESS
+
+    fun shouldHookMiConnectService(packageName: String?, processName: String?): Boolean =
+        packageName == XIAOMI_MI_CONNECT_PACKAGE && processName == XIAOMI_MI_CONNECT_PROCESS
 
     fun shouldHookInCallUi(packageName: String?, processName: String?): Boolean =
         packageName == INCALLUI_PACKAGE && processName == INCALLUI_PROCESS
@@ -115,6 +124,13 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun hasAllowedCallerPackage(packages: Array<String>?): Boolean =
         packages?.any(::isAllowedCallerPackage) == true
+
+    fun isAllowedMiConnectCallerPackage(requestedPackageName: String?, callerPackages: Array<String>?): Boolean {
+        if (requestedPackageName != null && !isAllowedCallerPackage(requestedPackageName)) {
+            return false
+        }
+        return hasAllowedCallerPackage(callerPackages)
+    }
 
     fun isAllowedMirrorPhoneProviderMethod(method: String?): Boolean =
         method in mirrorPhoneProviderMethods
@@ -241,6 +257,17 @@ internal object MiLinkPrivilegeHookPolicy {
 }
 
 class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
+    private data class FakeMirrorSinkSurface(
+        val texture: SurfaceTexture,
+        val surface: Surface
+    ) {
+        fun release() {
+            runCatching { surface.release() }
+            runCatching { texture.release() }
+        }
+    }
+
+    private val fakeMirrorSinkSurfaces = ConcurrentHashMap<Int, FakeMirrorSinkSurface>()
     private var lastFakeMirrorAttachUptimeMs: Long = 0L
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
     private var lastFakeMirrorAudioParamsUptimeMs: Long = 0L
@@ -270,6 +297,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         if (MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(lpparam.packageName, lpparam.processName)) {
             hookMirrorCallProviderAccessCheck(lpparam.classLoader)
             hookMirrorRemoteExperiment(lpparam.classLoader)
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(lpparam.packageName, lpparam.processName)) {
+            hookMiConnectNetworkingPermission(lpparam.classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookInCallUi(lpparam.packageName, lpparam.processName)) {
             hookInCallUiRelayExperiment(lpparam.classLoader)
@@ -376,6 +406,59 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook mirror call provider check: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMiConnectNetworkingPermission(classLoader: ClassLoader) {
+        hookMiConnectPermissionChecker(
+            classLoader = classLoader,
+            signature = arrayOf(Context::class.java)
+        )
+        hookMiConnectPermissionChecker(
+            classLoader = classLoader,
+            signature = arrayOf(Context::class.java, String::class.java)
+        )
+        hookMiConnectPermissionChecker(
+            classLoader = classLoader,
+            signature = arrayOf(Context::class.java, String::class.java, String::class.java)
+        )
+        hookMiConnectPermissionChecker(
+            classLoader = classLoader,
+            signature = arrayOf(Context::class.java, String::class.java, String::class.java, String::class.java)
+        )
+    }
+
+    private fun hookMiConnectPermissionChecker(classLoader: ClassLoader, signature: Array<Class<*>>) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                MI_CONNECT_PERMISSION_CHECKER,
+                classLoader,
+                "checkPermissions",
+                *signature,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val context = param.args.getOrNull(0) as? Context ?: return
+                        val requestedPackage = param.args.getOrNull(1) as? String
+                        val permission = param.args.getOrNull(2) as? String
+                        val serviceId = param.args.getOrNull(3) as? String
+                        val callerUid = Binder.getCallingUid()
+                        val packages = context.packageManager.getPackagesForUid(callerUid)
+                        if (MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(requestedPackage, packages)) {
+                            param.setResult(0)
+                            log(
+                                "allowed mi_connect networking permission callerUid=$callerUid " +
+                                    "requestedPackage=${requestedPackage ?: "-"} " +
+                                    "permission=${permission ?: "-"} serviceId=${serviceId ?: "-"}"
+                            )
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log(
+                "failed to hook mi_connect permission checker args=${signature.size}: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
         }
     }
 
@@ -938,6 +1021,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun hookMirrorScreenRouteDiagnostics(classLoader: ClassLoader) {
         hookMirrorTerminalAddressOverride(classLoader)
         hookMirrorSinkViewLifecycle(classLoader)
+        hookMirrorSinkSurfaceCallback(classLoader)
+        hookMirrorControlSinkStart(classLoader)
         hookMirrorAdvConnectionLifecycle(classLoader)
         hookMirrorLyraGateDiagnostics(classLoader)
     }
@@ -1043,6 +1128,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                                 val deviceId = mirrorSinkDeviceId(param.thisObject)
                                 if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                                     log("mirror sink detached ${mirrorSinkStateSummary(param.thisObject, deviceId)}")
+                                    releaseFakeMirrorSinkSurface(param.thisObject)
                                 }
                             }
                         }
@@ -1131,6 +1217,108 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 }
         }.onFailure { error ->
             log("failed to hook mirror sink lifecycle: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorSinkSurfaceCallback(classLoader: ClassLoader) {
+        runCatching {
+            val callbackClass = findTargetClass(classLoader, XIAOMI_MIRROR_SINK_VIEW_SURFACE_CALLBACK)
+            XposedHelpers.findAndHookMethod(
+                callbackClass.name,
+                classLoader,
+                "surfaceCreated",
+                SurfaceHolder::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val sinkView = readReflectiveFieldAny(param.thisObject, "this$0")
+                        val deviceId = mirrorSinkDeviceId(sinkView)
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                            return
+                        }
+                        val holderSurface = runCatching {
+                            (param.args.getOrNull(0) as? SurfaceHolder)?.surface
+                        }.getOrNull()
+                        log(
+                            "mirror sink surfaceCreated " +
+                                "holderSurface=${holderSurface != null} " +
+                                "holderSurfaceValid=${holderSurface?.isValid == true} " +
+                                mirrorSinkStateSummary(sinkView, deviceId)
+                        )
+                        if (shouldForceMirrorScreenTerminalPresent()) {
+                            releaseFakeMirrorSinkSurface(sinkView)
+                            scheduleFakeMirrorSinkRoute(classLoader, sinkView, deviceId)
+                        }
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                callbackClass.name,
+                classLoader,
+                "surfaceDestroyed",
+                SurfaceHolder::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val sinkView = readReflectiveFieldAny(param.thisObject, "this$0")
+                        val deviceId = mirrorSinkDeviceId(sinkView)
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                            return
+                        }
+                        log("mirror sink surfaceDestroyed ${mirrorSinkStateSummary(sinkView, deviceId)}")
+                        releaseFakeMirrorSinkSurface(sinkView)
+                    }
+                }
+            )
+            log("mirror sink surface callback hooks installed")
+        }.onFailure { error ->
+            log("failed to hook mirror sink surface callback: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorControlSinkStart(classLoader: ClassLoader) {
+        runCatching {
+            val sinkClass = findTargetClass(classLoader, XIAOMI_MIRROR_CONTROL_SINK)
+            val startMethods = sinkClass.declaredMethods.filter { method ->
+                method.name == "startMirror" &&
+                    method.parameterTypes.size == 5 &&
+                    method.parameterTypes[1] == String::class.java &&
+                    method.parameterTypes[2] == Integer.TYPE &&
+                    method.parameterTypes[3] == java.lang.Boolean.TYPE &&
+                    Surface::class.java.isAssignableFrom(method.parameterTypes[4])
+            }
+            startMethods.forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceMirrorScreenTerminalPresent()) {
+                                return
+                            }
+                            val remoteIp = param.args.getOrNull(1) as? String
+                            val port = param.args.getOrNull(2) as? Int
+                            val useTcp = param.args.getOrNull(3) as? Boolean
+                            val surface = param.args.getOrNull(4) as? Surface
+                            log(
+                                "mirror control sink startMirror enter " +
+                                    "remoteIp=${remoteIp.orEmpty()} " +
+                                    "port=${port ?: -1} " +
+                                    "useTcp=${useTcp?.toString() ?: "?"} " +
+                                    "surface=${surface != null} " +
+                                    "surfaceValid=${surface?.isValid == true}"
+                            )
+                        }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceMirrorScreenTerminalPresent()) {
+                                return
+                            }
+                            log("mirror control sink startMirror exit result=${param.getResult()}")
+                        }
+                    }
+                )
+            }
+            log("mirror control sink start hooks installing count=${startMethods.size}")
+        }.onFailure { error ->
+            log("failed to hook mirror control sink start: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -1335,9 +1523,21 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         if (existing != null && existing.isValid) {
             return "surfaceWrite=false surfaceValid=true surfaceSource=field"
         }
+        val surfaceView = runCatching {
+            sinkView.javaClass.getMethod("getSurfaceView").invoke(sinkView) as? View
+        }.getOrNull()
+        if (surfaceView != null) {
+            runCatching { surfaceView.visibility = View.VISIBLE }
+            runCatching { surfaceView.requestLayout() }
+            runCatching { surfaceView.invalidate() }
+        }
+        val viewSummary =
+            "surfaceViewAttached=${surfaceView?.isAttachedToWindow == true} " +
+                "surfaceViewShown=${surfaceView?.isShown == true} " +
+                "surfaceViewVisibility=${surfaceView?.visibility ?: -1}"
         val surface = runCatching {
-            val surfaceView = sinkView.javaClass.getMethod("getSurfaceView").invoke(sinkView) ?: return@runCatching null
-            val holder = surfaceView.javaClass.getMethod("getHolder").invoke(surfaceView) ?: return@runCatching null
+            val holder = surfaceView?.javaClass?.getMethod("getHolder")?.invoke(surfaceView)
+                ?: return@runCatching null
             holder.javaClass.getMethod("getSurface").invoke(holder) as? Surface
         }.getOrNull()
         val valid = surface?.isValid == true
@@ -1346,7 +1546,64 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         } else {
             false
         }
-        return "surfaceWrite=$wrote surfaceValid=$valid surfaceSource=holder"
+        if (wrote) {
+            releaseFakeMirrorSinkSurface(sinkView)
+            return "surfaceWrite=true surfaceValid=true surfaceSource=holder $viewSummary"
+        }
+        if (!shouldForceMirrorScreenTerminalPresent()) {
+            return "surfaceWrite=false surfaceValid=$valid surfaceSource=holder $viewSummary"
+        }
+        val deviceId = mirrorSinkDeviceId(sinkView)
+        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+            return "surfaceWrite=false surfaceValid=$valid surfaceSource=holder $viewSummary"
+        }
+        val fallback = createOrReuseFakeMirrorSinkSurface(sinkView)
+        val fallbackWrote = writeReflectiveFieldAny(sinkView, fallback.surface, "y", "f10744y")
+        return "surfaceWrite=$fallbackWrote " +
+            "surfaceValid=${fallback.surface.isValid} " +
+            "surfaceSource=fallback " +
+            "holderSurface=${surface != null} " +
+            "holderSurfaceValid=$valid " +
+            viewSummary
+    }
+
+    private fun createOrReuseFakeMirrorSinkSurface(sinkView: Any): FakeMirrorSinkSurface {
+        val key = System.identityHashCode(sinkView)
+        fakeMirrorSinkSurfaces[key]?.takeIf { it.surface.isValid }?.let { existing ->
+            return existing
+        }
+        fakeMirrorSinkSurfaces.remove(key)?.release()
+        val (width, height) = fakeMirrorSinkSurfaceSize(sinkView)
+        val texture = SurfaceTexture(0)
+        texture.setDefaultBufferSize(width, height)
+        val surface = Surface(texture)
+        val fallback = FakeMirrorSinkSurface(texture, surface)
+        fakeMirrorSinkSurfaces[key] = fallback
+        log(
+            "mirror fake sink fallback surface created " +
+                "key=$key width=$width height=$height surfaceValid=${surface.isValid}"
+        )
+        return fallback
+    }
+
+    private fun releaseFakeMirrorSinkSurface(sinkView: Any?) {
+        val key = System.identityHashCode(sinkView ?: return)
+        val removed = fakeMirrorSinkSurfaces.remove(key) ?: return
+        removed.release()
+        log("mirror fake sink fallback surface released key=$key")
+    }
+
+    private fun fakeMirrorSinkSurfaceSize(sinkView: Any): Pair<Int, Int> {
+        val config = runCatching {
+            sinkView.javaClass.getMethod("getConfig").invoke(sinkView)
+        }.getOrNull() ?: readReflectiveFieldAny(sinkView, "z", "f10748z")
+        val width = (readReflectiveFieldAny(config, "b", "f14777b") as? Int)
+            ?.takeIf { it in 1..8192 }
+            ?: 1080
+        val height = (readReflectiveFieldAny(config, "c", "f14778c") as? Int)
+            ?.takeIf { it in 1..8192 }
+            ?: 2400
+        return width to height
     }
 
     private fun configureFakeMirrorSinkConfig(sinkView: Any): String {
@@ -1380,7 +1637,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             return
                         }
-                        val lyraDevice = param.getResult()
+                        var lyraDevice = param.getResult()
+                        if (lyraDevice == null && shouldForceMirrorScreenTerminalPresent()) {
+                            lyraDevice = ensureFakeMirrorCastBusinessDevice(classLoader, deviceId.orEmpty())
+                            if (lyraDevice != null) {
+                                param.setResult(lyraDevice)
+                            }
+                        }
                         val trusted = runCatching {
                             lyraDevice?.javaClass?.getMethod("d")?.invoke(lyraDevice)
                         }.getOrNull()
@@ -1397,20 +1660,38 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             log("failed to hook mirror lyra device lookup: ${error.javaClass.simpleName}: ${error.message}")
         }
         runCatching {
-            XposedHelpers.findAndHookMethod(
-                XIAOMI_MIRROR_LYRA_BUSINESS,
-                classLoader,
-                "l",
-                String::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val deviceId = param.args.getOrNull(0) as? String
-                        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
-                            log("mirror lyra channel exists deviceId=$deviceId value=${param.getResult()}")
+            val businessClass = findTargetClass(classLoader, XIAOMI_MIRROR_LYRA_BUSINESS)
+            val channelMethods = businessClass.methods
+                .filter { method ->
+                    method.name == "l" &&
+                        method.parameterTypes.size == 1 &&
+                        method.parameterTypes[0] == String::class.java &&
+                        method.returnType == java.lang.Boolean.TYPE
+                }
+            channelMethods.forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val deviceId = param.args.getOrNull(0) as? String
+                            if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) &&
+                                shouldForceMirrorScreenTerminalPresent()
+                            ) {
+                                param.setResult(true)
+                                log("mirror lyra channel exists override deviceId=$deviceId")
+                            }
+                        }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val deviceId = param.args.getOrNull(0) as? String
+                            if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                                log("mirror lyra channel exists deviceId=$deviceId value=${param.getResult()}")
+                            }
                         }
                     }
-                }
-            )
+                )
+            }
+            log("mirror lyra channel hooks installing count=${channelMethods.size}")
         }.onFailure { error ->
             log("failed to hook mirror lyra channel check: ${error.javaClass.simpleName}: ${error.message}")
         }
@@ -1440,7 +1721,84 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook mirror lyra remote ip: ${error.javaClass.simpleName}: ${error.message}")
         }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_LYRA_UTILS,
+                classLoader,
+                "p0",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) &&
+                            shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            param.setResult(true)
+                            log("mirror lyra wlan ability override deviceId=$deviceId")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror lyra wlan ability: ${error.javaClass.simpleName}: ${error.message}")
+        }
     }
+
+    private fun ensureFakeMirrorCastBusinessDevice(classLoader: ClassLoader, deviceId: String): Any? =
+        runCatching {
+            val mirrorClass = findTargetClass(classLoader, XIAOMI_MIRROR_APPLICATION)
+            val mirror = mirrorClass.getMethod("z").invoke(null) ?: return@runCatching null
+            val castBusiness = mirrorClass.getMethod("p").invoke(mirror) ?: return@runCatching null
+            val existing = castBusiness.javaClass.getMethod("g", String::class.java)
+                .invoke(castBusiness, deviceId)
+            if (existing != null) {
+                return@runCatching existing
+            }
+            val trustedInfo = createFakeMirrorTrustedDeviceInfo(classLoader, deviceId)
+                ?: return@runCatching null
+            val trustedInfoClass = findTargetClass(classLoader, XIAOMI_CONTINUITY_TRUSTED_DEVICE_INFO)
+            val added = runCatching {
+                castBusiness.javaClass.getMethod("a", trustedInfoClass)
+                    .invoke(castBusiness, trustedInfo) as? Boolean
+            }.getOrDefault(false)
+            val resolved = castBusiness.javaClass.getMethod("g", String::class.java)
+                .invoke(castBusiness, deviceId)
+            log(
+                "mirror fake lyra device injected " +
+                    "deviceId=$deviceId added=$added " +
+                    "resolved=${identitySummary(resolved)} " +
+                    "trusted=${trustedInfo}"
+            )
+            resolved
+        }.onFailure { error ->
+            log("failed to inject fake lyra device: ${error.javaClass.simpleName}: ${error.message}")
+        }.getOrNull()
+
+    private fun createFakeMirrorTrustedDeviceInfo(classLoader: ClassLoader, deviceId: String): Any? =
+        runCatching {
+            val trustedInfoClass = findTargetClass(classLoader, XIAOMI_CONTINUITY_TRUSTED_DEVICE_INFO)
+            val trustedInfo = trustedInfoClass.getConstructor().newInstance()
+            trustedInfoClass.getMethod("k", String::class.java).invoke(trustedInfo, deviceId)
+            trustedInfoClass.getMethod("l", String::class.java)
+                .invoke(trustedInfo, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+            trustedInfoClass.getMethod("m", Integer.TYPE)
+                .invoke(trustedInfo, FAKE_MIRROR_TRUSTED_DEVICE_TYPE)
+            writeReflectiveIntFieldAny(
+                trustedInfo,
+                FAKE_MIRROR_TRUSTED_MEDIUM_TYPES,
+                "d",
+                "f8997d"
+            )
+            writeReflectiveIntFieldAny(
+                trustedInfo,
+                FAKE_MIRROR_TRUSTED_TYPES,
+                "e",
+                "f8998e"
+            )
+            trustedInfo
+        }.onFailure { error ->
+            log("failed to create fake trusted device info: ${error.javaClass.simpleName}: ${error.message}")
+        }.getOrNull()
 
     private fun maybeAttachFakeMirrorCallFlow(classLoader: ClassLoader, mode: String, terminal: Any?) {
         if (mode != "pad" || terminal == null || !shouldAttachFakeMirrorTerminal()) {
@@ -2806,22 +3164,28 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private companion object {
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val MILINK_PRIVILEGED_PACKAGE_MANAGER = "com.milink.base.utils.p"
+        private const val MI_CONNECT_PERMISSION_CHECKER = "com.xiaomi.continuity.util.PermissionChecker"
         private const val XIAOMI_MIRROR_CALL_PROVIDER = "com.xiaomi.mirror.provider.CallProvider"
+        private const val XIAOMI_MIRROR_APPLICATION = "com.xiaomi.mirror.Mirror"
         private const val XIAOMI_MIRROR_CONNECTION_MANAGER = "com.xiaomi.mirror.connection.G"
         private const val XIAOMI_MIRROR_FUSION_UTILS = "o4.B"
         private const val XIAOMI_MIRROR_REMOTE_DEVICE_INFO = "com.xiaomi.mirror.RemoteDeviceInfo"
         private const val XIAOMI_MIRROR_TERMINAL = "com.xiaomi.mirror.g0"
         private const val XIAOMI_MIRROR_SINK_VIEW = "com.xiaomi.mirror.sink.SinkView"
+        private const val XIAOMI_MIRROR_SINK_VIEW_SURFACE_CALLBACK = "com.xiaomi.mirror.sink.SinkView\$a"
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE = "com.xiaomi.mirror.connection.C0701g"
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE_OBFUSCATED = "com.xiaomi.mirror.connection.g"
         private const val XIAOMI_MIRROR_CAST_BUSINESS_WRAPPER = "N2.d"
         private const val XIAOMI_MIRROR_LYRA_BUSINESS = "N2.a"
         private const val XIAOMI_MIRROR_LYRA_UTILS = "x3.z"
+        private const val XIAOMI_CONTINUITY_TRUSTED_DEVICE_INFO =
+            "com.xiaomi.continuity.networking.TrustedDeviceInfo"
         private const val XIAOMI_MIRROR_CALL_SERVICE = "com.xiaomi.mirror.relay.G"
         private const val XIAOMI_MIRROR_ECDH_HELPER = "com.xiaomi.mirror.relay.n"
         private const val XIAOMI_MIRROR_ECDH_HELPER_JADX_NAME = "com.xiaomi.mirror.relay.C0761n"
         private const val XIAOMI_MIRROR_KEY_DATA = "com.xiaomi.mirror.relay.KeyData"
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
+        private const val XIAOMI_MIRROR_CONTROL_SINK = "com.xiaomi.mirrorcontrol.MirrorControlSink"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlAudioSource"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
         private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
@@ -2854,6 +3218,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val TELECOM_RELAY_FORCE_LOG_THROTTLE_MS = 2_000L
         private const val MIRROR_AUDIO_START_OPTION_WINDOW_MS = 2_000L
         private const val FAKE_MIRROR_LINK_ADDRESS = "edgelink-fake-pad"
+        private const val FAKE_MIRROR_TRUSTED_DEVICE_TYPE = 4
+        private const val FAKE_MIRROR_TRUSTED_MEDIUM_TYPES = 65_664
+        private const val FAKE_MIRROR_TRUSTED_TYPES = 1
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
         private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102
         private const val MIRROR_RELAY_FIELD_LOCAL_IP = "m"

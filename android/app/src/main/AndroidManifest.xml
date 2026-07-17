@@ -20,6 +20,7 @@
   <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
   <uses-permission android:name="com.miui.audiomonitor.permission.ACCESS_DIST_AUDIO_SERVICE" />
   <uses-permission android:name="com.miui.mishare.PERMISSION.ALL" />
+  <uses-permission android:name="com.xiaomi.permission.BIND_CONTINUITY_SERVICE" />
 
   <application
     android:allowBackup="false"
