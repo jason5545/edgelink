@@ -66,6 +66,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private var advertisedHost: String?
 
     private let sourceRTPPort: UInt16 = 19_002
+    private let officialMPTClientPort: UInt16 = 15_550
     private let transportModeDefaultsKey = "xiaomiMirrorRTSPTransportMode"
     private let protocolProfileDefaultsKey = "xiaomiMirrorRTSPProtocolProfile"
 
@@ -271,12 +272,22 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
         switch request {
         case "OPTIONS":
-            sendGetParameterIfNeeded(id: id, connection: connection)
+            if isOfficialMPTRoute {
+                DiagnosticsLog.info("xiaomi.mirror.rtsp.official_sink_wait_peer_m3 id=\(id.uuidString)")
+            } else {
+                sendGetParameterIfNeeded(id: id, connection: connection)
+            }
         case "GET_PARAMETER":
             recordSinkCapabilities(message.body, id: id)
             sendSetParameterIfNeeded(id: id, connection: connection)
         case "SET_PARAMETER":
             DiagnosticsLog.info("xiaomi.mirror.rtsp.m4_ack id=\(id.uuidString) cseq=\(cseq)")
+        case "ACTIVE_SETUP":
+            recordActiveSetupResponse(message, id: id)
+            sendActivePlayIfNeeded(id: id, connection: connection)
+        case "ACTIVE_PLAY":
+            DiagnosticsLog.info("xiaomi.mirror.rtsp.active_play_ack id=\(id.uuidString) cseq=\(cseq)")
+            startOfficialMPTSinkIfNeeded(id: id, connection: connection, reason: "active_play_ack")
         case "SET_PARAMETER_IDR":
             DiagnosticsLog.info("xiaomi.mirror.rtsp.idr_request_ack id=\(id.uuidString) cseq=\(cseq)")
         default:
@@ -302,7 +313,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                     "Public: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER"
                 ]
             )
-            sendGetParameterIfNeeded(id: id, connection: connection)
+            if isOfficialMPTRoute {
+                DiagnosticsLog.info("xiaomi.mirror.rtsp.official_sink_peer_options id=\(id.uuidString)")
+            } else {
+                sendGetParameterIfNeeded(id: id, connection: connection)
+            }
         case "GET_PARAMETER":
             let currentState = states[id] ?? RTSPConnectionState()
             let profile = protocolProfile
@@ -335,6 +350,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 )
             }
             sendResponse(id: id, connection: connection, cseq: message.cseq)
+            if isOfficialMPTRoute {
+                recordPeerSetParameter(message.body, id: id)
+                startOfficialMPTSinkIfNeeded(id: id, connection: connection, reason: "peer_m4")
+                sendActiveSetupIfNeeded(id: id, connection: connection)
+            }
         case "SETUP":
             handleSetupRequest(message, id: id, connection: connection)
         case "PLAY":
@@ -349,7 +369,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 "xiaomi.mirror.rtsp.play_received id=\(id.uuidString) " +
                     "protocolProfile=\(protocolProfile.rawValue) session=\(session(for: id)) range=\(playRangeHeaderValue)"
             )
-            startMediaIfPossible(id: id)
+            startMediaIfPossible(id: id, connection: connection)
         case "PAUSE", "TEARDOWN":
             sendResponse(id: id, connection: connection, cseq: message.cseq, session: session(for: id))
             stopMediaIfNeeded(id: id, reason: method.lowercased())
@@ -536,6 +556,21 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 "bodyFp=\(state.sinkCapabilitiesFingerprint ?? "none") " +
                 "videoFormats=\(Self.preview(state.sinkVideoFormats ?? "none")) " +
                 "clientRTPPorts=\(Self.preview(state.sinkClientRTPPorts ?? "none")) " +
+            "body=\(Self.preview(body, limit: 900))"
+        )
+    }
+
+    private func recordPeerSetParameter(_ body: String, id: UUID) {
+        var state = states[id] ?? RTSPConnectionState()
+        state.peerSetParameterFingerprint = DiagnosticsLog.fingerprint(Data(body.utf8))
+        state.peerPresentationURL = Self.parameterValue(named: "wfd_presentation_URL", in: body)
+        state.peerClientRTPPorts = Self.parameterValue(named: "wfd_client_rtp_ports", in: body)
+        states[id] = state
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.peer_m4 id=\(id.uuidString) " +
+                "bodyFp=\(state.peerSetParameterFingerprint ?? "none") " +
+                "presentationURL=\(Self.preview(state.peerPresentationURL ?? "none")) " +
+                "clientRTPPorts=\(Self.preview(state.peerClientRTPPorts ?? "none")) " +
                 "body=\(Self.preview(body, limit: 900))"
         )
     }
@@ -700,6 +735,10 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         XiaomiMirrorRTSPProtocolProfile(rawValue: UserDefaults.standard.string(forKey: protocolProfileDefaultsKey) ?? "") ?? .edge
     }
 
+    private var isOfficialMPTRoute: Bool {
+        protocolProfile == .official && transportMode == .mpt
+    }
+
     private func sourceTimerServerPort() -> String? {
         guard let host = sourceHostForTransport(),
               let ipInteger = Self.ipv4Integer(host) else {
@@ -817,7 +856,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         return host
     }
 
-    private func startMediaIfPossible(id: UUID) {
+    private func startMediaIfPossible(id: UUID, connection: NWConnection) {
+        if isOfficialMPTRoute {
+            startOfficialMPTSinkIfNeeded(id: id, connection: connection, reason: "peer_play")
+            return
+        }
         guard var state = states[id] else {
             return
         }
@@ -844,21 +887,24 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             )
             return
         }
+        let mode = transportMode
         let clientRTCPPort = transport.clientRTCPPort ?? clientRTPPort &+ 1
         do {
             let sender = try XiaomiMirrorRTPMediaSender(
+                transportMode: mode,
                 destinationHost: host,
                 destinationRTPPort: clientRTPPort,
                 destinationRTCPPort: clientRTCPPort,
                 localRTPPort: sourceRTPPort,
                 localRTCPPort: sourceRTPPort + 1,
-                sessionID: id
+                sessionID: id,
+                mptSinkOnly: false
             )
             state.mediaSender = sender
             states[id] = state
             sender.start()
             DiagnosticsLog.info(
-                "xiaomi.mirror.rtsp.media_started id=\(id.uuidString) destination=\(host):\(clientRTPPort) " +
+                "xiaomi.mirror.rtsp.media_started id=\(id.uuidString) transportMode=\(mode.rawValue) destination=\(host):\(clientRTPPort) " +
                     "remoteRTCPPort=\(clientRTCPPort) localRTPPort=\(sourceRTPPort) localRTCPPort=\(sourceRTPPort + 1) " +
                     "payload=rtp_pt33_mpegts_h264_annexb"
             )
@@ -868,6 +914,143 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 error
             )
         }
+    }
+
+    private func startOfficialMPTSinkIfNeeded(id: UUID, connection: NWConnection, reason: String) {
+        guard var state = states[id] else {
+            return
+        }
+        guard state.mediaSender == nil else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.mpt_sink_already_running id=\(id.uuidString) reason=\(reason)"
+            )
+            return
+        }
+        guard let host = Self.endpointHost(connection.endpoint) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.mpt_sink_start_skipped id=\(id.uuidString) reason=missing_peer_host"
+            )
+            return
+        }
+        let remotePort = state.activePeerMPTServerPort ?? officialMPTClientPort
+        do {
+            let sender = try XiaomiMirrorRTPMediaSender(
+                transportMode: .mpt,
+                destinationHost: host,
+                destinationRTPPort: remotePort,
+                destinationRTCPPort: remotePort,
+                localRTPPort: officialMPTClientPort,
+                localRTCPPort: officialMPTClientPort,
+                sessionID: id,
+                mptSinkOnly: true
+            )
+            state.mediaSender = sender
+            states[id] = state
+            sender.start()
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.mpt_sink_started id=\(id.uuidString) reason=\(reason) " +
+                    "localPort=\(officialMPTClientPort) peer=\(host):\(remotePort) " +
+                    "protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
+            )
+        } catch {
+            DiagnosticsLog.error(
+                "xiaomi.mirror.rtsp.mpt_sink_start_failed id=\(id.uuidString) peer=\(host):\(remotePort)",
+                error
+            )
+        }
+    }
+
+    private func sendActiveSetupIfNeeded(id: UUID, connection: NWConnection) {
+        var state = states[id] ?? RTSPConnectionState()
+        guard !state.sentActiveSetup else {
+            return
+        }
+        guard let target = peerPresentationURL(for: connection.endpoint) else {
+            DiagnosticsLog.warn("xiaomi.mirror.rtsp.active_setup_skipped id=\(id.uuidString) reason=missing_peer_url")
+            return
+        }
+        let userID = activeMPTUserID(for: &state)
+        let cseq = state.nextCSeq
+        state.nextCSeq += 1
+        state.sentActiveSetup = true
+        state.pendingRequests[cseq] = "ACTIVE_SETUP"
+        states[id] = state
+        let message = makeRequest(
+            method: "SETUP",
+            target: target,
+            cseq: cseq,
+            extraHeaders: [
+                "Transport: RTP/AVP/MPT;unicast;client_port=\(officialMPTClientPort);userid=\(userID)"
+            ]
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.active_setup_sent id=\(id.uuidString) cseq=\(cseq) " +
+                "target=\(Self.preview(target)) clientPort=\(officialMPTClientPort) userid=\(userID)"
+        )
+        send(message, id: id, connection: connection)
+    }
+
+    private func sendActivePlayIfNeeded(id: UUID, connection: NWConnection) {
+        var state = states[id] ?? RTSPConnectionState()
+        guard !state.sentActivePlay else {
+            return
+        }
+        guard let session = state.session else {
+            DiagnosticsLog.warn("xiaomi.mirror.rtsp.active_play_skipped id=\(id.uuidString) reason=missing_session")
+            return
+        }
+        guard let target = peerPresentationURL(for: connection.endpoint) else {
+            DiagnosticsLog.warn("xiaomi.mirror.rtsp.active_play_skipped id=\(id.uuidString) reason=missing_peer_url")
+            return
+        }
+        let cseq = state.nextCSeq
+        state.nextCSeq += 1
+        state.sentActivePlay = true
+        state.pendingRequests[cseq] = "ACTIVE_PLAY"
+        states[id] = state
+        let message = makeRequest(
+            method: "PLAY",
+            target: target,
+            cseq: cseq,
+            extraHeaders: ["Session: \(sessionHeaderValue(for: session))"]
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.active_play_sent id=\(id.uuidString) cseq=\(cseq) " +
+                "target=\(Self.preview(target)) session=\(session)"
+        )
+        send(message, id: id, connection: connection)
+    }
+
+    private func recordActiveSetupResponse(_ message: RTSPMessage, id: UUID) {
+        var state = states[id] ?? RTSPConnectionState()
+        let transport = message.headers["transport"]
+        state.activeSetupTransportRaw = transport
+        state.activePeerMPTServerPort = Self.serverPort(fromTransport: transport)
+        states[id] = state
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.active_setup_ack id=\(id.uuidString) " +
+                "session=\(state.session ?? "none") transport=\(Self.preview(transport ?? "none")) " +
+                "peerServerPort=\(state.activePeerMPTServerPort.map(String.init) ?? "none")"
+        )
+    }
+
+    private func activeMPTUserID(for state: inout RTSPConnectionState) -> String {
+        if let userID = state.activeMPTUserID {
+            return userID
+        }
+        let userID = String(Int.random(in: 10_000...65_535))
+        state.activeMPTUserID = userID
+        return userID
+    }
+
+    private func peerPresentationURL(for endpoint: NWEndpoint) -> String? {
+        guard let host = Self.endpointHost(endpoint), !host.isEmpty else {
+            return nil
+        }
+        if host.contains(":") {
+            return "rtsp://[\(host)]/wfd1.0/streamid=0"
+        }
+        return "rtsp://\(host)/wfd1.0/streamid=0"
     }
 
     private func stopMediaIfNeeded(id: UUID, reason: String) {
@@ -1208,6 +1391,21 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         return nil
     }
 
+    private static func serverPort(fromTransport raw: String?) -> UInt16? {
+        guard let raw else {
+            return nil
+        }
+        let components = raw.split(separator: ";", omittingEmptySubsequences: true).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let serverPortRaw = components.first(where: { $0.lowercased().hasPrefix("server_port=") })?
+            .dropFirst("server_port=".count)
+            .description else {
+            return nil
+        }
+        return parsePortPair(serverPortRaw).0 ?? UInt16(serverPortRaw)
+    }
+
     private static func isBareUnicastPortComponent(_ component: String) -> Bool {
         let tokens = component.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
         guard tokens.count >= 2,
@@ -1237,7 +1435,15 @@ private struct RTSPConnectionState {
     var sinkVideoGamutType: String?
     var sinkAudioCodecs: String?
     var sinkClientRTPPorts: String?
+    var peerSetParameterFingerprint: String?
+    var peerPresentationURL: String?
+    var peerClientRTPPorts: String?
     var setupTransport: RTSPTransportSelection?
+    var sentActiveSetup = false
+    var sentActivePlay = false
+    var activeMPTUserID: String?
+    var activeSetupTransportRaw: String?
+    var activePeerMPTServerPort: UInt16?
     var mediaSender: XiaomiMirrorRTPMediaSender?
 }
 
@@ -1268,16 +1474,21 @@ private struct RTSPTransportSelection {
 
 private final class XiaomiMirrorRTPMediaSender {
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTPMediaSender")
+    private let transportMode: XiaomiMirrorRTSPTransportMode
     private let destinationHost: String
     private let destinationRTPPort: UInt16
     private let destinationRTCPPort: UInt16
     private let localRTPPort: UInt16
     private let localRTCPPort: UInt16
     private let sessionID: UUID
+    private let mptSinkOnly: Bool
     private let frameRate: Int32 = XiaomiMirrorVideoDefaults.frameRate
     private let rtpPacketsPerPayload = 7
     private var connection: NWConnection?
     private var rtcpConnection: NWConnection?
+    private var mptSocketFD: Int32 = -1
+    private var mptReadSource: DispatchSourceRead?
+    private var mptDestinationAddress: sockaddr_in?
     private var frameTimer: DispatchSourceTimer?
     private var rtcpTimer: DispatchSourceTimer?
     private var encoder: XiaomiMirrorH264Encoder
@@ -1290,22 +1501,40 @@ private final class XiaomiMirrorRTPMediaSender {
     private var rtpPayloadOctetsSent: UInt64 = 0
     private var rtcpSRSent: UInt64 = 0
     private var lastRTPTimestamp: UInt32 = 0
+    private var kcpSendSN: UInt32 = 0
+    private var kcpRemoteNextReceiveSN: UInt32 = 0
+    private var kcpPacketsSent: UInt64 = 0
+    private var kcpBytesSent: UInt64 = 0
+    private var kcpACKsReceived: UInt64 = 0
+    private var kcpACKSent: UInt64 = 0
+    private var kcpWASKReceived: UInt64 = 0
+    private var kcpWINSSent: UInt64 = 0
+    private var kcpWINSReceived: UInt64 = 0
+    private var kcpPUSHReceived: UInt64 = 0
+    private var kcpDatagramsReceived: UInt64 = 0
+    private var kcpDatagramReceiveErrors: UInt64 = 0
+    private var kcpLatestACKSN: UInt32?
+    private var kcpLatestRemoteUNA: UInt32?
     private var stopped = false
 
     init(
+        transportMode: XiaomiMirrorRTSPTransportMode,
         destinationHost: String,
         destinationRTPPort: UInt16,
         destinationRTCPPort: UInt16,
         localRTPPort: UInt16,
         localRTCPPort: UInt16,
-        sessionID: UUID
+        sessionID: UUID,
+        mptSinkOnly: Bool
     ) throws {
+        self.transportMode = transportMode
         self.destinationHost = destinationHost
         self.destinationRTPPort = destinationRTPPort
         self.destinationRTCPPort = destinationRTCPPort
         self.localRTPPort = localRTPPort
         self.localRTCPPort = localRTCPPort
         self.sessionID = sessionID
+        self.mptSinkOnly = mptSinkOnly
         self.encoder = try XiaomiMirrorH264Encoder(
             width: XiaomiMirrorVideoDefaults.width,
             height: XiaomiMirrorVideoDefaults.height,
@@ -1329,12 +1558,14 @@ private final class XiaomiMirrorRTPMediaSender {
         guard connection == nil, !stopped else {
             return
         }
+        if transportMode == .mpt {
+            startMPTSocketOnQueue()
+            return
+        }
         guard let remotePort = NWEndpoint.Port(rawValue: destinationRTPPort),
-              let remoteRTCPPort = NWEndpoint.Port(rawValue: destinationRTCPPort),
-              let localPort = NWEndpoint.Port(rawValue: localRTPPort),
-              let localRTCPPort = NWEndpoint.Port(rawValue: localRTCPPort) else {
+              let localPort = NWEndpoint.Port(rawValue: localRTPPort) else {
             DiagnosticsLog.warn(
-                "xiaomi.mirror.rtp.start_skipped session=\(sessionID.uuidString) reason=invalid_port " +
+                "xiaomi.mirror.media.start_skipped session=\(sessionID.uuidString) reason=invalid_port " +
                     "destinationPort=\(destinationRTPPort) destinationRTCPPort=\(destinationRTCPPort) " +
                     "localPort=\(localRTPPort) localRTCPPort=\(self.localRTCPPort)"
             )
@@ -1345,11 +1576,6 @@ private final class XiaomiMirrorRTPMediaSender {
         parameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localPort)
         let connection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remotePort, using: parameters)
         self.connection = connection
-        let rtcpParameters = NWParameters.udp
-        rtcpParameters.allowLocalEndpointReuse = true
-        rtcpParameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localRTCPPort)
-        let rtcpConnection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remoteRTCPPort, using: rtcpParameters)
-        self.rtcpConnection = rtcpConnection
         encoder.onFrame = { [weak self] frame in
             self?.queue.async {
                 self?.send(frame)
@@ -1360,15 +1586,30 @@ private final class XiaomiMirrorRTPMediaSender {
                 self?.handleConnectionState(state)
             }
         }
-        rtcpConnection.stateUpdateHandler = { [weak self] state in
-            self?.queue.async {
-                self?.handleRTCPConnectionState(state)
+        if transportMode == .udp {
+            guard let remoteRTCPPort = NWEndpoint.Port(rawValue: destinationRTCPPort),
+                  let localRTCPPort = NWEndpoint.Port(rawValue: localRTCPPort) else {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.rtp.start_skipped session=\(sessionID.uuidString) reason=invalid_rtcp_port " +
+                        "destinationRTCPPort=\(destinationRTCPPort) localRTCPPort=\(self.localRTCPPort)"
+                )
+                return
             }
+            let rtcpParameters = NWParameters.udp
+            rtcpParameters.allowLocalEndpointReuse = true
+            rtcpParameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localRTCPPort)
+            let rtcpConnection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remoteRTCPPort, using: rtcpParameters)
+            self.rtcpConnection = rtcpConnection
+            rtcpConnection.stateUpdateHandler = { [weak self] state in
+                self?.queue.async {
+                    self?.handleRTCPConnectionState(state)
+                }
+            }
+            rtcpConnection.start(queue: queue)
+            receiveRTCP()
+            startRTCPTimer()
         }
         connection.start(queue: queue)
-        rtcpConnection.start(queue: queue)
-        receiveRTCP()
-        startRTCPTimer()
         startFrameTimer()
         DiagnosticsLog.info(
             "xiaomi.mirror.rtp.start session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort) " +
@@ -1377,17 +1618,97 @@ private final class XiaomiMirrorRTPMediaSender {
         )
     }
 
+    private func startMPTSocketOnQueue() {
+        guard mptSocketFD < 0, !stopped else {
+            return
+        }
+        guard let destinationAddress = Self.makeIPv4SocketAddress(host: destinationHost, port: destinationRTPPort) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.start_skipped session=\(sessionID.uuidString) reason=invalid_destination " +
+                    "destination=\(destinationHost):\(destinationRTPPort)"
+            )
+            return
+        }
+
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.start_skipped session=\(sessionID.uuidString) reason=socket_failed errno=\(errno)"
+            )
+            return
+        }
+
+        var reuse: Int32 = 1
+        _ = withUnsafePointer(to: &reuse) { pointer in
+            Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, pointer, socklen_t(MemoryLayout<Int32>.size))
+        }
+        _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+
+        var localAddress = Self.anyIPv4SocketAddress(port: localRTPPort)
+        let bindResult = withUnsafePointer(to: &localAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let bindErrno = errno
+            Darwin.close(fd)
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.start_skipped session=\(sessionID.uuidString) reason=bind_failed " +
+                    "localPort=\(localRTPPort) errno=\(bindErrno)"
+            )
+            return
+        }
+
+        mptSocketFD = fd
+        mptDestinationAddress = destinationAddress
+        if !mptSinkOnly {
+            encoder.onFrame = { [weak self] frame in
+                self?.queue.async {
+                    self?.send(frame)
+                }
+            }
+            startFrameTimer()
+        }
+        startMPTReceiveSource(fd: fd)
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.start session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort) " +
+                "localPort=\(localRTPPort) socket=raw_udp_recvfrom conv=0x12345678 " +
+                "role=\(mptSinkOnly ? "sink_receiver" : "sender") " +
+                "payload=\(mptSinkOnly ? "KCP_PUSH_RECEIVE_ACK_ONLY" : "KCP_PUSH_RTP/PT33/MP2T/H264AnnexB") " +
+                "video=\(XiaomiMirrorVideoDefaults.width)x\(XiaomiMirrorVideoDefaults.height)@\(frameRate)"
+        )
+    }
+
+    private func startMPTReceiveSource(fd: Int32) {
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            self?.receiveMPTDatagrams()
+        }
+        source.setCancelHandler {
+            Darwin.close(fd)
+        }
+        mptReadSource = source
+        source.resume()
+    }
+
     private func handleConnectionState(_ state: NWConnection.State) {
         switch state {
         case .ready:
-            DiagnosticsLog.info(
-                "xiaomi.mirror.rtp.ready session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort)"
-            )
+            if transportMode == .mpt {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.ready session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort)"
+                )
+            } else {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.rtp.ready session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort)"
+                )
+            }
         case .failed(let error):
-            DiagnosticsLog.error("xiaomi.mirror.rtp.failed session=\(sessionID.uuidString)", error)
+            DiagnosticsLog.error("xiaomi.mirror.\(transportMode == .mpt ? "mpt" : "rtp").failed session=\(sessionID.uuidString)", error)
             stopOnQueue(reason: "udp_failed")
         case .cancelled:
-            DiagnosticsLog.info("xiaomi.mirror.rtp.cancelled session=\(sessionID.uuidString)")
+            DiagnosticsLog.info("xiaomi.mirror.\(transportMode == .mpt ? "mpt" : "rtp").cancelled session=\(sessionID.uuidString)")
         default:
             break
         }
@@ -1445,7 +1766,7 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func send(_ frame: XiaomiMirrorEncodedH264Frame) {
-        guard !stopped, let connection else {
+        guard !stopped, transportMode == .mpt || connection != nil else {
             return
         }
         let includeProgramInfo = frame.isKeyframe || framesSent % UInt64(frameRate) == 0
@@ -1464,8 +1785,7 @@ private final class XiaomiMirrorRTPMediaSender {
             sendRTPPayload(
                 payload,
                 timestamp: UInt32(frame.pts90k & 0xffff_ffff),
-                marker: end == tsPackets.count,
-                connection: connection
+                marker: end == tsPackets.count
             )
             packetIndex = end
         }
@@ -1479,7 +1799,7 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
-    private func sendRTPPayload(_ payload: Data, timestamp: UInt32, marker: Bool, connection: NWConnection) {
+    private func sendRTPPayload(_ payload: Data, timestamp: UInt32, marker: Bool) {
         var packet = Data(capacity: 12 + payload.count)
         packet.append(0x80)
         packet.append(UInt8((marker ? 0x80 : 0x00) | 33))
@@ -1492,14 +1812,45 @@ private final class XiaomiMirrorRTPMediaSender {
         rtpPacketsSent += 1
         rtpPayloadOctetsSent += UInt64(payload.count)
         lastRTPTimestamp = timestamp
-        connection.send(content: packet, completion: .contentProcessed { error in
-            if let error {
-                DiagnosticsLog.error(
-                    "xiaomi.mirror.rtp.send_failed session=\(self.sessionID.uuidString) seq=\(currentSequence)",
-                    error
-                )
-            }
-        })
+        if transportMode == .mpt {
+            sendKCPPush(payload: packet, rtpSequence: currentSequence)
+        } else {
+            connection?.send(content: packet, completion: .contentProcessed { error in
+                if let error {
+                    DiagnosticsLog.error(
+                        "xiaomi.mirror.rtp.send_failed session=\(self.sessionID.uuidString) seq=\(currentSequence)",
+                        error
+                    )
+                }
+            })
+        }
+    }
+
+    private func sendKCPPush(payload: Data, rtpSequence: UInt16) {
+        let sn = kcpSendSN
+        kcpSendSN &+= 1
+        let packet = makeKCPSegment(
+            cmd: Self.kcpCommandPush,
+            ts: Self.monotonicMilliseconds(),
+            sn: sn,
+            una: kcpRemoteNextReceiveSN,
+            payload: payload
+        )
+        guard sendMPTDatagram(packet) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_push_failed session=\(sessionID.uuidString) sn=\(sn) rtpSeq=\(rtpSequence) errno=\(errno)"
+            )
+            return
+        }
+        kcpPacketsSent += 1
+        kcpBytesSent += UInt64(packet.count)
+        if kcpPacketsSent <= 5 || kcpPacketsSent % 300 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.kcp_push_sent session=\(sessionID.uuidString) sn=\(sn) rtpSeq=\(rtpSequence) " +
+                    "bytes=\(packet.count) payloadBytes=\(payload.count) una=\(kcpRemoteNextReceiveSN) " +
+                    "packetsSent=\(kcpPacketsSent) bytesSent=\(kcpBytesSent)"
+            )
+        }
     }
 
     private func sendRTCPSenderReport() {
@@ -1560,12 +1911,217 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
+    private func receiveMPTDatagrams() {
+        guard !stopped, mptSocketFD >= 0 else {
+            return
+        }
+        while true {
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            var sourceAddress = sockaddr_storage()
+            var sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let byteCount = withUnsafeMutablePointer(to: &sourceAddress) { sourcePointer in
+                sourcePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    Darwin.recvfrom(mptSocketFD, &buffer, buffer.count, 0, sockaddrPointer, &sourceLength)
+                }
+            }
+            if byteCount > 0 {
+                kcpDatagramsReceived += 1
+                let data = Data(buffer.prefix(byteCount))
+                if let responseAddress = Self.ipv4SocketAddress(from: sourceAddress) {
+                    mptDestinationAddress = responseAddress
+                }
+                if kcpDatagramsReceived <= 5 || kcpDatagramsReceived % 50 == 0 {
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.mpt.datagram_received session=\(sessionID.uuidString) bytes=\(byteCount) " +
+                            "source=\(Self.describeSocketAddress(sourceAddress)) datagrams=\(kcpDatagramsReceived) " +
+                            "firstBytes=\(Self.hexPreview(data, limit: 12))"
+                    )
+                }
+                handleKCPDatagram(data)
+                continue
+            }
+            if byteCount == 0 {
+                return
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
+            kcpDatagramReceiveErrors += 1
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.recvfrom_failed session=\(sessionID.uuidString) errno=\(errno) " +
+                    "errors=\(kcpDatagramReceiveErrors)"
+            )
+            return
+        }
+    }
+
+    private func handleKCPDatagram(_ data: Data) {
+        var offset = 0
+        var parsedSegments = 0
+        while offset + Self.kcpHeaderLength <= data.count {
+            guard let segment = KCPIncomingSegment(data: data, offset: offset) else {
+                break
+            }
+            let segmentLength = Self.kcpHeaderLength + Int(segment.length)
+            guard offset + segmentLength <= data.count else {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.kcp_malformed session=\(sessionID.uuidString) bytes=\(data.count) " +
+                        "offset=\(offset) declaredLength=\(segment.length)"
+                )
+                break
+            }
+            handleKCPSegment(segment)
+            offset += segmentLength
+            parsedSegments += 1
+        }
+        if parsedSegments == 0 {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_malformed session=\(sessionID.uuidString) bytes=\(data.count) " +
+                    "firstBytes=\(Self.hexPreview(data, limit: 16))"
+            )
+        }
+    }
+
+    private func handleKCPSegment(_ segment: KCPIncomingSegment) {
+        guard segment.conv == Self.kcpConversationID else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_conv_ignored session=\(sessionID.uuidString) conv=0x\(String(segment.conv, radix: 16)) " +
+                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn)"
+            )
+            return
+        }
+        switch segment.command {
+        case Self.kcpCommandACK:
+            kcpACKsReceived += 1
+            kcpLatestACKSN = segment.sn
+            kcpLatestRemoteUNA = segment.una
+            if kcpACKsReceived <= 5 || kcpACKsReceived % 100 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.kcp_ack_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
+                        "una=\(segment.una) ts=\(segment.ts) acks=\(kcpACKsReceived) packetsSent=\(kcpPacketsSent)"
+                )
+            }
+        case Self.kcpCommandWASK:
+            kcpWASKReceived += 1
+            sendKCPWINS(responseTo: segment)
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.kcp_wask_received session=\(sessionID.uuidString) count=\(kcpWASKReceived) " +
+                    "sn=\(segment.sn) una=\(segment.una)"
+            )
+        case Self.kcpCommandWINS:
+            kcpWINSReceived += 1
+            if kcpWINSReceived <= 5 || kcpWINSReceived % 20 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.kcp_wins_received session=\(sessionID.uuidString) count=\(kcpWINSReceived) " +
+                        "sn=\(segment.sn) una=\(segment.una)"
+                )
+            }
+        case Self.kcpCommandPush:
+            kcpPUSHReceived += 1
+            if segment.sn >= kcpRemoteNextReceiveSN {
+                kcpRemoteNextReceiveSN = segment.sn &+ 1
+            }
+            sendKCPACK(responseTo: segment)
+            if kcpPUSHReceived <= 5 || kcpPUSHReceived % 20 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.kcp_push_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
+                        "payloadBytes=\(segment.length) remoteNext=\(kcpRemoteNextReceiveSN) pushReceived=\(kcpPUSHReceived)"
+                )
+            }
+        default:
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_unknown_received session=\(sessionID.uuidString) " +
+                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn) len=\(segment.length)"
+            )
+        }
+    }
+
+    private func sendKCPACK(responseTo segment: KCPIncomingSegment) {
+        let packet = makeKCPSegment(
+            cmd: Self.kcpCommandACK,
+            ts: segment.ts,
+            sn: segment.sn,
+            una: kcpRemoteNextReceiveSN,
+            payload: Data()
+        )
+        if sendMPTDatagram(packet) {
+            kcpACKSent += 1
+            if kcpACKSent <= 5 || kcpACKSent % 50 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.kcp_ack_sent session=\(sessionID.uuidString) sn=\(segment.sn) " +
+                        "una=\(kcpRemoteNextReceiveSN) ackSent=\(kcpACKSent)"
+                )
+            }
+        } else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_ack_send_failed session=\(sessionID.uuidString) sn=\(segment.sn) errno=\(errno)"
+            )
+        }
+    }
+
+    private func sendKCPWINS(responseTo segment: KCPIncomingSegment) {
+        let packet = makeKCPSegment(
+            cmd: Self.kcpCommandWINS,
+            ts: segment.ts,
+            sn: segment.sn,
+            una: kcpRemoteNextReceiveSN,
+            payload: Data()
+        )
+        if sendMPTDatagram(packet) {
+            kcpWINSSent += 1
+        } else {
+            DiagnosticsLog.warn("xiaomi.mirror.mpt.kcp_wins_send_failed session=\(sessionID.uuidString) errno=\(errno)")
+        }
+    }
+
+    private func sendMPTDatagram(_ packet: Data) -> Bool {
+        guard mptSocketFD >= 0, var destination = mptDestinationAddress else {
+            return false
+        }
+        let sent = packet.withUnsafeBytes { rawBuffer -> ssize_t in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return -1
+            }
+            return withUnsafePointer(to: &destination) { addressPointer in
+                addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    Darwin.sendto(
+                        mptSocketFD,
+                        baseAddress,
+                        packet.count,
+                        0,
+                        sockaddrPointer,
+                        socklen_t(MemoryLayout<sockaddr_in>.size)
+                    )
+                }
+            }
+        }
+        return sent == packet.count
+    }
+
+    private func makeKCPSegment(cmd: UInt8, ts: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data {
+        var packet = Data(capacity: Self.kcpHeaderLength + payload.count)
+        packet.appendUInt32LE(Self.kcpConversationID)
+        packet.append(cmd)
+        packet.append(0)
+        packet.appendUInt16LE(Self.kcpReceiveWindow)
+        packet.appendUInt32LE(ts)
+        packet.appendUInt32LE(sn)
+        packet.appendUInt32LE(una)
+        packet.appendUInt32LE(UInt32(truncatingIfNeeded: payload.count))
+        packet.append(payload)
+        return packet
+    }
+
     private static func currentNTPTimestamp() -> (seconds: UInt32, fraction: UInt32) {
         let ntpEpochOffset: TimeInterval = 2_208_988_800
         let timestamp = Date().timeIntervalSince1970 + ntpEpochOffset
         let seconds = UInt32(timestamp)
         let fraction = UInt32((timestamp - floor(timestamp)) * 4_294_967_296)
         return (seconds, fraction)
+    }
+
+    private static func monotonicMilliseconds() -> UInt32 {
+        UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
     private static func hexPreview(_ data: Data, limit: Int) -> String {
@@ -1582,14 +2138,123 @@ private final class XiaomiMirrorRTPMediaSender {
         rtcpTimer?.cancel()
         rtcpTimer = nil
         encoder.invalidate()
+        mptReadSource?.cancel()
+        mptReadSource = nil
+        mptSocketFD = -1
+        mptDestinationAddress = nil
         connection?.cancel()
         connection = nil
         rtcpConnection?.cancel()
         rtcpConnection = nil
-        DiagnosticsLog.info(
-            "xiaomi.mirror.rtp.stop session=\(sessionID.uuidString) reason=\(reason) " +
-                "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) rtcpSR=\(rtcpSRSent)"
+        if transportMode == .mpt {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.stop session=\(sessionID.uuidString) reason=\(reason) " +
+                    "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) kcpPackets=\(kcpPacketsSent) " +
+                    "bytesSent=\(kcpBytesSent) acks=\(kcpACKsReceived) ackSent=\(kcpACKSent) " +
+                    "wask=\(kcpWASKReceived) winsReceived=\(kcpWINSReceived) winsSent=\(kcpWINSSent) " +
+                    "pushReceived=\(kcpPUSHReceived) datagrams=\(kcpDatagramsReceived) recvErrors=\(kcpDatagramReceiveErrors) " +
+                    "latestAck=\(kcpLatestACKSN.map(String.init) ?? "none") " +
+                    "latestRemoteUna=\(kcpLatestRemoteUNA.map(String.init) ?? "none")"
+            )
+        } else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtp.stop session=\(sessionID.uuidString) reason=\(reason) " +
+                    "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) rtcpSR=\(rtcpSRSent)"
+            )
+        }
+    }
+
+    private static let kcpConversationID: UInt32 = 0x1234_5678
+    private static let kcpCommandPush: UInt8 = 0x51
+    private static let kcpCommandACK: UInt8 = 0x52
+    private static let kcpCommandWASK: UInt8 = 0x53
+    private static let kcpCommandWINS: UInt8 = 0x54
+    private static let kcpHeaderLength = 24
+    private static let kcpReceiveWindow: UInt16 = 128
+
+    private static func anyIPv4SocketAddress(port: UInt16) -> sockaddr_in {
+        sockaddr_in(
+            sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+            sin_family: sa_family_t(AF_INET),
+            sin_port: port.bigEndian,
+            sin_addr: in_addr(s_addr: INADDR_ANY.bigEndian),
+            sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
         )
+    }
+
+    private static func makeIPv4SocketAddress(host: String, port: UInt16) -> sockaddr_in? {
+        var address = in_addr()
+        guard inet_pton(AF_INET, host, &address) == 1 else {
+            return nil
+        }
+        return sockaddr_in(
+            sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
+            sin_family: sa_family_t(AF_INET),
+            sin_port: port.bigEndian,
+            sin_addr: address,
+            sin_zero: (0, 0, 0, 0, 0, 0, 0, 0)
+        )
+    }
+
+    private static func ipv4SocketAddress(from storage: sockaddr_storage) -> sockaddr_in? {
+        guard Int32(storage.ss_family) == AF_INET else {
+            return nil
+        }
+        var copy = storage
+        return withUnsafePointer(to: &copy) { pointer in
+            pointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { addressPointer in
+                addressPointer.pointee
+            }
+        }
+    }
+
+    private static func describeSocketAddress(_ storage: sockaddr_storage) -> String {
+        guard Int32(storage.ss_family) == AF_INET else {
+            return "family:\(storage.ss_family)"
+        }
+        var copy = storage
+        var hostBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        let port = withUnsafePointer(to: &copy) { pointer -> UInt16 in
+            pointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { addressPointer in
+                let address = addressPointer.pointee
+                var addr = address.sin_addr
+                inet_ntop(AF_INET, &addr, &hostBuffer, socklen_t(hostBuffer.count))
+                return UInt16(bigEndian: address.sin_port)
+            }
+        }
+        let host = String(cString: hostBuffer)
+        return "\(host):\(port)"
+    }
+}
+
+private struct KCPIncomingSegment {
+    let conv: UInt32
+    let command: UInt8
+    let fragment: UInt8
+    let window: UInt16
+    let ts: UInt32
+    let sn: UInt32
+    let una: UInt32
+    let length: UInt32
+
+    init?(data: Data, offset: Int) {
+        guard offset + 24 <= data.count,
+              let conv = data.readUInt32LE(at: offset),
+              let window = data.readUInt16LE(at: offset + 6),
+              let ts = data.readUInt32LE(at: offset + 8),
+              let sn = data.readUInt32LE(at: offset + 12),
+              let una = data.readUInt32LE(at: offset + 16),
+              let length = data.readUInt32LE(at: offset + 20) else {
+            return nil
+        }
+        self.conv = conv
+        self.command = data[offset + 4]
+        self.fragment = data[offset + 5]
+        self.window = window
+        self.ts = ts
+        self.sn = sn
+        self.una = una
+        self.length = length
     }
 }
 
@@ -1964,6 +2629,35 @@ private extension Data {
         append(UInt8((value >> 16) & 0xff))
         append(UInt8((value >> 8) & 0xff))
         append(UInt8(value & 0xff))
+    }
+
+    mutating func appendUInt16LE(_ value: UInt16) {
+        append(UInt8(value & 0xff))
+        append(UInt8((value >> 8) & 0xff))
+    }
+
+    mutating func appendUInt32LE(_ value: UInt32) {
+        append(UInt8(value & 0xff))
+        append(UInt8((value >> 8) & 0xff))
+        append(UInt8((value >> 16) & 0xff))
+        append(UInt8((value >> 24) & 0xff))
+    }
+
+    func readUInt16LE(at offset: Int) -> UInt16? {
+        guard offset >= 0, offset + 1 < count else {
+            return nil
+        }
+        return UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
+    }
+
+    func readUInt32LE(at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 3 < count else {
+            return nil
+        }
+        return UInt32(self[offset]) |
+            (UInt32(self[offset + 1]) << 8) |
+            (UInt32(self[offset + 2]) << 16) |
+            (UInt32(self[offset + 3]) << 24)
     }
 
     mutating func appendStartCode() {

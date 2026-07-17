@@ -292,7 +292,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
-            let peerHost = Self.phoneRelayAdvertisedHost()
+            let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
             let xiaomiMirrorDeviceId = XiaomiHyperConnectBridge.localDeviceId()
@@ -778,7 +778,7 @@ final class EdgeLinkRuntime: ObservableObject {
             let args = Self.externalURLQueryArgs(url)
             let requestedPeerHost = args["peerHost"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let peerHost = requestedPeerHost?.isEmpty == false ? requestedPeerHost : Self.phoneRelayAdvertisedHost()
+            let peerHost = requestedPeerHost?.isEmpty == false ? requestedPeerHost : Self.xiaomiMirrorAdvertisedHost()
             DiagnosticsLog.info(
                 "runtime.mac.url_xiaomi_mirror_rtsp_listener peerHost=\(peerHost ?? "none") args=\(args)"
             )
@@ -922,7 +922,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(
-            peerHost: Self.phoneRelayAdvertisedHost(),
+            peerHost: Self.xiaomiMirrorAdvertisedHost(),
             reason: "runtime_launch"
         )
     }
@@ -2123,6 +2123,22 @@ final class EdgeLinkRuntime: ObservableObject {
             return override
         }
         return MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
+    }
+
+    private static func xiaomiMirrorAdvertisedHost() -> String? {
+        let current = MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
+        let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let current, !current.isEmpty {
+            if let override, !override.isEmpty, override != current {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.rtsp.advertised_host_override_ignored " +
+                        "override=\(override) current=\(current)"
+                )
+            }
+            return current
+        }
+        return override?.isEmpty == false ? override : nil
     }
 }
 
