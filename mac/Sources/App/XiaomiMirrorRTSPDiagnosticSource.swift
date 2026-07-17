@@ -10,6 +10,51 @@ private enum XiaomiMirrorRTSPTransportMode: String {
     case mpt
 }
 
+private enum XiaomiMirrorRTSPProtocolProfile: String {
+    case edge
+    case official
+}
+
+private enum XiaomiMirrorVideoDefaults {
+    static let width: Int32 = 640
+    static let height: Int32 = 360
+    static let frameRate: Int32 = 30
+    static let bitrate = 5_000_000
+
+    private static let hh640x360p30Mask = "00000040"
+
+    static let h264VideoFormats = [
+        "a8",
+        "00",
+        "01",
+        "01",
+        "00000000",
+        "00000000",
+        hh640x360p30Mask,
+        "00",
+        "0000",
+        "0000",
+        "00",
+        "none",
+        "none"
+    ].joined(separator: " ")
+
+    static var currentVideoInfo: String {
+        "\(width) \(height) \(frameRate) \(bitrate)"
+    }
+}
+
+private enum XiaomiMirrorOfficialRTSPDefaults {
+    static let videoFormats = "40 0 2 10 1ffff 1fffffff 0fff 0 0 0 0 none none"
+    static let currentVideoInfo = "-1 -1 -1 -1"
+    static let audioCodecsV2 = "2 0 0 0"
+    static let selectedAudioCodecsV2 = "0 1"
+    static let contentSPProtection = "4 1 256 3 1 1 1 1"
+    static let typeEncryption = "4 1 1 1 1"
+    static let bufferCapability = "1F"
+    static let fallbackClientRTPPorts = "RTP/AVP/MPT;unicast 15550 0 mode=play"
+}
+
 final class XiaomiMirrorRTSPDiagnosticSource {
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
@@ -22,6 +67,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
     private let sourceRTPPort: UInt16 = 19_002
     private let transportModeDefaultsKey = "xiaomiMirrorRTSPTransportMode"
+    private let protocolProfileDefaultsKey = "xiaomiMirrorRTSPProtocolProfile"
 
     init() {
         queue.setSpecific(key: queueKey, value: ())
@@ -48,7 +94,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.listener_already_running port=\(self.port) " +
                     "advertisedHost=\(host ?? "none") lifetime=\(Int(lifetime)) " +
-                    "transportMode=\(transportMode.rawValue)"
+                    "protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
             )
             return
         }
@@ -66,7 +112,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         scheduleAutoStop(lifetime: lifetime)
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.listener_start port=\(port) advertisedHost=\(host ?? "none") " +
-                "lifetime=\(Int(lifetime)) transportMode=\(transportMode.rawValue)"
+                "lifetime=\(Int(lifetime)) protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
         )
         listener.start(queue: queue)
     }
@@ -231,6 +277,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             sendSetParameterIfNeeded(id: id, connection: connection)
         case "SET_PARAMETER":
             DiagnosticsLog.info("xiaomi.mirror.rtsp.m4_ack id=\(id.uuidString) cseq=\(cseq)")
+        case "SET_PARAMETER_IDR":
+            DiagnosticsLog.info("xiaomi.mirror.rtsp.idr_request_ack id=\(id.uuidString) cseq=\(cseq)")
         default:
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.response_unmatched id=\(id.uuidString) cseq=\(cseq) " +
@@ -257,9 +305,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             sendGetParameterIfNeeded(id: id, connection: connection)
         case "GET_PARAMETER":
             let currentState = states[id] ?? RTSPConnectionState()
-            let body = sourceParameterResponseBody(requestBody: message.body, state: currentState)
-            let extraHeaders = ["Content-Type: text/parameters"]
-            let loggedHeaders = ([currentState.session.map { "Session: \($0)" }].compactMap { $0 } + extraHeaders)
+            let profile = protocolProfile
+            let isOfficialM16 = profile == .official && currentState.session != nil
+            let body = isOfficialM16 ? "" : sourceParameterResponseBody(requestBody: message.body, state: currentState)
+            let extraHeaders = isOfficialM16 ? [] : ["Content-Type: text/parameters"]
+            let loggedHeaders = ([currentState.session.map { "Session: \(sessionHeaderValue(for: $0))" }].compactMap { $0 } + extraHeaders)
                 .joined(separator: "|")
             sendResponse(
                 id: id,
@@ -271,9 +321,13 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             )
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.source_parameter_response id=\(id.uuidString) " +
+                    "protocolProfile=\(profile.rawValue) officialM16=\(isOfficialM16) " +
                     "session=\(currentState.session ?? "none") headers=\(Self.preview(loggedHeaders)) " +
                     "body=\(Self.preview(body, limit: 900))"
             )
+            if isOfficialM16 {
+                sendIDRRequest(id: id, connection: connection)
+            }
         case "SET_PARAMETER":
             if message.body.contains("wfd_trigger_method") {
                 DiagnosticsLog.info(
@@ -289,9 +343,12 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 connection: connection,
                 cseq: message.cseq,
                 session: session(for: id),
-                extraHeaders: ["Range: npt=0-"]
+                extraHeaders: ["Range: \(playRangeHeaderValue)"]
             )
-            DiagnosticsLog.info("xiaomi.mirror.rtsp.play_received id=\(id.uuidString) session=\(session(for: id))")
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.play_received id=\(id.uuidString) " +
+                    "protocolProfile=\(protocolProfile.rawValue) session=\(session(for: id)) range=\(playRangeHeaderValue)"
+            )
             startMediaIfPossible(id: id)
         case "PAUSE", "TEARDOWN":
             sendResponse(id: id, connection: connection, cseq: message.cseq, session: session(for: id))
@@ -334,7 +391,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         )
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.setup_received id=\(id.uuidString) session=\(session(for: id)) " +
-                "transportMode=\(mode.rawValue) requestTransport=\(Self.preview(requestTransport ?? "none")) " +
+                "protocolProfile=\(protocolProfile.rawValue) transportMode=\(mode.rawValue) " +
+                "requestTransport=\(Self.preview(requestTransport ?? "none")) " +
                 "responseTransport=\(responseTransport.value) " +
                 "preservedTokens=\(Self.preview(responseTransport.preservedTokens.joined(separator: ","))) " +
                 "omittedTokens=\(Self.preview(responseTransport.omittedTokens.joined(separator: ","))) " +
@@ -428,9 +486,38 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             extraHeaders: ["Content-Type: text/parameters"]
         )
         DiagnosticsLog.info(
-            "xiaomi.mirror.rtsp.m4_body id=\(id.uuidString) transportMode=\(mode.rawValue) " +
+            "xiaomi.mirror.rtsp.m4_body id=\(id.uuidString) protocolProfile=\(protocolProfile.rawValue) " +
+                "transportMode=\(mode.rawValue) " +
                 "clientRTPPorts=\(Self.preview(clientRTPPorts)) mptEnable=\(mptEnable) " +
                 "body=\(Self.preview(body, limit: 900))"
+        )
+        send(message, id: id, connection: connection)
+    }
+
+    private func sendIDRRequest(id: UUID, connection: NWConnection) {
+        var state = states[id] ?? RTSPConnectionState()
+        guard let session = state.session else {
+            DiagnosticsLog.warn("xiaomi.mirror.rtsp.idr_request_skipped id=\(id.uuidString) reason=missing_session")
+            return
+        }
+        let cseq = state.nextCSeq
+        state.nextCSeq += 1
+        state.pendingRequests[cseq] = "SET_PARAMETER_IDR"
+        states[id] = state
+        let body = "wfd_idr_request\r\n"
+        let message = makeRequest(
+            method: "SET_PARAMETER",
+            target: sourcePresentationURL(),
+            cseq: cseq,
+            body: body,
+            extraHeaders: [
+                "Session: \(sessionHeaderValue(for: session))",
+                "Content-Type: text/parameters"
+            ]
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.idr_request_sent id=\(id.uuidString) " +
+                "protocolProfile=\(protocolProfile.rawValue) cseq=\(cseq) session=\(session)"
         )
         send(message, id: id, connection: connection)
     }
@@ -455,23 +542,24 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
     private func sourceSetParameterBody(state: RTSPConnectionState) -> String {
         let presentationURL = sourcePresentationURL()
-        let videoFormats = Self.defaultH264VideoFormats
+        let profile = protocolProfile
+        let videoFormats = profile == .official ? XiaomiMirrorOfficialRTSPDefaults.videoFormats : Self.defaultH264VideoFormats
         let videoEnctype = "1 1"
         let videoGamutType = "1 1"
         let audioCodecs = sourceAudioCodecs
         let mode = transportMode
         let clientRTPPorts = sourceClientRTPPorts(from: state, mode: mode)
         let mptEnable = sourceMPTEnable(from: state, mode: mode)
-        return [
+        var lines = [
             "wfd_presentation_URL: \(presentationURL) none",
             "wfd_video_formats: \(videoFormats)",
-            "wfd_video_bitrate: 5000000",
+            "wfd_video_bitrate: \(XiaomiMirrorVideoDefaults.bitrate)",
             "wfd_video_enctype: \(videoEnctype)",
             "wfd_video_gamuttype: \(videoGamutType)",
             "wfd_audio_codecs: \(audioCodecs)",
             "wfd_client_rtp_ports: \(clientRTPPorts)",
             "wfd_content_protection: none",
-            "wfd_content_SP_protection: 0 0 0 0 0 0 0 0",
+            "wfd_content_SP_protection: \(profile == .official ? XiaomiMirrorOfficialRTSPDefaults.contentSPProtection : "0 0 0 0 0 0 0 0")",
             "wfd_mirror_control_enable: enable",
             "wfd_support_secure_win: enable",
             "wfd_standby_resume_capability: supported",
@@ -481,21 +569,37 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             "wfd_connector_type: 07",
             "wfd_platform_type: 2",
             "wfd_trigger_method: SETUP"
-        ].joined(separator: "\r\n") + "\r\n"
+        ]
+        if profile == .official {
+            if let audioIndex = lines.firstIndex(of: "wfd_audio_codecs: \(audioCodecs)") {
+                lines.insert("wfd_audio_codecs_v2: \(XiaomiMirrorOfficialRTSPDefaults.selectedAudioCodecsV2)", at: audioIndex + 1)
+            }
+            lines.append("wfd_type_encryp: \(XiaomiMirrorOfficialRTSPDefaults.typeEncryption)")
+            if let timerServerPort = sourceTimerServerPort() {
+                lines.append("wfd_timer_server_port:\(timerServerPort)")
+            } else {
+                DiagnosticsLog.info("xiaomi.mirror.rtsp.official_timer_server_port_skipped reason=missing_ipv4_advertised_host")
+            }
+        }
+        return lines.joined(separator: "\r\n") + "\r\n"
     }
 
     private func sourceParameterResponseBody(requestBody: String, state: RTSPConnectionState) -> String {
         let requestedNames = Self.requestedParameterNames(in: requestBody)
         let mode = transportMode
-        let parameters: [(String, String)] = [
+        let profile = protocolProfile
+        let videoFormats = profile == .official ? XiaomiMirrorOfficialRTSPDefaults.videoFormats : Self.defaultH264VideoFormats
+        let currentVideoInfo = profile == .official ? XiaomiMirrorOfficialRTSPDefaults.currentVideoInfo : Self.sourceCurrentVideoInfo
+        let contentSPProtection = profile == .official ? XiaomiMirrorOfficialRTSPDefaults.contentSPProtection : "0 0 0 0 0 0 0 0"
+        var parameters: [(String, String)] = [
             ("wfd_audio_codecs", sourceAudioCodecs),
-            ("wfd_video_formats", Self.defaultH264VideoFormats),
+            ("wfd_video_formats", videoFormats),
             ("wfd_video_enctype", "1 1"),
             ("wfd_video_gamuttype", "1 1"),
-            ("wfd_current_video_info", Self.sourceCurrentVideoInfo),
+            ("wfd_current_video_info", currentVideoInfo),
             ("wfd_client_rtp_ports", sourceClientRTPPorts(from: state, mode: mode)),
             ("wfd_content_protection", "none"),
-            ("wfd_content_SP_protection", "0 0 0 0 0 0 0 0"),
+            ("wfd_content_SP_protection", contentSPProtection),
             ("wfd_mirror_control_enable", "enable"),
             ("wfd_support_secure_win", "enable"),
             ("wfd_standby_resume_capability", "supported"),
@@ -508,7 +612,21 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             ("wfd_connector_type", "07"),
             ("wfd_presentation_URL", "\(sourcePresentationURL()) none")
         ]
+        if profile == .official {
+            if let audioIndex = parameters.firstIndex(where: { $0.0 == "wfd_audio_codecs" }) {
+                parameters.insert(("wfd_audio_codecs_v2", XiaomiMirrorOfficialRTSPDefaults.audioCodecsV2), at: audioIndex + 1)
+            }
+            if let secureWinIndex = parameters.firstIndex(where: { $0.0 == "wfd_support_secure_win" }) {
+                parameters.insert(
+                    ("wfd_buffer_capabity", XiaomiMirrorOfficialRTSPDefaults.bufferCapability),
+                    at: secureWinIndex + 1
+                )
+            }
+        }
         return parameters.compactMap { name, value -> String? in
+            if profile == .official && Self.isOfficialAlwaysReturnedParameter(name) {
+                return "\(name): \(value)"
+            }
             if requestedNames.isEmpty || requestedNames.contains(name.lowercased()) {
                 return "\(name): \(value)"
             }
@@ -519,6 +637,9 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private func sourceClientRTPPorts(from state: RTSPConnectionState, mode: XiaomiMirrorRTSPTransportMode) -> String {
         guard let raw = state.sinkClientRTPPorts?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
+            if mode == .mpt || protocolProfile == .official {
+                return XiaomiMirrorOfficialRTSPDefaults.fallbackClientRTPPorts
+            }
             return "RTP/AVP/UDP;unicast 0 0 mode=play"
         }
         if mode == .udp {
@@ -547,6 +668,18 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         "AAC 00000001 00"
     }
 
+    private var playRangeHeaderValue: String {
+        protocolProfile == .official ? "npt=now-" : "npt=0-"
+    }
+
+    private func sessionHeaderValue(for session: String) -> String {
+        guard protocolProfile == .official,
+              !session.localizedCaseInsensitiveContains("timeout=") else {
+            return session
+        }
+        return "\(session);timeout=60"
+    }
+
     private func sourcePresentationURL() -> String {
         let host = advertisedHost ?? "localhost"
         if host.contains(":") {
@@ -556,7 +689,23 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     }
 
     private var transportMode: XiaomiMirrorRTSPTransportMode {
-        XiaomiMirrorRTSPTransportMode(rawValue: UserDefaults.standard.string(forKey: transportModeDefaultsKey) ?? "") ?? .udp
+        if let rawMode = UserDefaults.standard.string(forKey: transportModeDefaultsKey),
+           !rawMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return XiaomiMirrorRTSPTransportMode(rawValue: rawMode) ?? .udp
+        }
+        return protocolProfile == .official ? .mpt : .udp
+    }
+
+    private var protocolProfile: XiaomiMirrorRTSPProtocolProfile {
+        XiaomiMirrorRTSPProtocolProfile(rawValue: UserDefaults.standard.string(forKey: protocolProfileDefaultsKey) ?? "") ?? .edge
+    }
+
+    private func sourceTimerServerPort() -> String? {
+        guard let host = sourceHostForTransport(),
+              let ipInteger = Self.ipv4Integer(host) else {
+            return nil
+        }
+        return "\(ipInteger):\(port)"
     }
 
     private func setupResponseTransport(
@@ -695,11 +844,14 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             )
             return
         }
+        let clientRTCPPort = transport.clientRTCPPort ?? clientRTPPort &+ 1
         do {
             let sender = try XiaomiMirrorRTPMediaSender(
                 destinationHost: host,
                 destinationRTPPort: clientRTPPort,
+                destinationRTCPPort: clientRTCPPort,
                 localRTPPort: sourceRTPPort,
+                localRTCPPort: sourceRTPPort + 1,
                 sessionID: id
             )
             state.mediaSender = sender
@@ -707,7 +859,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             sender.start()
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.media_started id=\(id.uuidString) destination=\(host):\(clientRTPPort) " +
-                    "localRTPPort=\(sourceRTPPort) payload=rtp_pt33_mpegts_h264_annexb"
+                    "remoteRTCPPort=\(clientRTCPPort) localRTPPort=\(sourceRTPPort) localRTCPPort=\(sourceRTPPort + 1) " +
+                    "payload=rtp_pt33_mpegts_h264_annexb"
             )
         } catch {
             DiagnosticsLog.error(
@@ -774,7 +927,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             headers.append("CSeq: \(cseq)")
         }
         if let session {
-            headers.append("Session: \(session)")
+            headers.append("Session: \(sessionHeaderValue(for: session))")
         }
         headers.append(contentsOf: extraHeaders)
         let bodyBytes = Data((body ?? "").utf8).count
@@ -938,6 +1091,23 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         )
     }
 
+    private static func isOfficialAlwaysReturnedParameter(_ name: String) -> Bool {
+        switch name.lowercased() {
+        case "wfd_audio_codecs",
+             "wfd_audio_codecs_v2",
+             "wfd_video_formats",
+             "wfd_current_video_info",
+             "wfd_client_rtp_ports",
+             "wfd_content_sp_protection",
+             "wfd_mirror_control_enable",
+             "wfd_support_secure_win",
+             "wfd_buffer_capabity":
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func preview(_ value: String, limit: Int = 320) -> String {
         let collapsed = value
             .replacingOccurrences(of: "\r", with: "\\r")
@@ -966,6 +1136,21 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         default:
             return nil
         }
+    }
+
+    private static func ipv4Integer(_ host: String) -> UInt32? {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4 else {
+            return nil
+        }
+        var result: UInt32 = 0
+        for part in parts {
+            guard let octet = UInt8(part) else {
+                return nil
+            }
+            result = (result << 8) | UInt32(octet)
+        }
+        return result
     }
 
     private static func parsePortPair(_ raw: String?) -> (UInt16?, UInt16?) {
@@ -1033,8 +1218,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         return port > 0
     }
 
-    private static let defaultH264VideoFormats = "a8 00 01 01 0061ffff 3fffffff 00000fff 00 0000 0000 00 none none"
-    private static let sourceCurrentVideoInfo = "640 360 15 5000000"
+    private static let defaultH264VideoFormats = XiaomiMirrorVideoDefaults.h264VideoFormats
+    private static let sourceCurrentVideoInfo = XiaomiMirrorVideoDefaults.currentVideoInfo
 }
 
 private struct RTSPConnectionState {
@@ -1085,12 +1270,16 @@ private final class XiaomiMirrorRTPMediaSender {
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTPMediaSender")
     private let destinationHost: String
     private let destinationRTPPort: UInt16
+    private let destinationRTCPPort: UInt16
     private let localRTPPort: UInt16
+    private let localRTCPPort: UInt16
     private let sessionID: UUID
-    private let frameRate: Int32 = 15
+    private let frameRate: Int32 = XiaomiMirrorVideoDefaults.frameRate
     private let rtpPacketsPerPayload = 7
     private var connection: NWConnection?
+    private var rtcpConnection: NWConnection?
     private var frameTimer: DispatchSourceTimer?
+    private var rtcpTimer: DispatchSourceTimer?
     private var encoder: XiaomiMirrorH264Encoder
     private var muxer = XiaomiMirrorMPEGTSMuxer()
     private var sequenceNumber = UInt16.random(in: 0...UInt16.max)
@@ -1098,14 +1287,30 @@ private final class XiaomiMirrorRTPMediaSender {
     private var frameIndex: UInt64 = 0
     private var framesSent: UInt64 = 0
     private var rtpPacketsSent: UInt64 = 0
+    private var rtpPayloadOctetsSent: UInt64 = 0
+    private var rtcpSRSent: UInt64 = 0
+    private var lastRTPTimestamp: UInt32 = 0
     private var stopped = false
 
-    init(destinationHost: String, destinationRTPPort: UInt16, localRTPPort: UInt16, sessionID: UUID) throws {
+    init(
+        destinationHost: String,
+        destinationRTPPort: UInt16,
+        destinationRTCPPort: UInt16,
+        localRTPPort: UInt16,
+        localRTCPPort: UInt16,
+        sessionID: UUID
+    ) throws {
         self.destinationHost = destinationHost
         self.destinationRTPPort = destinationRTPPort
+        self.destinationRTCPPort = destinationRTCPPort
         self.localRTPPort = localRTPPort
+        self.localRTCPPort = localRTCPPort
         self.sessionID = sessionID
-        self.encoder = try XiaomiMirrorH264Encoder(width: 640, height: 360, frameRate: frameRate)
+        self.encoder = try XiaomiMirrorH264Encoder(
+            width: XiaomiMirrorVideoDefaults.width,
+            height: XiaomiMirrorVideoDefaults.height,
+            frameRate: frameRate
+        )
     }
 
     func start() {
@@ -1125,10 +1330,13 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         guard let remotePort = NWEndpoint.Port(rawValue: destinationRTPPort),
-              let localPort = NWEndpoint.Port(rawValue: localRTPPort) else {
+              let remoteRTCPPort = NWEndpoint.Port(rawValue: destinationRTCPPort),
+              let localPort = NWEndpoint.Port(rawValue: localRTPPort),
+              let localRTCPPort = NWEndpoint.Port(rawValue: localRTCPPort) else {
             DiagnosticsLog.warn(
                 "xiaomi.mirror.rtp.start_skipped session=\(sessionID.uuidString) reason=invalid_port " +
-                    "destinationPort=\(destinationRTPPort) localPort=\(localRTPPort)"
+                    "destinationPort=\(destinationRTPPort) destinationRTCPPort=\(destinationRTCPPort) " +
+                    "localPort=\(localRTPPort) localRTCPPort=\(self.localRTCPPort)"
             )
             return
         }
@@ -1137,6 +1345,11 @@ private final class XiaomiMirrorRTPMediaSender {
         parameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localPort)
         let connection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remotePort, using: parameters)
         self.connection = connection
+        let rtcpParameters = NWParameters.udp
+        rtcpParameters.allowLocalEndpointReuse = true
+        rtcpParameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localRTCPPort)
+        let rtcpConnection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remoteRTCPPort, using: rtcpParameters)
+        self.rtcpConnection = rtcpConnection
         encoder.onFrame = { [weak self] frame in
             self?.queue.async {
                 self?.send(frame)
@@ -1147,11 +1360,20 @@ private final class XiaomiMirrorRTPMediaSender {
                 self?.handleConnectionState(state)
             }
         }
+        rtcpConnection.stateUpdateHandler = { [weak self] state in
+            self?.queue.async {
+                self?.handleRTCPConnectionState(state)
+            }
+        }
         connection.start(queue: queue)
+        rtcpConnection.start(queue: queue)
+        receiveRTCP()
+        startRTCPTimer()
         startFrameTimer()
         DiagnosticsLog.info(
             "xiaomi.mirror.rtp.start session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort) " +
-                "localRTPPort=\(localRTPPort) payload=RTP/PT33/MP2T/H264AnnexB video=640x360@\(frameRate)"
+                "remoteRTCPPort=\(destinationRTCPPort) localRTPPort=\(localRTPPort) localRTCPPort=\(self.localRTCPPort) " +
+                "payload=RTP/PT33/MP2T/H264AnnexB video=\(XiaomiMirrorVideoDefaults.width)x\(XiaomiMirrorVideoDefaults.height)@\(frameRate)"
         )
     }
 
@@ -1171,6 +1393,21 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
+    private func handleRTCPConnectionState(_ state: NWConnection.State) {
+        switch state {
+        case .ready:
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtcp.ready session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTCPPort)"
+            )
+        case .failed(let error):
+            DiagnosticsLog.error("xiaomi.mirror.rtcp.failed session=\(sessionID.uuidString)", error)
+        case .cancelled:
+            DiagnosticsLog.info("xiaomi.mirror.rtcp.cancelled session=\(sessionID.uuidString)")
+        default:
+            break
+        }
+    }
+
     private func startFrameTimer() {
         frameTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -1180,6 +1417,17 @@ private final class XiaomiMirrorRTPMediaSender {
             self?.encodeNextFrame()
         }
         frameTimer = timer
+        timer.resume()
+    }
+
+    private func startRTCPTimer() {
+        rtcpTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            self?.sendRTCPSenderReport()
+        }
+        rtcpTimer = timer
         timer.resume()
     }
 
@@ -1242,6 +1490,8 @@ private final class XiaomiMirrorRTPMediaSender {
         let currentSequence = sequenceNumber
         sequenceNumber &+= 1
         rtpPacketsSent += 1
+        rtpPayloadOctetsSent += UInt64(payload.count)
+        lastRTPTimestamp = timestamp
         connection.send(content: packet, completion: .contentProcessed { error in
             if let error {
                 DiagnosticsLog.error(
@@ -1252,19 +1502,93 @@ private final class XiaomiMirrorRTPMediaSender {
         })
     }
 
+    private func sendRTCPSenderReport() {
+        guard !stopped, let rtcpConnection else {
+            return
+        }
+        var packet = Data(capacity: 28)
+        packet.append(0x80)
+        packet.append(200)
+        packet.appendUInt16(6)
+        packet.appendUInt32(ssrc)
+        let ntp = Self.currentNTPTimestamp()
+        packet.appendUInt32(ntp.seconds)
+        packet.appendUInt32(ntp.fraction)
+        packet.appendUInt32(lastRTPTimestamp)
+        packet.appendUInt32(UInt32(truncatingIfNeeded: rtpPacketsSent))
+        packet.appendUInt32(UInt32(truncatingIfNeeded: rtpPayloadOctetsSent))
+        let reportIndex = rtcpSRSent + 1
+        rtcpConnection.send(content: packet, completion: .contentProcessed { error in
+            if let error {
+                DiagnosticsLog.error(
+                    "xiaomi.mirror.rtcp.sr_failed session=\(self.sessionID.uuidString) count=\(reportIndex)",
+                    error
+                )
+            }
+        })
+        rtcpSRSent = reportIndex
+        if rtcpSRSent <= 3 || rtcpSRSent % 5 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtcp.sr_sent session=\(sessionID.uuidString) count=\(rtcpSRSent) " +
+                    "rtpPackets=\(rtpPacketsSent) octets=\(rtpPayloadOctetsSent) rtpTimestamp=\(lastRTPTimestamp)"
+            )
+        }
+    }
+
+    private func receiveRTCP() {
+        guard !stopped, let rtcpConnection else {
+            return
+        }
+        rtcpConnection.receiveMessage { [weak self] content, _, _, error in
+            guard let self else {
+                return
+            }
+            self.queue.async {
+                if let error {
+                    DiagnosticsLog.error("xiaomi.mirror.rtcp.receive_failed session=\(self.sessionID.uuidString)", error)
+                    return
+                }
+                if let content, !content.isEmpty {
+                    let packetType = content.count > 1 ? Int(content[1]) : -1
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.rtcp.received session=\(self.sessionID.uuidString) bytes=\(content.count) " +
+                            "type=\(packetType) firstBytes=\(Self.hexPreview(content, limit: 12))"
+                    )
+                }
+                self.receiveRTCP()
+            }
+        }
+    }
+
+    private static func currentNTPTimestamp() -> (seconds: UInt32, fraction: UInt32) {
+        let ntpEpochOffset: TimeInterval = 2_208_988_800
+        let timestamp = Date().timeIntervalSince1970 + ntpEpochOffset
+        let seconds = UInt32(timestamp)
+        let fraction = UInt32((timestamp - floor(timestamp)) * 4_294_967_296)
+        return (seconds, fraction)
+    }
+
+    private static func hexPreview(_ data: Data, limit: Int) -> String {
+        data.prefix(limit).map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
     private func stopOnQueue(reason: String) {
-        guard !stopped || connection != nil || frameTimer != nil else {
+        guard !stopped || connection != nil || rtcpConnection != nil || frameTimer != nil || rtcpTimer != nil else {
             return
         }
         stopped = true
         frameTimer?.cancel()
         frameTimer = nil
+        rtcpTimer?.cancel()
+        rtcpTimer = nil
         encoder.invalidate()
         connection?.cancel()
         connection = nil
+        rtcpConnection?.cancel()
+        rtcpConnection = nil
         DiagnosticsLog.info(
             "xiaomi.mirror.rtp.stop session=\(sessionID.uuidString) reason=\(reason) " +
-                "frames=\(framesSent) rtpPackets=\(rtpPacketsSent)"
+                "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) rtcpSR=\(rtcpSRSent)"
         )
     }
 }
