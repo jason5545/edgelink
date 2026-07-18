@@ -157,6 +157,11 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.isPhoneScreenSessionActive = active
             }
         }
+        xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [screenSession] pixelBuffer, width, height in
+            Task { @MainActor in
+                screenSession.renderXiaomiMirrorFrame(pixelBuffer, width: width, height: height)
+            }
+        }
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
             Task { @MainActor in
                 self?.handlePhoneRelayPCMStats(stats)
@@ -783,6 +788,19 @@ final class EdgeLinkRuntime: ObservableObject {
                 "runtime.mac.url_xiaomi_mirror_rtsp_listener peerHost=\(peerHost ?? "none") args=\(args)"
             )
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "url")
+        case "xiaomi-mirror-rtsp-client", "mirror-rtsp-client":
+            let args = Self.externalURLQueryArgs(url)
+            guard let host = args["host"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !host.isEmpty,
+                  let rawPort = args["port"],
+                  let port = UInt16(rawPort) else {
+                DiagnosticsLog.warn("runtime.mac.url_xiaomi_mirror_rtsp_client_invalid args=\(args)")
+                return
+            }
+            DiagnosticsLog.info(
+                "runtime.mac.url_xiaomi_mirror_rtsp_client host=\(host) port=\(port) args=\(args)"
+            )
+            connectXiaomiMirrorRTSPDiagnosticSource(host: host, port: port, reason: "url")
         case "xiaomi-mishare", "mishare":
             DiagnosticsLog.info("runtime.mac.url_xiaomi_mishare")
             openPhoneMiShare()
@@ -915,6 +933,33 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func stopXiaomiMirrorRTSPDiagnosticSource(reason: String) {
         xiaomiMirrorRTSPDiagnosticSource.stop(reason: reason)
+    }
+
+    private func connectXiaomiMirrorRTSPDiagnosticSource(host: String, port: UInt16, reason: String) {
+        guard Self.xiaomiMirrorRTSPDiagnosticEnabled() else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.active_client_start_skipped reason=\(reason) disabled=true " +
+                    "defaultsKey=\(Self.xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey)"
+            )
+            return
+        }
+        do {
+            try xiaomiMirrorRTSPDiagnosticSource.connect(
+                host: host,
+                port: port,
+                advertisedHost: Self.xiaomiMirrorAdvertisedHost(),
+                lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds
+            )
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.active_client_auto_started reason=\(reason) " +
+                    "host=\(host) port=\(port)"
+            )
+        } catch {
+            DiagnosticsLog.error(
+                "xiaomi.mirror.rtsp.active_client_start_failed reason=\(reason) host=\(host) port=\(port)",
+                error
+            )
+        }
     }
 
     private func startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded() {
@@ -1774,6 +1819,21 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
 
+        if isMirrorPending, let sourceEndpoint = Self.xiaomiMirrorAndroidSourceEndpoint(from: result) {
+            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_pending_active_client requestId=\(result.requestId) command=\(pending.command) " +
+                    "route=\(pending.route) elapsedMs=\(pending.elapsedMs) " +
+                    "source=\(sourceEndpoint.host):\(sourceEndpoint.port) data=\(Self.formatDiagnosticsData(result.data))"
+            )
+            connectXiaomiMirrorRTSPDiagnosticSource(
+                host: sourceEndpoint.host,
+                port: sourceEndpoint.port,
+                reason: "xiaomi_pending_android_server"
+            )
+            return
+        }
+
         if isMirrorPending {
             xiaomiMiLinkCommandStatus = "小米鏡像未完成，已用 EdgeLink 畫面"
             DiagnosticsLog.warn(
@@ -1817,6 +1877,22 @@ final class EdgeLinkRuntime: ObservableObject {
         return result.data["state"] == "pending" ||
             result.data["pending"] == "true" ||
             result.data["providerValue"] == "pending"
+    }
+
+    private static func xiaomiMirrorAndroidSourceEndpoint(
+        from result: MiLinkCommandResultBody
+    ) -> (host: String, port: UInt16)? {
+        guard result.command == "xiaomi.mirror.startMainDisplay",
+              result.route == "xiaomi.mirror.pending",
+              result.data["sourceRole"] == "android_server",
+              let rawHost = result.data["sourceListenHost"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawHost.isEmpty,
+              rawHost != "0.0.0.0",
+              let rawPort = result.data["sourceListenPort"],
+              let portValue = UInt16(rawPort) else {
+            return nil
+        }
+        return (rawHost, portValue)
     }
 
     private func autoWarmXiaomiServicesIfNeeded(_ status: MiLinkStatusBody) {

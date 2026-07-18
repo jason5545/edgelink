@@ -19,6 +19,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -581,6 +583,8 @@ class AndroidMiLinkCommandBridge(
         val fakeBody = body.copy(
             args = body.args + ("remoteDeviceId" to MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
         )
+        val sourceListenHost = preferredLocalIPv4Address().orEmpty()
+        val sourceListenPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 } ?: 7_102
         val queryResult = runCatching {
             queryMirrorRemoteDevices(fakeBody)
         }.getOrElse { error ->
@@ -590,6 +594,37 @@ class AndroidMiLinkCommandBridge(
                 message = "queryRemoteDevices exception=${error.javaClass.simpleName}:${error.message.orEmpty()}"
             )
         }
+        val sourceShareCall = callMirrorSourceShareWithDeadline(
+            body = fakeBody,
+            remoteDeviceId = MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
+            deadlineMs = mirrorFakeScreenProviderQuickDeadlineMs
+        )
+        if (sourceShareCall is MirrorProviderDeadlineResult.Pending) {
+            return pendingFakeMirrorResult(
+                method = "startShare",
+                remoteDeviceId = MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
+                deadlineMs = sourceShareCall.deadlineMs,
+                queryResult = queryResult,
+                armResult = armResult,
+                sourceListenHost = sourceListenHost,
+                sourceListenPort = sourceListenPort
+            )
+        }
+        val sourceShareResult = (sourceShareCall as MirrorProviderDeadlineResult.Completed).result
+        if (sourceShareResult.success) {
+            return sourceShareResult.copy(
+                message = "${sourceShareResult.message}; ${queryResult.message}; arm=${armResult.message.forSingleLineLog()}",
+                data = sourceShareResult.data + mapOf(
+                    "query" to queryResult.message,
+                    "arm" to armResult.success.toString(),
+                    "debugFakeRemote" to "true",
+                    "sourceRole" to "android_server",
+                    "sourceListenHost" to sourceListenHost,
+                    "sourceListenPort" to sourceListenPort.toString()
+                )
+            )
+        }
+
         val startCall = callMirrorDeviceProviderWithDeadline(
             body = fakeBody,
             method = "startRemoteMainMirrorDisplay",
@@ -601,14 +636,17 @@ class AndroidMiLinkCommandBridge(
                 remoteDeviceId = MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
                 deadlineMs = startCall.deadlineMs,
                 queryResult = queryResult,
-                armResult = armResult
+                armResult = armResult,
+                sourceShareResult = sourceShareResult
             )
         }
         val startResult = (startCall as MirrorProviderDeadlineResult.Completed).result
         if (startResult.success) {
             return startResult.copy(
-                message = "${startResult.message}; ${queryResult.message}; arm=${armResult.message.forSingleLineLog()}",
+                message = "sourceShare=${sourceShareResult.message}; ${startResult.message}; " +
+                    "${queryResult.message}; arm=${armResult.message.forSingleLineLog()}",
                 data = startResult.data + mapOf(
+                    "sourceShareValue" to sourceShareResult.data["value"].orEmpty(),
                     "query" to queryResult.message,
                     "arm" to armResult.success.toString(),
                     "debugFakeRemote" to "true"
@@ -628,16 +666,19 @@ class AndroidMiLinkCommandBridge(
                 deadlineMs = openCall.deadlineMs,
                 queryResult = queryResult,
                 armResult = armResult,
-                startResult = startResult
+                startResult = startResult,
+                sourceShareResult = sourceShareResult
             )
         }
         val openResult = (openCall as MirrorProviderDeadlineResult.Completed).result
         return CommandResult(
             success = openResult.success,
             route = "xiaomi.mirror",
-            message = "debugFakeRemote=true; start=${startResult.message}; open=${openResult.message}; " +
+            message = "debugFakeRemote=true; sourceShare=${sourceShareResult.message}; " +
+                "start=${startResult.message}; open=${openResult.message}; " +
                 "${queryResult.message}; arm=${armResult.message.forSingleLineLog()}",
             data = startResult.data + mapOf(
+                "sourceShareValue" to sourceShareResult.data["value"].orEmpty(),
                 "startValue" to startResult.data["value"].orEmpty(),
                 "openValue" to openResult.data["value"].orEmpty(),
                 "query" to queryResult.message,
@@ -653,15 +694,30 @@ class AndroidMiLinkCommandBridge(
         deadlineMs: Long,
         queryResult: CommandResult,
         armResult: ShizukuOperationResult,
-        startResult: CommandResult? = null
+        startResult: CommandResult? = null,
+        sourceShareResult: CommandResult? = null,
+        sourceListenHost: String? = null,
+        sourceListenPort: Int? = null
     ): CommandResult {
         val queryCount = queryResult.data["count"]?.toIntOrNull() ?: 0
-        val accepted = armResult.success && queryCount > 0
+        val hasSourceEndpoint = method == "startShare" && !sourceListenHost.isNullOrBlank() && sourceListenPort != null
+        val accepted = armResult.success && (queryCount > 0 || hasSourceEndpoint)
+        val sourceEndpointData =
+            if (accepted && hasSourceEndpoint) {
+                mapOf(
+                    "sourceRole" to "android_server",
+                    "sourceListenHost" to sourceListenHost,
+                    "sourceListenPort" to sourceListenPort.toString()
+                )
+            } else {
+                emptyMap()
+            }
         return CommandResult(
             success = false,
             route = if (accepted) "xiaomi.mirror.pending" else "edgelink.screen",
             message = "debugFakeRemote=true; $method pending>${deadlineMs}ms; " +
                 listOfNotNull(
+                    sourceShareResult?.let { "sourceShare=${it.message}" },
                     startResult?.let { "start=${it.message}" },
                     queryResult.message,
                     "arm=${armResult.message.forSingleLineLog()}"
@@ -679,7 +735,9 @@ class AndroidMiLinkCommandBridge(
                 "arm" to armResult.success.toString(),
                 "debugFakeRemote" to "true",
                 "fallback" to if (accepted) "" else "edgelink.screen"
-            ) + (startResult?.data?.let { mapOf("startValue" to it["value"].orEmpty()) } ?: emptyMap())
+            ) + sourceEndpointData +
+                (startResult?.data?.let { mapOf("startValue" to it["value"].orEmpty()) } ?: emptyMap()) +
+                (sourceShareResult?.data?.let { mapOf("sourceShareValue" to it["value"].orEmpty()) } ?: emptyMap())
         )
     }
 
@@ -710,6 +768,15 @@ class AndroidMiLinkCommandBridge(
     ): MirrorProviderDeadlineResult =
         callMirrorProviderWithDeadline(method = "performMirrorDeviceIconClick", deadlineMs = deadlineMs) {
             callMirrorDeviceIconClick(body, remoteDeviceId)
+        }
+
+    private fun callMirrorSourceShareWithDeadline(
+        body: MiLinkCommandBody,
+        remoteDeviceId: String,
+        deadlineMs: Long
+    ): MirrorProviderDeadlineResult =
+        callMirrorProviderWithDeadline(method = "startShare", deadlineMs = deadlineMs) {
+            callMirrorSourceShare(body, remoteDeviceId)
         }
 
     private fun callMirrorProviderWithDeadline(
@@ -769,6 +836,31 @@ class AndroidMiLinkCommandBridge(
                 "nextMethod" to "openRemoteDeviceMirrorByBtMac",
                 "nextDelayMs" to mirrorBtMacFallbackDelayMs.toString(),
                 "fallback" to ""
+            )
+        )
+    }
+
+    private fun callMirrorSourceShare(
+        body: MiLinkCommandBody,
+        remoteDeviceId: String
+    ): CommandResult {
+        val extras = body.args.toBundle().apply {
+            putString("deviceId", remoteDeviceId)
+            putString("remoteDeviceId", remoteDeviceId)
+            putBoolean("isStart", true)
+            putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
+        }
+        val result = appContext.contentResolver.callMirrorProvider("startShare", extras)
+        val enabled = result?.getBoolean("enable", false) == true
+        val value = if (enabled) "0" else result?.valueInt()?.toString() ?: "false"
+        return CommandResult(
+            success = enabled,
+            route = if (enabled) "xiaomi.mirror.source" else "xiaomi.mirror",
+            message = "startShare source deviceId=$remoteDeviceId enable=$enabled keys=${result?.keySummary().orEmpty()}",
+            data = mapOf(
+                "remoteDeviceId" to remoteDeviceId,
+                "value" to value,
+                "sourceRole" to "true"
             )
         )
     }
@@ -1211,6 +1303,32 @@ class AndroidMiLinkCommandBridge(
 
     private fun String.maskBluetoothMac(): String =
         split(':').takeIf { it.size == 6 }?.let { "**:**:**:**:${it[4]}:${it[5]}" } ?: this
+
+    private fun preferredLocalIPv4Address(): String? =
+        runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            var fallback: String? = null
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+                if (!networkInterface.isUp || networkInterface.isLoopback) {
+                    continue
+                }
+                val addresses = networkInterface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is Inet4Address && !address.isLoopbackAddress) {
+                        val host = address.hostAddress
+                        if (networkInterface.name == "wlan0") {
+                            return@runCatching host
+                        }
+                        if (fallback == null) {
+                            fallback = host
+                        }
+                    }
+                }
+            }
+            fallback
+        }.getOrNull()
 
     private companion object {
         const val COMMAND_MISHARE_OPEN_SETTINGS = "xiaomi.mishare.openSettings"

@@ -1,5 +1,6 @@
 import CoreMedia
 import CoreVideo
+import CryptoKit
 import Darwin
 import Foundation
 import Network
@@ -53,9 +54,12 @@ private enum XiaomiMirrorOfficialRTSPDefaults {
     static let typeEncryption = "4 1 1 1 1"
     static let bufferCapability = "1F"
     static let fallbackClientRTPPorts = "RTP/AVP/MPT;unicast 15550 0 mode=play"
+    static let screenAuthKey = Data("EdgeLinkMirrorK!".utf8)
 }
 
 final class XiaomiMirrorRTSPDiagnosticSource {
+    var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
+
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
     private var listener: NWListener?
@@ -69,6 +73,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private let officialMPTClientPort: UInt16 = 15_550
     private let transportModeDefaultsKey = "xiaomiMirrorRTSPTransportMode"
     private let protocolProfileDefaultsKey = "xiaomiMirrorRTSPProtocolProfile"
+    private let authKeyDefaultsKey = "xiaomiMirrorRTSPAuthKey"
 
     init() {
         queue.setSpecific(key: queueKey, value: ())
@@ -77,6 +82,12 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     func start(port: UInt16 = 7102, advertisedHost: String?, lifetime: TimeInterval) throws {
         try performOnQueue {
             try self.startOnQueue(port: port, advertisedHost: advertisedHost, lifetime: lifetime)
+        }
+    }
+
+    func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
+        try performOnQueue {
+            try self.connectOnQueue(host: host, port: port, advertisedHost: advertisedHost, lifetime: lifetime)
         }
     }
 
@@ -116,6 +127,36 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 "lifetime=\(Int(lifetime)) protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
         )
         listener.start(queue: queue)
+    }
+
+    private func connectOnQueue(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else {
+            throw XiaomiMirrorRTSPDiagnosticSourceError.invalidHost(host)
+        }
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            throw XiaomiMirrorRTSPDiagnosticSourceError.invalidPort(port)
+        }
+        let trimmedAdvertisedHost = advertisedHost?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.advertisedHost = trimmedAdvertisedHost?.isEmpty == false ? trimmedAdvertisedHost : self.advertisedHost
+        scheduleAutoStop(lifetime: lifetime)
+
+        let id = UUID()
+        let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: endpointPort, using: .tcp)
+        var state = RTSPConnectionState()
+        state.mode = "active_client"
+        connections[id] = connection
+        states[id] = state
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.active_client_start id=\(id.uuidString) host=\(trimmedHost) port=\(port) " +
+                "advertisedHost=\(self.advertisedHost ?? "none") lifetime=\(Int(lifetime)) " +
+                "protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
+        )
+        connection.stateUpdateHandler = { [weak self] state in
+            self?.handleConnectionState(id: id, connection: connection, state: state)
+        }
+        connection.start(queue: queue)
+        receive(id: id, connection: connection)
     }
 
     private func stopOnQueue(reason: String) {
@@ -163,7 +204,9 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private func accept(_ connection: NWConnection) {
         let id = UUID()
         connections[id] = connection
-        states[id] = RTSPConnectionState()
+        var state = RTSPConnectionState()
+        state.mode = "listener"
+        states[id] = state
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.connection id=\(id.uuidString) endpoint=\(Self.endpointDescription(connection.endpoint))"
         )
@@ -175,18 +218,33 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     }
 
     private func handleConnectionState(id: UUID, connection: NWConnection, state: NWConnection.State) {
+        let mode = states[id]?.mode ?? "unknown"
         switch state {
         case .ready:
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.connection_ready id=\(id.uuidString) " +
-                    "endpoint=\(Self.endpointDescription(connection.endpoint))"
+                    "mode=\(mode) endpoint=\(Self.endpointDescription(connection.endpoint))"
             )
+            if mode == "active_client" {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.rtsp.active_client_ready id=\(id.uuidString) " +
+                        "endpoint=\(Self.endpointDescription(connection.endpoint))"
+                )
+            }
             sendOptionsIfNeeded(id: id, connection: connection)
         case .failed(let error):
-            DiagnosticsLog.error("xiaomi.mirror.rtsp.connection_failed id=\(id.uuidString)", error)
+            if mode == "active_client" {
+                DiagnosticsLog.error(
+                    "xiaomi.mirror.rtsp.active_client_failed id=\(id.uuidString) " +
+                        "endpoint=\(Self.endpointDescription(connection.endpoint))",
+                    error
+                )
+            } else {
+                DiagnosticsLog.error("xiaomi.mirror.rtsp.connection_failed id=\(id.uuidString)", error)
+            }
             cleanupConnection(id: id)
         case .cancelled:
-            DiagnosticsLog.info("xiaomi.mirror.rtsp.connection_cancelled id=\(id.uuidString)")
+            DiagnosticsLog.info("xiaomi.mirror.rtsp.connection_cancelled id=\(id.uuidString) mode=\(mode)")
             cleanupConnection(id: id)
         default:
             break
@@ -251,6 +309,10 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         )
         states[id] = state
 
+        if isOfficialMPTRoute {
+            logOfficialAuthHeaders(message, id: id)
+        }
+
         if message.isResponse {
             handleResponse(message, id: id, connection: connection)
         } else {
@@ -269,6 +331,9 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             state.session = String(session)
         }
         states[id] = state
+        if isOfficialMPTRoute, request == "OPTIONS" {
+            verifyOfficialM2ResponseAuthIfPossible(message, state: state, id: id)
+        }
 
         switch request {
         case "OPTIONS":
@@ -305,13 +370,16 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         }
         switch method {
         case "OPTIONS":
+            let extraHeaders = isOfficialMPTRoute
+                ? officialOptionsResponseHeaders(for: message, id: id)
+                : [
+                    "Public: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER"
+                ]
             sendResponse(
                 id: id,
                 connection: connection,
                 cseq: message.cseq,
-                extraHeaders: [
-                    "Public: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER"
-                ]
+                extraHeaders: extraHeaders
             )
             if isOfficialMPTRoute {
                 DiagnosticsLog.info("xiaomi.mirror.rtsp.official_sink_peer_options id=\(id.uuidString)")
@@ -430,16 +498,24 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         state.nextCSeq += 1
         state.sentOptions = true
         state.pendingRequests[cseq] = "OPTIONS"
+        let extraHeaders: [String]
+        if isOfficialMPTRoute {
+            let authMsg = state.localAuthMsg ?? Self.randomHex(byteCount: 16)
+            state.localAuthMsg = authMsg
+            extraHeaders = officialOptionsRequestHeaders(authMsg: authMsg)
+        } else {
+            extraHeaders = [
+                "Require: org.wfa.wfd1.0",
+                "User-Agent: EdgeLink-XiaomiMirror/1.0",
+                "fastRTSPVersion: 0"
+            ]
+        }
         states[id] = state
         let message = makeRequest(
             method: "OPTIONS",
             target: "*",
             cseq: cseq,
-            extraHeaders: [
-                "Require: org.wfa.wfd1.0",
-                "User-Agent: EdgeLink-XiaomiMirror/1.0",
-                "fastRTSPVersion: 0"
-            ]
+            extraHeaders: extraHeaders
         )
         send(message, id: id, connection: connection)
     }
@@ -739,6 +815,147 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         protocolProfile == .official && transportMode == .mpt
     }
 
+    private func officialOptionsRequestHeaders(authMsg: String) -> [String] {
+        [
+            "Date: \(Self.rtspDate())",
+            "User-Agent: \(Self.officialRTSPUserAgent)",
+            "Require: org.wfa.wfd1.0",
+            "lib_version: \(Self.officialRTSPLibVersion)",
+            "authMsg:\(authMsg)",
+            "authKeyType:\(Self.officialRTSPAuthKeyType)",
+            "authAlgorithmTypes:\(Self.officialRTSPAuthAlgorithmTypes)",
+            "fastRTSPVersion: 0"
+        ]
+    }
+
+    private func officialOptionsResponseHeaders(for message: RTSPMessage, id: UUID) -> [String] {
+        var headers = [
+            "Date: \(Self.rtspDate())",
+            "User-Agent: \(Self.officialRTSPUserAgent)",
+            "Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER",
+            "fastRTSPVersion: 0"
+        ]
+        guard let peerAuthMsg = message.headers["authmsg"],
+              !peerAuthMsg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            DiagnosticsLog.warn("xiaomi.mirror.rtsp.official_auth_ack_unavailable id=\(id.uuidString) reason=missing_peer_auth_msg")
+            return headers
+        }
+        guard let ack = officialAuthMsgAck(for: peerAuthMsg) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.official_auth_ack_unavailable id=\(id.uuidString) " +
+                    "reason=missing_auth_key defaultsKey=\(authKeyDefaultsKey) peerAuthMsgFp=\(Self.authFingerprint(peerAuthMsg))"
+            )
+            return headers
+        }
+        let authKeyType = officialResponseAuthKeyType(for: message)
+        let authAlgorithmVal = officialResponseAuthAlgorithmVal(for: message)
+        headers.append("authKeyType:\(authKeyType)")
+        headers.append("authAlgorithmVal:\(authAlgorithmVal)")
+        headers.append("authMsgAck:\(ack)")
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.official_auth_ack_ready id=\(id.uuidString) " +
+                "peerAuthMsgFp=\(Self.authFingerprint(peerAuthMsg)) ackFp=\(Self.authFingerprint(ack)) " +
+                "authKeyType=\(authKeyType) authAlgorithmVal=\(authAlgorithmVal)"
+        )
+        return headers
+    }
+
+    private func officialResponseAuthKeyType(for message: RTSPMessage) -> String {
+        let peerType = message.headers["authkeytype"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return peerType?.isEmpty == false ? peerType! : Self.officialRTSPAuthKeyType
+    }
+
+    private func officialResponseAuthAlgorithmVal(for message: RTSPMessage) -> String {
+        guard let rawTypes = message.headers["authalgorithmtypes"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let types = Self.parseRTSPAuthInteger(rawTypes) else {
+            return Self.officialRTSPPreferredAuthAlgorithmVal
+        }
+        if types & 4 != 0 {
+            return "4"
+        }
+        if types & 2 != 0 {
+            return "2"
+        }
+        if types & 1 != 0 {
+            return "1"
+        }
+        return Self.officialRTSPPreferredAuthAlgorithmVal
+    }
+
+    private static func parseRTSPAuthInteger(_ raw: String) -> Int? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("0x") || trimmed.hasPrefix("0X") {
+            return Int(trimmed.dropFirst(2), radix: 16)
+        }
+        return Int(trimmed)
+    }
+
+    private func verifyOfficialM2ResponseAuthIfPossible(_ message: RTSPMessage, state: RTSPConnectionState, id: UUID) {
+        guard let localAuthMsg = state.localAuthMsg else {
+            return
+        }
+        guard let peerAck = message.headers["authmsgack"],
+              !peerAck.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.official_m2_auth_missing id=\(id.uuidString) localAuthMsgFp=\(Self.authFingerprint(localAuthMsg))"
+            )
+            return
+        }
+        guard let expectedAck = officialAuthMsgAck(for: localAuthMsg) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.official_m2_auth_unverified id=\(id.uuidString) " +
+                    "reason=missing_auth_key defaultsKey=\(authKeyDefaultsKey) " +
+                    "localAuthMsgFp=\(Self.authFingerprint(localAuthMsg)) peerAckFp=\(Self.authFingerprint(peerAck))"
+            )
+            return
+        }
+        let matches = peerAck.caseInsensitiveCompare(expectedAck) == .orderedSame
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.official_m2_auth_check id=\(id.uuidString) match=\(matches) " +
+                "localAuthMsgFp=\(Self.authFingerprint(localAuthMsg)) peerAckFp=\(Self.authFingerprint(peerAck))"
+        )
+    }
+
+    private func officialAuthMsgAck(for authMsg: String) -> String? {
+        guard let authKeyData = configuredOfficialAuthKeyData() else {
+            return nil
+        }
+        let key = SymmetricKey(data: authKeyData)
+        let code = HMAC<SHA256>.authenticationCode(for: Data(authMsg.utf8), using: key)
+        return Data(code).hexString
+    }
+
+    private func configuredOfficialAuthKeyData() -> Data? {
+        guard let raw = UserDefaults.standard.string(forKey: authKeyDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return isOfficialMPTRoute ? XiaomiMirrorOfficialRTSPDefaults.screenAuthKey : nil
+        }
+        if let hex = Self.hexData(from: raw) {
+            return hex
+        }
+        return Data(raw.utf8)
+    }
+
+    private func logOfficialAuthHeaders(_ message: RTSPMessage, id: UUID) {
+        let authMsg = message.headers["authmsg"].map(Self.authFingerprint) ?? "none"
+        let authMsgAck = message.headers["authmsgack"].map(Self.authFingerprint) ?? "none"
+        let authKeyType = message.headers["authkeytype"] ?? "none"
+        let authAlgorithmTypes = message.headers["authalgorithmtypes"] ?? "none"
+        let authAlgorithmVal = message.headers["authalgorithmval"] ?? "none"
+        let fastRTSPVersion = message.headers["fastrtspversion"] ?? "none"
+        let libVersion = message.headers["lib_version"] ?? "none"
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.official_auth_headers id=\(id.uuidString) " +
+                "response=\(message.isResponse) method=\(message.method ?? "none") " +
+                "cseq=\(message.cseq.map(String.init) ?? "none") " +
+                "authMsgFp=\(authMsg) authMsgAckFp=\(authMsgAck) " +
+                "authKeyType=\(Self.preview(authKeyType)) authAlgorithmTypes=\(Self.preview(authAlgorithmTypes)) " +
+                "authAlgorithmVal=\(Self.preview(authAlgorithmVal)) fastRTSPVersion=\(Self.preview(fastRTSPVersion)) " +
+                "libVersion=\(Self.preview(libVersion))"
+        )
+    }
+
     private func sourceTimerServerPort() -> String? {
         guard let host = sourceHostForTransport(),
               let ipInteger = Self.ipv4Integer(host) else {
@@ -898,7 +1115,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 localRTPPort: sourceRTPPort,
                 localRTCPPort: sourceRTPPort + 1,
                 sessionID: id,
-                mptSinkOnly: false
+                mptSinkOnly: false,
+                onDecodedFrame: nil
             )
             state.mediaSender = sender
             states[id] = state
@@ -942,7 +1160,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 localRTPPort: officialMPTClientPort,
                 localRTCPPort: officialMPTClientPort,
                 sessionID: id,
-                mptSinkOnly: true
+                mptSinkOnly: true,
+                onDecodedFrame: onDecodedFrame
             )
             state.mediaSender = sender
             states[id] = state
@@ -1246,6 +1465,54 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         return 0
     }
 
+    private static let officialRTSPUserAgent = "stagefright/1.1 (Linux;Android 4.1)"
+    private static let officialRTSPLibVersion = "miplaycast_os3_release1.7 3.2.6011403"
+    private static let officialRTSPAuthKeyType = "3"
+    private static let officialRTSPAuthAlgorithmTypes = "7"
+    private static let officialRTSPPreferredAuthAlgorithmVal = "4"
+
+    private static func rtspDate(_ date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: TimeZone.current.secondsFromGMT(for: date))
+        formatter.dateFormat = "EEE, d MMM yyyy H:mm:ss Z"
+        return formatter.string(from: date)
+    }
+
+    private static func randomHex(byteCount: Int) -> String {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<byteCount)
+            .map { _ in String(format: "%02x", UInt8.random(in: 0...UInt8.max, using: &generator)) }
+            .joined()
+    }
+
+    private static func hexData(from raw: String) -> Data? {
+        let normalized = raw
+            .replacingOccurrences(of: "hex:", with: "", options: [.anchored, .caseInsensitive])
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        guard normalized.count >= 2, normalized.count.isMultiple(of: 2),
+              normalized.allSatisfy({ $0.isHexDigit }) else {
+            return nil
+        }
+        var data = Data()
+        var index = normalized.startIndex
+        while index < normalized.endIndex {
+            let next = normalized.index(index, offsetBy: 2)
+            guard let byte = UInt8(normalized[index..<next], radix: 16) else {
+                return nil
+            }
+            data.append(byte)
+            index = next
+        }
+        return data
+    }
+
+    private static func authFingerprint(_ value: String) -> String {
+        DiagnosticsLog.fingerprint(Data(value.utf8))
+    }
+
     private static func parameterValue(named name: String, in body: String) -> String? {
         let normalizedName = name.lowercased()
         for line in body.components(separatedBy: .newlines) {
@@ -1422,12 +1689,14 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
 private struct RTSPConnectionState {
     var buffer = Data()
+    var mode = "listener"
     var nextCSeq = 1
     var pendingRequests: [Int: String] = [:]
     var sentOptions = false
     var sentGetParameter = false
     var sentSetParameter = false
     var loggedFirstInbound = false
+    var localAuthMsg: String?
     var session: String?
     var sinkCapabilitiesFingerprint: String?
     var sinkVideoFormats: String?
@@ -1482,6 +1751,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private let localRTCPPort: UInt16
     private let sessionID: UUID
     private let mptSinkOnly: Bool
+    private let onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     private let frameRate: Int32 = XiaomiMirrorVideoDefaults.frameRate
     private let rtpPacketsPerPayload = 7
     private var connection: NWConnection?
@@ -1515,6 +1785,21 @@ private final class XiaomiMirrorRTPMediaSender {
     private var kcpDatagramReceiveErrors: UInt64 = 0
     private var kcpLatestACKSN: UInt32?
     private var kcpLatestRemoteUNA: UInt32?
+    private var kcpConversationID: UInt32?
+    private var kcpConversationIgnoredCount: UInt64 = 0
+    private var mptSinkInterleavedBuffer = Data()
+    private var mptSinkInterleavedFramesReceived: UInt64 = 0
+    private var mptSinkInterleavedMalformedCount: UInt64 = 0
+    private var mptSinkRTPPacketsReceived: UInt64 = 0
+    private var mptSinkRTPMalformedCount: UInt64 = 0
+    private var mptSinkTSPacketsReceived: UInt64 = 0
+    private var mptSinkTSCaptureHandle: FileHandle?
+    private var mptSinkTSCaptureBytes = 0
+    private var mptSinkTSCaptureStartLogged = false
+    private var mptSinkTSDemuxer: XiaomiMirrorMPEGTSHEVCDemuxer?
+    private var mptSinkHEVCDecoder: XiaomiMirrorHEVCDecoder?
+    private var mptSinkDecodedFrames: UInt64 = 0
+    private var mptSinkDecodeFailedFrames: UInt64 = 0
     private var stopped = false
 
     init(
@@ -1525,7 +1810,8 @@ private final class XiaomiMirrorRTPMediaSender {
         localRTPPort: UInt16,
         localRTCPPort: UInt16,
         sessionID: UUID,
-        mptSinkOnly: Bool
+        mptSinkOnly: Bool,
+        onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     ) throws {
         self.transportMode = transportMode
         self.destinationHost = destinationHost
@@ -1535,11 +1821,26 @@ private final class XiaomiMirrorRTPMediaSender {
         self.localRTCPPort = localRTCPPort
         self.sessionID = sessionID
         self.mptSinkOnly = mptSinkOnly
+        self.onDecodedFrame = onDecodedFrame
+        self.kcpConversationID = mptSinkOnly ? nil : Self.defaultKCPConversationID
         self.encoder = try XiaomiMirrorH264Encoder(
             width: XiaomiMirrorVideoDefaults.width,
             height: XiaomiMirrorVideoDefaults.height,
             frameRate: frameRate
         )
+        if mptSinkOnly {
+            let decoder = XiaomiMirrorHEVCDecoder(sessionID: sessionID)
+            decoder.onFrame = { [weak self] pixelBuffer, width, height in
+                self?.handleDecodedMPTSinkFrame(pixelBuffer, width: width, height: height)
+            }
+            decoder.onDecodeFailed = { [weak self] in
+                self?.mptSinkDecodeFailedFrames += 1
+            }
+            self.mptSinkHEVCDecoder = decoder
+            self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(sessionID: sessionID) { [weak decoder] accessUnit, pts90k in
+                decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+            }
+        }
     }
 
     func start() {
@@ -1671,9 +1972,10 @@ private final class XiaomiMirrorRTPMediaSender {
             startFrameTimer()
         }
         startMPTReceiveSource(fd: fd)
+        let convDescription = kcpConversationID.map { Self.hex32($0) } ?? "pending_peer_first_segment"
         DiagnosticsLog.info(
             "xiaomi.mirror.mpt.start session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort) " +
-                "localPort=\(localRTPPort) socket=raw_udp_recvfrom conv=0x12345678 " +
+                "localPort=\(localRTPPort) socket=raw_udp_recvfrom conv=\(convDescription) " +
                 "role=\(mptSinkOnly ? "sink_receiver" : "sender") " +
                 "payload=\(mptSinkOnly ? "KCP_PUSH_RECEIVE_ACK_ONLY" : "KCP_PUSH_RTP/PT33/MP2T/H264AnnexB") " +
                 "video=\(XiaomiMirrorVideoDefaults.width)x\(XiaomiMirrorVideoDefaults.height)@\(frameRate)"
@@ -1829,13 +2131,18 @@ private final class XiaomiMirrorRTPMediaSender {
     private func sendKCPPush(payload: Data, rtpSequence: UInt16) {
         let sn = kcpSendSN
         kcpSendSN &+= 1
-        let packet = makeKCPSegment(
+        guard let packet = makeKCPSegment(
             cmd: Self.kcpCommandPush,
             ts: Self.monotonicMilliseconds(),
             sn: sn,
             una: kcpRemoteNextReceiveSN,
             payload: payload
-        )
+        ) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_push_skipped session=\(sessionID.uuidString) reason=missing_conv sn=\(sn) rtpSeq=\(rtpSequence)"
+            )
+            return
+        }
         guard sendMPTDatagram(packet) else {
             DiagnosticsLog.warn(
                 "xiaomi.mirror.mpt.kcp_push_failed session=\(sessionID.uuidString) sn=\(sn) rtpSeq=\(rtpSequence) errno=\(errno)"
@@ -1983,11 +2290,12 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func handleKCPSegment(_ segment: KCPIncomingSegment) {
-        guard segment.conv == Self.kcpConversationID else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_conv_ignored session=\(sessionID.uuidString) conv=0x\(String(segment.conv, radix: 16)) " +
-                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn)"
-            )
+        guard establishKCPConversationIfNeeded(from: segment) else {
+            logIgnoredKCPConversation(segment)
+            return
+        }
+        guard segment.conv == kcpConversationID else {
+            logIgnoredKCPConversation(segment)
             return
         }
         switch segment.command {
@@ -2025,9 +2333,11 @@ private final class XiaomiMirrorRTPMediaSender {
             if kcpPUSHReceived <= 5 || kcpPUSHReceived % 20 == 0 {
                 DiagnosticsLog.info(
                     "xiaomi.mirror.mpt.kcp_push_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
-                        "payloadBytes=\(segment.length) remoteNext=\(kcpRemoteNextReceiveSN) pushReceived=\(kcpPUSHReceived)"
+                        "payloadBytes=\(segment.length) remoteNext=\(kcpRemoteNextReceiveSN) " +
+                        "pushReceived=\(kcpPUSHReceived) payloadFirstBytes=\(Self.hexPreview(segment.payload, limit: 12))"
                 )
             }
+            handleMPTSinkKCPPayload(segment.payload, sn: segment.sn)
         default:
             DiagnosticsLog.warn(
                 "xiaomi.mirror.mpt.kcp_unknown_received session=\(sessionID.uuidString) " +
@@ -2036,20 +2346,169 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
+    private func handleMPTSinkKCPPayload(_ payload: Data, sn: UInt32) {
+        guard mptSinkOnly, !payload.isEmpty else {
+            return
+        }
+        mptSinkInterleavedBuffer.append(payload)
+        while !mptSinkInterleavedBuffer.isEmpty {
+            if mptSinkInterleavedBuffer[0] != Self.rtspInterleavedMagic {
+                if looksLikeRTPPacket(mptSinkInterleavedBuffer) {
+                    handleMPTSinkRTPPacket(mptSinkInterleavedBuffer, channel: nil, sn: sn)
+                    mptSinkInterleavedBuffer.removeAll(keepingCapacity: true)
+                    return
+                }
+                guard let nextFrame = mptSinkInterleavedBuffer.firstIndex(of: Self.rtspInterleavedMagic) else {
+                    mptSinkInterleavedMalformedCount += 1
+                    if mptSinkInterleavedMalformedCount <= 5 || mptSinkInterleavedMalformedCount % 20 == 0 {
+                        DiagnosticsLog.warn(
+                            "xiaomi.mirror.mpt.rtsp_interleaved_resync_failed session=\(sessionID.uuidString) " +
+                                "sn=\(sn) bufferedBytes=\(mptSinkInterleavedBuffer.count) " +
+                                "firstBytes=\(Self.hexPreview(mptSinkInterleavedBuffer, limit: 16)) " +
+                                "malformed=\(mptSinkInterleavedMalformedCount)"
+                        )
+                    }
+                    mptSinkInterleavedBuffer.removeAll(keepingCapacity: true)
+                    return
+                }
+                mptSinkInterleavedMalformedCount += 1
+                if mptSinkInterleavedMalformedCount <= 5 || mptSinkInterleavedMalformedCount % 20 == 0 {
+                    DiagnosticsLog.warn(
+                        "xiaomi.mirror.mpt.rtsp_interleaved_resync session=\(sessionID.uuidString) " +
+                            "sn=\(sn) discardedBytes=\(nextFrame) malformed=\(mptSinkInterleavedMalformedCount)"
+                    )
+                }
+                mptSinkInterleavedBuffer.removeSubrange(0..<nextFrame)
+            }
+
+            guard mptSinkInterleavedBuffer.count >= Self.rtspInterleavedHeaderLength,
+                  let rtpLength = mptSinkInterleavedBuffer.readUInt16BE(at: 2) else {
+                return
+            }
+            let frameLength = Self.rtspInterleavedHeaderLength + Int(rtpLength)
+            guard mptSinkInterleavedBuffer.count >= frameLength else {
+                return
+            }
+            let channel = mptSinkInterleavedBuffer[1]
+            let rtpPacket = mptSinkInterleavedBuffer.subdata(in: Self.rtspInterleavedHeaderLength..<frameLength)
+            mptSinkInterleavedBuffer.removeSubrange(0..<frameLength)
+            mptSinkInterleavedFramesReceived += 1
+            handleMPTSinkRTPPacket(rtpPacket, channel: channel, sn: sn)
+        }
+    }
+
+    private func handleMPTSinkRTPPacket(_ data: Data, channel: UInt8?, sn: UInt32) {
+        guard let packet = RTPIncomingPacket(data: data) else {
+            mptSinkRTPMalformedCount += 1
+            if mptSinkRTPMalformedCount <= 5 || mptSinkRTPMalformedCount % 20 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.rtp_malformed session=\(sessionID.uuidString) " +
+                        "sn=\(sn) channel=\(channel.map(String.init) ?? "raw") bytes=\(data.count) " +
+                        "firstBytes=\(Self.hexPreview(data, limit: 16)) malformed=\(mptSinkRTPMalformedCount)"
+                )
+            }
+            return
+        }
+        mptSinkRTPPacketsReceived += 1
+        let tsInfo = Self.inspectMPEGTS(packet.payload)
+        mptSinkTSPacketsReceived += UInt64(tsInfo.packetCount)
+        if tsInfo.sync {
+            captureMPTSinkTS(packet.payload)
+            mptSinkTSDemuxer?.pushTSPayload(packet.payload, rtpTimestamp: packet.timestamp)
+        }
+        if mptSinkRTPPacketsReceived <= 10 || mptSinkRTPPacketsReceived % 100 == 0 || !tsInfo.sync {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.rtp_received session=\(sessionID.uuidString) " +
+                    "pt=\(packet.payloadType) tsPackets=\(tsInfo.packetCount) sync=\(tsInfo.sync) " +
+                    "seq=\(packet.sequenceNumber) marker=\(packet.marker) timestamp=\(packet.timestamp) " +
+                    "ssrc=\(Self.hex32(packet.ssrc)) channel=\(channel.map(String.init) ?? "raw") " +
+                    "sn=\(sn) rtpBytes=\(data.count) payloadBytes=\(packet.payload.count) " +
+                    "firstPID=\(tsInfo.firstPacket.map { Self.hexPID($0.pid) } ?? "none") " +
+                    "firstPUSI=\(tsInfo.firstPacket.map { String($0.payloadUnitStart) } ?? "none") " +
+                    "firstAFC=\(tsInfo.firstPacket.map { String($0.adaptationFieldControl) } ?? "none") " +
+                    "firstCC=\(tsInfo.firstPacket.map { String($0.continuityCounter) } ?? "none") " +
+                    "interleavedFrames=\(mptSinkInterleavedFramesReceived) rtpReceived=\(mptSinkRTPPacketsReceived) " +
+                    "tsReceived=\(mptSinkTSPacketsReceived) tsCapturePath=\(Self.mptSinkTSCapturePath) " +
+                    "tsCaptureBytes=\(mptSinkTSCaptureBytes)"
+            )
+        }
+    }
+
+    private func captureMPTSinkTS(_ payload: Data) {
+        guard mptSinkTSCaptureBytes < Self.mptSinkTSCaptureLimitBytes else {
+            return
+        }
+        let remaining = Self.mptSinkTSCaptureLimitBytes - mptSinkTSCaptureBytes
+        let writeCount = min(remaining, payload.count)
+        guard writeCount > 0 else {
+            return
+        }
+        if mptSinkTSCaptureHandle == nil {
+            if !FileManager.default.fileExists(atPath: Self.mptSinkTSCapturePath) {
+                FileManager.default.createFile(atPath: Self.mptSinkTSCapturePath, contents: nil)
+            }
+            mptSinkTSCaptureHandle = FileHandle(forWritingAtPath: Self.mptSinkTSCapturePath)
+            mptSinkTSCaptureHandle?.truncateFile(atOffset: 0)
+            if !mptSinkTSCaptureStartLogged {
+                mptSinkTSCaptureStartLogged = true
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.ts_capture_start session=\(sessionID.uuidString) " +
+                        "path=\(Self.mptSinkTSCapturePath) limitBytes=\(Self.mptSinkTSCaptureLimitBytes)"
+                )
+            }
+        }
+        guard let handle = mptSinkTSCaptureHandle else {
+            return
+        }
+        handle.seekToEndOfFile()
+        handle.write(payload.prefix(writeCount))
+        mptSinkTSCaptureBytes += writeCount
+        if mptSinkTSCaptureBytes == Self.mptSinkTSCaptureLimitBytes {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.ts_capture_limit_reached session=\(sessionID.uuidString) " +
+                    "path=\(Self.mptSinkTSCapturePath) bytes=\(mptSinkTSCaptureBytes)"
+            )
+        }
+    }
+
+    private func handleDecodedMPTSinkFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+        mptSinkDecodedFrames += 1
+        if mptSinkDecodedFrames <= 5 || mptSinkDecodedFrames % 60 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.hevc_frame_decoded session=\(sessionID.uuidString) " +
+                    "frames=\(mptSinkDecodedFrames) size=\(width)x\(height)"
+            )
+        }
+        onDecodedFrame?(pixelBuffer, width, height)
+    }
+
+    private func looksLikeRTPPacket(_ data: Data) -> Bool {
+        guard data.count >= Self.rtpMinimumHeaderLength else {
+            return false
+        }
+        return (data[0] >> 6) == 2
+    }
+
     private func sendKCPACK(responseTo segment: KCPIncomingSegment) {
-        let packet = makeKCPSegment(
+        guard let packet = makeKCPSegment(
             cmd: Self.kcpCommandACK,
             ts: segment.ts,
             sn: segment.sn,
             una: kcpRemoteNextReceiveSN,
             payload: Data()
-        )
+        ) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_ack_send_skipped session=\(sessionID.uuidString) reason=missing_conv " +
+                    "peerConv=\(Self.hex32(segment.conv)) sn=\(segment.sn)"
+            )
+            return
+        }
         if sendMPTDatagram(packet) {
             kcpACKSent += 1
             if kcpACKSent <= 5 || kcpACKSent % 50 == 0 {
                 DiagnosticsLog.info(
                     "xiaomi.mirror.mpt.kcp_ack_sent session=\(sessionID.uuidString) sn=\(segment.sn) " +
-                        "una=\(kcpRemoteNextReceiveSN) ackSent=\(kcpACKSent)"
+                        "una=\(kcpRemoteNextReceiveSN) conv=\(Self.hex32(segment.conv)) ackSent=\(kcpACKSent)"
                 )
             }
         } else {
@@ -2060,13 +2519,19 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func sendKCPWINS(responseTo segment: KCPIncomingSegment) {
-        let packet = makeKCPSegment(
+        guard let packet = makeKCPSegment(
             cmd: Self.kcpCommandWINS,
             ts: segment.ts,
             sn: segment.sn,
             una: kcpRemoteNextReceiveSN,
             payload: Data()
-        )
+        ) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_wins_send_skipped session=\(sessionID.uuidString) reason=missing_conv " +
+                    "peerConv=\(Self.hex32(segment.conv)) sn=\(segment.sn)"
+            )
+            return
+        }
         if sendMPTDatagram(packet) {
             kcpWINSSent += 1
         } else {
@@ -2098,9 +2563,12 @@ private final class XiaomiMirrorRTPMediaSender {
         return sent == packet.count
     }
 
-    private func makeKCPSegment(cmd: UInt8, ts: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data {
+    private func makeKCPSegment(cmd: UInt8, ts: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data? {
+        guard let conv = kcpConversationID else {
+            return nil
+        }
         var packet = Data(capacity: Self.kcpHeaderLength + payload.count)
-        packet.appendUInt32LE(Self.kcpConversationID)
+        packet.appendUInt32LE(conv)
         packet.append(cmd)
         packet.append(0)
         packet.appendUInt16LE(Self.kcpReceiveWindow)
@@ -2110,6 +2578,38 @@ private final class XiaomiMirrorRTPMediaSender {
         packet.appendUInt32LE(UInt32(truncatingIfNeeded: payload.count))
         packet.append(payload)
         return packet
+    }
+
+    private func establishKCPConversationIfNeeded(from segment: KCPIncomingSegment) -> Bool {
+        if kcpConversationID != nil {
+            return true
+        }
+        guard mptSinkOnly else {
+            kcpConversationID = Self.defaultKCPConversationID
+            return true
+        }
+        guard Self.isKnownKCPCommand(segment.command), segment.conv != 0 else {
+            return false
+        }
+        kcpConversationID = segment.conv
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.kcp_conv_initialized session=\(sessionID.uuidString) " +
+                "role=sink_receiver conv=\(Self.hex32(segment.conv)) cmd=0x\(String(segment.command, radix: 16)) " +
+                "sn=\(segment.sn) una=\(segment.una) len=\(segment.length)"
+        )
+        return true
+    }
+
+    private func logIgnoredKCPConversation(_ segment: KCPIncomingSegment) {
+        kcpConversationIgnoredCount += 1
+        if kcpConversationIgnoredCount <= 5 || kcpConversationIgnoredCount % 50 == 0 {
+            let expected = kcpConversationID.map { Self.hex32($0) } ?? "uninitialized"
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.kcp_conv_ignored session=\(sessionID.uuidString) " +
+                    "expected=\(expected) actual=\(Self.hex32(segment.conv)) " +
+                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn) count=\(kcpConversationIgnoredCount)"
+            )
+        }
     }
 
     private static func currentNTPTimestamp() -> (seconds: UInt32, fraction: UInt32) {
@@ -2126,6 +2626,10 @@ private final class XiaomiMirrorRTPMediaSender {
 
     private static func hexPreview(_ data: Data, limit: Int) -> String {
         data.prefix(limit).map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    private static func hex32(_ value: UInt32) -> String {
+        String(format: "0x%08x", value)
     }
 
     private func stopOnQueue(reason: String) {
@@ -2146,6 +2650,10 @@ private final class XiaomiMirrorRTPMediaSender {
         connection = nil
         rtcpConnection?.cancel()
         rtcpConnection = nil
+        mptSinkTSCaptureHandle?.closeFile()
+        mptSinkTSCaptureHandle = nil
+        mptSinkTSDemuxer?.flush()
+        mptSinkHEVCDecoder?.invalidate()
         if transportMode == .mpt {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.stop session=\(sessionID.uuidString) reason=\(reason) " +
@@ -2153,8 +2661,14 @@ private final class XiaomiMirrorRTPMediaSender {
                     "bytesSent=\(kcpBytesSent) acks=\(kcpACKsReceived) ackSent=\(kcpACKSent) " +
                     "wask=\(kcpWASKReceived) winsReceived=\(kcpWINSReceived) winsSent=\(kcpWINSSent) " +
                     "pushReceived=\(kcpPUSHReceived) datagrams=\(kcpDatagramsReceived) recvErrors=\(kcpDatagramReceiveErrors) " +
+                    "interleavedFrames=\(mptSinkInterleavedFramesReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                    "inboundTS=\(mptSinkTSPacketsReceived) rtpMalformed=\(mptSinkRTPMalformedCount) " +
+                    "interleavedMalformed=\(mptSinkInterleavedMalformedCount) tsCaptureBytes=\(mptSinkTSCaptureBytes) " +
+                    "decodedFrames=\(mptSinkDecodedFrames) decodeFailed=\(mptSinkDecodeFailedFrames) " +
+                    "tsCapturePath=\(Self.mptSinkTSCapturePath) " +
                     "latestAck=\(kcpLatestACKSN.map(String.init) ?? "none") " +
-                    "latestRemoteUna=\(kcpLatestRemoteUNA.map(String.init) ?? "none")"
+                    "latestRemoteUna=\(kcpLatestRemoteUNA.map(String.init) ?? "none") " +
+                    "conv=\(kcpConversationID.map { Self.hex32($0) } ?? "none") convIgnored=\(kcpConversationIgnoredCount)"
             )
         } else {
             DiagnosticsLog.info(
@@ -2164,13 +2678,48 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
-    private static let kcpConversationID: UInt32 = 0x1234_5678
+    private static let defaultKCPConversationID: UInt32 = 0x1234_5678
     private static let kcpCommandPush: UInt8 = 0x51
     private static let kcpCommandACK: UInt8 = 0x52
     private static let kcpCommandWASK: UInt8 = 0x53
     private static let kcpCommandWINS: UInt8 = 0x54
     private static let kcpHeaderLength = 24
     private static let kcpReceiveWindow: UInt16 = 128
+    private static let rtspInterleavedMagic: UInt8 = 0x24
+    private static let rtspInterleavedHeaderLength = 4
+    private static let rtpMinimumHeaderLength = 12
+    private static let mpegTSPacketLength = 188
+    private static let mptSinkTSCapturePath = "/private/tmp/edgelink-xiaomi-mirror.ts"
+    private static let mptSinkTSCaptureLimitBytes = 8 * 1024 * 1024
+
+    private static func isKnownKCPCommand(_ command: UInt8) -> Bool {
+        command == kcpCommandPush || command == kcpCommandACK || command == kcpCommandWASK || command == kcpCommandWINS
+    }
+
+    private static func inspectMPEGTS(_ payload: Data) -> MPEGTSInspection {
+        let packetCount = payload.count / mpegTSPacketLength
+        let sync = packetCount > 0 &&
+            payload.count % mpegTSPacketLength == 0 &&
+            (0..<packetCount).allSatisfy { payload[$0 * mpegTSPacketLength] == 0x47 }
+        let firstPacket: MPEGTSFirstPacket?
+        if sync,
+           payload.count >= mpegTSPacketLength {
+            let pid = (UInt16(payload[1] & 0x1f) << 8) | UInt16(payload[2])
+            firstPacket = MPEGTSFirstPacket(
+                pid: pid,
+                payloadUnitStart: (payload[1] & 0x40) != 0,
+                adaptationFieldControl: (payload[3] >> 4) & 0x03,
+                continuityCounter: payload[3] & 0x0f
+            )
+        } else {
+            firstPacket = nil
+        }
+        return MPEGTSInspection(packetCount: packetCount, sync: sync, firstPacket: firstPacket)
+    }
+
+    private static func hexPID(_ value: UInt16) -> String {
+        String(format: "0x%04x", value)
+    }
 
     private static func anyIPv4SocketAddress(port: UInt16) -> sockaddr_in {
         sockaddr_in(
@@ -2236,6 +2785,7 @@ private struct KCPIncomingSegment {
     let sn: UInt32
     let una: UInt32
     let length: UInt32
+    let payload: Data
 
     init?(data: Data, offset: Int) {
         guard offset + 24 <= data.count,
@@ -2255,6 +2805,675 @@ private struct KCPIncomingSegment {
         self.sn = sn
         self.una = una
         self.length = length
+        let payloadStart = offset + 24
+        let payloadEnd = payloadStart + Int(length)
+        self.payload = payloadEnd <= data.count ? data[payloadStart..<payloadEnd] : Data()
+    }
+}
+
+private struct RTPIncomingPacket {
+    let marker: Bool
+    let payloadType: UInt8
+    let sequenceNumber: UInt16
+    let timestamp: UInt32
+    let ssrc: UInt32
+    let payload: Data
+
+    init?(data: Data) {
+        guard data.count >= 12,
+              (data[0] >> 6) == 2,
+              let sequenceNumber = data.readUInt16BE(at: 2),
+              let timestamp = data.readUInt32BE(at: 4),
+              let ssrc = data.readUInt32BE(at: 8) else {
+            return nil
+        }
+        let csrcCount = Int(data[0] & 0x0f)
+        var headerLength = 12 + csrcCount * 4
+        guard data.count >= headerLength else {
+            return nil
+        }
+        if (data[0] & 0x10) != 0 {
+            guard data.count >= headerLength + 4,
+                  let extensionLengthWords = data.readUInt16BE(at: headerLength + 2) else {
+                return nil
+            }
+            headerLength += 4 + Int(extensionLengthWords) * 4
+            guard data.count >= headerLength else {
+                return nil
+            }
+        }
+        var payloadEnd = data.count
+        if (data[0] & 0x20) != 0 {
+            guard let paddingLength = data.last,
+                  paddingLength > 0,
+                  Int(paddingLength) <= data.count - headerLength else {
+                return nil
+            }
+            payloadEnd -= Int(paddingLength)
+        }
+        guard payloadEnd >= headerLength else {
+            return nil
+        }
+        self.marker = (data[1] & 0x80) != 0
+        self.payloadType = data[1] & 0x7f
+        self.sequenceNumber = sequenceNumber
+        self.timestamp = timestamp
+        self.ssrc = ssrc
+        self.payload = data.subdata(in: headerLength..<payloadEnd)
+    }
+}
+
+private struct MPEGTSInspection {
+    let packetCount: Int
+    let sync: Bool
+    let firstPacket: MPEGTSFirstPacket?
+}
+
+private struct MPEGTSFirstPacket {
+    let pid: UInt16
+    let payloadUnitStart: Bool
+    let adaptationFieldControl: UInt8
+    let continuityCounter: UInt8
+}
+
+private final class XiaomiMirrorMPEGTSHEVCDemuxer {
+    private let sessionID: UUID
+    private let onAccessUnit: ([Data], UInt64?) -> Void
+    private var pmtPID: UInt16?
+    private var videoPID: UInt16?
+    private var currentPES = Data()
+    private var currentPESPTS90k: UInt64?
+    private var accessUnitAssembler: XiaomiMirrorHEVCAccessUnitAssembler
+    private var packetsParsed: UInt64 = 0
+    private var pesParsed: UInt64 = 0
+    private var didLogPAT = false
+    private var didLogPMT = false
+
+    init(sessionID: UUID, onAccessUnit: @escaping ([Data], UInt64?) -> Void) {
+        self.sessionID = sessionID
+        self.onAccessUnit = onAccessUnit
+        self.accessUnitAssembler = XiaomiMirrorHEVCAccessUnitAssembler(sessionID: sessionID, onAccessUnit: onAccessUnit)
+    }
+
+    func pushTSPayload(_ payload: Data, rtpTimestamp: UInt32) {
+        guard payload.count >= Self.packetLength, payload.count % Self.packetLength == 0 else {
+            return
+        }
+        var offset = 0
+        while offset + Self.packetLength <= payload.count {
+            parseTSPacket(payload.subdata(in: offset..<(offset + Self.packetLength)), rtpTimestamp: rtpTimestamp)
+            offset += Self.packetLength
+        }
+    }
+
+    func flush() {
+        flushCurrentPES()
+        accessUnitAssembler.flush()
+    }
+
+    private func parseTSPacket(_ packet: Data, rtpTimestamp: UInt32) {
+        guard packet.count == Self.packetLength, packet[0] == Self.syncByte else {
+            return
+        }
+        packetsParsed += 1
+        let payloadUnitStart = (packet[1] & 0x40) != 0
+        let pid = (UInt16(packet[1] & 0x1f) << 8) | UInt16(packet[2])
+        let adaptationFieldControl = (packet[3] >> 4) & 0x03
+        guard adaptationFieldControl == 1 || adaptationFieldControl == 3 else {
+            return
+        }
+        var payloadOffset = 4
+        if adaptationFieldControl == 3 {
+            guard payloadOffset < packet.count else {
+                return
+            }
+            payloadOffset += 1 + Int(packet[payloadOffset])
+        }
+        guard payloadOffset < packet.count else {
+            return
+        }
+        let payload = packet.subdata(in: payloadOffset..<packet.count)
+        if pid == 0 {
+            parsePAT(payload, payloadUnitStart: payloadUnitStart)
+            return
+        }
+        if let pmtPID, pid == pmtPID {
+            parsePMT(payload, payloadUnitStart: payloadUnitStart)
+            return
+        }
+        if let videoPID, pid == videoPID {
+            parseVideoPayload(payload, payloadUnitStart: payloadUnitStart, rtpTimestamp: rtpTimestamp)
+        }
+    }
+
+    private func parsePAT(_ payload: Data, payloadUnitStart: Bool) {
+        guard let section = sectionPayload(payload, payloadUnitStart: payloadUnitStart),
+              section.count >= 12,
+              section[0] == 0x00 else {
+            return
+        }
+        guard let sectionLength = sectionLength(section), section.count >= 3 + sectionLength else {
+            return
+        }
+        let entriesEnd = 3 + sectionLength - 4
+        var offset = 8
+        while offset + 4 <= entriesEnd {
+            guard let programNumber = section.readUInt16BE(at: offset) else {
+                return
+            }
+            let pid = (UInt16(section[offset + 2] & 0x1f) << 8) | UInt16(section[offset + 3])
+            if programNumber != 0 {
+                pmtPID = pid
+                if !didLogPAT {
+                    didLogPAT = true
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.mpt.ts_pat session=\(sessionID.uuidString) pmtPID=\(Self.hexPID(pid))"
+                    )
+                }
+                return
+            }
+            offset += 4
+        }
+    }
+
+    private func parsePMT(_ payload: Data, payloadUnitStart: Bool) {
+        guard let section = sectionPayload(payload, payloadUnitStart: payloadUnitStart),
+              section.count >= 16,
+              section[0] == 0x02 else {
+            return
+        }
+        guard let sectionLength = sectionLength(section), section.count >= 3 + sectionLength else {
+            return
+        }
+        guard let programInfoLength = section.readUInt16BE(at: 10).map({ Int($0 & 0x0fff) }) else {
+            return
+        }
+        var offset = 12 + programInfoLength
+        let entriesEnd = 3 + sectionLength - 4
+        while offset + 5 <= entriesEnd {
+            let streamType = section[offset]
+            let elementaryPID = (UInt16(section[offset + 1] & 0x1f) << 8) | UInt16(section[offset + 2])
+            let esInfoLength = Int(((UInt16(section[offset + 3] & 0x0f) << 8) | UInt16(section[offset + 4])))
+            if streamType == Self.hevcStreamType {
+                videoPID = elementaryPID
+                if !didLogPMT {
+                    didLogPMT = true
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.mpt.ts_pmt session=\(sessionID.uuidString) " +
+                            "videoPID=\(Self.hexPID(elementaryPID)) streamType=0x24"
+                    )
+                }
+                return
+            }
+            offset += 5 + esInfoLength
+        }
+    }
+
+    private func parseVideoPayload(_ payload: Data, payloadUnitStart: Bool, rtpTimestamp: UInt32) {
+        if payloadUnitStart {
+            flushCurrentPES()
+            guard let pes = parsePESStart(payload, fallbackPTS90k: UInt64(rtpTimestamp)) else {
+                return
+            }
+            currentPES = pes.payload
+            currentPESPTS90k = pes.pts90k
+        } else if !currentPES.isEmpty {
+            currentPES.append(payload)
+        }
+    }
+
+    private func flushCurrentPES() {
+        guard !currentPES.isEmpty else {
+            return
+        }
+        pesParsed += 1
+        accessUnitAssembler.pushPESPayload(currentPES, pts90k: currentPESPTS90k)
+        if pesParsed <= 5 || pesParsed % 100 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.ts_pes session=\(sessionID.uuidString) pes=\(pesParsed) " +
+                    "bytes=\(currentPES.count) pts90k=\(currentPESPTS90k.map(String.init) ?? "none")"
+            )
+        }
+        currentPES.removeAll(keepingCapacity: true)
+        currentPESPTS90k = nil
+    }
+
+    private func parsePESStart(_ payload: Data, fallbackPTS90k: UInt64?) -> (payload: Data, pts90k: UInt64?)? {
+        guard payload.count >= 9,
+              payload[0] == 0x00,
+              payload[1] == 0x00,
+              payload[2] == 0x01 else {
+            return nil
+        }
+        let ptsDTSFlags = (payload[7] >> 6) & 0x03
+        let headerLength = Int(payload[8])
+        let payloadOffset = 9 + headerLength
+        guard payloadOffset <= payload.count else {
+            return nil
+        }
+        let pts90k = ptsDTSFlags == 0x02 || ptsDTSFlags == 0x03
+            ? parsePTS(payload, offset: 9)
+            : fallbackPTS90k
+        return (payload.subdata(in: payloadOffset..<payload.count), pts90k)
+    }
+
+    private func parsePTS(_ data: Data, offset: Int) -> UInt64? {
+        guard offset + 4 < data.count else {
+            return nil
+        }
+        let p0 = UInt64((data[offset] >> 1) & 0x07) << 30
+        let p1 = UInt64(data[offset + 1]) << 22
+        let p2 = UInt64((data[offset + 2] >> 1) & 0x7f) << 15
+        let p3 = UInt64(data[offset + 3]) << 7
+        let p4 = UInt64((data[offset + 4] >> 1) & 0x7f)
+        return p0 | p1 | p2 | p3 | p4
+    }
+
+    private func sectionPayload(_ payload: Data, payloadUnitStart: Bool) -> Data? {
+        if payloadUnitStart {
+            guard let pointer = payload.first, Int(pointer) + 1 < payload.count else {
+                return nil
+            }
+            return payload.subdata(in: (1 + Int(pointer))..<payload.count)
+        }
+        return payload
+    }
+
+    private func sectionLength(_ section: Data) -> Int? {
+        guard section.count >= 3 else {
+            return nil
+        }
+        return Int(((UInt16(section[1] & 0x0f) << 8) | UInt16(section[2])))
+    }
+
+    private static func hexPID(_ value: UInt16) -> String {
+        String(format: "0x%04x", value)
+    }
+
+    private static let packetLength = 188
+    private static let syncByte: UInt8 = 0x47
+    private static let hevcStreamType: UInt8 = 0x24
+}
+
+private final class XiaomiMirrorHEVCAccessUnitAssembler {
+    private let sessionID: UUID
+    private let onAccessUnit: ([Data], UInt64?) -> Void
+    private var pendingNALUnits: [Data] = []
+    private var pendingHasVCL = false
+    private var pendingPTS90k: UInt64?
+    private var accessUnits = 0
+
+    init(sessionID: UUID, onAccessUnit: @escaping ([Data], UInt64?) -> Void) {
+        self.sessionID = sessionID
+        self.onAccessUnit = onAccessUnit
+    }
+
+    func pushPESPayload(_ payload: Data, pts90k: UInt64?) {
+        for nalUnit in Self.annexBNALUnits(in: payload) {
+            pushNALUnit(nalUnit, pts90k: pts90k)
+        }
+    }
+
+    func flush() {
+        flushPending()
+    }
+
+    private func pushNALUnit(_ nalUnit: Data, pts90k: UInt64?) {
+        guard nalUnit.count >= 2 else {
+            return
+        }
+        let nalType = Self.nalType(nalUnit)
+        let vcl = Self.isVCLNALType(nalType)
+        let firstSlice = vcl && nalUnit.count > 2 && (nalUnit[2] & 0x80) != 0
+        if firstSlice && pendingHasVCL {
+            flushPending()
+        }
+        if pendingNALUnits.isEmpty {
+            pendingPTS90k = pts90k
+        }
+        pendingNALUnits.append(nalUnit)
+        if vcl {
+            pendingHasVCL = true
+        }
+    }
+
+    private func flushPending() {
+        guard pendingHasVCL, !pendingNALUnits.isEmpty else {
+            pendingNALUnits.removeAll(keepingCapacity: true)
+            pendingPTS90k = nil
+            pendingHasVCL = false
+            return
+        }
+        accessUnits += 1
+        if accessUnits <= 5 || accessUnits % 60 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.hevc_access_unit session=\(sessionID.uuidString) " +
+                    "au=\(accessUnits) nals=\(pendingNALUnits.count) pts90k=\(pendingPTS90k.map(String.init) ?? "none")"
+            )
+        }
+        onAccessUnit(pendingNALUnits, pendingPTS90k)
+        pendingNALUnits.removeAll(keepingCapacity: true)
+        pendingPTS90k = nil
+        pendingHasVCL = false
+    }
+
+    private static func annexBNALUnits(in data: Data) -> [Data] {
+        let bytes = [UInt8](data)
+        var starts: [(startCode: Int, nalStart: Int)] = []
+        var index = 0
+        while index + 3 < bytes.count {
+            if bytes[index] == 0, bytes[index + 1] == 0 {
+                if bytes[index + 2] == 1 {
+                    starts.append((index, index + 3))
+                    index += 3
+                    continue
+                }
+                if index + 3 < bytes.count, bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                    starts.append((index, index + 4))
+                    index += 4
+                    continue
+                }
+            }
+            index += 1
+        }
+        guard !starts.isEmpty else {
+            return []
+        }
+        var result: [Data] = []
+        for startIndex in starts.indices {
+            let nalStart = starts[startIndex].nalStart
+            let nalEnd = startIndex + 1 < starts.count ? starts[startIndex + 1].startCode : bytes.count
+            if nalEnd > nalStart {
+                result.append(Data(bytes[nalStart..<nalEnd]))
+            }
+        }
+        return result
+    }
+
+    fileprivate static func nalType(_ nalUnit: Data) -> UInt8 {
+        guard let first = nalUnit.first else {
+            return 0xff
+        }
+        return (first & 0x7e) >> 1
+    }
+
+    fileprivate static func isVCLNALType(_ nalType: UInt8) -> Bool {
+        nalType <= 31
+    }
+}
+
+private final class XiaomiMirrorHEVCDecoder {
+    var onFrame: ((CVPixelBuffer, Int, Int) -> Void)?
+    var onDecodeFailed: (() -> Void)?
+
+    private let sessionID: UUID
+    private var decompressionSession: VTDecompressionSession?
+    private var formatDescription: CMVideoFormatDescription?
+    private var vps: Data?
+    private var sps: Data?
+    private var pps: Data?
+    private var decodedFrames: UInt64 = 0
+    private var decodeRequests: UInt64 = 0
+    private var droppedUntilFormat: UInt64 = 0
+
+    init(sessionID: UUID) {
+        self.sessionID = sessionID
+    }
+
+    func decode(accessUnit: [Data], pts90k: UInt64?) {
+        guard !accessUnit.isEmpty else {
+            return
+        }
+        updateParameterSets(from: accessUnit)
+        guard accessUnit.contains(where: { XiaomiMirrorHEVCAccessUnitAssembler.isVCLNALType(Self.nalType($0)) }) else {
+            return
+        }
+        guard ensureSession() else {
+            droppedUntilFormat += 1
+            if droppedUntilFormat <= 5 || droppedUntilFormat % 30 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.hevc_decode_wait_format session=\(sessionID.uuidString) " +
+                        "dropped=\(droppedUntilFormat) hasVPS=\(vps != nil) hasSPS=\(sps != nil) hasPPS=\(pps != nil)"
+                )
+            }
+            return
+        }
+        guard let formatDescription,
+              let sampleBuffer = makeSampleBuffer(accessUnit: accessUnit, formatDescription: formatDescription, pts90k: pts90k) else {
+            onDecodeFailed?()
+            return
+        }
+        decodeRequests += 1
+        var infoFlags = VTDecodeInfoFlags()
+        let status = VTDecompressionSessionDecodeFrame(
+            decompressionSession!,
+            sampleBuffer: sampleBuffer,
+            flags: [],
+            frameRefcon: nil,
+            infoFlagsOut: &infoFlags
+        )
+        if status != noErr {
+            onDecodeFailed?()
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_decode_failed session=\(sessionID.uuidString) " +
+                    "status=\(status) requests=\(decodeRequests) nals=\(accessUnit.count)"
+            )
+        } else if decodeRequests <= 5 || decodeRequests % 60 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.hevc_decode_submitted session=\(sessionID.uuidString) " +
+                    "requests=\(decodeRequests) nals=\(accessUnit.count) pts90k=\(pts90k.map(String.init) ?? "none")"
+            )
+        }
+    }
+
+    func invalidate() {
+        if let decompressionSession {
+            VTDecompressionSessionInvalidate(decompressionSession)
+        }
+        decompressionSession = nil
+        formatDescription = nil
+    }
+
+    private func updateParameterSets(from accessUnit: [Data]) {
+        var changed = false
+        for nalUnit in accessUnit {
+            switch Self.nalType(nalUnit) {
+            case 32:
+                changed = replaceIfChanged(&vps, nalUnit)
+            case 33:
+                changed = replaceIfChanged(&sps, nalUnit) || changed
+            case 34:
+                changed = replaceIfChanged(&pps, nalUnit) || changed
+            default:
+                break
+            }
+        }
+        if changed {
+            invalidate()
+        }
+    }
+
+    private func replaceIfChanged(_ target: inout Data?, _ value: Data) -> Bool {
+        guard target != value else {
+            return false
+        }
+        target = value
+        return true
+    }
+
+    private func ensureSession() -> Bool {
+        if decompressionSession != nil {
+            return true
+        }
+        guard let vps, let sps, let pps else {
+            return false
+        }
+        guard let description = makeFormatDescription(vps: vps, sps: sps, pps: pps) else {
+            return false
+        }
+        formatDescription = description
+        var callback = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: Self.outputCallback,
+            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        let attributes = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ] as CFDictionary
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: description,
+            decoderSpecification: nil,
+            imageBufferAttributes: attributes,
+            outputCallback: &callback,
+            decompressionSessionOut: &session
+        )
+        guard status == noErr, let session else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_decoder_create_failed session=\(sessionID.uuidString) status=\(status)"
+            )
+            return false
+        }
+        decompressionSession = session
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.hevc_decoder_ready session=\(sessionID.uuidString) " +
+                "vps=\(vps.count) sps=\(sps.count) pps=\(pps.count)"
+        )
+        return true
+    }
+
+    private func makeFormatDescription(vps: Data, sps: Data, pps: Data) -> CMVideoFormatDescription? {
+        var description: CMVideoFormatDescription?
+        vps.withUnsafeBytes { vpsRaw in
+            sps.withUnsafeBytes { spsRaw in
+                pps.withUnsafeBytes { ppsRaw in
+                    guard let vpsBase = vpsRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let spsBase = spsRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let ppsBase = ppsRaw.bindMemory(to: UInt8.self).baseAddress else {
+                        return
+                    }
+                    var parameterSetPointers: [UnsafePointer<UInt8>] = [vpsBase, spsBase, ppsBase]
+                    var parameterSetSizes = [vps.count, sps.count, pps.count]
+                    let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: parameterSetPointers.count,
+                        parameterSetPointers: &parameterSetPointers,
+                        parameterSetSizes: &parameterSetSizes,
+                        nalUnitHeaderLength: 4,
+                        extensions: nil,
+                        formatDescriptionOut: &description
+                    )
+                    if status != noErr {
+                        DiagnosticsLog.warn(
+                            "xiaomi.mirror.mpt.hevc_format_create_failed session=\(sessionID.uuidString) status=\(status)"
+                        )
+                    }
+                }
+            }
+        }
+        return description
+    }
+
+    private func makeSampleBuffer(
+        accessUnit: [Data],
+        formatDescription: CMVideoFormatDescription,
+        pts90k: UInt64?
+    ) -> CMSampleBuffer? {
+        var sampleData = Data()
+        for nalUnit in accessUnit {
+            sampleData.appendUInt32BE(UInt32(nalUnit.count))
+            sampleData.append(nalUnit)
+        }
+        guard !sampleData.isEmpty else {
+            return nil
+        }
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: sampleData.count,
+            blockAllocator: nil,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: sampleData.count,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else {
+            return nil
+        }
+        let replaceStatus = sampleData.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return OSStatus(kCMBlockBufferBadPointerParameterErr)
+            }
+            return CMBlockBufferReplaceDataBytes(
+                with: baseAddress,
+                blockBuffer: blockBuffer,
+                offsetIntoDestination: 0,
+                dataLength: sampleData.count
+            )
+        }
+        guard replaceStatus == kCMBlockBufferNoErr else {
+            return nil
+        }
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: pts90k.map { CMTime(value: CMTimeValue($0), timescale: 90_000) } ?? .invalid,
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = sampleData.count
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: formatDescription,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sampleStatus == noErr else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_sample_create_failed session=\(sessionID.uuidString) status=\(sampleStatus)"
+            )
+            return nil
+        }
+        return sampleBuffer
+    }
+
+    private func handleDecoded(pixelBuffer: CVPixelBuffer) {
+        decodedFrames += 1
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        if decodedFrames <= 5 || decodedFrames % 60 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.hevc_decoder_output session=\(sessionID.uuidString) " +
+                    "frames=\(decodedFrames) size=\(width)x\(height)"
+            )
+        }
+        onFrame?(pixelBuffer, width, height)
+    }
+
+    private static func nalType(_ nalUnit: Data) -> UInt8 {
+        XiaomiMirrorHEVCAccessUnitAssembler.nalType(nalUnit)
+    }
+
+    private static let outputCallback: VTDecompressionOutputCallback = { refCon, _, status, _, imageBuffer, _, _ in
+        guard let refCon else {
+            return
+        }
+        let decoder = Unmanaged<XiaomiMirrorHEVCDecoder>.fromOpaque(refCon).takeUnretainedValue()
+        guard status == noErr, let imageBuffer else {
+            decoder.onDecodeFailed?()
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_decoder_output_failed session=\(decoder.sessionID.uuidString) status=\(status)"
+            )
+            return
+        }
+        decoder.handleDecoded(pixelBuffer: imageBuffer)
     }
 }
 
@@ -2660,6 +3879,30 @@ private extension Data {
             (UInt32(self[offset + 3]) << 24)
     }
 
+    func readUInt16BE(at offset: Int) -> UInt16? {
+        guard offset >= 0, offset + 1 < count else {
+            return nil
+        }
+        return (UInt16(self[offset]) << 8) | UInt16(self[offset + 1])
+    }
+
+    func readUInt32BE(at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 3 < count else {
+            return nil
+        }
+        return (UInt32(self[offset]) << 24) |
+            (UInt32(self[offset + 1]) << 16) |
+            (UInt32(self[offset + 2]) << 8) |
+            UInt32(self[offset + 3])
+    }
+
+    mutating func appendUInt32BE(_ value: UInt32) {
+        append(UInt8((value >> 24) & 0xff))
+        append(UInt8((value >> 16) & 0xff))
+        append(UInt8((value >> 8) & 0xff))
+        append(UInt8(value & 0xff))
+    }
+
     mutating func appendStartCode() {
         append(contentsOf: [0x00, 0x00, 0x00, 0x01])
     }
@@ -2710,7 +3953,14 @@ private struct RTSPMessage {
     }
 }
 
+private extension Data {
+    var hexString: String {
+        map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 private enum XiaomiMirrorRTSPDiagnosticSourceError: Error {
+    case invalidHost(String)
     case invalidPort(UInt16)
     case pixelBufferCreateFailed(CVReturn)
     case videoToolboxCreateFailed(OSStatus)

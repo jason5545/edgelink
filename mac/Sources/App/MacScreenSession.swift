@@ -115,6 +115,20 @@ final class MacScreenSession: NSObject, ObservableObject {
         DiagnosticsLog.info("screen.mac.meta w=\(body.w) h=\(body.h) scale=\(body.scale) dpi=\(body.dpi)")
     }
 
+    func renderXiaomiMirrorFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+        if !isScreenSessionActive {
+            isScreenSessionActive = true
+            onSessionActivityChanged?(true)
+        }
+        screenMeta = ScreenMetaBody(w: width, h: height, scale: 1, dpi: 0)
+        hasRemoteVideo = true
+        status = "Xiaomi Mirror"
+        if window?.isVisible != true {
+            showWindow()
+        }
+        videoView.renderPixelBuffer(pixelBuffer)
+    }
+
     func handleOffer(_ body: RtcSdpBody) {
         guard isScreenSessionActive else {
             DiagnosticsLog.warn("screen.mac.offer_ignored inactive_session")
@@ -1593,17 +1607,29 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
             return
         }
 
-        let convertStartedAt = ProcessInfo.processInfo.systemUptime
-        var image = CIImage(cvPixelBuffer: cvBuffer.pixelBuffer)
-        if cvBuffer.requiresCropping() {
-            image = image.cropped(to: CGRect(
+        let crop: CGRect? = cvBuffer.requiresCropping()
+            ? CGRect(
                 x: CGFloat(cvBuffer.cropX),
                 y: CGFloat(cvBuffer.cropY),
                 width: CGFloat(cvBuffer.cropWidth),
                 height: CGFloat(cvBuffer.cropHeight)
-            ))
+            )
+            : nil
+        renderPixelBuffer(cvBuffer.pixelBuffer, crop: crop, rotation: frame.rotation.rawValue)
+    }
+
+    func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
+        recordReceivedFrameAndGap()
+        renderPixelBuffer(pixelBuffer, crop: nil, rotation: 0)
+    }
+
+    private func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer, crop: CGRect?, rotation: Int) {
+        let convertStartedAt = ProcessInfo.processInfo.systemUptime
+        var image = CIImage(cvPixelBuffer: pixelBuffer)
+        if let crop {
+            image = image.cropped(to: crop)
         }
-        image = rotated(image, rotation: frame.rotation.rawValue)
+        image = rotated(image, rotation: rotation)
 
         guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
             return

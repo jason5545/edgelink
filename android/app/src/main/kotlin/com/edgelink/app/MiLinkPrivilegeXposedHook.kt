@@ -66,6 +66,7 @@ internal object MiLinkPrivilegeHookPolicy {
         "getAliveBinder",
         "queryRemoteDevices",
         "queryRemoteDevice",
+        "startShare",
         "openRemoteDeviceMirror",
         "openRemoteDeviceMirrorByBtMac",
         "performMirrorDeviceIconClick",
@@ -275,6 +276,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorAudioSourceStartUptimeMs: Long = 0L
     private var lastFakeMirrorAudioSinkStartUptimeMs: Long = 0L
     private var lastFakeMirrorTerminalReadyUptimeMs: Long = 0L
+    private var fakeMirrorSourceRouteUntilUptimeMs: Long = 0L
+    private var fakeMirrorSourceSessionUntilUptimeMs: Long = 0L
+    private var fakeMirrorSourceOptionHandle: Long = 0L
+    private var fakeMirrorSourceAuthConfigDepth: Int = 0
+    private var mirrorSourceClassDiagnosticsLogged: Boolean = false
+    private var mirrorControlClassDiagnosticsLogged: Boolean = false
     private var lastInCallUiRelayAnswerUptimeMs: Long = 0L
     private var lastInCallUiRelaySelectionUptimeMs: Long = 0L
     private var lastTelecomRelayForceLogUptimeMs: Long = 0L
@@ -918,6 +925,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             return
                         }
+                        if (shouldForceMirrorSourceRoute()) {
+                            val terminal = prepareFakeMirrorSourceTerminal(classLoader)
+                            param.setResult(terminal)
+                            log(
+                                "mirror fake terminal lookup sourceRole=mac " +
+                                    "platform=${mirrorTerminalPlatform(terminal)} " +
+                                    "ip=${mirrorTerminalIp(terminal)}"
+                            )
+                            return
+                        }
                         val terminal = prepareFakeMirrorTerminal(classLoader, mode)
                         maybeAttachFakeMirrorCallFlow(classLoader, mode, terminal)
                         param.setResult(terminal)
@@ -941,6 +958,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val mode = currentFakeMirrorProviderMode() ?: return
                         val deviceId = param.args.getOrNull(0) as? String
+                        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) &&
+                            shouldForceMirrorSourceRoute()
+                        ) {
+                            param.setResult(false)
+                            log("mirror fake source route rejected AndroidPad identity")
+                            return
+                        }
                         if (mode == "pad" && MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
                             param.setResult(true)
                             log("mirror fake remote accepted as AndroidPad")
@@ -950,6 +974,48 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook mirror pad identity check: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_FUSION_UTILS,
+                classLoader,
+                "D",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) &&
+                            shouldForceMirrorSourceRoute()
+                        ) {
+                            param.setResult(true)
+                            log("mirror fake source route accepted as PC")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror PC identity check: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_FUSION_UTILS,
+                classLoader,
+                "E",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) &&
+                            shouldForceMirrorSourceRoute()
+                        ) {
+                            param.setResult(true)
+                            log("mirror fake source route accepted as Mac")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror Mac identity check: ${error.javaClass.simpleName}: ${error.message}")
         }
         runCatching {
             XposedHelpers.findAndHookMethod(
@@ -1020,9 +1086,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun hookMirrorScreenRouteDiagnostics(classLoader: ClassLoader) {
         hookMirrorTerminalAddressOverride(classLoader)
+        hookMirrorSourceRouteOverrides(classLoader)
         hookMirrorSinkViewLifecycle(classLoader)
         hookMirrorSinkSurfaceCallback(classLoader)
         hookMirrorControlSinkStart(classLoader)
+        hookMirrorControlSourceStart(classLoader)
+        hookMirrorControlNativeDiagnostics(classLoader)
         hookMirrorAdvConnectionLifecycle(classLoader)
         hookMirrorLyraGateDiagnostics(classLoader)
     }
@@ -1058,6 +1127,532 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook mirror terminal address: ${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    private fun hookMirrorSourceRouteOverrides(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_FUSION_UTILS,
+                classLoader,
+                "k",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) ||
+                            !shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            return
+                        }
+                        val peerIp = currentFakeMirrorRemotePeerIp() ?: DEFAULT_FAKE_MIRROR_PEER_IP
+                        val bindIp = if (shouldForceMirrorSourceRoute()) {
+                            currentFakeMirrorSourceBindIp()
+                        } else {
+                            peerIp
+                        }
+                        param.setResult(bindIp)
+                        log("mirror source endpoint override deviceId=$deviceId bindIp=$bindIp peerIp=$peerIp")
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror source endpoint: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_SHARE_PROCESSOR,
+                classLoader,
+                "n0",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) ||
+                            !shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            return
+                        }
+                        startFakeMirrorSourceDisplay(classLoader, deviceId.orEmpty())
+                        param.setResult(null)
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror source share processor: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun startFakeMirrorSourceDisplay(classLoader: ClassLoader, deviceId: String) {
+        runCatching {
+            armFakeMirrorSourceRouteWindow()
+            val sourceTerminal = prepareFakeMirrorSourceTerminal(classLoader)
+            ensureFakeMirrorCastBusinessDevice(classLoader, deviceId)
+            val displayManagerClass = findTargetClass(classLoader, XIAOMI_MIRROR_DISPLAY_MANAGER)
+            val displayHelperClass = findTargetClass(classLoader, XIAOMI_MIRROR_DISPLAY_HELPER)
+            val configBuilder = displayHelperClass
+                .getMethod("c", String::class.java, java.lang.Boolean.TYPE)
+                .invoke(null, deviceId, false)
+                ?: return@runCatching
+            val config = configBuilder.javaClass.getMethod("a").invoke(configBuilder)
+                ?: return@runCatching
+            val callbackClass = findTargetClass(classLoader, XIAOMI_MIRROR_DISPLAY_CALLBACK)
+            val manager = displayManagerClass.getMethod("C").invoke(null)
+                ?: return@runCatching
+            displayManagerClass.getMethod(
+                "P0",
+                config.javaClass,
+                String::class.java,
+                String::class.java,
+                callbackClass
+            ).invoke(manager, config, deviceId, null, null)
+            val peerIp = currentFakeMirrorRemotePeerIp() ?: DEFAULT_FAKE_MIRROR_PEER_IP
+            val peerPort = currentFakeMirrorRemotePeerPort() ?: DEFAULT_FAKE_MIRROR_PEER_PORT
+            log(
+                "mirror fake source display requested " +
+                    "deviceId=$deviceId peer=$peerIp:$peerPort config=${identitySummary(config)} " +
+                    " sourceTerminal=${identitySummary(sourceTerminal)} " +
+                    "sourceTerminalPlatform=${mirrorTerminalPlatform(sourceTerminal)} " +
+                    "sourceTerminalIp=${mirrorTerminalIp(sourceTerminal)}"
+            )
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to start fake source display: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
+
+    private fun hookMirrorControlSourceStart(classLoader: ClassLoader) {
+        runCatching {
+            val sourceClass = findTargetClass(classLoader, XIAOMI_MIRROR_CONTROL_SOURCE)
+            sourceClass.declaredConstructors.forEach { constructor ->
+                XposedBridge.hookMethod(
+                    constructor,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceMirrorSourceRoute() && !shouldForceMirrorScreenTerminalPresent()) {
+                                return
+                            }
+                            armFakeMirrorSourceSessionWindow()
+                            logMirrorSourceClassDiagnostics(param.thisObject)
+                            configureFakeMirrorSourceAuth(param.thisObject)
+                            overrideFakeMirrorSourcePort(param.thisObject)
+                            val optionHandle = readMirrorControlSourceOptionHandle(param.thisObject)
+                            if (optionHandle > 0L) {
+                                fakeMirrorSourceOptionHandle = optionHandle
+                            }
+                            log(
+                                "mirror source constructor configured " +
+                                    "optionHandle=$optionHandle " +
+                                    mirrorControlSourceSummary(param.thisObject)
+                            )
+                        }
+                    }
+                )
+            }
+            hookMirrorSourceOptionWrappers(sourceClass)
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL_SOURCE,
+                classLoader,
+                "startMirror",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorScreenTerminalPresent()) {
+                            return
+                        }
+                        armFakeMirrorSourceSessionWindow()
+                        enableMirrorNativeDebugLog(classLoader)
+                        logMirrorSourceClassDiagnostics(param.thisObject)
+                        configureFakeMirrorSourceAuth(param.thisObject)
+                        overrideFakeMirrorSourcePort(param.thisObject)
+                        val optionHandle = readMirrorControlSourceOptionHandle(param.thisObject)
+                        if (optionHandle > 0L) {
+                            fakeMirrorSourceOptionHandle = optionHandle
+                        }
+                        log(
+                            "mirror source startMirror enter " +
+                                "optionHandle=$optionHandle " +
+                                mirrorControlSourceSummary(param.thisObject)
+                        )
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorScreenTerminalPresent()) {
+                            return
+                        }
+                        log(
+                            "mirror source startMirror exit " +
+                                "result=${param.getResult()} " +
+                                mirrorControlSourceSummary(param.thisObject)
+                        )
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL_SOURCE,
+                classLoader,
+                "onDisplayConnected",
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorScreenTerminalPresent()) {
+                            return
+                        }
+                        log(
+                            "mirror source display connected " +
+                                "width=${param.args.getOrNull(0)} " +
+                                "height=${param.args.getOrNull(1)} " +
+                                "flags=${param.args.getOrNull(2)} " +
+                                mirrorControlSourceSummary(param.thisObject)
+                        )
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL_SOURCE,
+                classLoader,
+                "onDisplayError",
+                Integer.TYPE,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorScreenTerminalPresent()) {
+                            return
+                        }
+                        log(
+                            "mirror source display error " +
+                                "what=${param.args.getOrNull(0)} " +
+                                "extra=${param.args.getOrNull(1)} " +
+                                mirrorControlSourceSummary(param.thisObject)
+                        )
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror source control: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorSourceOptionWrappers(sourceClass: Class<*>) {
+        sourceClass.declaredMethods
+            .filter { method -> method.name == "setMirrorSourceOption" }
+            .forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceMirrorSourceSession()) {
+                                return
+                            }
+                            val option = (param.args.getOrNull(0) as? Int) ?: return
+                            if (option == MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE &&
+                                fakeMirrorSourceAuthConfigDepth == 0
+                            ) {
+                                val oldValue = param.args.getOrNull(1)
+                                if (oldValue != MIRROR_AUTHKEY_SOURCE_NONE) {
+                                    param.args[1] = MIRROR_AUTHKEY_SOURCE_NONE
+                                    log(
+                                        "mirror source auth type wrapper forced " +
+                                            "old=$oldValue new=$MIRROR_AUTHKEY_SOURCE_NONE"
+                                    )
+                                }
+                            }
+                            if (isMirrorSourceAuthOption(option)) {
+                                log(
+                                    "mirror source option wrapper enter " +
+                                        "option=$option " +
+                                        "args=${summarizeMirrorOptionArgs(param.args)} " +
+                                        "sourceOptionHandle=${readMirrorControlSourceOptionHandle(param.thisObject)}"
+                                )
+                            }
+                        }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceMirrorSourceSession()) {
+                                return
+                            }
+                            val option = (param.args.getOrNull(0) as? Int) ?: return
+                            if (!isMirrorSourceAuthOption(option)) {
+                                return
+                            }
+                            log(
+                                "mirror source option wrapper exit " +
+                                    "option=$option result=${param.getResult()} " +
+                                    "sourceOptionHandle=${readMirrorControlSourceOptionHandle(param.thisObject)}"
+                            )
+                        }
+                    }
+                )
+            }
+    }
+
+    private fun hookMirrorControlNativeDiagnostics(classLoader: ClassLoader) {
+        runCatching {
+            val mirrorControlClass = findTargetClass(classLoader, XIAOMI_MIRROR_CONTROL)
+            logMirrorControlClassDiagnostics(mirrorControlClass)
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL,
+                classLoader,
+                "createSourceMirror",
+                Any::class.java,
+                String::class.java,
+                Integer.TYPE,
+                java.lang.Boolean.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                java.lang.Long.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorSourceSession()) {
+                            return
+                        }
+                        val source = param.args.getOrNull(0)
+                        configureFakeMirrorSourceAuth(source)
+                        overrideFakeMirrorSourcePort(source)
+                        val optionHandle = (param.args.getOrNull(8) as? Number)?.toLong() ?: 0L
+                        if (optionHandle > 0L) {
+                            fakeMirrorSourceOptionHandle = optionHandle
+                        }
+                        log(
+                            "mirror source native createSourceMirror enter " +
+                                "ip=${param.args.getOrNull(1)} " +
+                                "port=${param.args.getOrNull(2)} " +
+                                "hevc=${param.args.getOrNull(3)} " +
+                                "max=${param.args.getOrNull(4)}x${param.args.getOrNull(5)}@${param.args.getOrNull(6)} " +
+                                "bitrate=${param.args.getOrNull(7)} " +
+                                "optionHandle=$optionHandle " +
+                                mirrorControlSourceSummary(source)
+                        )
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorSourceSession()) {
+                            return
+                        }
+                        log("mirror source native createSourceMirror exit handle=${param.getResult()}")
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL,
+                classLoader,
+                "startSourceMirror",
+                java.lang.Long.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (shouldForceMirrorSourceSession()) {
+                            log("mirror source native startSourceMirror enter handle=${param.args.getOrNull(0)}")
+                        }
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (shouldForceMirrorSourceSession()) {
+                            log(
+                                "mirror source native startSourceMirror exit " +
+                                    "handle=${param.args.getOrNull(0)} result=${param.getResult()}"
+                            )
+                        }
+                    }
+                }
+            )
+            hookMirrorControlOptionInt(classLoader)
+            hookMirrorControlOptionByte(classLoader)
+            hookMirrorControlOptionString(classLoader)
+        }.onFailure { error ->
+            log("failed to hook mirror native diagnostics: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorControlOptionInt(classLoader: ClassLoader) {
+        XposedHelpers.findAndHookMethod(
+            XIAOMI_MIRROR_CONTROL,
+            classLoader,
+            "setMirrorOption",
+            java.lang.Long.TYPE,
+            Integer.TYPE,
+            Integer.TYPE,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldForceMirrorSourceSession() &&
+                        option == MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE &&
+                        fakeMirrorSourceAuthConfigDepth == 0
+                    ) {
+                        val oldValue = param.args.getOrNull(2)
+                        if (oldValue != MIRROR_AUTHKEY_SOURCE_NONE) {
+                            param.args[2] = MIRROR_AUTHKEY_SOURCE_NONE
+                            log(
+                                "mirror source native auth type forced " +
+                                    "handle=$handle old=$oldValue new=$MIRROR_AUTHKEY_SOURCE_NONE"
+                            )
+                        }
+                    }
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option int enter " +
+                                "handle=$handle option=$option value=${param.args.getOrNull(2)}"
+                        )
+                    }
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option int exit " +
+                                "handle=$handle option=$option result=${param.getResult()}"
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun hookMirrorControlOptionByte(classLoader: ClassLoader) {
+        XposedHelpers.findAndHookMethod(
+            XIAOMI_MIRROR_CONTROL,
+            classLoader,
+            "setMirrorOptionByte",
+            java.lang.Long.TYPE,
+            Integer.TYPE,
+            ByteArray::class.java,
+            Integer.TYPE,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option byte enter " +
+                                "handle=$handle option=$option " +
+                                "bytes=${summarizeByteArray(param.args.getOrNull(2) as? ByteArray)} " +
+                                "len=${param.args.getOrNull(3)}"
+                        )
+                    }
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option byte exit " +
+                                "handle=$handle option=$option result=${param.getResult()}"
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun hookMirrorControlOptionString(classLoader: ClassLoader) {
+        XposedHelpers.findAndHookMethod(
+            XIAOMI_MIRROR_CONTROL,
+            classLoader,
+            "setMirrorOptionString",
+            java.lang.Long.TYPE,
+            Integer.TYPE,
+            String::class.java,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option string enter " +
+                                "handle=$handle option=$option value=${sanitizeMirrorFieldValue(param.args.getOrNull(2) as? String)}"
+                        )
+                    }
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val handle = (param.args.getOrNull(0) as? Number)?.toLong() ?: 0L
+                    val option = param.args.getOrNull(1) as? Int ?: return
+                    if (shouldLogMirrorSourceOption(handle, option)) {
+                        log(
+                            "mirror source native option string exit " +
+                                "handle=$handle option=$option result=${param.getResult()}"
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun enableMirrorNativeDebugLog(classLoader: ClassLoader) {
+        if (!shouldForceMirrorSourceSession()) {
+            return
+        }
+        runCatching {
+            val logManagerClass = findTargetClass(classLoader, XIAOMI_MIRROR_NATIVE_LOG_MANAGER)
+            val singleton = logManagerClass.getMethod("a").invoke(null) ?: return@runCatching
+            singleton.javaClass.getMethod("b").invoke(singleton)
+            log("mirror native debug log enabled")
+        }.onFailure { error ->
+            log("failed to enable mirror native debug log: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun armFakeMirrorSourceRouteWindow() {
+        val now = SystemClock.uptimeMillis()
+        fakeMirrorSourceRouteUntilUptimeMs = now + FAKE_MIRROR_SOURCE_ROUTE_WINDOW_MS
+        fakeMirrorSourceSessionUntilUptimeMs = now + FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS
+    }
+
+    private fun armFakeMirrorSourceSessionWindow() {
+        fakeMirrorSourceSessionUntilUptimeMs =
+            SystemClock.uptimeMillis() + FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS
+    }
+
+    private fun configureFakeMirrorSourceAuth(source: Any?) {
+        if (!shouldForceMirrorSourceSession() || source == null) {
+            return
+        }
+        fakeMirrorSourceAuthConfigDepth += 1
+        runCatching {
+            val optionHandle = readMirrorControlSourceOptionHandle(source)
+            if (optionHandle > 0L) {
+                fakeMirrorSourceOptionHandle = optionHandle
+            }
+            source.javaClass
+                .getMethod("setMirrorSourceOption", Integer.TYPE, Integer.TYPE)
+                .invoke(source, MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE, MIRROR_AUTHKEY_SOURCE_NONE)
+            source.javaClass
+                .getMethod("setMirrorSourceOption", Integer.TYPE, Integer.TYPE)
+                .invoke(source, MIRROR_OPTION_ENCRYPT_TRANS_BY_MIPLAY, 0)
+            log(
+                "mirror source external rtsp auth configured " +
+                    "optionHandle=$optionHandle " +
+                    "authType=$MIRROR_AUTHKEY_SOURCE_NONE " +
+                    "auth=disabled_for_screen_route"
+            )
+        }.onFailure { error ->
+            log("failed to configure mirror source auth: ${error.javaClass.simpleName}: ${error.message}")
+        }.also {
+            fakeMirrorSourceAuthConfigDepth -= 1
+        }
+    }
+
+    private fun overrideFakeMirrorSourcePort(source: Any?) {
+        if (!shouldForceMirrorSourceSession()) {
+            return
+        }
+        val currentIp = readReflectiveStringFieldAny(source, "ip")
+        val expectedIp = currentFakeMirrorSourceBindIp()
+        if (currentIp != expectedIp) {
+            return
+        }
+        val targetPort = currentFakeMirrorRemotePeerPort() ?: DEFAULT_FAKE_MIRROR_PEER_PORT
+        val currentPort = readReflectiveFieldAny(source, "port") as? Int
+        if (currentPort == targetPort) {
+            return
+        }
+        val wrote = writeReflectiveIntFieldAny(source, targetPort, "port")
+        log("mirror source port override ip=$expectedIp old=${currentPort ?: -1} new=$targetPort wrote=$wrote")
     }
 
     private fun hookMirrorSinkViewLifecycle(classLoader: ClassLoader) {
@@ -2690,6 +3285,45 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             log("failed to prepare fake mirror terminal: ${error.javaClass.simpleName}: ${error.message}")
         }.getOrNull()
 
+    private fun prepareFakeMirrorSourceTerminal(classLoader: ClassLoader): Any? =
+        runCatching {
+            val terminalClass = findTargetClass(classLoader, XIAOMI_MIRROR_TERMINAL)
+            val terminal = terminalClass.getMethod("Q", String::class.java)
+                .invoke(null, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                ?: return@runCatching null
+            callStringTargetMethod(terminal, "H", "Mac")
+            callStringTargetMethod(terminal, "D", "xiaomi")
+            callStringTargetMethod(terminal, "x", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+            callStringTargetMethod(terminal, "F", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+            callStringTargetMethod(terminal, "K", FAKE_MIRROR_LINK_ADDRESS)
+            callInetAddressTargetMethod(
+                terminal,
+                "u",
+                currentFakeMirrorRemotePeerIp() ?: DEFAULT_FAKE_MIRROR_PEER_IP
+            )
+            callStringTargetMethod(terminal, "I", "Mac")
+            callIntTargetMethod(terminal, "v", 170130)
+            callIntTargetMethod(terminal, "t", 1)
+            callIntTargetMethod(terminal, "a", 2)
+            terminal.javaClass.getMethod("B0", Map::class.java)
+                .invoke(terminal, fakeMirrorCapabilities("pad"))
+            callBooleanTargetMethod(terminal, "F0", true)
+            callIntTargetMethod(terminal, "H0", 1)
+            callIntTargetMethod(terminal, "N0", 1)
+            callIntTargetMethod(terminal, "L0", 1)
+            callIntTargetMethod(terminal, "O0", 1)
+            log(
+                "mirror fake source terminal prepared " +
+                    "terminal=${identitySummary(terminal)} " +
+                    "id=${mirrorTerminalId(terminal).orEmpty()} " +
+                    "platform=${mirrorTerminalPlatform(terminal)} " +
+                    "ip=${mirrorTerminalIp(terminal)}"
+            )
+            terminal
+        }.onFailure { error ->
+            log("failed to prepare fake mirror source terminal: ${error.javaClass.simpleName}: ${error.message}")
+        }.getOrNull()
+
     private fun fakeMirrorCapabilities(mode: String): HashMap<String, String> =
         hashMapOf(
             MiLinkPrivilegeHookPolicy.XIAOMI_MIRROR_PACKAGE to when (mode) {
@@ -2801,6 +3435,108 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             val address = terminal.javaClass.getMethod("b").invoke(terminal) as? InetAddress
             address?.hostAddress.orEmpty()
         }.getOrDefault("")
+
+    private fun mirrorTerminalPlatform(terminal: Any?): String =
+        runCatching {
+            if (terminal == null) {
+                return@runCatching ""
+            }
+            (terminal.javaClass.getMethod("n").invoke(terminal) as? String).orEmpty()
+        }.getOrDefault("")
+
+    private fun mirrorControlSourceSummary(source: Any?): String {
+        val ip = readReflectiveStringFieldAny(source, "ip")
+        val port = readReflectiveFieldAny(source, "port") as? Int
+        val handler = readReflectiveFieldAny(source, "mirrorHandler") as? Long
+        val optionHandle = readMirrorControlSourceOptionHandle(source)
+        val hevc = readReflectiveFieldAny(source, "hevc") as? Boolean
+        val hasAudio = readReflectiveFieldAny(source, "has_audio") as? Boolean
+        val runCapture = readReflectiveFieldAny(source, "run_capture") as? Boolean
+        return "source=${identitySummary(source)} " +
+            "ip=${ip.orEmpty()} " +
+            "port=${port ?: -1} " +
+            "handler=${handler ?: -1L} " +
+            "option=$optionHandle " +
+            "hevc=${hevc ?: false} " +
+            "hasAudio=${hasAudio ?: false} " +
+            "runCapture=${runCapture ?: false}"
+    }
+
+    private fun readMirrorControlSourceOptionHandle(source: Any?): Long =
+        (readReflectiveFieldAny(source, "optionHandle") as? Number)?.toLong() ?: 0L
+
+    private fun isMirrorSourceAuthOption(option: Int): Boolean =
+        option == MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_KEY ||
+            option == MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE ||
+            option == MIRROR_OPTION_ENCRYPT_AES_KEY ||
+            option == MIRROR_OPTION_ENCRYPT_AES_IV ||
+            option == MIRROR_OPTION_ENCRYPT_TRANS_BY_MIPLAY
+
+    private fun shouldLogMirrorSourceOption(handle: Long, option: Int): Boolean =
+        shouldForceMirrorSourceSession() &&
+            (isMirrorSourceAuthOption(option) || handle == fakeMirrorSourceOptionHandle)
+
+    private fun summarizeMirrorOptionArgs(args: Array<Any?>): String =
+        args.mapIndexed { index, value ->
+            val summary = when (value) {
+                is ByteArray -> summarizeByteArray(value)
+                is String -> sanitizeMirrorFieldValue(value)
+                else -> value?.toString() ?: "null"
+            }
+            "$index=$summary"
+        }.joinToString(",")
+
+    private fun summarizeByteArray(value: ByteArray?): String {
+        if (value == null) {
+            return "null"
+        }
+        var checksum = 0
+        value.forEach { byte ->
+            checksum = ((checksum * 31) + (byte.toInt() and 0xff)) and 0xffff
+        }
+        return "${value.size}b#${checksum.toString(16)}"
+    }
+
+    private fun logMirrorSourceClassDiagnostics(source: Any?) {
+        if (mirrorSourceClassDiagnosticsLogged || source == null) {
+            return
+        }
+        mirrorSourceClassDiagnosticsLogged = true
+        val sourceClass = source.javaClass
+        log(
+            "mirror source class diagnostics " +
+                "class=${sourceClass.name} " +
+                "methods=${summarizeDeclaredMethods(sourceClass)} " +
+                "fields=${summarizeDeclaredFields(sourceClass)}"
+        )
+    }
+
+    private fun logMirrorControlClassDiagnostics(mirrorControlClass: Class<*>) {
+        if (mirrorControlClassDiagnosticsLogged) {
+            return
+        }
+        mirrorControlClassDiagnosticsLogged = true
+        log(
+            "mirror control class diagnostics " +
+                "class=${mirrorControlClass.name} " +
+                "methods=${summarizeDeclaredMethods(mirrorControlClass)}"
+        )
+    }
+
+    private fun summarizeDeclaredMethods(targetClass: Class<*>): String =
+        targetClass.declaredMethods
+            .sortedWith(compareBy<java.lang.reflect.Method> { it.name }.thenBy { it.parameterTypes.size })
+            .take(MAX_MIRROR_METHOD_DIAGNOSTIC_COUNT)
+            .joinToString("|") { method ->
+                val params = method.parameterTypes.joinToString(",") { type -> type.simpleName }
+                "${method.name}($params):${method.returnType.simpleName}"
+            }
+
+    private fun summarizeDeclaredFields(targetClass: Class<*>): String =
+        targetClass.declaredFields
+            .filter { field -> !Modifier.isStatic(field.modifiers) }
+            .take(MAX_MIRROR_FIELD_DIAGNOSTIC_COUNT)
+            .joinToString("|") { field -> "${field.name}:${field.type.simpleName}" }
 
     private fun mirrorAdvState(reference: Any?): String =
         runCatching {
@@ -3011,6 +3747,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY)
         )
 
+    private fun currentFakeMirrorSourceBindIp(): String =
+        currentFakeMirrorRemoteLocalIp() ?: DEFAULT_FAKE_MIRROR_SOURCE_BIND_IP
+
     private fun shouldForceMirrorCallRelay(): Boolean =
         currentFakeMirrorRemoteMode() == "pad" &&
             currentFakeMirrorRemoteUsingPadEnabled() &&
@@ -3027,6 +3766,14 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun shouldForceMirrorScreenTerminalPresent(): Boolean =
         currentFakeMirrorScreenMode() == "pad"
+
+    private fun shouldForceMirrorSourceRoute(): Boolean =
+        shouldForceMirrorScreenTerminalPresent() &&
+            SystemClock.uptimeMillis() < fakeMirrorSourceRouteUntilUptimeMs
+
+    private fun shouldForceMirrorSourceSession(): Boolean =
+        shouldForceMirrorSourceRoute() ||
+            SystemClock.uptimeMillis() < fakeMirrorSourceSessionUntilUptimeMs
 
     private fun shouldOfferMirrorCallRelay(): Boolean =
         currentFakeMirrorRemoteMode() == "pad" &&
@@ -3178,6 +3925,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_CAST_BUSINESS_WRAPPER = "N2.d"
         private const val XIAOMI_MIRROR_LYRA_BUSINESS = "N2.a"
         private const val XIAOMI_MIRROR_LYRA_UTILS = "x3.z"
+        private const val XIAOMI_MIRROR_NATIVE_LOG_MANAGER = "o4.Q\$a"
         private const val XIAOMI_CONTINUITY_TRUSTED_DEVICE_INFO =
             "com.xiaomi.continuity.networking.TrustedDeviceInfo"
         private const val XIAOMI_MIRROR_CALL_SERVICE = "com.xiaomi.mirror.relay.G"
@@ -3186,6 +3934,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_KEY_DATA = "com.xiaomi.mirror.relay.KeyData"
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
         private const val XIAOMI_MIRROR_CONTROL_SINK = "com.xiaomi.mirrorcontrol.MirrorControlSink"
+        private const val XIAOMI_MIRROR_CONTROL_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlSource"
+        private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
+        private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"
+        private const val XIAOMI_MIRROR_DISPLAY_HELPER = "r3.M"
+        private const val XIAOMI_MIRROR_DISPLAY_CALLBACK = "r3.Y\$a"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlAudioSource"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
         private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
@@ -3212,7 +3965,17 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_AUDIO_PARAMS_THROTTLE_MS = 1_000L
         private const val FAKE_MIRROR_AUDIO_START_PROBE_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
+        private const val FAKE_MIRROR_SOURCE_ROUTE_WINDOW_MS = 30_000L
+        private const val FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS = 120_000L
         private const val FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS = 120_000L
+        private const val MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_KEY = 41
+        private const val MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE = 43
+        private const val MIRROR_AUTHKEY_SOURCE_NONE = 0
+        private const val MIRROR_AUTHKEY_SOURCE_EXTERNAL = 3
+        private val SCREEN_RTSP_AUTH_KEY =
+            "EdgeLinkMirrorK!".toByteArray(Charsets.UTF_8)
+        private val SCREEN_RTSP_AUTH_IV =
+            "EdgeLinkMirrorIV".toByteArray(Charsets.UTF_8)
         private const val INCALLUI_RELAY_ANSWER_THROTTLE_MS = 750L
         private const val INCALLUI_RELAY_SELECTION_THROTTLE_MS = 1_000L
         private const val TELECOM_RELAY_FORCE_LOG_THROTTLE_MS = 2_000L
@@ -3223,6 +3986,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_TRUSTED_TYPES = 1
         private const val DEFAULT_FAKE_MIRROR_PEER_IP = "127.0.0.1"
         private const val DEFAULT_FAKE_MIRROR_PEER_PORT = 7102
+        private const val DEFAULT_FAKE_MIRROR_SOURCE_BIND_IP = "0.0.0.0"
         private const val MIRROR_RELAY_FIELD_LOCAL_IP = "m"
         private const val MIRROR_RELAY_FIELD_PEER_IP = "n"
         private const val MIRROR_RELAY_FIELD_LOCAL_PORT = "o"
@@ -3247,5 +4011,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val MIRROR_SHARED_KEY_MIN_BYTES = 16
         private const val MAX_MIRROR_AUDIO_PARAM_FIELDS = 12
         private const val MAX_MIRROR_FIELD_VALUE_CHARS = 80
+        private const val MAX_MIRROR_METHOD_DIAGNOSTIC_COUNT = 80
+        private const val MAX_MIRROR_FIELD_DIAGNOSTIC_COUNT = 32
     }
 }
