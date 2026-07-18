@@ -312,6 +312,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastFakeMirrorControlSourceUptimeMs: Long = 0L
     private val fakeMirrorScreenAudioLinkedSources =
         Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
+    private val fakeMirrorScreenAudioLinkedDisplays =
+        Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
     private val liveMirrorHEVCEncoders =
         Collections.synchronizedMap(WeakHashMap<MediaCodec, MirrorHEVCEncoderState>())
     private var fakeMirrorSourceAuthConfigDepth: Int = 0
@@ -332,7 +334,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         if (MiLinkPrivilegeHookPolicy.shouldHookRuntime(lpparam.packageName, lpparam.processName)) {
             hookRuntimeCallingPackageCheck(lpparam.classLoader)
             hookRuntimeCallingUidCheck(lpparam.classLoader)
-            hookMirrorHEVCEncoderRecovery()
+            hookMirrorScreenRouteDiagnostics(lpparam.classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMainService(lpparam.packageName, lpparam.processName)) {
             hookCastClientServiceCheck(lpparam.classLoader)
@@ -1131,6 +1133,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorSinkViewLifecycle(classLoader)
         hookMirrorSinkSurfaceCallback(classLoader)
         hookMirrorControlSinkStart(classLoader)
+        hookMirrorDisplayAudioLifecycle(classLoader)
         hookMirrorControlSourceStart(classLoader)
         hookMirrorHEVCEncoderRecovery()
         hookMirrorControlNativeDiagnostics(classLoader)
@@ -1481,7 +1484,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!shouldForceMirrorScreenTerminalPresent()) {
                             return
                         }
-                        linkFakeMirrorScreenAudio(classLoader, param.thisObject, "startMirror")
+                        scheduleFakeMirrorScreenAudioDisplayAttach(
+                            classLoader = classLoader,
+                            source = param.thisObject,
+                            reason = "startMirror"
+                        )
                         log(
                             "mirror source startMirror exit " +
                                 "result=${param.getResult()} " +
@@ -1555,14 +1562,220 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun linkFakeMirrorScreenAudio(classLoader: ClassLoader, source: Any?, reason: String) {
-        applyFakeMirrorScreenAudioLink(
+    private fun hookMirrorDisplayAudioLifecycle(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_DISPLAY,
+                classLoader,
+                "onNotifyAudioInfo",
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!shouldUseOfficialMirrorScreenAudioOwner()) {
+                            return
+                        }
+                        attachFakeMirrorScreenAudioDisplay(
+                            classLoader = classLoader,
+                            display = param.thisObject,
+                            reason = "onNotifyAudioInfo",
+                            sampleRate = param.args.getOrNull(0) as? Int,
+                            bitsPerSample = param.args.getOrNull(1) as? Int,
+                            channels = param.args.getOrNull(2) as? Int,
+                            encodeType = param.args.getOrNull(3) as? Int,
+                            bitrate = param.args.getOrNull(4) as? Int
+                        )
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror display audio lifecycle: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun scheduleFakeMirrorScreenAudioDisplayAttach(
+        classLoader: ClassLoader,
+        source: Any?,
+        reason: String
+    ) {
+        if (source == null || !shouldUseOfficialMirrorScreenAudioOwner()) {
+            return
+        }
+        val delays = longArrayOf(120L, 350L, 800L, 1_600L, 2_800L, 4_200L)
+        val handler = Handler(Looper.getMainLooper())
+        delays.forEach { delayMs ->
+            handler.postDelayed(
+                {
+                    attachActiveFakeMirrorScreenAudioDisplay(
+                        classLoader = classLoader,
+                        source = source,
+                        reason = "$reason:display_poll:${delayMs}ms"
+                    )
+                },
+                delayMs
+            )
+        }
+        log("mirror fake screen official audio display attach scheduled reason=$reason")
+    }
+
+    private fun attachActiveFakeMirrorScreenAudioDisplay(
+        classLoader: ClassLoader,
+        source: Any,
+        reason: String
+    ) {
+        if (!shouldUseOfficialMirrorScreenAudioOwner()) {
+            return
+        }
+        val displays = activeMirrorDisplays(classLoader)
+        val display = displays.firstOrNull { candidate ->
+            MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(readMirrorDisplayDeviceId(candidate)) &&
+                readMirrorDisplaySource(candidate) === source
+        }
+        if (display == null) {
+            log(
+                "mirror fake screen official audio display wait reason=$reason " +
+                    "displays=${displays.joinToString(limit = 4, separator = ";") { mirrorDisplaySummary(it) }} " +
+                    mirrorControlSourceSummary(source)
+            )
+            return
+        }
+        attachFakeMirrorScreenAudioDisplay(
             classLoader = classLoader,
-            source = source,
-            methodName = "l",
-            action = "link",
-            reason = reason
+            display = display,
+            reason = reason,
+            sampleRate = FAKE_MIRROR_SCREEN_AUDIO_SAMPLE_RATE,
+            bitsPerSample = FAKE_MIRROR_SCREEN_AUDIO_BITS,
+            channels = FAKE_MIRROR_SCREEN_AUDIO_CHANNELS,
+            encodeType = FAKE_MIRROR_SCREEN_AUDIO_ENCODE_TYPE,
+            bitrate = FAKE_MIRROR_SCREEN_AUDIO_BITRATE
         )
+    }
+
+    private fun attachFakeMirrorScreenAudioDisplay(
+        classLoader: ClassLoader,
+        display: Any?,
+        reason: String,
+        sampleRate: Int?,
+        bitsPerSample: Int?,
+        channels: Int?,
+        encodeType: Int?,
+        bitrate: Int?
+    ) {
+        if (display == null || !shouldUseOfficialMirrorScreenAudioOwner()) {
+            return
+        }
+        val deviceId = readMirrorDisplayDeviceId(display)
+        val source = readMirrorDisplaySource(display)
+        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) || source == null) {
+            return
+        }
+        if (!isMirrorAudioInfoUsable(sampleRate, bitsPerSample, channels, encodeType, bitrate)) {
+            log(
+                "mirror fake screen official audio wait reason=$reason " +
+                    "deviceId=${deviceId.orEmpty()} " +
+                    "sampleRate=${sampleRate ?: -1} bits=${bitsPerSample ?: -1} " +
+                    "channels=${channels ?: -1} encode=${encodeType ?: -1} bitrate=${bitrate ?: -1} " +
+                    mirrorDisplaySummary(display)
+            )
+            return
+        }
+        if (fakeMirrorScreenAudioLinkedDisplays.containsKey(display) ||
+            fakeMirrorScreenAudioLinkedSources.containsKey(source)
+        ) {
+            refreshFakeMirrorScreenAudioRoute(
+                displayManager = mirrorDisplayManager(classLoader) ?: return,
+                reason = "$reason:already_linked"
+            )
+            return
+        }
+        val usedExistingStrategy =
+            reason == "onNotifyAudioInfo" && mirrorDisplayAudioStrategyAlreadyActive(display)
+        if (!usedExistingStrategy) {
+            applyFakeMirrorScreenAudioDisplayAttach(
+                classLoader = classLoader,
+                display = display,
+                source = source,
+                reason = reason,
+                sampleRate = sampleRate ?: 0,
+                channels = channels ?: 0,
+                encodeType = encodeType ?: 0,
+                bitrate = bitrate ?: 0
+            )
+        } else {
+            fakeMirrorScreenAudioLinkedDisplays[display] = true
+            fakeMirrorScreenAudioLinkedSources[source] = true
+            log(
+                "mirror fake screen official audio attach reason=$reason strategy=existing " +
+                    "audio=${mirrorAudioInfoSummary(sampleRate, bitsPerSample, channels, encodeType, bitrate)} " +
+                    mirrorDisplaySummary(display)
+            )
+        }
+        mirrorDisplayManager(classLoader)?.let { manager ->
+            refreshFakeMirrorScreenAudioRoute(manager, reason)
+        }
+    }
+
+    private fun applyFakeMirrorScreenAudioDisplayAttach(
+        classLoader: ClassLoader,
+        display: Any,
+        source: Any,
+        reason: String,
+        sampleRate: Int,
+        channels: Int,
+        encodeType: Int,
+        bitrate: Int
+    ) {
+        runCatching {
+            val manager = mirrorDisplayManager(classLoader) ?: return@runCatching
+            manager.javaClass
+                .getMethod(
+                    "f1",
+                    Integer.TYPE,
+                    Integer.TYPE,
+                    Integer.TYPE,
+                    Integer.TYPE,
+                    Integer.TYPE
+                )
+                .invoke(manager, encodeType, bitrate, sampleRate, channels, 2)
+            val attachMethod = manager.javaClass.methods.firstOrNull { method ->
+                method.name == "s" &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0].isAssignableFrom(display.javaClass)
+            } ?: throw NoSuchMethodException("s(${display.javaClass.name})")
+            attachMethod.invoke(manager, display)
+            applyFakeMirrorScreenAudioUid(manager, reason)
+            fakeMirrorScreenAudioLinkedDisplays[display] = true
+            fakeMirrorScreenAudioLinkedSources[source] = true
+            log(
+                "mirror fake screen official audio attach reason=$reason strategy=display_lifecycle " +
+                    mirrorDisplaySummary(display)
+            )
+        }.onFailure { error ->
+            log(
+                "failed to attach mirror fake screen official audio display: " +
+                    "${error.javaClass.simpleName}: ${error.message} " +
+                    mirrorDisplaySummary(display)
+            )
+        }
+    }
+
+    private fun applyFakeMirrorScreenAudioUid(displayManager: Any, reason: String) {
+        runCatching {
+            val audioManager = displayManager.javaClass.getMethod("G").invoke(displayManager)
+                ?: return@runCatching
+            val builder = audioManager.javaClass.getMethod("j").invoke(audioManager)
+                ?: return@runCatching
+            val applied = builder.javaClass.getMethod("b").invoke(builder)
+            log("mirror fake screen official audio uid apply reason=$reason applied=$applied")
+        }.onFailure { error ->
+            log(
+                "failed to apply mirror fake screen official audio uid: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
     }
 
     private fun unlinkFakeMirrorScreenAudio(classLoader: ClassLoader, source: Any?, reason: String) {
@@ -1608,6 +1821,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 refreshFakeMirrorScreenAudioRoute(displayManager, reason)
             } else {
                 fakeMirrorScreenAudioLinkedSources.remove(source)
+                removeFakeMirrorScreenAudioLinkedDisplay(source)
                 clearFakeMirrorScreenAudioRoute(audioManager, reason)
             }
             log(
@@ -1620,6 +1834,31 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     "${error.javaClass.simpleName}: ${error.message}"
             )
         }
+    }
+
+    private fun removeFakeMirrorScreenAudioLinkedDisplay(source: Any) {
+        synchronized(fakeMirrorScreenAudioLinkedDisplays) {
+            val iterator = fakeMirrorScreenAudioLinkedDisplays.keys.iterator()
+            while (iterator.hasNext()) {
+                val display = iterator.next()
+                if (readMirrorDisplaySource(display) === source) {
+                    iterator.remove()
+                }
+            }
+        }
+    }
+
+    private fun mirrorDisplayManager(classLoader: ClassLoader): Any? =
+        runCatching {
+            val displayManagerClass = findTargetClass(classLoader, XIAOMI_MIRROR_DISPLAY_MANAGER)
+            displayManagerClass.getMethod("C").invoke(null)
+        }.getOrNull()
+
+    private fun activeMirrorDisplays(classLoader: ClassLoader): List<Any> {
+        val displayManager = mirrorDisplayManager(classLoader) ?: return emptyList()
+        val displayMap = readReflectiveFieldAny(displayManager, "p", "f19232p") as? Map<*, *>
+            ?: return emptyList()
+        return displayMap.values.filterNotNull()
     }
 
     private fun refreshFakeMirrorScreenAudioRoute(displayManager: Any, reason: String) {
@@ -3880,6 +4119,84 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             "runCapture=${runCapture ?: false}"
     }
 
+    private fun mirrorDisplaySummary(display: Any?): String {
+        val config = readMirrorDisplayConfig(display)
+        val source = readMirrorDisplaySource(display)
+        return "display=${identitySummary(display)} " +
+            "deviceId=${readMirrorDisplayDeviceId(display).orEmpty()} " +
+            "screenId=${readMirrorDisplayScreenId(display) ?: -1} " +
+            "displayId=${readMirrorDisplayVirtualDisplayId(display) ?: -1} " +
+            "state=${readReflectiveFieldAny(display, "f19113g") ?: "?"} " +
+            "configAudio=${readReflectiveBooleanMethod(config, "A") ?: false} " +
+            "configMirror=${readReflectiveBooleanMethod(config, "D") ?: false} " +
+            "strategy=${readReflectiveFieldAny(display, "f19103R")?.javaClass?.name.orEmpty()} " +
+            mirrorControlSourceSummary(source)
+    }
+
+    private fun mirrorAudioInfoSummary(
+        sampleRate: Int?,
+        bitsPerSample: Int?,
+        channels: Int?,
+        encodeType: Int?,
+        bitrate: Int?
+    ): String =
+        "sampleRate=${sampleRate ?: -1} " +
+            "bits=${bitsPerSample ?: -1} " +
+            "channels=${channels ?: -1} " +
+            "encode=${encodeType ?: -1} " +
+            "bitrate=${bitrate ?: -1}"
+
+    private fun isMirrorAudioInfoUsable(
+        sampleRate: Int?,
+        bitsPerSample: Int?,
+        channels: Int?,
+        encodeType: Int?,
+        bitrate: Int?
+    ): Boolean =
+        (sampleRate ?: 0) in 8_000..192_000 &&
+            (bitsPerSample ?: 0) in 8..32 &&
+            (channels ?: 0) in 1..8 &&
+            (encodeType ?: 0) > 0 &&
+            (bitrate ?: 0) >= 0
+
+    private fun mirrorDisplayAudioStrategyAlreadyActive(display: Any?): Boolean {
+        val config = readMirrorDisplayConfig(display)
+        val strategy = readReflectiveFieldAny(display, "f19103R")
+        return readReflectiveBooleanMethod(config, "A") == true &&
+            strategy != null &&
+            strategy.javaClass.name != XIAOMI_MIRROR_STUB_AUDIO_ROUTE_STRATEGY
+    }
+
+    private fun readMirrorDisplayConfig(display: Any?): Any? =
+        runCatching {
+            display?.javaClass?.getMethod("c")?.invoke(display)
+        }.getOrNull()
+
+    private fun readMirrorDisplaySource(display: Any?): Any? =
+        runCatching {
+            display?.javaClass?.getMethod("G")?.invoke(display)
+        }.getOrNull() ?: readReflectiveFieldAny(display, "f19109c")
+
+    private fun readMirrorDisplayDeviceId(display: Any?): String? =
+        runCatching {
+            display?.javaClass?.getMethod("A")?.invoke(display) as? String
+        }.getOrNull() ?: readReflectiveStringFieldAny(display, "f19087B")
+
+    private fun readMirrorDisplayScreenId(display: Any?): Int? =
+        runCatching {
+            display?.javaClass?.getMethod("getScreenId")?.invoke(display) as? Int
+        }.getOrNull() ?: readReflectiveFieldAny(display, "f19111e") as? Int
+
+    private fun readMirrorDisplayVirtualDisplayId(display: Any?): Int? =
+        runCatching {
+            display?.javaClass?.getMethod("e")?.invoke(display) as? Int
+        }.getOrNull()
+
+    private fun readReflectiveBooleanMethod(target: Any?, methodName: String): Boolean? =
+        runCatching {
+            target?.javaClass?.getMethod(methodName)?.invoke(target) as? Boolean
+        }.getOrNull()
+
     private fun readMirrorControlSourceOptionHandle(source: Any?): Long =
         (readReflectiveFieldAny(source, "optionHandle") as? Number)?.toLong() ?: 0L
 
@@ -4412,8 +4729,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_CONTROL_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlSource"
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
         private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"
+        private const val XIAOMI_MIRROR_DISPLAY = "r3.AbstractC1397I"
         private const val XIAOMI_MIRROR_DISPLAY_HELPER = "r3.M"
         private const val XIAOMI_MIRROR_DISPLAY_CALLBACK = "r3.Y\$a"
+        private const val XIAOMI_MIRROR_STUB_AUDIO_ROUTE_STRATEGY = "k2.C1054b"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlAudioSource"
         private const val XIAOMI_MIRROR_CONTROL_AUDIO_SINK = "com.xiaomi.mirrorcontrol.MirrorControlAudioSink"
         private const val XIAOMI_MIRROR_META_INFO = "com.xiaomi.miplay.report.MirrorMetaInfo"
@@ -4458,6 +4777,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val MIRROR_HEVC_MIME = "video/hevc"
         private const val MIRROR_HEVC_MAX_I_FRAME_INTERVAL_SECONDS = 1
         private const val MIRROR_HEVC_SYNC_REQUEST_THROTTLE_MS = 600L
+        private const val FAKE_MIRROR_SCREEN_AUDIO_SAMPLE_RATE = 48_000
+        private const val FAKE_MIRROR_SCREEN_AUDIO_BITS = 16
+        private const val FAKE_MIRROR_SCREEN_AUDIO_CHANNELS = 2
+        private const val FAKE_MIRROR_SCREEN_AUDIO_ENCODE_TYPE = 3
+        private const val FAKE_MIRROR_SCREEN_AUDIO_BITRATE = 192_000
         private const val FAKE_MIRROR_LINK_ADDRESS = "edgelink-fake-pad"
         private const val FAKE_MIRROR_TRUSTED_DEVICE_TYPE = 4
         private const val FAKE_MIRROR_TRUSTED_MEDIUM_TYPES = 65_664
