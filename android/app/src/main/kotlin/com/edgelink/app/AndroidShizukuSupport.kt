@@ -302,6 +302,11 @@ object AndroidShizukuSupport {
                     "setprop",
                     MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY,
                     untilEpochMs.toString()
+                ),
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY,
+                    "official"
                 )
             )
             sanitizedPeerHost?.let {

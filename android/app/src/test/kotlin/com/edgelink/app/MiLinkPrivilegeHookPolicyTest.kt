@@ -350,6 +350,16 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun parsesMirrorFakeRemoteScreenAudioOwner() {
+        assertEquals("official", MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner("official"))
+
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner("mute"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner("1"))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner(""))
+        assertEquals(null, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner(null))
+    }
+
+    @Test
     fun parsesMirrorFakeRemoteCallState() {
         assertEquals(0, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("idle"))
         assertEquals(1, MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState("ringing"))

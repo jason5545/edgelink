@@ -473,10 +473,28 @@ class EdgeLinkShizukuCommandPolicyTest {
                 )
             )
         )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY,
+                    "official"
+                )
+            )
+        )
 
         assertFalse(
             EdgeLinkShizukuCommandPolicy.isAllowed(
                 arrayOf("setprop", MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY, "car")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf(
+                    "setprop",
+                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY,
+                    "mute"
+                )
             )
         )
         assertFalse(

@@ -56,6 +56,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY = "debug.edgelink.mirror_fake_remote_call_relay_until"
     const val MIRROR_FAKE_REMOTE_SCREEN_PROPERTY = "debug.edgelink.mirror_fake_remote_screen"
     const val MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY = "debug.edgelink.mirror_fake_remote_screen_until"
+    const val MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY = "debug.edgelink.mirror_fake_remote_screen_audio_owner"
     const val MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY = "debug.edgelink.mirror_fake_remote_call_state"
     const val MIRROR_FAKE_REMOTE_AUDIO_PROPERTY = "debug.edgelink.mirror_fake_remote_audio"
     const val MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_params"
@@ -198,6 +199,12 @@ internal object MiLinkPrivilegeHookPolicy {
             untilEpochMs > nowEpochMs
         } == true
 
+    fun mirrorFakeRemoteScreenAudioOwner(rawValue: String?): String? =
+        when (rawValue?.trim()?.lowercase()) {
+            "official" -> "official"
+            else -> null
+        }
+
     fun mirrorFakeRemoteCallState(rawValue: String?): Int? =
         when (rawValue?.trim()?.lowercase()) {
             "0", "idle" -> 0
@@ -303,6 +310,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var fakeMirrorSourceOptionHandle: Long = 0L
     private var lastFakeMirrorControlSource: Any? = null
     private var lastFakeMirrorControlSourceUptimeMs: Long = 0L
+    private val fakeMirrorScreenAudioLinkedSources =
+        Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
     private val liveMirrorHEVCEncoders =
         Collections.synchronizedMap(WeakHashMap<MediaCodec, MirrorHEVCEncoderState>())
     private var fakeMirrorSourceAuthConfigDepth: Int = 0
@@ -1472,6 +1481,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         if (!shouldForceMirrorScreenTerminalPresent()) {
                             return
                         }
+                        linkFakeMirrorScreenAudio(classLoader, param.thisObject, "startMirror")
                         log(
                             "mirror source startMirror exit " +
                                 "result=${param.getResult()} " +
@@ -1486,6 +1496,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 "closeMirror",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        unlinkFakeMirrorScreenAudio(classLoader, param.thisObject, "closeMirror")
                         if (lastFakeMirrorControlSource === param.thisObject) {
                             log(
                                 "mirror source remembered instance closing " +
@@ -1541,6 +1552,102 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }.onFailure { error ->
             log("failed to hook mirror source control: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun linkFakeMirrorScreenAudio(classLoader: ClassLoader, source: Any?, reason: String) {
+        applyFakeMirrorScreenAudioLink(
+            classLoader = classLoader,
+            source = source,
+            methodName = "l",
+            action = "link",
+            reason = reason
+        )
+    }
+
+    private fun unlinkFakeMirrorScreenAudio(classLoader: ClassLoader, source: Any?, reason: String) {
+        applyFakeMirrorScreenAudioLink(
+            classLoader = classLoader,
+            source = source,
+            methodName = "n",
+            action = "unlink",
+            reason = reason
+        )
+    }
+
+    private fun applyFakeMirrorScreenAudioLink(
+        classLoader: ClassLoader,
+        source: Any?,
+        methodName: String,
+        action: String,
+        reason: String
+    ) {
+        if (source == null) {
+            return
+        }
+        val linkAction = action == "link"
+        val previouslyLinked = fakeMirrorScreenAudioLinkedSources.containsKey(source)
+        if (linkAction && !shouldUseOfficialMirrorScreenAudioOwner()) {
+            return
+        }
+        if (!linkAction && !previouslyLinked && !shouldUseOfficialMirrorScreenAudioOwner()) {
+            return
+        }
+        runCatching {
+            val sourceClass = findTargetClass(classLoader, XIAOMI_MIRROR_CONTROL_SOURCE)
+            val displayManagerClass = findTargetClass(classLoader, XIAOMI_MIRROR_DISPLAY_MANAGER)
+            val displayManager = displayManagerClass.getMethod("C").invoke(null)
+                ?: return@runCatching
+            val audioManager = displayManager.javaClass.getMethod("G").invoke(displayManager)
+                ?: return@runCatching
+            audioManager.javaClass
+                .getMethod(methodName, sourceClass, java.lang.Boolean.TYPE)
+                .invoke(audioManager, source, true)
+            if (linkAction) {
+                fakeMirrorScreenAudioLinkedSources[source] = true
+                refreshFakeMirrorScreenAudioRoute(displayManager, reason)
+            } else {
+                fakeMirrorScreenAudioLinkedSources.remove(source)
+                clearFakeMirrorScreenAudioRoute(audioManager, reason)
+            }
+            log(
+                "mirror fake screen official audio $action reason=$reason " +
+                    mirrorControlSourceSummary(source)
+            )
+        }.onFailure { error ->
+            log(
+                "failed to $action mirror fake screen official audio: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    private fun refreshFakeMirrorScreenAudioRoute(displayManager: Any, reason: String) {
+        runCatching {
+            val runnable = readReflectiveFieldAny(displayManager, "H", "f19214H") as? Runnable
+                ?: return@runCatching
+            runnable.run()
+            log("mirror fake screen official audio route refresh reason=$reason")
+        }.onFailure { error ->
+            log(
+                "failed to refresh mirror fake screen official audio route: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    private fun clearFakeMirrorScreenAudioRoute(audioManager: Any, reason: String) {
+        runCatching {
+            val builder = audioManager.javaClass.getMethod("j").invoke(audioManager)
+                ?: return@runCatching
+            builder.javaClass.getMethod("c").invoke(builder)
+            val applied = builder.javaClass.getMethod("b").invoke(builder)
+            log("mirror fake screen official audio route clear reason=$reason applied=$applied")
+        }.onFailure { error ->
+            log(
+                "failed to clear mirror fake screen official audio route: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
         }
     }
 
@@ -4008,6 +4115,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun currentFakeMirrorProviderMode(): String? =
         currentFakeMirrorCallRelayMode() ?: currentFakeMirrorScreenMode()
 
+    private fun currentFakeMirrorScreenAudioOwner(): String? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenAudioOwner(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY)
+        )?.takeIf { currentFakeMirrorScreenMode() == "pad" }
+
     private fun currentFakeMirrorRemoteCallState(): Int? =
         MiLinkPrivilegeHookPolicy.mirrorFakeRemoteCallState(
             readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY)
@@ -4077,6 +4189,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun shouldForceMirrorScreenTerminalPresent(): Boolean =
         currentFakeMirrorScreenMode() == "pad"
+
+    private fun shouldUseOfficialMirrorScreenAudioOwner(): Boolean =
+        currentFakeMirrorScreenAudioOwner() == "official"
 
     private fun shouldForceMirrorSourceRoute(): Boolean =
         shouldForceMirrorScreenTerminalPresent() &&
