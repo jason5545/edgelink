@@ -9,7 +9,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
     private static var allowXiaomiScreenPrimaryRoute: Bool {
-        UserDefaults.standard.object(forKey: xiaomiScreenPrimaryRouteDefaultsKey) as? Bool ?? false
+        UserDefaults.standard.object(forKey: xiaomiScreenPrimaryRouteDefaultsKey) as? Bool ?? true
     }
 
     @Published private(set) var localDeviceId = "Registering..."
@@ -281,18 +281,22 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         let preferredScreenRoute = latestMiLinkStatus?.preferredRoutes?["screen"]
-        if preferredScreenRoute?.hasPrefix("xiaomi.") == true {
+        let xiaomiScreenRoute = Self.xiaomiScreenRouteCandidate(
+            from: latestMiLinkStatus,
+            preferredRoute: preferredScreenRoute
+        )
+        if xiaomiScreenRoute?.hasPrefix("xiaomi.") == true {
             guard Self.allowXiaomiScreenPrimaryRoute else {
-                xiaomiMiLinkCommandStatus = "小米鏡像仍在診斷，改用 EdgeLink 畫面"
+                xiaomiMiLinkCommandStatus = "小米鏡像已停用"
                 DiagnosticsLog.warn(
-                    "xiaomi.mac.screen_route_skipped route=\(preferredScreenRoute ?? "unknown") " +
-                        "reason=self_contained_endpoint_unverified " +
+                    "xiaomi.mac.screen_no_fallback route=\(xiaomiScreenRoute ?? "unknown") " +
+                        "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
+                        "reason=disabled_by_user_default " +
                         "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
                         "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
                         "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) " +
                         "xiaomiMirrorDeviceIdSource=hyperconnect_cache"
                 )
-                startEdgeLinkPhoneScreen(reason: "xiaomi_self_contained_unverified")
                 return
             }
             let command = "xiaomi.mirror.startMainDisplay"
@@ -300,23 +304,21 @@ final class EdgeLinkRuntime: ObservableObject {
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
-            let xiaomiMirrorDeviceId = XiaomiHyperConnectBridge.localDeviceId()
             DiagnosticsLog.info(
-                "xiaomi.mac.screen_route_selected command=\(command) route=\(preferredScreenRoute ?? "unknown") " +
+                "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "unknown") " +
+                    "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
                     "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
                     "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
                     "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) gatedByOfficialApp=false " +
-                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=false " +
-                    "xiaomiMirrorDeviceId=\(xiaomiMirrorDeviceId ?? "none") timeoutMs=\(timeoutMs)"
+                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
+                    "xiaomiMirrorDeviceId=none timeoutMs=\(timeoutMs)"
             )
             var args: [String: String] = [:]
             if let peerHost {
                 args["peerHost"] = peerHost
             }
             args["peerPort"] = String(peerPort)
-            if let xiaomiMirrorDeviceId {
-                args["remoteDeviceId"] = xiaomiMirrorDeviceId
-            }
+            args["forceFakeRemote"] = "true"
             let requestId = sendMiLinkCommand(
                 command: command,
                 args: args
@@ -325,7 +327,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 pendingXiaomiScreenFallback = PendingXiaomiScreenFallback(
                     requestId: requestId,
                     command: command,
-                    route: preferredScreenRoute ?? "unknown",
+                    route: xiaomiScreenRoute ?? "unknown",
                     startedAt: Date(),
                     timeoutMs: timeoutMs,
                     officialDiscoveryRequired: latestMiLinkStatus?.officialDiscoveryRequired ?? false,
@@ -338,28 +340,26 @@ final class EdgeLinkRuntime: ObservableObject {
                     try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
                     await MainActor.run {
                         guard let self,
-                              var pending = self.pendingXiaomiScreenFallback,
+                              let pending = self.pendingXiaomiScreenFallback,
                               pending.requestId == requestId,
                               !pending.fallbackStarted else {
                             return
                         }
-                        pending.fallbackStarted = true
-                        self.pendingXiaomiScreenFallback = pending
                         self.pendingXiaomiScreenFallbackTask = nil
-                        self.xiaomiMiLinkCommandStatus = "小米鏡像未回應，改用 EdgeLink 畫面"
+                        self.xiaomiMiLinkCommandStatus = "小米鏡像未回應"
                         DiagnosticsLog.warn(
-                            "xiaomi.mac.screen_fallback requestId=\(requestId) command=\(pending.command) " +
+                            "xiaomi.mac.screen_no_fallback requestId=\(requestId) command=\(pending.command) " +
                                 "route=\(pending.route) reason=timeout timeoutMs=\(pending.timeoutMs) " +
                                 "elapsedMs=\(pending.elapsedMs) officialDiscoveryRequired=\(pending.officialDiscoveryRequired) " +
                                 "phoneDevices=\(pending.phoneDevices) hyperConnectInstalled=\(pending.hyperConnectInstalled)"
                         )
-                        self.stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_timeout")
-                        self.startEdgeLinkPhoneScreen(reason: "xiaomi_timeout")
                     }
                 }
                 return
             }
-            DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(preferredScreenRoute ?? "unknown")")
+            DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "unknown")")
+            xiaomiMiLinkCommandStatus = "小米鏡像指令未送出"
+            return
         }
         startEdgeLinkPhoneScreen(reason: "generic")
     }
@@ -1065,7 +1065,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 pendingXiaomiScreenFallback = nil
                 pendingXiaomiScreenFallbackTask?.cancel()
                 pendingXiaomiScreenFallbackTask = nil
-                startEdgeLinkPhoneScreen(reason: "xiaomi_send_failed")
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_no_fallback requestId=\(body.requestId) " +
+                        "command=\(body.command) reason=send_failed"
+                )
             }
             xiaomiMiLinkCommandStatus = "小米服務送出失敗"
             DiagnosticsLog.error("xiaomi.mac.command_send_failed requestId=\(body.requestId) command=\(body.command)", error)
@@ -1835,14 +1838,12 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         if isMirrorPending {
-            xiaomiMiLinkCommandStatus = "小米鏡像未完成，已用 EdgeLink 畫面"
+            xiaomiMiLinkCommandStatus = "小米鏡像未完成"
             DiagnosticsLog.warn(
-                "xiaomi.mac.screen_fallback requestId=\(result.requestId) command=\(pending.command) " +
+                "xiaomi.mac.screen_no_fallback requestId=\(result.requestId) command=\(pending.command) " +
                     "route=\(pending.route) reason=pending elapsedMs=\(pending.elapsedMs) " +
                     "message=\(result.message) data=\(Self.formatDiagnosticsData(result.data))"
             )
-            stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_pending_fallback")
-            startEdgeLinkPhoneScreen(reason: "xiaomi_pending")
             return
         }
 
@@ -1853,13 +1854,12 @@ final class EdgeLinkRuntime: ObservableObject {
                     "elapsedMs=\(pending.elapsedMs) data=\(Self.formatDiagnosticsData(result.data))"
             )
         } else {
+            xiaomiMiLinkCommandStatus = "小米鏡像失敗"
             DiagnosticsLog.warn(
-                "xiaomi.mac.screen_fallback requestId=\(result.requestId) command=\(pending.command) " +
+                "xiaomi.mac.screen_no_fallback requestId=\(result.requestId) command=\(pending.command) " +
                     "route=\(pending.route) reason=result_failed elapsedMs=\(pending.elapsedMs) " +
                     "message=\(result.message) data=\(Self.formatDiagnosticsData(result.data))"
             )
-            stopXiaomiMirrorRTSPDiagnosticSource(reason: "xiaomi_result_failed")
-            startEdgeLinkPhoneScreen(reason: "xiaomi_result_failed")
         }
     }
 
@@ -1895,12 +1895,29 @@ final class EdgeLinkRuntime: ObservableObject {
         return (rawHost, portValue)
     }
 
+    private static func xiaomiScreenRouteCandidate(
+        from status: MiLinkStatusBody?,
+        preferredRoute: String?
+    ) -> String? {
+        if preferredRoute?.hasPrefix("xiaomi.") == true {
+            return preferredRoute
+        }
+        return status?.services?.first { service in
+            service.category == "screen" &&
+                service.available &&
+                service.route.hasPrefix("xiaomi.")
+        }?.id
+    }
+
     private func autoWarmXiaomiServicesIfNeeded(_ status: MiLinkStatusBody) {
         guard isConnected else {
             return
         }
         let prefersXiaomiMirror =
-            status.preferredRoutes?["screen"]?.hasPrefix("xiaomi.") == true ||
+            Self.xiaomiScreenRouteCandidate(
+                from: status,
+                preferredRoute: status.preferredRoutes?["screen"]
+            )?.hasPrefix("xiaomi.") == true ||
             status.preferredRoutes?["recentApps"]?.hasPrefix("xiaomi.") == true
         if !didAutoQueryXiaomiMirrorDevices, prefersXiaomiMirror {
             didAutoQueryXiaomiMirrorDevices = true

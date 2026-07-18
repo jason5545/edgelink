@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import com.edgelink.core.MiLinkServiceCapabilityBody
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -62,10 +63,12 @@ object AndroidMiLinkServiceCatalog {
                 BindProbeResult(false, "service=missing")
             }
 
+            val xiaomiFamilyDevice = isXiaomiOrPocoDevice()
             val miShareAvailable = miShareInstalled && miShareStaticConfig && messengerTransportOk
             val miSharePreferred = false
             val mirrorRemoteAvailable = mirrorRemoteDeviceCount > 0
             val mirrorScreenAvailable = mirrorInstalled && castServiceOk
+            val mirrorScreenPreferred = xiaomiFamilyDevice && mirrorScreenAvailable
             val recentAppsAvailable = mirrorInstalled && castServiceOk && mirrorRemoteAvailable
             val synergyAvailable = mirrorInstalled && mirrorSynergyService && synergyBind.success && mirrorRemoteAvailable
             val distAudioAvailable = audioInstalled && distAudioService && distAudioBind.success
@@ -102,8 +105,8 @@ object AndroidMiLinkServiceCatalog {
                     category = "screen",
                     route = "xiaomi.mirror",
                     available = mirrorScreenAvailable,
-                    preferred = officialXiaomiPreferred,
-                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount remoteArm=realDevice diagnosticOnly=true"
+                    preferred = mirrorScreenPreferred,
+                    evidence = "package=${mirrorInstalled.step()} castBinder=${castServiceOk.step()} remoteDevices=$mirrorRemoteDeviceCount remoteArm=realDevice xiaomiFamily=${xiaomiFamilyDevice.step()} defaultRoute=xiaomiMirror"
                 ),
                 MiLinkServiceCapabilityBody(
                     id = "xiaomi.mirror.synergy",
@@ -153,13 +156,27 @@ object AndroidMiLinkServiceCatalog {
                     services.joinToString(separator = " ") { service ->
                         "${service.id}=${service.available.step()}"
                     } +
-                    " preferred=$preferredRoutes"
+                    " xiaomiFamily=${xiaomiFamilyDevice.step()} preferred=$preferredRoutes"
             )
             ServiceCatalogResult(
                 services = services,
                 preferredRoutes = preferredRoutes
             )
         }
+
+    private fun isXiaomiOrPocoDevice(): Boolean {
+        val fields = listOf(
+            Build.MANUFACTURER,
+            Build.BRAND,
+            Build.PRODUCT,
+            Build.DEVICE,
+            Build.MODEL
+        )
+        return fields.any { raw ->
+            val value = raw.lowercase(Locale.US)
+            value.contains("xiaomi") || value.contains("poco") || value.contains("redmi")
+        }
+    }
 
     private suspend fun bindProbe(context: Context, intent: Intent): BindProbeResult =
         runCatching {

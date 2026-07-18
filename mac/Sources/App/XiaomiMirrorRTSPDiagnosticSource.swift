@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreMedia
 import CoreVideo
 import CryptoKit
@@ -1798,6 +1799,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkTSCaptureStartLogged = false
     private var mptSinkTSDemuxer: XiaomiMirrorMPEGTSHEVCDemuxer?
     private var mptSinkHEVCDecoder: XiaomiMirrorHEVCDecoder?
+    private var mptSinkAudioPlayer: XiaomiMirrorMPTPrivateAudioPlayer?
     private var mptSinkDecodedFrames: UInt64 = 0
     private var mptSinkDecodeFailedFrames: UInt64 = 0
     private var stopped = false
@@ -1836,10 +1838,18 @@ private final class XiaomiMirrorRTPMediaSender {
             decoder.onDecodeFailed = { [weak self] in
                 self?.mptSinkDecodeFailedFrames += 1
             }
+            let audioPlayer = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: sessionID)
             self.mptSinkHEVCDecoder = decoder
-            self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(sessionID: sessionID) { [weak decoder] accessUnit, pts90k in
-                decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
-            }
+            self.mptSinkAudioPlayer = audioPlayer
+            self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(
+                sessionID: sessionID,
+                onAccessUnit: { [weak decoder] accessUnit, pts90k in
+                    decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+                },
+                onPrivateAudioPES: { [weak audioPlayer] payload, pts90k in
+                    audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
+                }
+            )
         }
     }
 
@@ -2653,6 +2663,7 @@ private final class XiaomiMirrorRTPMediaSender {
         mptSinkTSCaptureHandle?.closeFile()
         mptSinkTSCaptureHandle = nil
         mptSinkTSDemuxer?.flush()
+        mptSinkAudioPlayer?.stop(reason: reason)
         mptSinkHEVCDecoder?.invalidate()
         if transportMode == .mpt {
             DiagnosticsLog.info(
@@ -2876,22 +2887,397 @@ private struct MPEGTSFirstPacket {
     let continuityCounter: UInt8
 }
 
+private struct XiaomiMirrorMPTPrivateAudioFormat: Equatable {
+    let sampleRate: Double
+    let channels: AVAudioChannelCount
+    let bitsPerSample: Int
+
+    var bytesPerFrame: Int {
+        Int(channels) * max(1, bitsPerSample / 8)
+    }
+
+    static let fallback = XiaomiMirrorMPTPrivateAudioFormat(
+        sampleRate: 48_000,
+        channels: 2,
+        bitsPerSample: 16
+    )
+}
+
+private struct XiaomiMirrorMPTPrivateAudioPayload {
+    let kind: String
+    let format: XiaomiMirrorMPTPrivateAudioFormat
+    let declaredFrames: Int?
+    let declaredPayloadBytes: Int
+    let privatePTS90k: UInt64?
+    let pcmPayload: Data
+}
+
+private final class XiaomiMirrorMPTPrivateAudioPlayer {
+    private let sessionID: UUID
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var playerFormat: AVAudioFormat?
+    private var activeFormat = XiaomiMirrorMPTPrivateAudioFormat.fallback
+    private var privateCaptureHandle: FileHandle?
+    private var pcmCaptureHandle: FileHandle?
+    private var privateCaptureBytes = 0
+    private var pcmCaptureBytes = 0
+    private var pesReceived: UInt64 = 0
+    private var pcmBytesScheduled: UInt64 = 0
+    private var validPCMReported = false
+    private var unsupportedFormatLogged = false
+    private var parseFailureCount: UInt64 = 0
+    private var scheduleFailureCount: UInt64 = 0
+
+    init(sessionID: UUID) {
+        self.sessionID = sessionID
+    }
+
+    func pushPESPayload(_ payload: Data, pts90k: UInt64?) {
+        pesReceived += 1
+        writePrivateCapture(payload)
+        guard let parsed = parsePrivatePayload(payload) else {
+            parseFailureCount += 1
+            if parseFailureCount <= 5 || parseFailureCount % 50 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.audio_private_parse_failed session=\(sessionID.uuidString) " +
+                        "pes=\(pesReceived) bytes=\(payload.count) pts90k=\(pts90k.map(String.init) ?? "none") " +
+                        "firstBytes=\(Self.hexPreview(payload, limit: 24)) failures=\(parseFailureCount)"
+                )
+            }
+            return
+        }
+
+        if parsed.format.bitsPerSample != 16 {
+            if !unsupportedFormatLogged {
+                unsupportedFormatLogged = true
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.audio_private_unsupported session=\(sessionID.uuidString) " +
+                        "bits=\(parsed.format.bitsPerSample) sampleRate=\(Int(parsed.format.sampleRate)) " +
+                        "channels=\(parsed.format.channels)"
+                )
+            }
+            return
+        }
+
+        activeFormat = parsed.format
+        let pcmPayload = parsed.pcmPayload
+        writePCMCapture(pcmPayload)
+        let stats = pcmS16LEStats(pcmPayload)
+        let shouldLog = pesReceived <= 5 || pesReceived % 100 == 0 || (stats.nonzeroSamples > 0 && !validPCMReported)
+        if stats.nonzeroSamples > 0 && !validPCMReported {
+            validPCMReported = true
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.audio_pcm_valid session=\(sessionID.uuidString) " +
+                    "pcmTotal=\(pcmBytesScheduled + UInt64(pcmPayload.count)) maxAbs=\(stats.maxAbs) " +
+                    "avgAbs=\(stats.averageAbs)"
+            )
+        }
+        if shouldLog {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.audio_private_payload session=\(sessionID.uuidString) " +
+                    "pes=\(pesReceived) kind=\(parsed.kind) sampleRate=\(Int(parsed.format.sampleRate)) " +
+                    "channels=\(parsed.format.channels) bits=\(parsed.format.bitsPerSample) " +
+                    "frames=\(parsed.declaredFrames.map(String.init) ?? "none") " +
+                    "declaredBytes=\(parsed.declaredPayloadBytes) pcmBytes=\(pcmPayload.count) " +
+                    "pts90k=\(pts90k.map(String.init) ?? "none") privatePTS90k=\(parsed.privatePTS90k.map(String.init) ?? "none") " +
+                    "nonzero=\(stats.nonzeroSamples) maxAbs=\(stats.maxAbs) avgAbs=\(stats.averageAbs) " +
+                    "fp=\(DiagnosticsLog.fingerprint(pcmPayload))"
+            )
+        }
+        schedulePCM(pcmPayload, format: parsed.format)
+    }
+
+    func stop(reason: String) {
+        let hadAudio = audioEngine != nil || privateCaptureHandle != nil || pcmCaptureHandle != nil || pesReceived > 0
+        playerNode?.stop()
+        audioEngine?.stop()
+        audioEngine = nil
+        playerNode = nil
+        playerFormat = nil
+        privateCaptureHandle?.closeFile()
+        privateCaptureHandle = nil
+        pcmCaptureHandle?.closeFile()
+        pcmCaptureHandle = nil
+        if hadAudio {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.audio_stop session=\(sessionID.uuidString) reason=\(reason) " +
+                    "pes=\(pesReceived) pcmScheduled=\(pcmBytesScheduled) privateCaptureBytes=\(privateCaptureBytes) " +
+                    "pcmCaptureBytes=\(pcmCaptureBytes) privatePath=\(Self.privateCapturePath) pcmPath=\(Self.pcmCapturePath)"
+            )
+        }
+    }
+
+    private func parsePrivatePayload(_ payload: Data) -> XiaomiMirrorMPTPrivateAudioPayload? {
+        guard payload.count >= 18,
+              payload[0] == 0xff else {
+            return nil
+        }
+        switch payload[1] {
+        case 0x03:
+            guard payload.count >= 32,
+                  let packedFormat = payload.readUInt16BE(at: 6),
+                  let sampleRate = payload.readUInt32BE(at: 8),
+                  let declaredFrames = payload.readUInt32BE(at: 12),
+                  let bitsPerSample = payload.readUInt32BE(at: 16),
+                  let declaredPayloadBytes = payload.readUInt32BE(at: 20) else {
+                return nil
+            }
+            let packedChannels = AVAudioChannelCount(max(1, Int((packedFormat >> 8) & 0xff)))
+            let packedBits = Int(packedFormat & 0xff)
+            let format = XiaomiMirrorMPTPrivateAudioFormat(
+                sampleRate: sampleRate > 0 ? Double(sampleRate) : activeFormat.sampleRate,
+                channels: packedChannels > 0 ? packedChannels : activeFormat.channels,
+                bitsPerSample: bitsPerSample > 0 ? Int(bitsPerSample) : (packedBits > 0 ? packedBits : activeFormat.bitsPerSample)
+            )
+            let pcmPayload = trimmedAudioPayload(payload, headerLength: 32, declaredPayloadBytes: Int(declaredPayloadBytes))
+            return XiaomiMirrorMPTPrivateAudioPayload(
+                kind: "ff03",
+                format: format,
+                declaredFrames: Int(declaredFrames),
+                declaredPayloadBytes: Int(declaredPayloadBytes),
+                privatePTS90k: payload.readUInt32BE(at: 28).map(UInt64.init),
+                pcmPayload: pcmPayload
+            )
+
+        case 0x02:
+            guard let declaredPayloadBytes = payload.readUInt32BE(at: 8) else {
+                return nil
+            }
+            let format = activeFormat
+            let pcmPayload = trimmedAudioPayload(payload, headerLength: 18, declaredPayloadBytes: Int(declaredPayloadBytes))
+            let frames = format.bytesPerFrame > 0 ? pcmPayload.count / format.bytesPerFrame : nil
+            return XiaomiMirrorMPTPrivateAudioPayload(
+                kind: "ff02",
+                format: format,
+                declaredFrames: frames,
+                declaredPayloadBytes: Int(declaredPayloadBytes),
+                privatePTS90k: payload.readUInt32BE(at: 14).map(UInt64.init),
+                pcmPayload: pcmPayload
+            )
+
+        default:
+            return nil
+        }
+    }
+
+    private func trimmedAudioPayload(_ payload: Data, headerLength: Int, declaredPayloadBytes: Int) -> Data {
+        guard payload.count > headerLength else {
+            return Data()
+        }
+        let payloadEnd = min(payload.count, headerLength + max(0, declaredPayloadBytes))
+        guard payloadEnd > headerLength else {
+            return Data()
+        }
+        return payload.subdata(in: headerLength..<payloadEnd)
+    }
+
+    private func schedulePCM(_ pcmPayload: Data, format: XiaomiMirrorMPTPrivateAudioFormat) {
+        guard !pcmPayload.isEmpty else {
+            return
+        }
+        guard ensureAudioEngine(format: format),
+              let playerNode,
+              let playerFormat else {
+            return
+        }
+        let bytesPerFrame = format.bytesPerFrame
+        let frameCount = pcmPayload.count / bytesPerFrame
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: playerFormat,
+                frameCapacity: AVAudioFrameCount(frameCount)
+              ) else {
+            return
+        }
+        let byteCount = frameCount * bytesPerFrame
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        guard let destination = buffer.int16ChannelData?[0] else {
+            scheduleFailureCount += 1
+            if scheduleFailureCount <= 5 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.audio_schedule_failed session=\(sessionID.uuidString) " +
+                        "reason=missing_int16_channel_data failures=\(scheduleFailureCount)"
+                )
+            }
+            return
+        }
+        pcmPayload.withUnsafeBytes { rawBuffer in
+            if let baseAddress = rawBuffer.baseAddress {
+                memcpy(destination, baseAddress, byteCount)
+            }
+        }
+        playerNode.scheduleBuffer(buffer, completionHandler: nil)
+        pcmBytesScheduled += UInt64(byteCount)
+    }
+
+    private func ensureAudioEngine(format: XiaomiMirrorMPTPrivateAudioFormat) -> Bool {
+        if audioEngine != nil, playerNode != nil, playerFormat != nil, activeFormat == format {
+            if playerNode?.isPlaying == false {
+                playerNode?.play()
+            }
+            return true
+        }
+        playerNode?.stop()
+        audioEngine?.stop()
+        audioEngine = nil
+        playerNode = nil
+        playerFormat = nil
+        activeFormat = format
+
+        guard let avFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: format.sampleRate,
+            channels: format.channels,
+            interleaved: true
+        ) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.audio_engine_unavailable session=\(sessionID.uuidString) reason=bad_format " +
+                    "sampleRate=\(Int(format.sampleRate)) channels=\(format.channels) bits=\(format.bitsPerSample)"
+            )
+            return false
+        }
+        let engine = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: avFormat)
+        do {
+            try engine.start()
+            node.play()
+            audioEngine = engine
+            playerNode = node
+            playerFormat = avFormat
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.audio_engine_start session=\(sessionID.uuidString) " +
+                    "sampleRate=\(Int(format.sampleRate)) channels=\(format.channels) bits=\(format.bitsPerSample)"
+            )
+            return true
+        } catch {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.audio_engine_start_failed session=\(sessionID.uuidString) error=\(error)"
+            )
+            return false
+        }
+    }
+
+    private func writePrivateCapture(_ payload: Data) {
+        writeCapture(
+            payload,
+            path: Self.privateCapturePath,
+            startEvent: "xiaomi.mirror.mpt.audio_private_capture_start",
+            handle: &privateCaptureHandle,
+            bytesWritten: &privateCaptureBytes
+        )
+    }
+
+    private func writePCMCapture(_ payload: Data) {
+        writeCapture(
+            payload,
+            path: Self.pcmCapturePath,
+            startEvent: "xiaomi.mirror.mpt.audio_pcm_capture_start",
+            handle: &pcmCaptureHandle,
+            bytesWritten: &pcmCaptureBytes
+        )
+    }
+
+    private func writeCapture(
+        _ payload: Data,
+        path: String,
+        startEvent: String,
+        handle: inout FileHandle?,
+        bytesWritten: inout Int
+    ) {
+        guard bytesWritten < Self.captureLimitBytes, !payload.isEmpty else {
+            return
+        }
+        if handle == nil {
+            if FileManager.default.fileExists(atPath: path) {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            FileManager.default.createFile(atPath: path, contents: nil)
+            handle = FileHandle(forWritingAtPath: path)
+            bytesWritten = 0
+            DiagnosticsLog.info("\(startEvent) session=\(sessionID.uuidString) path=\(path) limitBytes=\(Self.captureLimitBytes)")
+        }
+        guard let handle else {
+            return
+        }
+        let remaining = Self.captureLimitBytes - bytesWritten
+        let chunk = payload.prefix(max(0, min(remaining, payload.count)))
+        guard !chunk.isEmpty else {
+            return
+        }
+        do {
+            handle.seekToEndOfFile()
+            try handle.write(contentsOf: chunk)
+            bytesWritten += chunk.count
+        } catch {
+            DiagnosticsLog.warn("xiaomi.mirror.mpt.audio_capture_write_failed session=\(sessionID.uuidString) path=\(path) error=\(error)")
+        }
+    }
+
+    private func pcmS16LEStats(_ data: Data) -> (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int) {
+        var samples = 0
+        var nonzeroSamples = 0
+        var maxAbs = 0
+        var absTotal = 0
+        var offset = 0
+        while offset + 1 < data.count {
+            let raw = UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+            let value = Int(Int16(bitPattern: raw))
+            let magnitude = abs(value)
+            samples += 1
+            if value != 0 {
+                nonzeroSamples += 1
+            }
+            maxAbs = max(maxAbs, magnitude)
+            absTotal += magnitude
+            offset += 2
+        }
+        return (
+            samples: samples,
+            nonzeroSamples: nonzeroSamples,
+            maxAbs: maxAbs,
+            averageAbs: samples > 0 ? absTotal / samples : 0
+        )
+    }
+
+    private static func hexPreview(_ data: Data, limit: Int) -> String {
+        data.prefix(limit).map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    private static let privateCapturePath = "/private/tmp/edgelink-xiaomi-mirror-audio-private.bin"
+    private static let pcmCapturePath = "/private/tmp/edgelink-xiaomi-mirror-audio.pcm"
+    private static let captureLimitBytes = 4 * 1024 * 1024
+}
+
 private final class XiaomiMirrorMPEGTSHEVCDemuxer {
     private let sessionID: UUID
     private let onAccessUnit: ([Data], UInt64?) -> Void
+    private let onPrivateAudioPES: ((Data, UInt64?) -> Void)?
     private var pmtPID: UInt16?
     private var videoPID: UInt16?
+    private var privateAudioPID: UInt16?
     private var currentPES = Data()
     private var currentPESPTS90k: UInt64?
+    private var currentAudioPES = Data()
+    private var currentAudioPESPTS90k: UInt64?
     private var accessUnitAssembler: XiaomiMirrorHEVCAccessUnitAssembler
     private var packetsParsed: UInt64 = 0
     private var pesParsed: UInt64 = 0
+    private var audioPESParsed: UInt64 = 0
     private var didLogPAT = false
     private var didLogPMT = false
+    private var didLogPrivateAudioPMT = false
 
-    init(sessionID: UUID, onAccessUnit: @escaping ([Data], UInt64?) -> Void) {
+    init(
+        sessionID: UUID,
+        onAccessUnit: @escaping ([Data], UInt64?) -> Void,
+        onPrivateAudioPES: ((Data, UInt64?) -> Void)? = nil
+    ) {
         self.sessionID = sessionID
         self.onAccessUnit = onAccessUnit
+        self.onPrivateAudioPES = onPrivateAudioPES
         self.accessUnitAssembler = XiaomiMirrorHEVCAccessUnitAssembler(sessionID: sessionID, onAccessUnit: onAccessUnit)
     }
 
@@ -2908,6 +3294,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
 
     func flush() {
         flushCurrentPES()
+        flushCurrentAudioPES()
         accessUnitAssembler.flush()
     }
 
@@ -2943,6 +3330,10 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
         if let videoPID, pid == videoPID {
             parseVideoPayload(payload, payloadUnitStart: payloadUnitStart, rtpTimestamp: rtpTimestamp)
+            return
+        }
+        if let privateAudioPID, pid == privateAudioPID {
+            parsePrivateAudioPayload(payload, payloadUnitStart: payloadUnitStart, rtpTimestamp: rtpTimestamp)
         }
     }
 
@@ -3003,7 +3394,15 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
                             "videoPID=\(Self.hexPID(elementaryPID)) streamType=0x24"
                     )
                 }
-                return
+            } else if streamType == Self.xiaomiPrivateAudioStreamType {
+                privateAudioPID = elementaryPID
+                if !didLogPrivateAudioPMT {
+                    didLogPrivateAudioPMT = true
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.mpt.ts_pmt_audio session=\(sessionID.uuidString) " +
+                            "audioPID=\(Self.hexPID(elementaryPID)) streamType=0x83"
+                    )
+                }
             }
             offset += 5 + esInfoLength
         }
@@ -3022,6 +3421,19 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
     }
 
+    private func parsePrivateAudioPayload(_ payload: Data, payloadUnitStart: Bool, rtpTimestamp: UInt32) {
+        if payloadUnitStart {
+            flushCurrentAudioPES()
+            guard let pes = parsePESStart(payload, fallbackPTS90k: UInt64(rtpTimestamp)) else {
+                return
+            }
+            currentAudioPES = pes.payload
+            currentAudioPESPTS90k = pes.pts90k
+        } else if !currentAudioPES.isEmpty {
+            currentAudioPES.append(payload)
+        }
+    }
+
     private func flushCurrentPES() {
         guard !currentPES.isEmpty else {
             return
@@ -3036,6 +3448,23 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
         currentPES.removeAll(keepingCapacity: true)
         currentPESPTS90k = nil
+    }
+
+    private func flushCurrentAudioPES() {
+        guard !currentAudioPES.isEmpty else {
+            return
+        }
+        audioPESParsed += 1
+        onPrivateAudioPES?(currentAudioPES, currentAudioPESPTS90k)
+        if audioPESParsed <= 5 || audioPESParsed % 100 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.ts_audio_pes session=\(sessionID.uuidString) pes=\(audioPESParsed) " +
+                    "bytes=\(currentAudioPES.count) pts90k=\(currentAudioPESPTS90k.map(String.init) ?? "none") " +
+                    "firstBytes=\(Self.hexPreview(currentAudioPES, limit: 16))"
+            )
+        }
+        currentAudioPES.removeAll(keepingCapacity: true)
+        currentAudioPESPTS90k = nil
     }
 
     private func parsePESStart(_ payload: Data, fallbackPTS90k: UInt64?) -> (payload: Data, pts90k: UInt64?)? {
@@ -3090,9 +3519,14 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         String(format: "0x%04x", value)
     }
 
+    private static func hexPreview(_ data: Data, limit: Int) -> String {
+        data.prefix(limit).map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
     private static let packetLength = 188
     private static let syncByte: UInt8 = 0x47
     private static let hevcStreamType: UInt8 = 0x24
+    private static let xiaomiPrivateAudioStreamType: UInt8 = 0x83
 }
 
 private final class XiaomiMirrorHEVCAccessUnitAssembler {
