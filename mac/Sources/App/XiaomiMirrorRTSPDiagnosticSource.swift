@@ -67,11 +67,14 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private var connections: [UUID: NWConnection] = [:]
     private var states: [UUID: RTSPConnectionState] = [:]
     private var stopWorkItem: DispatchWorkItem?
+    private var activeClientRetryWorkItems: [UUID: DispatchWorkItem] = [:]
     private var port: UInt16 = 7102
     private var advertisedHost: String?
 
     private let sourceRTPPort: UInt16 = 19_002
     private let officialMPTClientPort: UInt16 = 15_550
+    private let officialMPTMaxRTSPRetries = 3
+    private let officialMPTRTSPRetryDelay: TimeInterval = 1
     private let transportModeDefaultsKey = "xiaomiMirrorRTSPTransportMode"
     private let protocolProfileDefaultsKey = "xiaomiMirrorRTSPProtocolProfile"
     private let authKeyDefaultsKey = "xiaomiMirrorRTSPAuthKey"
@@ -88,7 +91,13 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
     func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
         try performOnQueue {
-            try self.connectOnQueue(host: host, port: port, advertisedHost: advertisedHost, lifetime: lifetime)
+            try self.connectOnQueue(
+                host: host,
+                port: port,
+                advertisedHost: advertisedHost,
+                lifetime: lifetime,
+                retryAttempt: 0
+            )
         }
     }
 
@@ -130,7 +139,13 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         listener.start(queue: queue)
     }
 
-    private func connectOnQueue(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
+    private func connectOnQueue(
+        host: String,
+        port: UInt16,
+        advertisedHost: String?,
+        lifetime: TimeInterval,
+        retryAttempt: Int
+    ) throws {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedHost.isEmpty else {
             throw XiaomiMirrorRTSPDiagnosticSourceError.invalidHost(host)
@@ -146,11 +161,15 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: endpointPort, using: .tcp)
         var state = RTSPConnectionState()
         state.mode = "active_client"
+        state.activeClientHost = trimmedHost
+        state.activeClientPort = port
+        state.activeClientLifetime = lifetime
+        state.activeClientRetryAttempt = retryAttempt
         connections[id] = connection
         states[id] = state
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.active_client_start id=\(id.uuidString) host=\(trimmedHost) port=\(port) " +
-                "advertisedHost=\(self.advertisedHost ?? "none") lifetime=\(Int(lifetime)) " +
+                "advertisedHost=\(self.advertisedHost ?? "none") lifetime=\(Int(lifetime)) retryAttempt=\(retryAttempt) " +
                 "protocolProfile=\(protocolProfile.rawValue) transportMode=\(transportMode.rawValue)"
         )
         connection.stateUpdateHandler = { [weak self] state in
@@ -164,6 +183,10 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         let hadListener = listener != nil || !connections.isEmpty
         stopWorkItem?.cancel()
         stopWorkItem = nil
+        for workItem in activeClientRetryWorkItems.values {
+            workItem.cancel()
+        }
+        activeClientRetryWorkItems.removeAll()
         listener?.cancel()
         listener = nil
         for state in states.values {
@@ -413,13 +436,33 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 sendIDRRequest(id: id, connection: connection)
             }
         case "SET_PARAMETER":
-            if message.body.contains("wfd_trigger_method") {
+            let triggerMethod = Self.rtspTriggerMethod(in: message.body)
+            if let triggerMethod {
                 DiagnosticsLog.info(
-                    "xiaomi.mirror.rtsp.peer_trigger id=\(id.uuidString) body=\(Self.preview(message.body))"
+                    "xiaomi.mirror.rtsp.peer_trigger id=\(id.uuidString) trigger=\(triggerMethod) " +
+                        "body=\(Self.preview(message.body))"
                 )
             }
             sendResponse(id: id, connection: connection, cseq: message.cseq)
             if isOfficialMPTRoute {
+                switch triggerMethod {
+                case "TEARDOWN":
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.rtsp.peer_trigger_teardown id=\(id.uuidString) " +
+                            "officialAction=stop_sink"
+                    )
+                    cleanupConnection(id: id, reason: "peer_trigger_teardown")
+                    return
+                case "PAUSE":
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.rtsp.peer_trigger_pause id=\(id.uuidString) " +
+                            "officialAction=stop_sink_keep_rtsp"
+                    )
+                    stopMediaIfNeeded(id: id, reason: "peer_trigger_pause")
+                    return
+                default:
+                    break
+                }
                 recordPeerSetParameter(message.body, id: id)
                 startOfficialMPTSinkIfNeeded(id: id, connection: connection, reason: "peer_m4")
                 sendActiveSetupIfNeeded(id: id, connection: connection)
@@ -1117,7 +1160,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 localRTCPPort: sourceRTPPort + 1,
                 sessionID: id,
                 mptSinkOnly: false,
-                onDecodedFrame: nil
+                onDecodedFrame: nil,
+                onMPTMediaStalled: nil
             )
             state.mediaSender = sender
             states[id] = state
@@ -1162,7 +1206,12 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 localRTCPPort: officialMPTClientPort,
                 sessionID: id,
                 mptSinkOnly: true,
-                onDecodedFrame: onDecodedFrame
+                onDecodedFrame: onDecodedFrame,
+                onMPTMediaStalled: { [weak self] stalledID, stallReason in
+                    self?.queue.async {
+                        self?.handleOfficialMPTSinkStalled(id: stalledID, reason: stallReason)
+                    }
+                }
             )
             state.mediaSender = sender
             states[id] = state
@@ -1282,6 +1331,91 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         states[id] = state
     }
 
+    private func handleOfficialMPTSinkStalled(id: UUID, reason: String) {
+        guard let state = states[id] else {
+            return
+        }
+        let retryAttempt = state.activeClientRetryAttempt
+        let retryHost = state.activeClientHost
+        let retryPort = state.activeClientPort
+        let retryLifetime = state.activeClientLifetime
+        let retryEndpoint = retryHost.map { host in
+            retryPort.map { "\(host):\($0)" } ?? "\(host):none"
+        } ?? "none"
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.rtsp.mpt_sink_stalled id=\(id.uuidString) reason=\(reason) " +
+                "mode=\(state.mode) retryAttempt=\(retryAttempt) " +
+                "retryEndpoint=\(retryEndpoint) " +
+                "officialAction=stop_sink_retry_rtsp"
+        )
+        cleanupConnection(id: id, reason: "mpt_sink_stalled")
+
+        guard state.mode == "active_client",
+              let retryHost,
+              let retryPort else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.mpt_sink_stall_retry_skipped id=\(id.uuidString) " +
+                    "reason=peer_controls_reconnect mode=\(state.mode)"
+            )
+            return
+        }
+        guard retryAttempt < officialMPTMaxRTSPRetries else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.active_client_retry_exhausted previousId=\(id.uuidString) " +
+                    "host=\(retryHost) port=\(retryPort) attempts=\(retryAttempt)"
+            )
+            return
+        }
+        scheduleOfficialActiveClientRetry(
+            previousID: id,
+            host: retryHost,
+            port: retryPort,
+            lifetime: retryLifetime,
+            nextAttempt: retryAttempt + 1
+        )
+    }
+
+    private func scheduleOfficialActiveClientRetry(
+        previousID: UUID,
+        host: String,
+        port: UInt16,
+        lifetime: TimeInterval,
+        nextAttempt: Int
+    ) {
+        activeClientRetryWorkItems[previousID]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+            self.activeClientRetryWorkItems.removeValue(forKey: previousID)
+            do {
+                try self.connectOnQueue(
+                    host: host,
+                    port: port,
+                    advertisedHost: self.advertisedHost,
+                    lifetime: lifetime,
+                    retryAttempt: nextAttempt
+                )
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.rtsp.active_client_retry_started previousId=\(previousID.uuidString) " +
+                        "host=\(host) port=\(port) attempt=\(nextAttempt)"
+                )
+            } catch {
+                DiagnosticsLog.error(
+                    "xiaomi.mirror.rtsp.active_client_retry_failed previousId=\(previousID.uuidString) " +
+                        "host=\(host) port=\(port) attempt=\(nextAttempt)",
+                    error
+                )
+            }
+        }
+        activeClientRetryWorkItems[previousID] = workItem
+        queue.asyncAfter(deadline: .now() + officialMPTRTSPRetryDelay, execute: workItem)
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.active_client_retry_scheduled previousId=\(previousID.uuidString) " +
+                "host=\(host) port=\(port) attempt=\(nextAttempt) delayMs=\(Int(officialMPTRTSPRetryDelay * 1000))"
+        )
+    }
+
     private func sendResponse(
         id: UUID,
         connection: NWConnection,
@@ -1363,8 +1497,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         return session
     }
 
-    private func cleanupConnection(id: UUID) {
-        stopMediaIfNeeded(id: id, reason: "connection_cleanup")
+    private func cleanupConnection(id: UUID, reason: String = "connection_cleanup") {
+        stopMediaIfNeeded(id: id, reason: reason)
         connections[id]?.cancel()
         connections.removeValue(forKey: id)
         states.removeValue(forKey: id)
@@ -1528,6 +1662,15 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             return value.isEmpty ? nil : String(value)
         }
         return nil
+    }
+
+    private static func rtspTriggerMethod(in body: String) -> String? {
+        guard let value = parameterValue(named: "wfd_trigger_method", in: body) else {
+            return nil
+        }
+        return value.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            .first
+            .map { String($0).uppercased() }
     }
 
     private static func requestedParameterNames(in body: String) -> Set<String> {
@@ -1714,6 +1857,10 @@ private struct RTSPConnectionState {
     var activeMPTUserID: String?
     var activeSetupTransportRaw: String?
     var activePeerMPTServerPort: UInt16?
+    var activeClientHost: String?
+    var activeClientPort: UInt16?
+    var activeClientLifetime: TimeInterval = 0
+    var activeClientRetryAttempt = 0
     var mediaSender: XiaomiMirrorRTPMediaSender?
 }
 
@@ -1744,6 +1891,7 @@ private struct RTSPTransportSelection {
 
 private final class XiaomiMirrorRTPMediaSender {
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTPMediaSender")
+    private let mptDecodeQueue = DispatchQueue(label: "EdgeLink.XiaomiMirrorMPTDecode")
     private let transportMode: XiaomiMirrorRTSPTransportMode
     private let destinationHost: String
     private let destinationRTPPort: UInt16
@@ -1753,6 +1901,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private let sessionID: UUID
     private let mptSinkOnly: Bool
     private let onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
+    private let onMPTMediaStalled: ((UUID, String) -> Void)?
     private let frameRate: Int32 = XiaomiMirrorVideoDefaults.frameRate
     private let rtpPacketsPerPayload = 7
     private var connection: NWConnection?
@@ -1762,6 +1911,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptDestinationAddress: sockaddr_in?
     private var frameTimer: DispatchSourceTimer?
     private var rtcpTimer: DispatchSourceTimer?
+    private var mptSinkPacketWatchdogTimer: DispatchSourceTimer?
     private var encoder: XiaomiMirrorH264Encoder
     private var muxer = XiaomiMirrorMPEGTSMuxer()
     private var sequenceNumber = UInt16.random(in: 0...UInt16.max)
@@ -1809,6 +1959,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkAudioPlayer: XiaomiMirrorMPTPrivateAudioPlayer?
     private var mptSinkDecodedFrames: UInt64 = 0
     private var mptSinkDecodeFailedFrames: UInt64 = 0
+    private var lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var stopped = false
 
     init(
@@ -1820,7 +1971,8 @@ private final class XiaomiMirrorRTPMediaSender {
         localRTCPPort: UInt16,
         sessionID: UUID,
         mptSinkOnly: Bool,
-        onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
+        onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?,
+        onMPTMediaStalled: ((UUID, String) -> Void)?
     ) throws {
         self.transportMode = transportMode
         self.destinationHost = destinationHost
@@ -1831,6 +1983,7 @@ private final class XiaomiMirrorRTPMediaSender {
         self.sessionID = sessionID
         self.mptSinkOnly = mptSinkOnly
         self.onDecodedFrame = onDecodedFrame
+        self.onMPTMediaStalled = onMPTMediaStalled
         self.kcpConversationID = mptSinkOnly ? nil : Self.defaultKCPConversationID
         self.encoder = try XiaomiMirrorH264Encoder(
             width: XiaomiMirrorVideoDefaults.width,
@@ -1840,21 +1993,29 @@ private final class XiaomiMirrorRTPMediaSender {
         if mptSinkOnly {
             let decoder = XiaomiMirrorHEVCDecoder(sessionID: sessionID)
             decoder.onFrame = { [weak self] pixelBuffer, width, height in
-                self?.handleDecodedMPTSinkFrame(pixelBuffer, width: width, height: height)
+                self?.mptDecodeQueue.async {
+                    self?.handleDecodedMPTSinkFrame(pixelBuffer, width: width, height: height)
+                }
             }
             decoder.onDecodeFailed = { [weak self] in
-                self?.mptSinkDecodeFailedFrames += 1
+                self?.mptDecodeQueue.async {
+                    self?.mptSinkDecodeFailedFrames += 1
+                }
             }
             let audioPlayer = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: sessionID)
             self.mptSinkHEVCDecoder = decoder
             self.mptSinkAudioPlayer = audioPlayer
             self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(
                 sessionID: sessionID,
-                onAccessUnit: { [weak decoder] accessUnit, pts90k in
-                    decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+                onAccessUnit: { [weak self, weak decoder] accessUnit, pts90k in
+                    self?.mptDecodeQueue.async {
+                        decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+                    }
                 },
-                onPrivateAudioPES: { [weak audioPlayer] payload, pts90k in
-                    audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
+                onPrivateAudioPES: { [weak self, weak audioPlayer] payload, pts90k in
+                    self?.mptDecodeQueue.async {
+                        audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
+                    }
                 }
             )
         }
@@ -1960,6 +2121,7 @@ private final class XiaomiMirrorRTPMediaSender {
         _ = withUnsafePointer(to: &reuse) { pointer in
             Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, pointer, socklen_t(MemoryLayout<Int32>.size))
         }
+        applyOfficialMPTSocketBufferOptions(fd: fd)
         _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
 
         var localAddress = Self.anyIPv4SocketAddress(port: localRTPPort)
@@ -1987,6 +2149,8 @@ private final class XiaomiMirrorRTPMediaSender {
                 }
             }
             startFrameTimer()
+        } else {
+            startMPTSinkPacketWatchdog()
         }
         startMPTReceiveSource(fd: fd)
         let convDescription = kcpConversationID.map { Self.hex32($0) } ?? "pending_peer_first_segment"
@@ -1997,6 +2161,75 @@ private final class XiaomiMirrorRTPMediaSender {
                 "payload=\(mptSinkOnly ? "KCP_PUSH_RECEIVE_ACK_ONLY" : "KCP_PUSH_RTP/PT33/MP2T/H264AnnexB") " +
                 "video=\(XiaomiMirrorVideoDefaults.width)x\(XiaomiMirrorVideoDefaults.height)@\(frameRate)"
         )
+    }
+
+    private func applyOfficialMPTSocketBufferOptions(fd: Int32) {
+        var sendBufferBytes: Int32 = Self.officialMPTSocketBufferBytes
+        var receiveBufferBytes: Int32 = Self.officialMPTSocketBufferBytes
+        let sendResult = withUnsafePointer(to: &sendBufferBytes) { pointer in
+            Darwin.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, pointer, socklen_t(MemoryLayout<Int32>.size))
+        }
+        let sendErrno = sendResult == 0 ? 0 : errno
+        let receiveResult = withUnsafePointer(to: &receiveBufferBytes) { pointer in
+            Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, pointer, socklen_t(MemoryLayout<Int32>.size))
+        }
+        let receiveErrno = receiveResult == 0 ? 0 : errno
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.socket_options session=\(sessionID.uuidString) " +
+                "sendBufferTarget=\(Self.officialMPTSocketBufferBytes) sendResult=\(sendResult) sendErrno=\(sendErrno) " +
+                "receiveBufferTarget=\(Self.officialMPTSocketBufferBytes) receiveResult=\(receiveResult) receiveErrno=\(receiveErrno)"
+        )
+    }
+
+    private func startMPTSinkPacketWatchdog() {
+        guard mptSinkOnly, mptSinkPacketWatchdogTimer == nil else {
+            return
+        }
+        lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            self?.checkMPTSinkPacketWatchdog()
+        }
+        mptSinkPacketWatchdogTimer = timer
+        timer.resume()
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.no_packet_watchdog_start session=\(sessionID.uuidString) " +
+                "thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) officialBehavior=stop_wifi_display_sink"
+        )
+    }
+
+    private func checkMPTSinkPacketWatchdog() {
+        guard mptSinkOnly, !stopped else {
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsedSeconds = Double(now - lastMPTMediaPacketUptimeNanoseconds) / 1_000_000_000
+        guard elapsedSeconds >= Self.mptSinkNoPacketTimeoutSeconds else {
+            return
+        }
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.mpt.no_packets_timeout session=\(sessionID.uuidString) " +
+                "elapsedSeconds=\(String(format: "%.2f", elapsedSeconds)) thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) " +
+                "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                "decodedFrames=\(mptSinkDecodedFrames) officialAction=stop_sink_retry_rtsp"
+        )
+        stopOnQueue(reason: "mpt_no_packets_timeout")
+        onMPTMediaStalled?(sessionID, "no_packets_beyond_6s")
+    }
+
+    private func recordMPTMediaPacketActivity(reason: String) {
+        guard mptSinkOnly else {
+            return
+        }
+        lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        if kcpPUSHReceived <= 5 || kcpPUSHReceived % 100 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.media_packet_activity session=\(sessionID.uuidString) " +
+                    "reason=\(reason) pushReceived=\(kcpPUSHReceived) rtpReceived=\(mptSinkRTPPacketsReceived) " +
+                    "decodedFrames=\(mptSinkDecodedFrames)"
+            )
+        }
     }
 
     private func startMPTReceiveSource(fd: Int32) {
@@ -2420,6 +2653,7 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func deliverKCPPush(_ segment: KCPIncomingSegment) {
+        recordMPTMediaPacketActivity(reason: "kcp_push")
         if kcpPUSHReceived <= 5 || kcpPUSHReceived % 20 == 0 {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.kcp_push_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
@@ -2563,7 +2797,11 @@ private final class XiaomiMirrorRTPMediaSender {
     private func resetMPTSinkAfterTransportLoss(reason: String, detail: String) {
         mptSinkInterleavedBuffer.removeAll(keepingCapacity: true)
         mptSinkTSDemuxer?.noteTransportDiscontinuity(reason: reason)
-        mptSinkHEVCDecoder?.requireRandomAccess(reason: reason)
+        if let decoder = mptSinkHEVCDecoder {
+            mptDecodeQueue.async {
+                decoder.requireRandomAccess(reason: reason)
+            }
+        }
         DiagnosticsLog.warn(
             "xiaomi.mirror.mpt.transport_discontinuity session=\(sessionID.uuidString) " +
                 "reason=\(reason) \(detail) kcpResync=\(kcpReceiveResyncCount) " +
@@ -2773,7 +3011,8 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func stopOnQueue(reason: String) {
-        guard !stopped || connection != nil || rtcpConnection != nil || frameTimer != nil || rtcpTimer != nil else {
+        guard !stopped || connection != nil || rtcpConnection != nil || frameTimer != nil ||
+            rtcpTimer != nil || mptSinkPacketWatchdogTimer != nil else {
             return
         }
         stopped = true
@@ -2781,6 +3020,8 @@ private final class XiaomiMirrorRTPMediaSender {
         frameTimer = nil
         rtcpTimer?.cancel()
         rtcpTimer = nil
+        mptSinkPacketWatchdogTimer?.cancel()
+        mptSinkPacketWatchdogTimer = nil
         encoder.invalidate()
         mptReadSource?.cancel()
         mptReadSource = nil
@@ -2793,8 +3034,12 @@ private final class XiaomiMirrorRTPMediaSender {
         mptSinkTSCaptureHandle?.closeFile()
         mptSinkTSCaptureHandle = nil
         mptSinkTSDemuxer?.flush()
-        mptSinkAudioPlayer?.stop(reason: reason)
-        mptSinkHEVCDecoder?.invalidate()
+        let audioPlayer = mptSinkAudioPlayer
+        let decoder = mptSinkHEVCDecoder
+        mptDecodeQueue.async {
+            audioPlayer?.stop(reason: reason)
+            decoder?.invalidate()
+        }
         if transportMode == .mpt {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.stop session=\(sessionID.uuidString) reason=\(reason) " +
@@ -2825,9 +3070,11 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let kcpCommandWASK: UInt8 = 0x53
     private static let kcpCommandWINS: UInt8 = 0x54
     private static let kcpHeaderLength = 24
-    private static let kcpReceiveWindow: UInt16 = 128
-    private static let kcpReceiveBufferLimit = 64
-    private static let kcpReceiveMaxGap: UInt32 = 512
+    private static let kcpReceiveWindow: UInt16 = 600
+    private static let kcpReceiveBufferLimit = 600
+    private static let kcpReceiveMaxGap: UInt32 = 1_200
+    private static let officialMPTSocketBufferBytes: Int32 = 6_291_456
+    private static let mptSinkNoPacketTimeoutSeconds: Double = 6
     private static let rtspInterleavedMagic: UInt8 = 0x24
     private static let rtspInterleavedHeaderLength = 4
     private static let rtpMinimumHeaderLength = 12
@@ -3973,7 +4220,7 @@ private final class XiaomiMirrorHEVCDecoder {
         let status = VTDecompressionSessionDecodeFrame(
             decompressionSession!,
             sampleBuffer: sampleBuffer,
-            flags: [],
+            flags: Self.asynchronousDecodeFrameFlags,
             frameRefcon: nil,
             infoFlagsOut: &infoFlags
         )
@@ -4186,6 +4433,8 @@ private final class XiaomiMirrorHEVCDecoder {
     private static func nalType(_ nalUnit: Data) -> UInt8 {
         XiaomiMirrorHEVCAccessUnitAssembler.nalType(nalUnit)
     }
+
+    private static let asynchronousDecodeFrameFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
 
     private static let outputCallback: VTDecompressionOutputCallback = { refCon, _, status, _, imageBuffer, _, _ in
         guard let refCon else {
