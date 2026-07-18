@@ -98,6 +98,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastSourceRecoveryAt = Date.distantPast
     private var xiaomiScreenLastSourceRecoverySessionID: UUID?
     private var xiaomiScreenLastSourceRecoveryRequestID: String?
+    private var xiaomiScreenLastSourceRecoveryDecodedFrames: UInt64?
     private var xiaomiScreenUserStopped = false
     private var didAutoBindXiaomiDistAudio = false
     private var didAutoQueryXiaomiMirrorDevices = false
@@ -169,6 +170,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [weak self, screenSession] pixelBuffer, width, height in
             Task { @MainActor in
                 self?.xiaomiScreenRecoveryAttempt = 0
+                self?.xiaomiScreenLastSourceRecoveryDecodedFrames = nil
                 screenSession.renderXiaomiMirrorFrame(pixelBuffer, width: width, height: height)
             }
         }
@@ -1065,6 +1067,11 @@ final class EdgeLinkRuntime: ObservableObject {
         if shouldSuppressXiaomiScreenRecoveryForCooldown(event: event, phase: "event") {
             return
         }
+        if Self.isXiaomiScreenFrameStall(event.reason),
+           !Self.shouldEscalateXiaomiScreenFrameStallToSessionRebuild(event),
+           shouldSuppressXiaomiScreenSourceRecoveryForCooldown(event: event, phase: "event_before_attempt") {
+            return
+        }
         let attempt = xiaomiScreenRecoveryAttempt + 1
         xiaomiScreenRecoveryAttempt = attempt
         let recoveryWillRebuildSession = Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt)
@@ -1224,7 +1231,8 @@ final class EdgeLinkRuntime: ObservableObject {
         markXiaomiScreenSourceRecoveryStarted(
             requestId: requestId,
             sourceSessionID: event.sessionID,
-            reason: event.reason
+            reason: event.reason,
+            decodedFrames: event.decodedFrames
         )
         if !isPhoneScreenSessionActive {
             xiaomiMiLinkCommandStatus = "小米鏡像要求來源刷新"
@@ -1305,6 +1313,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenLastSourceRecoveryAt = .distantPast
         xiaomiScreenLastSourceRecoverySessionID = nil
         xiaomiScreenLastSourceRecoveryRequestID = nil
+        xiaomiScreenLastSourceRecoveryDecodedFrames = nil
         DiagnosticsLog.info("xiaomi.mac.screen_recovery_state_reset reason=\(reason)")
     }
 
@@ -1312,6 +1321,31 @@ final class EdgeLinkRuntime: ObservableObject {
         event: XiaomiMirrorRTSPRecoveryEvent,
         phase: String
     ) -> Bool {
+        if Self.isXiaomiScreenFrameStall(event.reason),
+           xiaomiScreenLastSourceRecoverySessionID == event.sessionID,
+           let lastDecodedFrames = xiaomiScreenLastSourceRecoveryDecodedFrames,
+           event.decodedFrames < lastDecodedFrames {
+            xiaomiScreenLastSourceRecoveryDecodedFrames = nil
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_source_counter_reset phase=\(phase) " +
+                    "rtspSession=\(event.sessionID.uuidString) " +
+                    "lastSourceRequestId=\(xiaomiScreenLastSourceRecoveryRequestID ?? "none") " +
+                    "trigger=\(event.trigger) stallReason=\(event.reason) " +
+                    "decodedFrames=\(event.decodedFrames) lastSourceDecodedFrames=\(lastDecodedFrames)"
+            )
+        } else if Self.isXiaomiScreenFrameStall(event.reason),
+                  xiaomiScreenLastSourceRecoverySessionID == event.sessionID,
+                  let lastDecodedFrames = xiaomiScreenLastSourceRecoveryDecodedFrames,
+                  event.decodedFrames == lastDecodedFrames {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_suppressed reason=source_recovery_no_decode_progress " +
+                    "phase=\(phase) rtspSession=\(event.sessionID.uuidString) " +
+                    "lastSourceRequestId=\(xiaomiScreenLastSourceRecoveryRequestID ?? "none") " +
+                    "trigger=\(event.trigger) stallReason=\(event.reason) " +
+                    "decodedFrames=\(event.decodedFrames) lastSourceDecodedFrames=\(lastDecodedFrames)"
+            )
+            return true
+        }
         let now = Date()
         let elapsed = now.timeIntervalSince(xiaomiScreenLastSourceRecoveryAt)
         guard elapsed >= 0,
@@ -1334,14 +1368,17 @@ final class EdgeLinkRuntime: ObservableObject {
     private func markXiaomiScreenSourceRecoveryStarted(
         requestId: String,
         sourceSessionID: UUID,
-        reason: String
+        reason: String,
+        decodedFrames: UInt64
     ) {
         xiaomiScreenLastSourceRecoveryAt = Date()
         xiaomiScreenLastSourceRecoverySessionID = sourceSessionID
         xiaomiScreenLastSourceRecoveryRequestID = requestId
+        xiaomiScreenLastSourceRecoveryDecodedFrames = decodedFrames
         DiagnosticsLog.info(
             "xiaomi.mac.screen_recovery_source_cooldown_started requestId=\(requestId) " +
                 "sourceSession=\(sourceSessionID.uuidString) reason=\(reason) " +
+                "decodedFrames=\(decodedFrames) " +
                 "cooldownMs=\(Int(Self.xiaomiScreenSourceRecoveryCooldownSeconds * 1_000))"
         )
     }
@@ -1357,10 +1394,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return true
         }
         if Self.isXiaomiScreenFrameStall(event.reason) {
-            guard let elapsedFrameSeconds = event.elapsedFrameSeconds else {
-                return false
-            }
-            return elapsedFrameSeconds >= xiaomiScreenSessionRebuildAfterNoFrameSeconds
+            return shouldEscalateXiaomiScreenFrameStallToSessionRebuild(event)
         }
         if attempt > xiaomiScreenSourceRecoveryMaxAttempts {
             return true
@@ -1375,6 +1409,15 @@ final class EdgeLinkRuntime: ObservableObject {
     private static func isXiaomiScreenFrameStall(_ reason: String) -> Bool {
         reason == "decoded_frame_stalled_beyond_threshold" ||
             reason.hasPrefix("decoded_frame_stalled")
+    }
+
+    private static func shouldEscalateXiaomiScreenFrameStallToSessionRebuild(
+        _ event: XiaomiMirrorRTSPRecoveryEvent
+    ) -> Bool {
+        guard let elapsedFrameSeconds = event.elapsedFrameSeconds else {
+            return false
+        }
+        return elapsedFrameSeconds >= xiaomiScreenSessionRebuildAfterNoFrameSeconds
     }
 
     private func startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded() {

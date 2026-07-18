@@ -314,6 +314,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
     private val fakeMirrorScreenAudioLinkedDisplays =
         Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
+    private val fakeMirrorScreenAudioOfficialLinkedSources =
+        Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
+    @Volatile
+    private var fakeMirrorScreenAudioCleanupWatchdogScheduled: Boolean = false
     private val liveMirrorHEVCEncoders =
         Collections.synchronizedMap(WeakHashMap<MediaCodec, MirrorHEVCEncoderState>())
     private var fakeMirrorSourceAuthConfigDepth: Int = 0
@@ -1504,6 +1508,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         unlinkFakeMirrorScreenAudio(classLoader, param.thisObject, "closeMirror")
+                        cleanupFakeMirrorScreenAudioIfInactive(classLoader, "closeMirror")
                         if (lastFakeMirrorControlSource === param.thisObject) {
                             log(
                                 "mirror source remembered instance closing " +
@@ -1546,8 +1551,14 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (!shouldForceMirrorScreenTerminalPresent()) {
+                            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "display_error:ttl_inactive")
                             return
                         }
+                        cleanupFakeMirrorScreenAudioSource(
+                            classLoader = classLoader,
+                            source = param.thisObject,
+                            reason = "display_error"
+                        )
                         log(
                             "mirror source display error " +
                                 "what=${param.args.getOrNull(0)} " +
@@ -1576,6 +1587,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (!shouldUseOfficialMirrorScreenAudioOwner()) {
+                            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "onNotifyAudioInfo:owner_inactive")
                             return
                         }
                         attachFakeMirrorScreenAudioDisplay(
@@ -1602,13 +1614,36 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         reason: String
     ) {
         if (source == null || !shouldUseOfficialMirrorScreenAudioOwner()) {
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:owner_inactive")
             return
         }
+        if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+            log(
+                "mirror fake screen official audio display attach skipped reason=$reason " +
+                    "cause=inactive_source " +
+                    mirrorControlSourceRecoverySummary(source)
+            )
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:inactive_source")
+            return
+        }
+        scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader, reason)
         val delays = longArrayOf(120L, 350L, 800L, 1_600L, 2_800L, 4_200L)
         val handler = Handler(Looper.getMainLooper())
         delays.forEach { delayMs ->
             handler.postDelayed(
                 {
+                    if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+                        log(
+                            "mirror fake screen official audio display attach skipped " +
+                                "reason=$reason:display_poll:${delayMs}ms cause=inactive_source " +
+                                mirrorControlSourceRecoverySummary(source)
+                        )
+                        cleanupFakeMirrorScreenAudioIfInactive(
+                            classLoader,
+                            "$reason:display_poll:${delayMs}ms:inactive_source"
+                        )
+                        return@postDelayed
+                    }
                     attachActiveFakeMirrorScreenAudioDisplay(
                         classLoader = classLoader,
                         source = source,
@@ -1627,6 +1662,16 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         reason: String
     ) {
         if (!shouldUseOfficialMirrorScreenAudioOwner()) {
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:owner_inactive")
+            return
+        }
+        if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+            log(
+                "mirror fake screen official audio display wait skipped reason=$reason " +
+                    "cause=inactive_source " +
+                    mirrorControlSourceRecoverySummary(source)
+            )
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:inactive_source")
             return
         }
         val displays = activeMirrorDisplays(classLoader)
@@ -1665,11 +1710,21 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         bitrate: Int?
     ) {
         if (display == null || !shouldUseOfficialMirrorScreenAudioOwner()) {
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:owner_inactive")
             return
         }
         val deviceId = readMirrorDisplayDeviceId(display)
         val source = readMirrorDisplaySource(display)
         if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId) || source == null) {
+            return
+        }
+        if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+            log(
+                "mirror fake screen official audio attach skipped reason=$reason " +
+                    "cause=inactive_source " +
+                    mirrorDisplaySummary(display)
+            )
+            cleanupFakeMirrorScreenAudioIfInactive(classLoader, "$reason:inactive_source")
             return
         }
         if (!isMirrorAudioInfoUsable(sampleRate, bitsPerSample, channels, encodeType, bitrate)) {
@@ -1682,9 +1737,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
             return
         }
+        scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader, reason)
         if (fakeMirrorScreenAudioLinkedDisplays.containsKey(display) ||
             fakeMirrorScreenAudioLinkedSources.containsKey(source)
         ) {
+            linkFakeMirrorScreenAudio(classLoader, source, "$reason:already_linked")
             refreshFakeMirrorScreenAudioRoute(
                 displayManager = mirrorDisplayManager(classLoader) ?: return,
                 reason = "$reason:already_linked"
@@ -1713,6 +1770,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     mirrorDisplaySummary(display)
             )
         }
+        linkFakeMirrorScreenAudio(classLoader, source, "$reason:display_ready")
         mirrorDisplayManager(classLoader)?.let { manager ->
             refreshFakeMirrorScreenAudioRoute(manager, reason)
         }
@@ -1784,7 +1842,25 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             source = source,
             methodName = "n",
             action = "unlink",
-            reason = reason
+            reason = reason,
+            force = false
+        )
+    }
+
+    private fun linkFakeMirrorScreenAudio(classLoader: ClassLoader, source: Any?, reason: String) {
+        if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+            return
+        }
+        if (source != null && fakeMirrorScreenAudioOfficialLinkedSources.containsKey(source)) {
+            return
+        }
+        applyFakeMirrorScreenAudioLink(
+            classLoader = classLoader,
+            source = source,
+            methodName = "l",
+            action = "link",
+            reason = reason,
+            force = false
         )
     }
 
@@ -1793,17 +1869,19 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         source: Any?,
         methodName: String,
         action: String,
-        reason: String
+        reason: String,
+        force: Boolean = false
     ) {
         if (source == null) {
             return
         }
         val linkAction = action == "link"
-        val previouslyLinked = fakeMirrorScreenAudioLinkedSources.containsKey(source)
+        val previouslyLinked = fakeMirrorScreenAudioLinkedSources.containsKey(source) ||
+            fakeMirrorScreenAudioOfficialLinkedSources.containsKey(source)
         if (linkAction && !shouldUseOfficialMirrorScreenAudioOwner()) {
             return
         }
-        if (!linkAction && !previouslyLinked && !shouldUseOfficialMirrorScreenAudioOwner()) {
+        if (!linkAction && !force && !previouslyLinked && !shouldUseOfficialMirrorScreenAudioOwner()) {
             return
         }
         runCatching {
@@ -1818,9 +1896,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 .invoke(audioManager, source, true)
             if (linkAction) {
                 fakeMirrorScreenAudioLinkedSources[source] = true
+                fakeMirrorScreenAudioOfficialLinkedSources[source] = true
                 refreshFakeMirrorScreenAudioRoute(displayManager, reason)
             } else {
                 fakeMirrorScreenAudioLinkedSources.remove(source)
+                fakeMirrorScreenAudioOfficialLinkedSources.remove(source)
                 removeFakeMirrorScreenAudioLinkedDisplay(source)
                 clearFakeMirrorScreenAudioRoute(audioManager, reason)
             }
@@ -1834,6 +1914,106 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     "${error.javaClass.simpleName}: ${error.message}"
             )
         }
+    }
+
+    private fun cleanupFakeMirrorScreenAudioSource(
+        classLoader: ClassLoader,
+        source: Any?,
+        reason: String
+    ) {
+        val linked = source != null &&
+            (fakeMirrorScreenAudioLinkedSources.containsKey(source) ||
+                fakeMirrorScreenAudioOfficialLinkedSources.containsKey(source))
+        if (!linked) {
+            return
+        }
+        applyFakeMirrorScreenAudioLink(
+            classLoader = classLoader,
+            source = source,
+            methodName = "n",
+            action = "unlink",
+            reason = reason,
+            force = true
+        )
+    }
+
+    private fun cleanupFakeMirrorScreenAudioIfInactive(classLoader: ClassLoader, reason: String) {
+        val linkedSources = (
+            synchronized(fakeMirrorScreenAudioLinkedSources) {
+                fakeMirrorScreenAudioLinkedSources.keys.toList()
+            } +
+                synchronized(fakeMirrorScreenAudioOfficialLinkedSources) {
+                    fakeMirrorScreenAudioOfficialLinkedSources.keys.toList()
+                }
+            ).distinctBy { System.identityHashCode(it) }
+        if (linkedSources.isEmpty()) {
+            return
+        }
+        val inactiveSources = linkedSources.filterNot { source ->
+            isLinkedFakeMirrorScreenAudioStillActive(classLoader, source)
+        }
+        if (inactiveSources.isEmpty()) {
+            scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader, "$reason:still_active")
+            return
+        }
+        inactiveSources.forEach { source ->
+            applyFakeMirrorScreenAudioLink(
+                classLoader = classLoader,
+                source = source,
+                methodName = "n",
+                action = "unlink",
+                reason = reason,
+                force = true
+            )
+        }
+        if (fakeMirrorScreenAudioLinkedSources.isEmpty()) {
+            synchronized(fakeMirrorScreenAudioLinkedDisplays) {
+                fakeMirrorScreenAudioLinkedDisplays.clear()
+            }
+            synchronized(fakeMirrorScreenAudioOfficialLinkedSources) {
+                fakeMirrorScreenAudioOfficialLinkedSources.clear()
+            }
+            val displayManager = mirrorDisplayManager(classLoader)
+            displayManager?.javaClass
+                ?.getMethod("G")
+                ?.invoke(displayManager)
+                ?.let { audioManager -> clearFakeMirrorScreenAudioRoute(audioManager, reason) }
+        }
+        log(
+            "mirror fake screen official audio cleanup reason=$reason " +
+                "inactive=${inactiveSources.size} remaining=${fakeMirrorScreenAudioLinkedSources.size} " +
+                "ownerActive=${shouldUseOfficialMirrorScreenAudioOwner()}"
+        )
+    }
+
+    private fun scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader: ClassLoader, reason: String) {
+        if (fakeMirrorScreenAudioCleanupWatchdogScheduled) {
+            return
+        }
+        fakeMirrorScreenAudioCleanupWatchdogScheduled = true
+        Handler(Looper.getMainLooper()).postDelayed(
+            {
+                fakeMirrorScreenAudioCleanupWatchdogScheduled = false
+                cleanupFakeMirrorScreenAudioIfInactive(classLoader, "watchdog:$reason")
+                if (fakeMirrorScreenAudioLinkedSources.isNotEmpty()) {
+                    scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader, "watchdog")
+                }
+            },
+            fakeMirrorScreenAudioCleanupWatchdogDelayMs()
+        )
+    }
+
+    private fun fakeMirrorScreenAudioCleanupWatchdogDelayMs(): Long {
+        val untilEpochMs = currentFakeMirrorScreenUntilEpochMs()
+        val remainingMs = if (untilEpochMs == null) {
+            0L
+        } else {
+            untilEpochMs - System.currentTimeMillis()
+        }
+        return remainingMs.coerceIn(
+            FAKE_MIRROR_SCREEN_AUDIO_CLEANUP_MIN_DELAY_MS,
+            FAKE_MIRROR_SCREEN_AUDIO_CLEANUP_MAX_DELAY_MS
+        )
     }
 
     private fun removeFakeMirrorScreenAudioLinkedDisplay(source: Any) {
@@ -4429,6 +4609,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
         }
 
+    private fun currentFakeMirrorScreenUntilEpochMs(): Long? =
+        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteScreenUntil(
+            readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY)
+        )
+
     private fun currentFakeMirrorProviderMode(): String? =
         currentFakeMirrorCallRelayMode() ?: currentFakeMirrorScreenMode()
 
@@ -4509,6 +4694,25 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun shouldUseOfficialMirrorScreenAudioOwner(): Boolean =
         currentFakeMirrorScreenAudioOwner() == "official"
+
+    private fun isCurrentFakeMirrorScreenAudioSource(source: Any?): Boolean =
+        source != null &&
+            shouldUseOfficialMirrorScreenAudioOwner() &&
+            lastFakeMirrorControlSource === source &&
+            shouldForceMirrorSourceSession()
+
+    private fun isLinkedFakeMirrorScreenAudioStillActive(classLoader: ClassLoader, source: Any): Boolean {
+        if (!isCurrentFakeMirrorScreenAudioSource(source)) {
+            return false
+        }
+        if (readReflectiveFieldAny(source, "run_capture") as? Boolean == false) {
+            return false
+        }
+        return activeMirrorDisplays(classLoader).any { display ->
+            MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(readMirrorDisplayDeviceId(display)) &&
+                readMirrorDisplaySource(display) === source
+        }
+    }
 
     private fun shouldForceMirrorSourceRoute(): Boolean =
         shouldForceMirrorScreenTerminalPresent() &&
@@ -4761,6 +4965,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val FAKE_MIRROR_KEY_STATUS_DELAY_MS = 250L
         private const val FAKE_MIRROR_SOURCE_ROUTE_WINDOW_MS = 30_000L
         private const val FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS = 120_000L
+        private const val FAKE_MIRROR_SCREEN_AUDIO_CLEANUP_MIN_DELAY_MS = 2_000L
+        private const val FAKE_MIRROR_SCREEN_AUDIO_CLEANUP_MAX_DELAY_MS = 10_000L
         private const val FAKE_MIRROR_PLAIN_AUDIO_SESSION_WINDOW_MS = 120_000L
         private const val MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_KEY = 41
         private const val MIRROR_SOURCE_OPTION_ENCRYPT_AUTH_TYPE = 43

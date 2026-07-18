@@ -4572,7 +4572,10 @@ private final class XiaomiMirrorHEVCAccessUnitAssembler {
         if accessUnits <= 5 || accessUnits % 60 == 0 {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.hevc_access_unit session=\(sessionID.uuidString) " +
-                    "au=\(accessUnits) nals=\(pendingNALUnits.count) pts90k=\(pendingPTS90k.map(String.init) ?? "none")"
+                    "au=\(accessUnits) nals=\(pendingNALUnits.count) " +
+                    "randomAccess=\(pendingHasRandomAccess) " +
+                    "types=\(Self.nalTypesSummary(pendingNALUnits)) " +
+                    "pts90k=\(pendingPTS90k.map(String.init) ?? "none")"
             )
         }
         onAccessUnit(pendingNALUnits, pendingPTS90k)
@@ -4624,6 +4627,10 @@ private final class XiaomiMirrorHEVCAccessUnitAssembler {
             return 0xff
         }
         return (first & 0x7e) >> 1
+    }
+
+    private static func nalTypesSummary(_ accessUnit: [Data]) -> String {
+        "[" + accessUnit.map { String(nalType($0)) }.joined(separator: ",") + "]"
     }
 
     fileprivate static func isVCLNALType(_ nalType: UInt8) -> Bool {
@@ -4899,8 +4906,25 @@ private final class XiaomiMirrorHEVCDecoder {
         pts90k: UInt64?,
         isRandomAccess: Bool
     ) -> CMSampleBuffer? {
+        let sampleNALUnits = accessUnit.filter { !Self.isParameterSetNALType(Self.nalType($0)) }
+        guard !sampleNALUnits.isEmpty else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_sample_skipped_no_payload session=\(sessionID.uuidString) " +
+                    "types=\(Self.nalTypesSummary(accessUnit)) pts90k=\(pts90k.map(String.init) ?? "none")"
+            )
+            return nil
+        }
+        if sampleNALUnits.count != accessUnit.count,
+           decodeRequests <= 5 || decodeRequests % 60 == 59 || isRandomAccess {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.hevc_sample_parameter_sets_stripped session=\(sessionID.uuidString) " +
+                    "sourceTypes=\(Self.nalTypesSummary(accessUnit)) " +
+                    "sampleTypes=\(Self.nalTypesSummary(sampleNALUnits)) " +
+                    "pts90k=\(pts90k.map(String.init) ?? "none")"
+            )
+        }
         var sampleData = Data()
-        for nalUnit in accessUnit {
+        for nalUnit in sampleNALUnits {
             sampleData.appendUInt32BE(UInt32(nalUnit.count))
             sampleData.append(nalUnit)
         }
@@ -5002,6 +5026,15 @@ private final class XiaomiMirrorHEVCDecoder {
 
     private static func nalTypesSummary(_ accessUnit: [Data]) -> String {
         "[" + accessUnit.map { String(nalType($0)) }.joined(separator: ",") + "]"
+    }
+
+    private static func isParameterSetNALType(_ nalType: UInt8) -> Bool {
+        switch nalType {
+        case 32, 33, 34:
+            return true
+        default:
+            return false
+        }
     }
 
     private static let asynchronousDecodeFrameFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
