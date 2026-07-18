@@ -4,10 +4,14 @@ import android.content.Context
 import android.content.ContentProvider
 import android.content.Intent
 import android.graphics.SurfaceTexture
+import android.media.MediaCodec
+import android.media.MediaCrypto
+import android.media.MediaFormat
 import android.os.Binder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.Parcelable
 import android.os.SystemClock
 import android.view.Surface
@@ -21,7 +25,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Modifier
 import java.net.InetAddress
 import java.util.ArrayList
+import java.util.Collections
 import java.util.HashMap
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 internal object MiLinkPrivilegeHookPolicy {
@@ -29,6 +35,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MILINK_PACKAGE = "com.milink.service"
     const val MILINK_MAIN_PROCESS = "com.milink.service"
     const val MILINK_RUNTIME_PROCESS = "com.milink.runtime"
+    const val MILINK_DISTRIBUTED_HARDWARE_PROCESS = "com.milink.service:distributedHardware"
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
@@ -87,6 +94,7 @@ internal object MiLinkPrivilegeHookPolicy {
     fun shouldHook(packageName: String?, processName: String?): Boolean =
         shouldHookRuntime(packageName, processName) ||
             shouldHookMainService(packageName, processName) ||
+            shouldHookDistributedHardware(packageName, processName) ||
             shouldHookXiaomiMirror(packageName, processName) ||
             shouldHookMiConnectService(packageName, processName) ||
             shouldHookInCallUi(packageName, processName) ||
@@ -98,6 +106,9 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun shouldHookMainService(packageName: String?, processName: String?): Boolean =
         packageName == MILINK_PACKAGE && processName == MILINK_MAIN_PROCESS
+
+    fun shouldHookDistributedHardware(packageName: String?, processName: String?): Boolean =
+        packageName == MILINK_PACKAGE && processName == MILINK_DISTRIBUTED_HARDWARE_PROCESS
 
     fun shouldHookXiaomiMirror(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MIRROR_PACKAGE && processName == XIAOMI_MIRROR_PROCESS
@@ -268,6 +279,17 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private data class MirrorHEVCEncoderState(
+        val codec: MediaCodec,
+        val codecId: Int,
+        val configuredUptimeMs: Long,
+        val mime: String,
+        val formatSummary: String,
+        var started: Boolean = false,
+        var released: Boolean = false,
+        var lastSyncRequestUptimeMs: Long = 0L
+    )
+
     private val fakeMirrorSinkSurfaces = ConcurrentHashMap<Int, FakeMirrorSinkSurface>()
     private var lastFakeMirrorAttachUptimeMs: Long = 0L
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
@@ -279,6 +301,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var fakeMirrorSourceRouteUntilUptimeMs: Long = 0L
     private var fakeMirrorSourceSessionUntilUptimeMs: Long = 0L
     private var fakeMirrorSourceOptionHandle: Long = 0L
+    private var lastFakeMirrorControlSource: Any? = null
+    private var lastFakeMirrorControlSourceUptimeMs: Long = 0L
+    private val liveMirrorHEVCEncoders =
+        Collections.synchronizedMap(WeakHashMap<MediaCodec, MirrorHEVCEncoderState>())
     private var fakeMirrorSourceAuthConfigDepth: Int = 0
     private var mirrorSourceClassDiagnosticsLogged: Boolean = false
     private var mirrorControlClassDiagnosticsLogged: Boolean = false
@@ -297,9 +323,14 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         if (MiLinkPrivilegeHookPolicy.shouldHookRuntime(lpparam.packageName, lpparam.processName)) {
             hookRuntimeCallingPackageCheck(lpparam.classLoader)
             hookRuntimeCallingUidCheck(lpparam.classLoader)
+            hookMirrorHEVCEncoderRecovery()
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMainService(lpparam.packageName, lpparam.processName)) {
             hookCastClientServiceCheck(lpparam.classLoader)
+            hookMirrorHEVCEncoderRecovery()
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookDistributedHardware(lpparam.packageName, lpparam.processName)) {
+            hookMirrorHEVCEncoderRecovery()
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(lpparam.packageName, lpparam.processName)) {
             hookMirrorCallProviderAccessCheck(lpparam.classLoader)
@@ -1086,11 +1117,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private fun hookMirrorScreenRouteDiagnostics(classLoader: ClassLoader) {
         hookMirrorTerminalAddressOverride(classLoader)
+        hookMirrorSourceRecoveryProvider(classLoader)
         hookMirrorSourceRouteOverrides(classLoader)
         hookMirrorSinkViewLifecycle(classLoader)
         hookMirrorSinkSurfaceCallback(classLoader)
         hookMirrorControlSinkStart(classLoader)
         hookMirrorControlSourceStart(classLoader)
+        hookMirrorHEVCEncoderRecovery()
         hookMirrorControlNativeDiagnostics(classLoader)
         hookMirrorAdvConnectionLifecycle(classLoader)
         hookMirrorLyraGateDiagnostics(classLoader)
@@ -1126,6 +1159,165 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 }
         }.onFailure { error ->
             log("failed to hook mirror terminal address: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorHEVCEncoderRecovery() {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                ANDROID_MEDIA_CODEC,
+                null,
+                "configure",
+                MediaFormat::class.java,
+                Surface::class.java,
+                MediaCrypto::class.java,
+                Integer.TYPE,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val format = param.args.getOrNull(0) as? MediaFormat ?: return
+                        val flags = param.args.getOrNull(3) as? Int ?: return
+                        if (!isHEVCEncoderFormat(format, flags) || !shouldForceMirrorSourceSession()) {
+                            return
+                        }
+                        applyMirrorHEVCRecoveryFormat(format)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val codec = param.thisObject as? MediaCodec ?: return
+                        val format = param.args.getOrNull(0) as? MediaFormat ?: return
+                        val flags = param.args.getOrNull(3) as? Int ?: return
+                        if (!isHEVCEncoderFormat(format, flags)) {
+                            return
+                        }
+                        val state = MirrorHEVCEncoderState(
+                            codec = codec,
+                            codecId = System.identityHashCode(codec),
+                            configuredUptimeMs = SystemClock.uptimeMillis(),
+                            mime = readMediaFormatString(format, MediaFormat.KEY_MIME).orEmpty(),
+                            formatSummary = format.toString()
+                        )
+                        liveMirrorHEVCEncoders[codec] = state
+                        log(
+                            "mirror hevc encoder configured process=${currentProcessName()} pid=${Process.myPid()} " +
+                                "codec=${state.codecId} fakeSession=${shouldForceMirrorSourceSession()} format=${state.formatSummary}"
+                        )
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                ANDROID_MEDIA_CODEC,
+                null,
+                "start",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val codec = param.thisObject as? MediaCodec ?: return
+                        val state = liveMirrorHEVCEncoders[codec] ?: return
+                        state.started = true
+                        state.released = false
+                        log("mirror hevc encoder started codec=${state.codecId} ageMs=${SystemClock.uptimeMillis() - state.configuredUptimeMs}")
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                ANDROID_MEDIA_CODEC,
+                null,
+                "stop",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val codec = param.thisObject as? MediaCodec ?: return
+                        liveMirrorHEVCEncoders[codec]?.let { state ->
+                            state.started = false
+                            log("mirror hevc encoder stopping codec=${state.codecId}")
+                        }
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                ANDROID_MEDIA_CODEC,
+                null,
+                "reset",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val codec = param.thisObject as? MediaCodec ?: return
+                        liveMirrorHEVCEncoders.remove(codec)?.let { state ->
+                            log("mirror hevc encoder reset codec=${state.codecId}")
+                        }
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                ANDROID_MEDIA_CODEC,
+                null,
+                "release",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val codec = param.thisObject as? MediaCodec ?: return
+                        liveMirrorHEVCEncoders.remove(codec)?.let { state ->
+                            state.released = true
+                            log("mirror hevc encoder released codec=${state.codecId}")
+                        }
+                    }
+                }
+            )
+            log("mirror hevc encoder recovery hook installed")
+        }.onFailure { error ->
+            log("failed to hook mirror hevc encoder recovery: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorSourceRecoveryProvider(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CALL_PROVIDER,
+                classLoader,
+                "f",
+                Integer.TYPE,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                Bundle::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val method = param.args.getOrNull(2) as? String
+                        val extras = param.args.getOrNull(4) as? Bundle ?: return
+                        val sourceRecoveryOnly = extras.booleanCompat("sourceRecoveryOnly")
+                        val edgeLinkRecoveryMethod = method == "edgeLinkSourceRecovery"
+                        val startShareRecovery = method == "startShare" && extras.booleanCompat("isStart")
+                        if ((!edgeLinkRecoveryMethod && !startShareRecovery) ||
+                            !extras.booleanCompat("recovery") ||
+                            !MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) ||
+                            !shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            return
+                        }
+                        armFakeMirrorSourceRouteWindow()
+                        val reason = extras.getString("recoveryReason").orEmpty().ifBlank { "mac_stall" }
+                        val attempt = extras.getString("recoveryAttempt").orEmpty().ifBlank { "?" }
+                        val sourceResult = requestFakeMirrorSourceIDR("provider_recovery:$reason")
+                        val codecResult = requestLiveMirrorHEVCEncoderSync("provider_recovery:$reason")
+                        scheduleFakeMirrorSourceIDRBurst("provider_recovery:$reason")
+                        log(
+                            "mirror source recovery provider accepted " +
+                                "method=$method sourceRecoveryOnly=$sourceRecoveryOnly " +
+                                "attempt=$attempt reason=$reason $sourceResult $codecResult"
+                        )
+                        if (edgeLinkRecoveryMethod || sourceRecoveryOnly) {
+                            param.result = Bundle().apply {
+                                putBoolean("edgelinkRecoveryAccepted", true)
+                                putBoolean("enable", true)
+                                putInt("value", 0)
+                                putString("recoveryMethod", method)
+                                putString("recoveryReason", reason)
+                                putString("recoveryAttempt", attempt)
+                                putString("recoveryResult", "$sourceResult $codecResult")
+                            }
+                        }
+                    }
+                }
+            )
+            log("mirror source recovery provider hook installed")
+        }.onFailure { error ->
+            log("failed to hook mirror source recovery provider: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -1235,6 +1427,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             logMirrorSourceClassDiagnostics(param.thisObject)
                             configureFakeMirrorSourceAuth(param.thisObject)
                             overrideFakeMirrorSourcePort(param.thisObject)
+                            rememberFakeMirrorControlSource(param.thisObject, "constructor")
                             val optionHandle = readMirrorControlSourceOptionHandle(param.thisObject)
                             if (optionHandle > 0L) {
                                 fakeMirrorSourceOptionHandle = optionHandle
@@ -1263,6 +1456,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         logMirrorSourceClassDiagnostics(param.thisObject)
                         configureFakeMirrorSourceAuth(param.thisObject)
                         overrideFakeMirrorSourcePort(param.thisObject)
+                        rememberFakeMirrorControlSource(param.thisObject, "startMirror_enter")
                         val optionHandle = readMirrorControlSourceOptionHandle(param.thisObject)
                         if (optionHandle > 0L) {
                             fakeMirrorSourceOptionHandle = optionHandle
@@ -1283,6 +1477,23 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                                 "result=${param.getResult()} " +
                                 mirrorControlSourceSummary(param.thisObject)
                         )
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_CONTROL_SOURCE,
+                classLoader,
+                "closeMirror",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (lastFakeMirrorControlSource === param.thisObject) {
+                            log(
+                                "mirror source remembered instance closing " +
+                                    mirrorControlSourceRecoverySummary(param.thisObject)
+                            )
+                            lastFakeMirrorControlSource = null
+                            lastFakeMirrorControlSourceUptimeMs = 0L
+                        }
                     }
                 }
             )
@@ -1411,6 +1622,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         val source = param.args.getOrNull(0)
                         configureFakeMirrorSourceAuth(source)
                         overrideFakeMirrorSourcePort(source)
+                        rememberFakeMirrorControlSource(source, "native_createSourceMirror")
                         val optionHandle = (param.args.getOrNull(8) as? Number)?.toLong() ?: 0L
                         if (optionHandle > 0L) {
                             fakeMirrorSourceOptionHandle = optionHandle
@@ -1653,6 +1865,105 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         val wrote = writeReflectiveIntFieldAny(source, targetPort, "port")
         log("mirror source port override ip=$expectedIp old=${currentPort ?: -1} new=$targetPort wrote=$wrote")
+    }
+
+    private fun rememberFakeMirrorControlSource(source: Any?, reason: String) {
+        if (source == null || !shouldForceMirrorSourceSession()) {
+            return
+        }
+        lastFakeMirrorControlSource = source
+        lastFakeMirrorControlSourceUptimeMs = SystemClock.uptimeMillis()
+        log("mirror source remembered reason=$reason ${mirrorControlSourceRecoverySummary(source)}")
+    }
+
+    private fun requestFakeMirrorSourceIDR(reason: String): String {
+        val source = lastFakeMirrorControlSource
+            ?: return "source=missing callback=false native=null ageMs=-1"
+        val ageMs = SystemClock.uptimeMillis() - lastFakeMirrorControlSourceUptimeMs
+        var callbackResult = false
+        var nativeResult: Boolean? = null
+        val callbackError = runCatching {
+            source.javaClass.getMethod("requestEncodeIDRFrame").invoke(source)
+            callbackResult = true
+        }.exceptionOrNull()
+        val nativeError = runCatching {
+            nativeResult = source.javaClass.getMethod("requestIDREncodeMeidaCodec")
+                .invoke(source) as? Boolean
+        }.exceptionOrNull()
+        val summary = "source=${identitySummary(source)} ageMs=$ageMs " +
+            "callback=$callbackResult native=${nativeResult?.toString() ?: "null"} " +
+            "handler=${readReflectiveFieldAny(source, "mirrorHandler") ?: -1L} " +
+            "option=${readMirrorControlSourceOptionHandle(source)}"
+        log(
+            "mirror source idr requested reason=$reason $summary " +
+                "callbackError=${callbackError?.javaClass?.simpleName ?: "none"} " +
+                "nativeError=${nativeError?.javaClass?.simpleName ?: "none"}"
+        )
+        return summary
+    }
+
+    private fun requestLiveMirrorHEVCEncoderSync(reason: String): String {
+        val now = SystemClock.uptimeMillis()
+        var candidates = 0
+        var requested = 0
+        var throttled = 0
+        val failures = ArrayList<String>()
+        val states = synchronized(liveMirrorHEVCEncoders) {
+            liveMirrorHEVCEncoders.values.toList()
+        }
+        states.forEach { state ->
+            if (!state.started || state.released) {
+                return@forEach
+            }
+            candidates += 1
+            if (now - state.lastSyncRequestUptimeMs < MIRROR_HEVC_SYNC_REQUEST_THROTTLE_MS) {
+                throttled += 1
+                return@forEach
+            }
+            state.lastSyncRequestUptimeMs = now
+            val result = runCatching {
+                val params = Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                }
+                state.codec.setParameters(params)
+            }
+            if (result.isSuccess) {
+                requested += 1
+                log(
+                    "mirror hevc encoder sync requested reason=$reason codec=${state.codecId} " +
+                        "ageMs=${now - state.configuredUptimeMs} format=${state.formatSummary}"
+                )
+            } else {
+                val error = result.exceptionOrNull()
+                failures += "${state.codecId}:${error?.javaClass?.simpleName ?: "error"}"
+            }
+        }
+        return "codecSync=candidates:$candidates requested:$requested throttled:$throttled failures:${failures.joinToString(",")}"
+    }
+
+    private fun scheduleFakeMirrorSourceIDRBurst(reason: String) {
+        val source = lastFakeMirrorControlSource ?: return
+        val handler = Handler(Looper.getMainLooper())
+        longArrayOf(650L).forEach { delayMs ->
+            handler.postDelayed(
+                {
+                    if (lastFakeMirrorControlSource === source && shouldForceMirrorScreenTerminalPresent()) {
+                        requestFakeMirrorSourceIDR("$reason:burst_${delayMs}ms")
+                        requestLiveMirrorHEVCEncoderSync("$reason:burst_${delayMs}ms")
+                    }
+                },
+                delayMs
+            )
+        }
+    }
+
+    private fun mirrorControlSourceRecoverySummary(source: Any?): String {
+        val ageMs = if (lastFakeMirrorControlSource === source && lastFakeMirrorControlSourceUptimeMs > 0L) {
+            SystemClock.uptimeMillis() - lastFakeMirrorControlSourceUptimeMs
+        } else {
+            -1L
+        }
+        return mirrorControlSourceSummary(source) + " rememberedAgeMs=$ageMs"
     }
 
     private fun hookMirrorSinkViewLifecycle(classLoader: ClassLoader) {
@@ -3853,6 +4164,54 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private fun isHEVCEncoderFormat(format: MediaFormat, flags: Int): Boolean {
+        val encode = flags and MediaCodec.CONFIGURE_FLAG_ENCODE != 0
+        val mime = readMediaFormatString(format, MediaFormat.KEY_MIME)
+        return encode && mime.equals(MIRROR_HEVC_MIME, ignoreCase = true)
+    }
+
+    private fun applyMirrorHEVCRecoveryFormat(format: MediaFormat) {
+        val previousInterval = readMediaFormatInt(format, MediaFormat.KEY_I_FRAME_INTERVAL)
+        runCatching {
+            format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+            if (previousInterval == null || previousInterval > MIRROR_HEVC_MAX_I_FRAME_INTERVAL_SECONDS) {
+                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, MIRROR_HEVC_MAX_I_FRAME_INTERVAL_SECONDS)
+            }
+            log(
+                "mirror hevc encoder recovery format applied " +
+                    "prependHeader=1 oldIFrameInterval=${previousInterval ?: "none"} " +
+                    "newIFrameInterval=${readMediaFormatInt(format, MediaFormat.KEY_I_FRAME_INTERVAL) ?: "none"}"
+            )
+        }.onFailure { error ->
+            log("failed to apply mirror hevc recovery format: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun readMediaFormatString(format: MediaFormat, key: String): String? =
+        runCatching { format.getString(key) }.getOrNull()
+
+    private fun readMediaFormatInt(format: MediaFormat, key: String): Int? =
+        runCatching { format.getInteger(key) }.getOrNull()
+
+    private fun currentProcessName(): String =
+        runCatching {
+            Class.forName("android.app.Application")
+                .getMethod("getProcessName")
+                .invoke(null) as? String
+        }.getOrNull().orEmpty()
+
+    private fun Bundle.booleanCompat(key: String): Boolean =
+        when (val value = get(key)) {
+            is Boolean -> value
+            is String -> value.equals("true", ignoreCase = true) ||
+                value == "1" ||
+                value.equals("yes", ignoreCase = true) ||
+                value.equals("on", ignoreCase = true)
+            is Int -> value != 0
+            is Long -> value != 0L
+            else -> false
+        }
+
     private fun currentApplicationContext(): Context? =
         runCatching {
             Class.forName("android.app.ActivityThread")
@@ -3910,6 +4269,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
 
     private companion object {
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
+        private const val ANDROID_MEDIA_CODEC = "android.media.MediaCodec"
         private const val MILINK_PRIVILEGED_PACKAGE_MANAGER = "com.milink.base.utils.p"
         private const val MI_CONNECT_PERMISSION_CHECKER = "com.xiaomi.continuity.util.PermissionChecker"
         private const val XIAOMI_MIRROR_CALL_PROVIDER = "com.xiaomi.mirror.provider.CallProvider"
@@ -3980,6 +4340,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val INCALLUI_RELAY_SELECTION_THROTTLE_MS = 1_000L
         private const val TELECOM_RELAY_FORCE_LOG_THROTTLE_MS = 2_000L
         private const val MIRROR_AUDIO_START_OPTION_WINDOW_MS = 2_000L
+        private const val MIRROR_HEVC_MIME = "video/hevc"
+        private const val MIRROR_HEVC_MAX_I_FRAME_INTERVAL_SECONDS = 1
+        private const val MIRROR_HEVC_SYNC_REQUEST_THROTTLE_MS = 600L
         private const val FAKE_MIRROR_LINK_ADDRESS = "edgelink-fake-pad"
         private const val FAKE_MIRROR_TRUSTED_DEVICE_TYPE = 4
         private const val FAKE_MIRROR_TRUSTED_MEDIUM_TYPES = 65_664

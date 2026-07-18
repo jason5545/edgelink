@@ -42,6 +42,7 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MI_CONNECT_NETWORKING_REGISTER -> probeMiConnectNetworking(body, addServiceInfo = true)
                     COMMAND_MIRROR_QUERY_REMOTE_DEVICES -> queryMirrorRemoteDevices(body)
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
+                    COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY -> requestMirrorSourceRecovery(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
                     COMMAND_SYNERGY_STATUS -> querySynergyStatus()
                     COMMAND_SYNERGY_SHOW_RELAY_DATA -> callSynergyRelay(body, transactionShowRelayData, "showRelayData")
@@ -354,6 +355,67 @@ class AndroidMiLinkCommandBridge(
                 "fallback" to if (openResult.success) "" else "edgelink.screen"
             )
         )
+    }
+
+    private suspend fun requestMirrorSourceRecovery(body: MiLinkCommandBody): CommandResult {
+        val armResult = runCatching {
+            AndroidShizukuSupport.armMirrorScreenRemote(
+                context = appContext,
+                peerHost = body.args["peerHost"],
+                peerPort = body.args["peerPort"]?.toIntOrNull()
+            )
+        }.getOrElse { error ->
+            ShizukuOperationResult(
+                success = false,
+                message = "mirror:screen_remote exception=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+        }
+        val result = callMirrorProviderWithDeadline(
+            method = "edgeLinkSourceRecovery",
+            deadlineMs = mirrorSourceRecoveryProviderDeadlineMs
+        ) {
+            val extras = body.args.toBundle().apply {
+                putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                putBoolean("recovery", true)
+                putBoolean("sourceRecoveryOnly", true)
+                putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
+            }
+            val providerResult = appContext.contentResolver.callMirrorProvider("edgeLinkSourceRecovery", extras)
+            val accepted = providerResult?.getBoolean("edgelinkRecoveryAccepted", false) == true
+            CommandResult(
+                success = accepted,
+                route = if (accepted) "xiaomi.mirror.source_recovery" else "xiaomi.mirror",
+                message = "sourceRecovery accepted=$accepted keys=${providerResult?.keySummary().orEmpty()}; " +
+                    "arm=${armResult.message.forSingleLineLog()}",
+                data = mapOf(
+                    "remoteDeviceId" to MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
+                    "accepted" to accepted.toString(),
+                    "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
+                    "arm" to armResult.success.toString(),
+                    "recoveryAttempt" to body.args["recoveryAttempt"].orEmpty(),
+                    "recoveryReason" to body.args["recoveryReason"].orEmpty()
+                )
+            )
+        }
+        if (result is MirrorProviderDeadlineResult.Pending) {
+            return CommandResult(
+                success = false,
+                route = "xiaomi.mirror.source_recovery",
+                message = "sourceRecovery pending>${result.deadlineMs}ms; arm=${armResult.message.forSingleLineLog()}",
+                data = mapOf(
+                    "remoteDeviceId" to MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
+                    "accepted" to "false",
+                    "providerValue" to "pending",
+                    "arm" to armResult.success.toString(),
+                    "pending" to "true",
+                    "pendingDeadlineMs" to result.deadlineMs.toString(),
+                    "recoveryAttempt" to body.args["recoveryAttempt"].orEmpty(),
+                    "recoveryReason" to body.args["recoveryReason"].orEmpty()
+                )
+            )
+        }
+        return (result as MirrorProviderDeadlineResult.Completed).result
     }
 
     private suspend fun startRealMirrorNativeRoute(
@@ -1338,6 +1400,7 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MI_CONNECT_NETWORKING_REGISTER = "xiaomi.mi_connect.registerLyraService"
         const val COMMAND_MIRROR_QUERY_REMOTE_DEVICES = "xiaomi.mirror.queryRemoteDevices"
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
+        const val COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"
         const val COMMAND_SYNERGY_STATUS = "xiaomi.synergy.status"
         const val COMMAND_SYNERGY_SHOW_RELAY_DATA = "xiaomi.synergy.showRelayData"
@@ -1365,6 +1428,7 @@ class AndroidMiLinkCommandBridge(
         const val mirrorBtMacFallbackDelayMs = 3_000L
         const val mirrorNativeShortcutProviderDeadlineMs = 8_000L
         const val mirrorFakeScreenProviderQuickDeadlineMs = 4_000L
+        const val mirrorSourceRecoveryProviderDeadlineMs = 1_500L
         const val KEY_BT_MAC = "bt_mac"
         const val KEY_DESKTOP_SWITCH = "desktop_switch"
         const val KEY_HANDOFF_SWITCH = "handoff_switch"

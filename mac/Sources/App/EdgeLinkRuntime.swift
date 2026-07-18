@@ -90,6 +90,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var turnCredentialTask: Task<TurnCredentialSnapshot?, Never>?
     private var pendingXiaomiScreenFallback: PendingXiaomiScreenFallback?
     private var pendingXiaomiScreenFallbackTask: Task<Void, Never>?
+    private var xiaomiScreenRecoveryTask: Task<Void, Never>?
+    private var xiaomiScreenRecoveryAttempt = 0
+    private var xiaomiScreenUserStopped = false
     private var didAutoBindXiaomiDistAudio = false
     private var didAutoQueryXiaomiMirrorDevices = false
 
@@ -157,9 +160,20 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.isPhoneScreenSessionActive = active
             }
         }
-        xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [screenSession] pixelBuffer, width, height in
+        xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [weak self, screenSession] pixelBuffer, width, height in
             Task { @MainActor in
+                self?.xiaomiScreenRecoveryAttempt = 0
                 screenSession.renderXiaomiMirrorFrame(pixelBuffer, width: width, height: height)
+            }
+        }
+        xiaomiMirrorRTSPDiagnosticSource.onRecoveryRequired = { [weak self] event in
+            Task { @MainActor in
+                self?.handleXiaomiMirrorRTSPRecoveryRequired(event)
+            }
+        }
+        xiaomiMirrorRTSPDiagnosticSource.onPeerStop = { [weak self] reason, sessionID in
+            Task { @MainActor in
+                self?.handleXiaomiMirrorPeerStop(reason: reason, sessionID: sessionID)
             }
         }
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
@@ -203,6 +217,7 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayDebugTask?.cancel()
         turnCredentialTask?.cancel()
         pendingXiaomiScreenFallbackTask?.cancel()
+        xiaomiScreenRecoveryTask?.cancel()
         currentChannel?.close()
         phoneRelayProbe.stop()
         xiaomiMirrorRTSPDiagnosticSource.stop(reason: "runtime_deinit")
@@ -299,10 +314,38 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
                 return
             }
+            if let pending = pendingXiaomiScreenFallback {
+                xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_start_gate reason=pending requestId=\(pending.requestId) " +
+                        "route=\(pending.route) elapsedMs=\(pending.elapsedMs)"
+                )
+                return
+            }
+            if xiaomiScreenRecoveryTask != nil {
+                xiaomiMiLinkCommandStatus = "小米鏡像恢復中"
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_start_gate reason=recovering " +
+                        "attempt=\(xiaomiScreenRecoveryAttempt)"
+                )
+                return
+            }
+            if isPhoneScreenSessionActive {
+                screenSession.showActiveWindow()
+                isPhoneScreenViewerVisible = true
+                hasViewedPhoneScreen = true
+                xiaomiScreenUserStopped = false
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_start_gate reason=active_show_existing " +
+                        "route=\(xiaomiScreenRoute ?? "unknown")"
+                )
+                return
+            }
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
+            xiaomiScreenUserStopped = false
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
             DiagnosticsLog.info(
                 "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "unknown") " +
@@ -324,37 +367,12 @@ final class EdgeLinkRuntime: ObservableObject {
                 args: args
             )
             if let requestId {
-                pendingXiaomiScreenFallback = PendingXiaomiScreenFallback(
+                armPendingXiaomiScreenCommand(
                     requestId: requestId,
                     command: command,
                     route: xiaomiScreenRoute ?? "unknown",
-                    startedAt: Date(),
-                    timeoutMs: timeoutMs,
-                    officialDiscoveryRequired: latestMiLinkStatus?.officialDiscoveryRequired ?? false,
-                    phoneDevices: latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0,
-                    hyperConnectInstalled: xiaomiHyperConnectAvailable,
-                    fallbackStarted: false
+                    timeoutMs: timeoutMs
                 )
-                pendingXiaomiScreenFallbackTask?.cancel()
-                pendingXiaomiScreenFallbackTask = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
-                    await MainActor.run {
-                        guard let self,
-                              let pending = self.pendingXiaomiScreenFallback,
-                              pending.requestId == requestId,
-                              !pending.fallbackStarted else {
-                            return
-                        }
-                        self.pendingXiaomiScreenFallbackTask = nil
-                        self.xiaomiMiLinkCommandStatus = "小米鏡像未回應"
-                        DiagnosticsLog.warn(
-                            "xiaomi.mac.screen_no_fallback requestId=\(requestId) command=\(pending.command) " +
-                                "route=\(pending.route) reason=timeout timeoutMs=\(pending.timeoutMs) " +
-                                "elapsedMs=\(pending.elapsedMs) officialDiscoveryRequired=\(pending.officialDiscoveryRequired) " +
-                                "phoneDevices=\(pending.phoneDevices) hyperConnectInstalled=\(pending.hyperConnectInstalled)"
-                        )
-                    }
-                }
                 return
             }
             DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "unknown")")
@@ -362,6 +380,45 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         startEdgeLinkPhoneScreen(reason: "generic")
+    }
+
+    private func armPendingXiaomiScreenCommand(
+        requestId: String,
+        command: String,
+        route: String,
+        timeoutMs: Int
+    ) {
+        pendingXiaomiScreenFallback = PendingXiaomiScreenFallback(
+            requestId: requestId,
+            command: command,
+            route: route,
+            startedAt: Date(),
+            timeoutMs: timeoutMs,
+            officialDiscoveryRequired: latestMiLinkStatus?.officialDiscoveryRequired ?? false,
+            phoneDevices: latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0,
+            hyperConnectInstalled: xiaomiHyperConnectAvailable,
+            fallbackStarted: false
+        )
+        pendingXiaomiScreenFallbackTask?.cancel()
+        pendingXiaomiScreenFallbackTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+            await MainActor.run {
+                guard let self,
+                      let pending = self.pendingXiaomiScreenFallback,
+                      pending.requestId == requestId,
+                      !pending.fallbackStarted else {
+                    return
+                }
+                self.pendingXiaomiScreenFallbackTask = nil
+                self.xiaomiMiLinkCommandStatus = "小米鏡像未回應"
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_no_fallback requestId=\(requestId) command=\(pending.command) " +
+                        "route=\(pending.route) reason=timeout timeoutMs=\(pending.timeoutMs) " +
+                        "elapsedMs=\(pending.elapsedMs) officialDiscoveryRequired=\(pending.officialDiscoveryRequired) " +
+                        "phoneDevices=\(pending.phoneDevices) hyperConnectInstalled=\(pending.hyperConnectInstalled)"
+                )
+            }
+        }
     }
 
     private func startEdgeLinkPhoneScreen(reason: String) {
@@ -395,6 +452,7 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     func stopPhoneScreen() {
+        stopXiaomiScreenRouteForUser(reason: "user_stop")
         screenSession.hideWindowAndStop(sendRemoteStop: isConnected)
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
@@ -412,6 +470,10 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
         pendingXiaomiScreenFallback = nil
+        xiaomiScreenRecoveryTask?.cancel()
+        xiaomiScreenRecoveryTask = nil
+        xiaomiScreenRecoveryAttempt = 0
+        xiaomiScreenUserStopped = false
         stopXiaomiMirrorRTSPDiagnosticSource(reason: "disconnect")
         didAutoBindXiaomiDistAudio = false
         didAutoQueryXiaomiMirrorDevices = false
@@ -960,6 +1022,223 @@ final class EdgeLinkRuntime: ObservableObject {
                 error
             )
         }
+    }
+
+    private func handleXiaomiMirrorRTSPRecoveryRequired(_ event: XiaomiMirrorRTSPRecoveryEvent) {
+        guard !xiaomiScreenUserStopped else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_suppressed reason=user_stopped " +
+                    "rtspSession=\(event.sessionID.uuidString) trigger=\(event.trigger) stallReason=\(event.reason)"
+            )
+            return
+        }
+        guard isConnected else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_skipped reason=not_connected " +
+                    "rtspSession=\(event.sessionID.uuidString) trigger=\(event.trigger)"
+            )
+            return
+        }
+        if let pending = pendingXiaomiScreenFallback {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_gate reason=pending rtspSession=\(event.sessionID.uuidString) " +
+                    "pendingRequestId=\(pending.requestId) pendingElapsedMs=\(pending.elapsedMs)"
+            )
+            return
+        }
+        guard xiaomiScreenRecoveryTask == nil else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_gate reason=recovering rtspSession=\(event.sessionID.uuidString) " +
+                    "attempt=\(xiaomiScreenRecoveryAttempt)"
+            )
+            return
+        }
+        let attempt = xiaomiScreenRecoveryAttempt + 1
+        xiaomiScreenRecoveryAttempt = attempt
+        xiaomiMiLinkCommandStatus = "小米鏡像恢復中"
+        if attempt > Self.xiaomiScreenRecoveryHighAttemptWarningThreshold {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_continuing rtspSession=\(event.sessionID.uuidString) " +
+                    "trigger=\(event.trigger) reason=\(event.reason) attempt=\(attempt) " +
+                    "lastMediaSeconds=\(Self.formatSeconds(event.elapsedMediaSeconds)) " +
+                    "lastFrameSeconds=\(Self.formatOptionalSeconds(event.elapsedFrameSeconds)) " +
+                    "pushReceived=\(event.pushReceived) inboundRTP=\(event.inboundRTP) decodedFrames=\(event.decodedFrames)"
+            )
+        }
+        DiagnosticsLog.warn(
+            "xiaomi.mac.screen_recovery_requested rtspSession=\(event.sessionID.uuidString) " +
+                "trigger=\(event.trigger) reason=\(event.reason) attempt=\(attempt) " +
+                "sourceEndpoint=\(event.host ?? "none"):\(event.port.map(String.init) ?? "none") " +
+                "lastMediaSeconds=\(Self.formatSeconds(event.elapsedMediaSeconds)) " +
+                "lastFrameSeconds=\(Self.formatOptionalSeconds(event.elapsedFrameSeconds)) " +
+                "datagrams=\(event.datagramsReceived) pushReceived=\(event.pushReceived) " +
+                "inboundRTP=\(event.inboundRTP) decodedFrames=\(event.decodedFrames)"
+        )
+        xiaomiScreenRecoveryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.xiaomiScreenRecoveryDelayNanoseconds)
+            await MainActor.run {
+                guard let self else {
+                    return
+                }
+                self.xiaomiScreenRecoveryTask = nil
+                self.startXiaomiMirrorRecoveryCommand(event: event, attempt: attempt)
+            }
+        }
+    }
+
+    private func startXiaomiMirrorRecoveryCommand(event: XiaomiMirrorRTSPRecoveryEvent, attempt: Int) {
+        guard !xiaomiScreenUserStopped else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_suppressed reason=user_stopped_after_delay " +
+                    "rtspSession=\(event.sessionID.uuidString) attempt=\(attempt) stallReason=\(event.reason)"
+            )
+            return
+        }
+        if let pending = pendingXiaomiScreenFallback {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_gate reason=pending_after_delay rtspSession=\(event.sessionID.uuidString) " +
+                    "pendingRequestId=\(pending.requestId) pendingElapsedMs=\(pending.elapsedMs)"
+            )
+            return
+        }
+        let preferredScreenRoute = latestMiLinkStatus?.preferredRoutes?["screen"]
+        guard let xiaomiScreenRoute = Self.xiaomiScreenRouteCandidate(
+            from: latestMiLinkStatus,
+            preferredRoute: preferredScreenRoute
+        ), xiaomiScreenRoute.hasPrefix("xiaomi.") else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_skipped reason=xiaomi_route_missing " +
+                    "rtspSession=\(event.sessionID.uuidString) preferredRoute=\(preferredScreenRoute ?? "unknown")"
+            )
+            return
+        }
+        guard Self.allowXiaomiScreenPrimaryRoute else {
+            xiaomiMiLinkCommandStatus = "小米鏡像已停用"
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_skipped reason=disabled_by_user_default " +
+                    "rtspSession=\(event.sessionID.uuidString) route=\(xiaomiScreenRoute)"
+            )
+            return
+        }
+
+        let peerHost = Self.xiaomiMirrorAdvertisedHost()
+        let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
+        if Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt) {
+            let command = "xiaomi.mirror.startMainDisplay"
+            let timeoutMs = Self.xiaomiScreenSessionRebuildTimeoutMs
+            stopXiaomiMirrorRTSPDiagnosticSource(reason: "screen_recovery_session_rebuild")
+            startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_recovery_session_rebuild")
+            var args: [String: String] = [
+                "peerPort": String(peerPort),
+                "forceFakeRemote": "true",
+                "recovery": "true",
+                "sessionRecovery": "true",
+                "recoveryAttempt": String(attempt),
+                "recoveryReason": event.reason
+            ]
+            if let peerHost {
+                args["peerHost"] = peerHost
+            }
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
+                    "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
+                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
+                    "action=session_rebuild timeoutMs=\(timeoutMs)"
+            )
+            guard let requestId = sendMiLinkCommand(command: command, args: args) else {
+                xiaomiMiLinkCommandStatus = "小米鏡像重建指令未送出"
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
+                        "attempt=\(attempt) reason=\(event.reason) action=session_rebuild"
+                )
+                return
+            }
+            armPendingXiaomiScreenCommand(
+                requestId: requestId,
+                command: command,
+                route: xiaomiScreenRoute,
+                timeoutMs: timeoutMs
+            )
+            xiaomiMiLinkCommandStatus = "小米鏡像重建連線中"
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
+                    "command=\(command) attempt=\(attempt) action=session_rebuild"
+            )
+            return
+        }
+
+        let command = "xiaomi.mirror.requestSourceRecovery"
+        var args: [String: String] = [
+            "peerPort": String(peerPort),
+            "forceFakeRemote": "true",
+            "recovery": "true",
+            "sourceRecoveryOnly": "true",
+            "recoveryAttempt": String(attempt),
+            "recoveryReason": event.reason
+        ]
+        if let peerHost {
+            args["peerHost"] = peerHost
+        }
+        DiagnosticsLog.warn(
+            "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
+                "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
+                "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
+                "action=source_only_keep_rtsp"
+        )
+        guard let requestId = sendMiLinkCommand(command: command, args: args) else {
+            xiaomiMiLinkCommandStatus = "小米鏡像恢復指令未送出"
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
+                    "attempt=\(attempt) reason=\(event.reason)"
+            )
+            return
+        }
+        xiaomiMiLinkCommandStatus = "小米鏡像要求來源刷新"
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
+                "command=\(command) attempt=\(attempt) action=source_only_keep_rtsp"
+        )
+    }
+
+    private func handleXiaomiMirrorPeerStop(reason: String, sessionID: UUID) {
+        stopXiaomiScreenRouteForUser(reason: reason)
+        screenSession.hideWindowAndStop(sendRemoteStop: false)
+        isPhoneScreenSessionActive = false
+        isPhoneScreenViewerVisible = false
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_peer_stop session=\(sessionID.uuidString) reason=\(reason) recoverySuppressed=true"
+        )
+    }
+
+    private func stopXiaomiScreenRouteForUser(reason: String) {
+        xiaomiScreenUserStopped = true
+        pendingXiaomiScreenFallbackTask?.cancel()
+        pendingXiaomiScreenFallbackTask = nil
+        pendingXiaomiScreenFallback = nil
+        xiaomiScreenRecoveryTask?.cancel()
+        xiaomiScreenRecoveryTask = nil
+        xiaomiScreenRecoveryAttempt = 0
+        stopXiaomiMirrorRTSPDiagnosticSource(reason: reason)
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_stop_cleanup reason=\(reason) recoverySuppressed=true"
+        )
+    }
+
+    private static func shouldRebuildXiaomiScreenSession(
+        event: XiaomiMirrorRTSPRecoveryEvent,
+        attempt: Int
+    ) -> Bool {
+        if event.reason == "rtsp_keepalive_missed" {
+            return true
+        }
+        if attempt > xiaomiScreenSourceRecoveryMaxAttempts {
+            return true
+        }
+        if let elapsedFrameSeconds = event.elapsedFrameSeconds,
+           elapsedFrameSeconds >= xiaomiScreenSessionRebuildAfterNoFrameSeconds {
+            return true
+        }
+        return false
     }
 
     private func startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded() {
@@ -1798,7 +2077,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 "message=\(result.message) data=\(Self.formatDiagnosticsData(result.data))"
         )
 
-        guard var pending, pending.requestId == result.requestId else {
+        guard let pending, pending.requestId == result.requestId else {
             if result.command == "xiaomi.mirror.startMainDisplay" {
                 DiagnosticsLog.warn(
                     "xiaomi.mac.command_result_unmatched requestId=\(result.requestId) command=\(result.command) " +
@@ -2183,6 +2462,14 @@ final class EdgeLinkRuntime: ObservableObject {
             .joined(separator: "|")
     }
 
+    private static func formatSeconds(_ value: Double) -> String {
+        String(format: "%.2f", value)
+    }
+
+    private static func formatOptionalSeconds(_ value: Double?) -> String {
+        value.map { String(format: "%.2f", $0) } ?? "none"
+    }
+
     private static let macNotificationSyncDefaultsKey = "macNotificationSyncEnabled"
     private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
@@ -2194,6 +2481,11 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey = "xiaomiMirrorRTSPDiagnosticEnabled"
     private static let xiaomiMirrorRTSPDiagnosticPort: UInt16 = 7102
     private static let xiaomiMirrorRTSPDiagnosticLifetimeSeconds: TimeInterval = 45
+    private static let xiaomiScreenRecoveryDelayNanoseconds: UInt64 = 150_000_000
+    private static let xiaomiScreenRecoveryHighAttemptWarningThreshold = 3
+    private static let xiaomiScreenSourceRecoveryMaxAttempts = 2
+    private static let xiaomiScreenSessionRebuildAfterNoFrameSeconds: Double = 6
+    private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let phoneRelayDebugDefaultNumber = "800"
     private static let phoneRelayDebugMaxTimeoutSeconds: TimeInterval = 30
 
