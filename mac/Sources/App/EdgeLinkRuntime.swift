@@ -51,7 +51,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let pairingTransport: PairingTransport
     private let clipboardSync = ClipboardSync()
     private let notificationPresenter = MacNotificationPresenter()
-    private let systemCallUIBridge = MacSystemCallUIBridge()
+    private let incomingCallPresenter = MacIncomingCallPresenter()
     private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
@@ -142,19 +142,14 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.copyVerificationCode(code, reason: "notification_action")
             }
         }
-        systemCallUIBridge.onAnswerPhoneCall = { [weak self] callId in
+        incomingCallPresenter.onAnswerPhoneCall = { [weak self] callId in
             Task { @MainActor in
-                self?.handleSystemCallUIAnswer(callId: callId)
+                self?.handleIncomingCallUIAnswer(callId: callId)
             }
         }
-        systemCallUIBridge.onHangUpPhoneCall = { [weak self] callId in
+        incomingCallPresenter.onHangUpPhoneCall = { [weak self] callId in
             Task { @MainActor in
-                self?.handleSystemCallUIHangUp(callId: callId)
-            }
-        }
-        systemCallUIBridge.onPlayDTMF = { [weak self] _, digits in
-            Task { @MainActor in
-                _ = self?.sendPhoneDTMF(sequence: digits)
+                self?.handleIncomingCallUIHangUp(callId: callId)
             }
         }
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
@@ -499,7 +494,7 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
         callRelayGatewayClient.close(reason: "disconnect")
-        systemCallUIBridge.endAll(reason: .failed)
+        incomingCallPresenter.endAll(reason: .failed)
         phoneCallStatuses.removeAll()
         incomingPhoneCallLabel = ""
         androidMicRelayArmed = false
@@ -1391,7 +1386,8 @@ final class EdgeLinkRuntime: ObservableObject {
             return true
         }
         if event.reason == "no_packets_beyond_6s" {
-            return true
+            return attempt > xiaomiScreenSourceRecoveryMaxAttempts &&
+                event.elapsedMediaSeconds >= xiaomiScreenSessionRebuildAfterNoPacketSeconds
         }
         if Self.isXiaomiScreenFrameStall(event.reason) {
             return shouldEscalateXiaomiScreenFrameStallToSessionRebuild(event)
@@ -2443,7 +2439,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handlePhoneCallStatus(_ status: PhoneCallStatusBody) {
         if status.callId == "all" {
-            systemCallUIBridge.endAll(reason: .remoteEnded)
+            incomingCallPresenter.endAll(reason: .remoteEnded)
             phoneCallStatuses.removeAll()
             incomingPhoneCallLabel = ""
             if isPhoneCallActive {
@@ -2461,18 +2457,18 @@ final class EdgeLinkRuntime: ObservableObject {
             phoneCallStatuses[status.callId] = status
             incomingPhoneCallLabel = caller
             phoneCallStatus = "手機來電：\(caller)"
-            systemCallUIBridge.reportIncomingCall(status)
+            incomingCallPresenter.reportIncomingCall(status)
         case "active", "dialing", "connecting", "held":
             phoneCallStatuses[status.callId] = status
-            if status.state == "active", !systemCallUIBridge.wasAnsweredBySystemUI(callId: status.callId) {
-                systemCallUIBridge.endCall(status, reason: .answeredElsewhere)
+            if status.state == "active", !incomingCallPresenter.wasAnsweredByIncomingUI(callId: status.callId) {
+                incomingCallPresenter.endCall(status, reason: .answeredElsewhere)
             }
             incomingPhoneCallLabel = ""
             isPhoneCallActive = true
             phoneCallStatus = Self.localizedPhoneCallStatus(status, caller: caller)
         case "disconnected", "disconnecting", "ended":
             phoneCallStatuses.removeValue(forKey: status.callId)
-            systemCallUIBridge.endCall(status, reason: .remoteEnded)
+            incomingCallPresenter.endCall(status, reason: .remoteEnded)
             if incomingPhoneCallLabel == caller {
                 incomingPhoneCallLabel = ""
             }
@@ -2492,18 +2488,18 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
-    private func handleSystemCallUIAnswer(callId: String) {
+    private func handleIncomingCallUIAnswer(callId: String) {
         incomingPhoneCallLabel = ""
         phoneCallStatus = "接聽手機來電中"
         _ = answerPhoneCall()
-        DiagnosticsLog.info("phone.mac.system_callui_answer callId=\(callId)")
+        DiagnosticsLog.info("phone.mac.incoming_ui_answer callId=\(callId)")
     }
 
-    private func handleSystemCallUIHangUp(callId: String) {
+    private func handleIncomingCallUIHangUp(callId: String) {
         incomingPhoneCallLabel = ""
         phoneCallStatus = "拒接手機來電中"
         _ = hangUpPhoneCall()
-        DiagnosticsLog.info("phone.mac.system_callui_hangup callId=\(callId)")
+        DiagnosticsLog.info("phone.mac.incoming_ui_hangup callId=\(callId)")
     }
 
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
@@ -2672,8 +2668,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenRecoveryHighAttemptWarningThreshold = 3
     private static let xiaomiScreenSourceRecoveryMaxAttempts = 2
     private static let xiaomiScreenSessionRebuildAfterNoFrameSeconds: Double = 18
+    private static let xiaomiScreenSessionRebuildAfterNoPacketSeconds: Double = 30
     private static let xiaomiScreenSourceRecoveryCooldownSeconds: TimeInterval = 10
-    private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 10
+    private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 45
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let phoneRelayDebugDefaultNumber = "800"
     private static let phoneRelayDebugMaxTimeoutSeconds: TimeInterval = 30

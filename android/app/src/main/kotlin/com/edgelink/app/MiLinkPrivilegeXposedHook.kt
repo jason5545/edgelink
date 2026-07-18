@@ -1953,6 +1953,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             isLinkedFakeMirrorScreenAudioStillActive(classLoader, source)
         }
         if (inactiveSources.isEmpty()) {
+            log(
+                "mirror fake screen official audio cleanup skipped reason=$reason " +
+                    "active=${linkedSources.size} ownerActive=${shouldUseOfficialMirrorScreenAudioOwner()}"
+            )
             scheduleFakeMirrorScreenAudioCleanupWatchdog(classLoader, "$reason:still_active")
             return
         }
@@ -4698,20 +4702,26 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun isCurrentFakeMirrorScreenAudioSource(source: Any?): Boolean =
         source != null &&
             shouldUseOfficialMirrorScreenAudioOwner() &&
-            lastFakeMirrorControlSource === source &&
-            shouldForceMirrorSourceSession()
+            lastFakeMirrorControlSource === source
 
     private fun isLinkedFakeMirrorScreenAudioStillActive(classLoader: ClassLoader, source: Any): Boolean {
         if (!isCurrentFakeMirrorScreenAudioSource(source)) {
             return false
         }
-        if (readReflectiveFieldAny(source, "run_capture") as? Boolean == false) {
-            return false
-        }
-        return activeMirrorDisplays(classLoader).any { display ->
+        val hasActiveDisplay = activeMirrorDisplays(classLoader).any { display ->
             MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(readMirrorDisplayDeviceId(display)) &&
                 readMirrorDisplaySource(display) === source
         }
+        if (!hasActiveDisplay) {
+            return false
+        }
+        if (readReflectiveFieldAny(source, "run_capture") as? Boolean == false) {
+            log(
+                "mirror fake screen official audio kept active with paused capture " +
+                    mirrorControlSourceSummary(source)
+            )
+        }
+        return true
     }
 
     private fun shouldForceMirrorSourceRoute(): Boolean =

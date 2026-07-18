@@ -1627,7 +1627,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
     private static func shouldKeepMPTSinkAliveDuringRecovery(_ reason: String) -> Bool {
         reason == "decoded_frame_stalled_beyond_threshold" ||
-            reason.hasPrefix("decoded_frame_stalled")
+            reason.hasPrefix("decoded_frame_stalled") ||
+            reason == "no_packets_beyond_6s"
     }
 
     private func notifyRecoveryRequired(
@@ -2554,9 +2555,8 @@ private final class XiaomiMirrorRTPMediaSender {
                 "xiaomi.mirror.mpt.no_packets_timeout session=\(sessionID.uuidString) " +
                     "elapsedSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) " +
                     "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
-                    "decodedFrames=\(mptSinkDecodedFrames) officialAction=stop_sink_retry_rtsp"
+                    "decodedFrames=\(mptSinkDecodedFrames) officialAction=keep_sink_request_source_recovery"
             )
-            stopOnQueue(reason: "mpt_no_packets_timeout")
             onMPTMediaStalled?(stall)
             return
         }
@@ -3806,8 +3806,10 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private var pcmBytesScheduled: UInt64 = 0
     private var validPCMReported = false
     private var unsupportedFormatLogged = false
+    private var privateAudioFormatPrimed = false
     private var parseFailureCount: UInt64 = 0
     private var scheduleFailureCount: UInt64 = 0
+    private var suspiciousPCMDropCount: UInt64 = 0
 
     init(sessionID: UUID) {
         self.sessionID = sessionID
@@ -3840,10 +3842,28 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
             return
         }
 
-        activeFormat = parsed.format
         let pcmPayload = parsed.pcmPayload
-        writePCMCapture(pcmPayload)
         let stats = pcmS16LEStats(pcmPayload)
+        guard isPrivateAudioPayloadSafe(parsed, stats: stats) else {
+            suspiciousPCMDropCount += 1
+            if suspiciousPCMDropCount <= 5 || suspiciousPCMDropCount % 50 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.audio_private_suspicious_drop session=\(sessionID.uuidString) " +
+                        "pes=\(pesReceived) drops=\(suspiciousPCMDropCount) kind=\(parsed.kind) " +
+                        "sampleRate=\(Int(parsed.format.sampleRate)) channels=\(parsed.format.channels) " +
+                        "bits=\(parsed.format.bitsPerSample) frames=\(parsed.declaredFrames.map(String.init) ?? "none") " +
+                        "declaredBytes=\(parsed.declaredPayloadBytes) pcmBytes=\(pcmPayload.count) " +
+                        "nonzero=\(stats.nonzeroSamples) maxAbs=\(stats.maxAbs) avgAbs=\(stats.averageAbs) " +
+                        "primed=\(privateAudioFormatPrimed) fp=\(DiagnosticsLog.fingerprint(pcmPayload))"
+                )
+            }
+            return
+        }
+        if parsed.kind == "ff03" {
+            privateAudioFormatPrimed = true
+        }
+        activeFormat = parsed.format
+        writePCMCapture(pcmPayload)
         let shouldLog = pesReceived <= 5 || pesReceived % 100 == 0 || (stats.nonzeroSamples > 0 && !validPCMReported)
         if stats.nonzeroSamples > 0 && !validPCMReported {
             validPCMReported = true
@@ -3866,6 +3886,49 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
             )
         }
         schedulePCM(pcmPayload, format: parsed.format)
+    }
+
+    private func isPrivateAudioPayloadSafe(
+        _ parsed: XiaomiMirrorMPTPrivateAudioPayload,
+        stats: (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int)
+    ) -> Bool {
+        guard parsed.format.sampleRate >= 8_000,
+              parsed.format.sampleRate <= 192_000,
+              parsed.format.channels >= 1,
+              parsed.format.channels <= 8,
+              parsed.format.bitsPerSample == 16 else {
+            return false
+        }
+        let bytesPerFrame = parsed.format.bytesPerFrame
+        guard bytesPerFrame > 0,
+              parsed.pcmPayload.count <= Self.maxPrivateAudioPayloadBytes,
+              parsed.pcmPayload.count % bytesPerFrame == 0 else {
+            return false
+        }
+        if parsed.kind == "ff03",
+           (parsed.declaredPayloadBytes < 0 || parsed.declaredPayloadBytes > Self.maxPrivateAudioPayloadBytes) {
+            return false
+        }
+        if parsed.kind == "ff02", !privateAudioFormatPrimed {
+            return false
+        }
+        if let declaredFrames = parsed.declaredFrames, declaredFrames > 0 {
+            let actualFrames = parsed.pcmPayload.count / bytesPerFrame
+            let toleratedDrift = max(2, declaredFrames / 4)
+            if abs(actualFrames - declaredFrames) > toleratedDrift {
+                return false
+            }
+        }
+        guard stats.samples > 0 else {
+            return true
+        }
+        let nonzeroRatio = Double(stats.nonzeroSamples) / Double(stats.samples)
+        if stats.maxAbs >= Self.suspiciousPCMMaxAbsThreshold,
+           stats.averageAbs >= Self.suspiciousPCMAverageAbsThreshold,
+           nonzeroRatio >= Self.suspiciousPCMNonzeroRatioThreshold {
+            return false
+        }
+        return true
     }
 
     func stop(reason: String) {
@@ -4129,6 +4192,10 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private static let privateCapturePath = "/private/tmp/edgelink-xiaomi-mirror-audio-private.bin"
     private static let pcmCapturePath = "/private/tmp/edgelink-xiaomi-mirror-audio.pcm"
     private static let captureLimitBytes = 4 * 1024 * 1024
+    private static let maxPrivateAudioPayloadBytes = 64 * 1024
+    private static let suspiciousPCMMaxAbsThreshold = 30_000
+    private static let suspiciousPCMAverageAbsThreshold = 12_000
+    private static let suspiciousPCMNonzeroRatioThreshold = 0.95
 }
 
 private final class XiaomiMirrorMPEGTSHEVCDemuxer {

@@ -93,27 +93,6 @@ targets:
           - INSendMessageIntent
         NSMicrophoneUsageDescription: EdgeLink uses the microphone only when Android requests relayed microphone audio.
         NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
-  EdgeLinkCallUI:
-    type: application
-    platform: iOS
-    deploymentTarget: "17.0"
-    sources:
-      - Sources/CallUIHelper
-    settings:
-      base:
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: MW4GWYGX56
-        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
-        PRODUCT_BUNDLE_IDENTIFIER: com.edgelink.callui
-        SUPPORTS_MACCATALYST: YES
-        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-        TARGETED_DEVICE_FAMILY: "1,2"
-    info:
-      path: Sources/CallUIHelper/Info.plist
-      properties:
-        CFBundleDisplayName: EdgeLink
-        LSUIElement: true
-        UIApplicationSupportsIndirectInputEvents: true
   EdgeLinkKitTests:
     type: bundle.unit-test
     platform: macOS
@@ -136,7 +115,3 @@ schemes:
     build:
       targets:
         EdgeLinkMac: all
-  EdgeLinkCallUI:
-    build:
-      targets:
-        EdgeLinkCallUI: all

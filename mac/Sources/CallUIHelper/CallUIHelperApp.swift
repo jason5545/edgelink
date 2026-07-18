@@ -65,14 +65,15 @@ private final class SystemCallProvider: NSObject, CXProviderDelegate {
     }
 
     func providerDidReset(_ provider: CXProvider) {
-        for (callId, _) in callUUIDsByCallId {
-            postAction(Self.endActionName, payload: [
-                "callId": callId,
-                "reason": "provider_reset"
-            ])
-        }
+        let callIds = Array(callUUIDsByCallId.keys)
         callUUIDsByCallId.removeAll()
         callIdsByUUID.removeAll()
+        for callId in callIds {
+            postAction(Self.reportFailedName, payload: [
+                "callId": callId,
+                "error": "provider_reset"
+            ])
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
@@ -137,11 +138,12 @@ private final class SystemCallProvider: NSObject, CXProviderDelegate {
 
         provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
             if let error {
+                let nsError = error as NSError
                 self?.callUUIDsByCallId.removeValue(forKey: callId)
                 self?.callIdsByUUID.removeValue(forKey: uuid)
                 self?.postAction(Self.reportFailedName, payload: [
                     "callId": callId,
-                    "error": error.localizedDescription
+                    "error": "domain=\(nsError.domain) code=\(nsError.code) description=\(nsError.localizedDescription)"
                 ])
             }
         }

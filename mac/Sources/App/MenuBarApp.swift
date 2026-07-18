@@ -4,14 +4,6 @@ import SwiftUI
 
 @MainActor
 private final class EdgeLinkAppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        MacSystemCallUIBridge.startInstalledHelper(reason: "app_delegate_did_finish_launching")
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        MacSystemCallUIBridge.stopInstalledHelper(reason: "app_delegate_will_terminate")
-    }
-
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
