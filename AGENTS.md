@@ -10,6 +10,26 @@
   `ditto /private/tmp/edgelink-callui-derived-data/Build/Products/Debug-maccatalyst/EdgeLinkCallUI.app /Applications/EdgeLinkCallUI.app`
 - Repeated Keychain password prompts usually mean the identity item was created by an old ad-hoc/DerivedData build. Do not delete it, because that changes the device ID and breaks pairing. Launch the stable `/Applications` build once and let `KeychainIdentityStore` migrate the item to the current signed app.
 
+## Xiaomi HyperConnect research artifact
+
+- For Xiaomi HyperConnect / `/Applications/小米互联服务.app` research, read the existing indexed artifact first:
+  `captures/xiaomi-hyperconnect/3.0.300-285/index/`
+- Start with:
+  `index/SUMMARY.md`,
+  `index/metadata/app-info.json`,
+  `index/metadata/frameworks.tsv`,
+  `index/metadata/macho-binaries.tsv`,
+  and `index/search/interesting-strings.txt`.
+- For binary-specific details, use `index/macho/<safe-binary-name>/` and its `rabin-*`, `otool-*`,
+  `objc-headers/`, and `swift-headers/` outputs.
+- Do not re-extract or decompile `/Applications/小米互联服务.app` by default. Only rerun
+  `tools/extract-xiaomi-hyperconnect.sh` when the local artifact is missing, the installed app version
+  changed, or Jason explicitly asks to refresh the extraction.
+- `captures/` is intentionally ignored. Do not commit copied Xiaomi binaries or generated
+  reverse-engineering output; keep product code clean-room and use these artifacts only as local
+  research references.
+- The workflow notes live in `cleanroom/xiaomi-hyperconnect/README.md`.
+
 ## macOS notification sender icon
 
 - If EdgeLink notifications show a blank sender icon in Notification Center, inspect LaunchServices before changing `UNNotificationContent`, attachments, `LSUIElement`, request identifiers, or private notification APIs. Notification Center resolves the sender icon through the posting bundle ID's LaunchServices record and IconServices, not from `UNNotificationAttachment`.
