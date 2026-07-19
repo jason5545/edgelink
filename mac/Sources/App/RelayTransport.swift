@@ -61,6 +61,8 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
     private let lifecycleLock = NSLock()
     private var keepaliveTask: Task<Void, Never>?
     private var isClosed = false
+    private var binaryFramesSent: UInt64 = 0
+    private var binaryFramesReceived: UInt64 = 0
 
     init(hostId: String, deviceId: String, task: URLSessionWebSocketTask) {
         self.hostId = hostId
@@ -69,7 +71,10 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
     }
 
     func send(_ bytes: Data) async throws {
-        DiagnosticsLog.info("relay.transport.mac.binary_out hostId=\(hostId) deviceId=\(deviceId) bytes=\(bytes.count)")
+        let count = nextBinaryFrameCount(sent: true)
+        if count <= 3 || count % 100 == 0 {
+            DiagnosticsLog.info("relay.transport.mac.binary_out hostId=\(hostId) deviceId=\(deviceId) count=\(count) bytes=\(bytes.count)")
+        }
         try await task.send(.data(bytes))
     }
 
@@ -78,7 +83,10 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
             let message = try await task.receive()
             switch message {
             case .data(let data):
-                DiagnosticsLog.info("relay.transport.mac.binary_in hostId=\(hostId) deviceId=\(deviceId) bytes=\(data.count)")
+                let count = nextBinaryFrameCount(sent: false)
+                if count <= 3 || count % 100 == 0 {
+                    DiagnosticsLog.info("relay.transport.mac.binary_in hostId=\(hostId) deviceId=\(deviceId) count=\(count) bytes=\(data.count)")
+                }
                 return data
             case .string(let text):
                 DiagnosticsLog.warn("relay.transport.mac.text_ignored hostId=\(hostId) deviceId=\(deviceId) text=\(text)")
@@ -88,6 +96,17 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
                 continue
             }
         }
+    }
+
+    private func nextBinaryFrameCount(sent: Bool) -> UInt64 {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if sent {
+            binaryFramesSent &+= 1
+            return binaryFramesSent
+        }
+        binaryFramesReceived &+= 1
+        return binaryFramesReceived
     }
 
     func close() {

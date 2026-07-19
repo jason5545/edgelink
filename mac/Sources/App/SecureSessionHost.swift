@@ -7,6 +7,9 @@ actor SecureSessionHost {
     private let peer: PinnedPeer
     private let dispatcher: CommandDispatcher
     private var established: EstablishedHandshake?
+    private var lastInboundActivityAt = Date.distantPast
+    private var framesSent: UInt64 = 0
+    private var framesReceived: UInt64 = 0
 
     init(
         channel: ByteChannel,
@@ -51,6 +54,7 @@ actor SecureSessionHost {
             confirm: confirm,
             pinnedClientPublicKey: peer.publicKey
         )
+        lastInboundActivityAt = Date()
         DiagnosticsLog.info("hs.mac.established reason=\(reason) hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
     }
 
@@ -71,7 +75,10 @@ actor SecureSessionHost {
         var session = try await waitForEstablished()
         let frame = try session.channel.seal(plaintext)
         established = session
-        DiagnosticsLog.info("secure.mac.frame_out plaintext=\(plaintext.count) frame=\(frame.count)")
+        framesSent &+= 1
+        if framesSent <= 3 || framesSent % 100 == 0 {
+            DiagnosticsLog.info("secure.mac.frame_out count=\(framesSent) plaintext=\(plaintext.count) frame=\(frame.count)")
+        }
         try await channel.send(frame)
     }
 
@@ -86,12 +93,20 @@ actor SecureSessionHost {
             var session = try requireEstablished()
             let plaintext = try session.channel.open(frame)
             established = session
-            DiagnosticsLog.info("secure.mac.frame_in frame=\(frame.count) plaintext=\(plaintext.count)")
+            lastInboundActivityAt = Date()
+            framesReceived &+= 1
+            if framesReceived <= 3 || framesReceived % 100 == 0 {
+                DiagnosticsLog.info("secure.mac.frame_in count=\(framesReceived) frame=\(frame.count) plaintext=\(plaintext.count)")
+            }
 
             if let response = try dispatcher.handle(plaintext) {
                 try await sendPlaintext(response)
             }
         }
+    }
+
+    func inboundIdleDuration(at now: Date = Date()) -> TimeInterval {
+        now.timeIntervalSince(lastInboundActivityAt)
     }
 
     private func requireEstablished() throws -> EstablishedHandshake {

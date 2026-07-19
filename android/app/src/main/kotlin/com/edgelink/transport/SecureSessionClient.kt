@@ -19,6 +19,10 @@ class SecureSessionClient(
 ) {
     private val secureMutex = Mutex()
     private var established: EstablishedHandshake? = null
+    @Volatile
+    private var lastInboundElapsedMs = 0L
+    private var framesSent = 0L
+    private var framesReceived = 0L
 
     suspend fun connect() {
         EdgeLinkLog.info("hs.android.start clientId=${identity.deviceId} hostId=${peer.deviceId}")
@@ -38,6 +42,7 @@ class SecureSessionClient(
         EdgeLinkLog.info("hs.android.confirm_out bytes=${confirm.size}")
         channel.send(confirm)
         established = session
+        lastInboundElapsedMs = monotonicMilliseconds()
         EdgeLinkLog.info("hs.android.established clientId=${identity.deviceId} hostId=${peer.deviceId}")
     }
 
@@ -58,7 +63,10 @@ class SecureSessionClient(
         secureMutex.withLock {
             val session = established ?: error("Secure session is not established.")
             val frame = session.channel.seal(plaintext)
-            EdgeLinkLog.info("secure.android.frame_out plaintext=${plaintext.size} frame=${frame.size}")
+            framesSent += 1
+            if (framesSent <= 3 || framesSent % 100L == 0L) {
+                EdgeLinkLog.info("secure.android.frame_out count=$framesSent plaintext=${plaintext.size} frame=${frame.size}")
+            }
             channel.send(frame)
         }
     }
@@ -70,7 +78,11 @@ class SecureSessionClient(
                 val session = established ?: error("Secure session is not established.")
                 session.channel.open(frame)
             }
-            EdgeLinkLog.info("secure.android.frame_in frame=${frame.size} plaintext=${plaintext.size}")
+            lastInboundElapsedMs = monotonicMilliseconds()
+            framesReceived += 1
+            if (framesReceived <= 3 || framesReceived % 100L == 0L) {
+                EdgeLinkLog.info("secure.android.frame_in count=$framesReceived frame=${frame.size} plaintext=${plaintext.size}")
+            }
             val response = handler(plaintext)
             if (response != null) {
                 sendPlaintext(response)
@@ -78,7 +90,16 @@ class SecureSessionClient(
         }
     }
 
+    fun inboundIdleMilliseconds(): Long {
+        val lastInbound = lastInboundElapsedMs
+        return if (lastInbound <= 0L) Long.MAX_VALUE else {
+            (monotonicMilliseconds() - lastInbound).coerceAtLeast(0L)
+        }
+    }
+
     fun close() {
         channel.close()
     }
+
+    private fun monotonicMilliseconds(): Long = System.nanoTime() / 1_000_000L
 }

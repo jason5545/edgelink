@@ -2400,8 +2400,15 @@ final class EdgeLinkRuntime: ObservableObject {
                         }
                     },
                     onPhoneRelayMedia: { [weak self] media in
+                        guard let self else {
+                            return
+                        }
+                        if media.kind == "rtp" {
+                            self.callRelayCloudflareBridge.handle(media)
+                            return
+                        }
                         Task { @MainActor in
-                            self?.handlePhoneRelayMedia(media)
+                            self.handlePhoneRelayMedia(media)
                         }
                     },
                     onPhoneCallStatus: { [weak self] status in
@@ -2535,10 +2542,15 @@ final class EdgeLinkRuntime: ObservableObject {
                 return
             }
 
-            let pongAgeSeconds = Date().timeIntervalSince(lastSecurePongAt)
-            if pongAgeSeconds >= Self.securePongTimeoutSeconds {
+            let now = Date()
+            let pongAgeSeconds = now.timeIntervalSince(lastSecurePongAt)
+            let inboundAgeSeconds = await session.inboundIdleDuration(at: now)
+            let livenessAgeSeconds = min(pongAgeSeconds, inboundAgeSeconds)
+            if livenessAgeSeconds >= Self.securePongTimeoutSeconds {
                 DiagnosticsLog.warn(
-                    "relay.mac.pong_timeout hostId=\(hostId) clientId=\(clientId) ageMs=\(Int(pongAgeSeconds * 1000)) timeoutMs=\(Int(Self.securePongTimeoutSeconds * 1000))"
+                    "relay.mac.pong_timeout hostId=\(hostId) clientId=\(clientId) " +
+                        "ageMs=\(Int(livenessAgeSeconds * 1000)) pongAgeMs=\(Int(pongAgeSeconds * 1000)) " +
+                        "inboundAgeMs=\(Int(inboundAgeSeconds * 1000)) timeoutMs=\(Int(Self.securePongTimeoutSeconds * 1000))"
                 )
                 currentChannel?.close()
                 throw SecureKeepaliveError.pongTimedOut

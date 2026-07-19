@@ -8,6 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -93,7 +95,7 @@ object AndroidCallRelayBridge {
             )
             return
         }
-        session.acceptSourceRTP(body)
+        session.enqueueSourceRTP(body)
     }
 
     fun stop(reason: String) {
@@ -119,6 +121,10 @@ object AndroidCallRelayBridge {
     ) {
         private var bridgeRtpPackets = 0
         private var sourceRtpPackets = 0
+        private val sourceRTPQueue = Channel<PhoneRelayMediaBody>(
+            capacity = SOURCE_RTP_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
         private val localBridge = LocalMiLinkRTSPBridge(
             relaySessionId = relaySessionId,
             localRtspPorts = localRtspPorts,
@@ -126,7 +132,12 @@ object AndroidCallRelayBridge {
             statusHandler = ::sendStatus
         )
 
-        suspend fun run() {
+        suspend fun run() = coroutineScope {
+            val sourceRTPJob = launch {
+                for (body in sourceRTPQueue) {
+                    acceptSourceRTP(body)
+                }
+            }
             sendStatus("bridge_starting")
             try {
                 localBridge.run()
@@ -140,8 +151,26 @@ object AndroidCallRelayBridge {
                 )
                 sendStatus("bridge_failed")
             } finally {
+                sourceRTPQueue.close()
+                sourceRTPJob.cancelAndJoin()
                 sendStatus("source_stop")
                 sendStatus("bridge_stopped")
+            }
+        }
+
+        fun enqueueSourceRTP(body: PhoneRelayMediaBody) {
+            sourceRtpPackets += 1
+            val accepted = sourceRTPQueue.trySend(body).isSuccess
+            if (sourceRtpPackets == 1 || sourceRtpPackets % 100 == 0) {
+                EdgeLinkLog.info(
+                    "callrelay.android.source_rtp_cloudflare_in sessionId=$relaySessionId " +
+                        "count=$sourceRtpPackets bytes=${body.bytes ?: -1} queued=$accepted"
+                )
+            }
+            if (!accepted) {
+                EdgeLinkLog.warn(
+                    "callrelay.android.source_rtp_queue_closed sessionId=$relaySessionId count=$sourceRtpPackets"
+                )
             }
         }
 
@@ -149,13 +178,6 @@ object AndroidCallRelayBridge {
             val packet = body.dataBase64
                 ?.takeIf { it.isNotEmpty() }
                 ?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
-            sourceRtpPackets += 1
-            if (sourceRtpPackets == 1 || sourceRtpPackets % 100 == 0) {
-                EdgeLinkLog.info(
-                    "callrelay.android.source_rtp_cloudflare_in sessionId=$relaySessionId " +
-                        "count=$sourceRtpPackets bytes=${body.bytes ?: -1} decoded=${packet?.size ?: -1}"
-                )
-            }
             if (packet == null) {
                 EdgeLinkLog.warn(
                     "callrelay.android.source_rtp_cloudflare_invalid sessionId=$relaySessionId " +
@@ -698,7 +720,9 @@ object AndroidCallRelayBridge {
         private var socket: Socket? = null
         private var writer: BufferedWriter? = null
         private var udpSocket: DatagramSocket? = null
+        private var rtcpSocket: DatagramSocket? = null
         private var destination: InetSocketAddress? = null
+        private var rtcpDestination: InetSocketAddress? = null
         private var tcpBuffer = ByteArray(0)
         private var nextCSeq = 1
         private var sentOptions = false
@@ -710,6 +734,11 @@ object AndroidCallRelayBridge {
         private var rtpPackets = 0
         private var bufferedPackets = 0
         private var droppedPackets = 0
+        private var rtpPayloadOctets = 0L
+        private var lastRTPTimestamp = 0L
+        private var rtpSSRC = 0L
+        private var lastRTCPSentElapsedMs = 0L
+        private var rtcpReportsSent = 0
 
         suspend fun run() = coroutineScope {
             val server = ServerSocket().apply {
@@ -742,10 +771,12 @@ object AndroidCallRelayBridge {
             runCatching { writer?.close() }
             runCatching { socket?.close() }
             runCatching { udpSocket?.close() }
+            runCatching { rtcpSocket?.close() }
             runCatching { serverSocket?.close() }
             writer = null
             socket = null
             udpSocket = null
+            rtcpSocket = null
             serverSocket = null
         }
 
@@ -771,15 +802,14 @@ object AndroidCallRelayBridge {
             client.soTimeout = 2_000
             socket = client
             writer = BufferedWriter(OutputStreamWriter(client.getOutputStream(), rtspCharset))
-            val udp = DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(0))
-            }
+            val (udp, rtcp) = openUDPPortPair()
             udpSocket = udp
+            rtcpSocket = rtcp
             resetControlState()
             EdgeLinkLog.info(
                 "callrelay.android.sink_rtsp_connected sessionId=$relaySessionId " +
-                    "from=${client.inetAddress.hostAddress}:${client.port} rtpSourcePort=${udp.localPort}"
+                    "from=${client.inetAddress.hostAddress}:${client.port} " +
+                    "rtpSourcePort=${udp.localPort} rtcpSourcePort=${rtcp.localPort}"
             )
             statusHandler("sink_rtsp_connected")
             try {
@@ -789,13 +819,16 @@ object AndroidCallRelayBridge {
                 sendMutex.withLock {
                     playing = false
                     destination = null
+                    rtcpDestination = null
                 }
                 runCatching { writer?.close() }
                 runCatching { client.close() }
                 runCatching { udp.close() }
+                runCatching { rtcp.close() }
                 writer = null
                 socket = null
                 udpSocket = null
+                rtcpSocket = null
                 EdgeLinkLog.info("callrelay.android.sink_rtsp_disconnected sessionId=$relaySessionId")
                 statusHandler("sink_rtsp_disconnected")
             }
@@ -812,6 +845,13 @@ object AndroidCallRelayBridge {
             sessionHeader = null
             playing = false
             destination = null
+            rtcpDestination = null
+            rtpPackets = 0
+            rtpPayloadOctets = 0L
+            lastRTPTimestamp = 0L
+            rtpSSRC = 0L
+            lastRTCPSentElapsedMs = 0L
+            rtcpReportsSent = 0
         }
 
         private suspend fun readLoop(client: Socket) {
@@ -966,7 +1006,7 @@ object AndroidCallRelayBridge {
             }
             sentGetParameters = true
             val body = listOf(
-                "wfd_audio_codecs",
+                "wfd_audio_codecs_v2",
                 "audio_sample_time_ms",
                 "wfd_client_rtp_ports",
                 "wfd_content_protection"
@@ -994,7 +1034,11 @@ object AndroidCallRelayBridge {
             sentSelectedParameters = true
             val body = listOf(
                 "wfd_video_formats: none",
-                "wfd_audio_codecs: AAC 00000001 00",
+                // Xiaomi's v2 table maps type 0 / index 3 to LPCM, 8 kHz,
+                // 16-bit, mono. This must match the Mac microphone RTP stream.
+                // The legacy AAC selection makes the native sink configure
+                // itself for 48 kHz stereo and silently render zero audio.
+                "wfd_audio_codecs_v2: $CALL_AUDIO_CODEC_V2_SELECTION",
                 "audio_sample_time_ms: 20",
                 "wfd_client_rtp_ports: RTP/AVP/UDP;unicast $sinkPort 0 mode=play",
                 "wfd_content_protection: none",
@@ -1049,9 +1093,11 @@ object AndroidCallRelayBridge {
                 val next = InetSocketAddress(address, port)
                 if (destination != next) {
                     destination = next
+                    rtcpDestination = InetSocketAddress(address, (port + 1).coerceAtMost(65_535))
                     EdgeLinkLog.info(
                         "callrelay.android.sink_rtp_destination sessionId=$relaySessionId " +
-                            "host=${address.hostAddress} port=$port reason=$reason pending=${pendingRTP.size} " +
+                            "host=${address.hostAddress} port=$port rtcpPort=${rtcpDestination?.port} " +
+                            "reason=$reason pending=${pendingRTP.size} " +
                             "source=${source.forRTSPLog()}"
                     )
                 }
@@ -1062,11 +1108,38 @@ object AndroidCallRelayBridge {
             val transport = rtspHeader("Transport", headerText).orEmpty()
             val clientPort = rtspTransportValue("client_port", transport)
             val serverPort = udpSocket?.localPort ?: 0
+            val serverRTCPPort = rtcpSocket?.localPort ?: (serverPort + 1)
             return if (clientPort != null) {
-                "RTP/AVP/UDP;unicast;client_port=$clientPort;server_port=$serverPort-${serverPort + 1}"
+                "RTP/AVP/UDP;unicast;client_port=$clientPort;server_port=$serverPort-$serverRTCPPort"
             } else {
-                "RTP/AVP/UDP;unicast;server_port=$serverPort-${serverPort + 1}"
+                "RTP/AVP/UDP;unicast;server_port=$serverPort-$serverRTCPPort"
             }
+        }
+
+        private fun openUDPPortPair(): Pair<DatagramSocket, DatagramSocket> {
+            repeat(32) {
+                val rtp = DatagramSocket(null)
+                try {
+                    rtp.reuseAddress = true
+                    rtp.bind(InetSocketAddress(0))
+                    if (rtp.localPort >= 65_535) {
+                        rtp.close()
+                        return@repeat
+                    }
+                    val rtcp = DatagramSocket(null)
+                    try {
+                        rtcp.reuseAddress = true
+                        rtcp.bind(InetSocketAddress(rtp.localPort + 1))
+                        return rtp to rtcp
+                    } catch (_: Throwable) {
+                        rtcp.close()
+                    }
+                } catch (_: Throwable) {
+                    // Try another ephemeral RTP port.
+                }
+                rtp.close()
+            }
+            error("Unable to allocate consecutive RTP/RTCP UDP ports.")
         }
 
         private fun bufferRTPLocked(packet: ByteArray, reason: String) {
@@ -1109,6 +1182,12 @@ object AndroidCallRelayBridge {
                 udp.send(DatagramPacket(packet, packet.size, address, target.port))
             }
             rtpPackets += 1
+            if (packet.size >= 12 && (packet[0].toInt() and 0xc0) == 0x80) {
+                lastRTPTimestamp = readUInt32BE(packet, 4)
+                rtpSSRC = readUInt32BE(packet, 8)
+                rtpPayloadOctets += (packet.size - 12).coerceAtLeast(0)
+                sendRTCPSenderReportIfDue()
+            }
             if (rtpPackets == 1 || rtpPackets % 100 == 0) {
                 EdgeLinkLog.info(
                     "callrelay.android.sink_rtp_out sessionId=$relaySessionId count=$rtpPackets " +
@@ -1116,6 +1195,59 @@ object AndroidCallRelayBridge {
                         "${rtpSummary(packet)} fp=${EdgeLinkLog.fingerprint(packet)}"
                 )
             }
+        }
+
+        private suspend fun sendRTCPSenderReportIfDue() {
+            val udp = rtcpSocket ?: return
+            val target = rtcpDestination ?: return
+            if (rtpSSRC == 0L) {
+                return
+            }
+            val nowElapsedMs = System.nanoTime() / 1_000_000L
+            if (lastRTCPSentElapsedMs > 0L && nowElapsedMs - lastRTCPSentElapsedMs < RTCP_REPORT_INTERVAL_MS) {
+                return
+            }
+            lastRTCPSentElapsedMs = nowElapsedMs
+
+            val nowWallMs = System.currentTimeMillis()
+            val ntpSeconds = nowWallMs / 1_000L + NTP_UNIX_EPOCH_OFFSET_SECONDS
+            val ntpFraction = ((nowWallMs % 1_000L) shl 32) / 1_000L
+            val report = ByteArray(28)
+            report[0] = 0x80.toByte()
+            report[1] = 200.toByte()
+            report[2] = 0
+            report[3] = 6
+            writeUInt32BE(report, 4, rtpSSRC)
+            writeUInt32BE(report, 8, ntpSeconds)
+            writeUInt32BE(report, 12, ntpFraction)
+            writeUInt32BE(report, 16, lastRTPTimestamp)
+            writeUInt32BE(report, 20, rtpPackets.toLong())
+            writeUInt32BE(report, 24, rtpPayloadOctets)
+            val address = target.address ?: return
+            withContext(Dispatchers.IO) {
+                udp.send(DatagramPacket(report, report.size, address, target.port))
+            }
+            rtcpReportsSent += 1
+            if (rtcpReportsSent <= 3 || rtcpReportsSent % 10 == 0) {
+                EdgeLinkLog.info(
+                    "callrelay.android.sink_rtcp_sr_out sessionId=$relaySessionId count=$rtcpReportsSent " +
+                        "to=${address.hostAddress}:${target.port} rtpPackets=$rtpPackets " +
+                        "octets=$rtpPayloadOctets rtpTimestamp=$lastRTPTimestamp"
+                )
+            }
+        }
+
+        private fun readUInt32BE(bytes: ByteArray, offset: Int): Long =
+            ((bytes[offset].toLong() and 0xffL) shl 24) or
+                ((bytes[offset + 1].toLong() and 0xffL) shl 16) or
+                ((bytes[offset + 2].toLong() and 0xffL) shl 8) or
+                (bytes[offset + 3].toLong() and 0xffL)
+
+        private fun writeUInt32BE(bytes: ByteArray, offset: Int, value: Long) {
+            bytes[offset] = ((value ushr 24) and 0xffL).toByte()
+            bytes[offset + 1] = ((value ushr 16) and 0xffL).toByte()
+            bytes[offset + 2] = ((value ushr 8) and 0xffL).toByte()
+            bytes[offset + 3] = (value and 0xffL).toByte()
         }
 
         private suspend fun sendRTSPResponse(
@@ -1208,6 +1340,10 @@ object AndroidCallRelayBridge {
 }
 
 private const val MAX_PENDING_SOURCE_RTP_PACKETS = 150
+private const val SOURCE_RTP_QUEUE_CAPACITY = 50
+private const val RTCP_REPORT_INTERVAL_MS = 1_000L
+private const val NTP_UNIX_EPOCH_OFFSET_SECONDS = 2_208_988_800L
+private const val CALL_AUDIO_CODEC_V2_SELECTION = "0 3"
 private val CRLFCRLF = byteArrayOf(13, 10, 13, 10)
 
 private fun preferredLocalIPv4Address(): String? =

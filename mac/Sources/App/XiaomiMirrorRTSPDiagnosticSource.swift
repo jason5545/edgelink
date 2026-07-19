@@ -1266,7 +1266,12 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 localRTCPPort: officialMPTClientPort,
                 sessionID: id,
                 mptSinkOnly: true,
-                onDecodedFrame: onDecodedFrame,
+                onDecodedFrame: { [weak self] pixelBuffer, width, height in
+                    self?.queue.async {
+                        self?.noteFirstVideoFrameRendered(id: id)
+                    }
+                    self?.onDecodedFrame?(pixelBuffer, width, height)
+                },
                 onMPTMediaStalled: { [weak self] stall in
                     self?.queue.async {
                         self?.handleOfficialMPTSinkStalled(stall)
@@ -1289,7 +1294,13 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                     }
                 }
             )
+            sender.onFirstAudioRendered = { [weak self] in
+                self?.queue.async {
+                    self?.noteFirstAudioFrameRendered(id: id)
+                }
+            }
             state.mediaSender = sender
+            state.mediaStartUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
             states[id] = state
             sender.start()
             startTimerSyncIfNeeded(id: id)
@@ -1411,6 +1422,67 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         state.timerSyncClient = nil
         states[id] = state
         cancelRTSPSessionKeepalive(id: id, reason: reason)
+    }
+
+    private func noteFirstVideoFrameRendered(id: UUID) {
+        guard var state = states[id], state.mediaSender != nil, !state.sentFirstRenderVideo else {
+            return
+        }
+        state.sentFirstRenderVideo = true
+        states[id] = state
+        sendFirstRender(id: id, isVideo: true)
+        if state.pendingFirstRenderAudio, !state.sentFirstRenderAudio {
+            state.pendingFirstRenderAudio = false
+            noteFirstAudioFrameRendered(id: id)
+        }
+    }
+
+    private func noteFirstAudioFrameRendered(id: UUID) {
+        guard var state = states[id], state.mediaSender != nil, !state.sentFirstRenderAudio else {
+            return
+        }
+        guard state.sentFirstRenderVideo else {
+            state.pendingFirstRenderAudio = true
+            states[id] = state
+            return
+        }
+        state.sentFirstRenderAudio = true
+        states[id] = state
+        sendFirstRender(id: id, isVideo: false)
+    }
+
+    private func sendFirstRender(id: UUID, isVideo: Bool) {
+        guard var state = states[id], let connection = connections[id] else {
+            return
+        }
+        let cseq = state.nextCSeq
+        state.nextCSeq += 1
+        state.pendingRequests[cseq] = "FIRST_RENDER"
+        let durationMs: Int
+        if let started = state.mediaStartUptimeNanoseconds {
+            durationMs = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+        } else {
+            durationMs = 0
+        }
+        states[id] = state
+        var headers = [
+            "FIRST_RENDER rtsp://localhost/wfd1.0 RTSP/1.0",
+            "CSeq: \(cseq)",
+            "User-Agent: stagefright/1.1 (Linux;Android 4.1)"
+        ]
+        if let session = state.session {
+            headers.append("Session: \(sessionHeaderValue(for: session))")
+        }
+        headers.append("Content-Type: text/parameters")
+        headers.append("isVideo:\(isVideo ? 1 : 0)")
+        headers.append("durationMs:\(durationMs)")
+        headers.append("Content-Length: 0")
+        let message = headers.joined(separator: "\r\n") + "\r\n\r\n"
+        DiagnosticsLog.info(
+            "xiaomi.mirror.rtsp.first_render_sent id=\(id.uuidString) isVideo=\(isVideo) " +
+                "durationMs=\(durationMs) cseq=\(cseq) session=\(state.session ?? "none")"
+        )
+        send(message, id: id, connection: connection)
     }
 
     private func startTimerSyncIfNeeded(id: UUID) {
@@ -2210,6 +2282,10 @@ private struct RTSPConnectionState {
     var keepaliveAckCount: UInt64 = 0
     var mediaSender: XiaomiMirrorRTPMediaSender?
     var timerSyncClient: XiaomiMirrorTimerSyncClient?
+    var sentFirstRenderVideo = false
+    var sentFirstRenderAudio = false
+    var pendingFirstRenderAudio = false
+    var mediaStartUptimeNanoseconds: UInt64?
 }
 
 private struct RTSPTransportResponse {
@@ -2432,6 +2508,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private let mptSinkOnly: Bool
     private let onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     private let onMPTMediaStalled: ((XiaomiMirrorMPTStallSnapshot) -> Void)?
+    var onFirstAudioRendered: (() -> Void)?
     private let initialHEVCParameterSets: XiaomiMirrorHEVCParameterSets?
     private let onMPTHEVCParameterSets: ((XiaomiMirrorHEVCParameterSets) -> Void)?
     private let frameRate: Int32 = XiaomiMirrorVideoDefaults.frameRate
@@ -2550,6 +2627,9 @@ private final class XiaomiMirrorRTPMediaSender {
                 }
             }
             let audioPlayer = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: sessionID)
+            audioPlayer.onFirstAudioRendered = { [weak self] in
+                self?.onFirstAudioRendered?()
+            }
             self.mptSinkHEVCDecoder = decoder
             self.mptSinkAudioPlayer = audioPlayer
             self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(
@@ -4003,6 +4083,7 @@ private struct XiaomiMirrorMPTPrivateAudioPayload {
 }
 
 private final class XiaomiMirrorMPTPrivateAudioPlayer {
+    var onFirstAudioRendered: (() -> Void)?
     private let sessionID: UUID
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
@@ -4015,6 +4096,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private var pesReceived: UInt64 = 0
     private var pcmBytesScheduled: UInt64 = 0
     private var validPCMReported = false
+    private var firstRenderedReported = false
     private var unsupportedFormatLogged = false
     private var privateAudioFormatPrimed = false
     private var parseFailureCount: UInt64 = 0
@@ -4233,6 +4315,10 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
               let playerNode,
               let playerFormat else {
             return
+        }
+        if !firstRenderedReported {
+            firstRenderedReported = true
+            onFirstAudioRendered?()
         }
         let bytesPerFrame = format.bytesPerFrame
         let frameCount = pcmPayload.count / bytesPerFrame

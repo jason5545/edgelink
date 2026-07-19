@@ -19,6 +19,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
 
 private const val RELAY_WEBSOCKET_PING_INTERVAL_SECONDS = 15L
@@ -81,6 +82,8 @@ private class OkHttpRelayByteChannel(
     // past that in a couple of seconds. Keep the reliable WebSocket stream
     // lossless here and let the suspending receive loop drain it in order.
     private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
+    private val binaryFramesReceived = AtomicLong(0)
+    private val binaryFramesSent = AtomicLong(0)
     private var webSocket: WebSocket? = null
 
     fun attach(socket: WebSocket) {
@@ -111,7 +114,10 @@ private class OkHttpRelayByteChannel(
     }
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-        EdgeLinkLog.info("relay.transport.binary_in hostId=$hostId deviceId=$deviceId bytes=${bytes.size}")
+        val count = binaryFramesReceived.incrementAndGet()
+        if (count <= 3 || count % 100L == 0L) {
+            EdgeLinkLog.info("relay.transport.binary_in hostId=$hostId deviceId=$deviceId count=$count bytes=${bytes.size}")
+        }
         val result = incoming.trySend(bytes.toByteArray())
         if (result.isFailure) {
             EdgeLinkLog.warn("relay.transport.binary_queue_failed hostId=$hostId deviceId=$deviceId")
@@ -135,7 +141,10 @@ private class OkHttpRelayByteChannel(
     override suspend fun send(bytes: ByteArray) {
         ready.await()
         val socket = webSocket ?: error("Relay WebSocket is not attached.")
-        EdgeLinkLog.info("relay.transport.binary_out hostId=$hostId deviceId=$deviceId bytes=${bytes.size}")
+        val count = binaryFramesSent.incrementAndGet()
+        if (count <= 3 || count % 100L == 0L) {
+            EdgeLinkLog.info("relay.transport.binary_out hostId=$hostId deviceId=$deviceId count=$count bytes=${bytes.size}")
+        }
         val accepted = withContext(Dispatchers.IO) {
             socket.send(bytes.toByteString())
         }

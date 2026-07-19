@@ -1658,9 +1658,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private suspend fun pingLoop(activeSession: SecureSessionClient) {
         while (coroutineContext.isActive) {
             val pongAgeMs = SystemClock.elapsedRealtime() - lastPongElapsedMs
-            if (lastPongElapsedMs > 0 && pongAgeMs >= PONG_TIMEOUT_MS) {
-                EdgeLinkLog.warn("relay.android.pong_timeout ageMs=$pongAgeMs timeoutMs=$PONG_TIMEOUT_MS")
-                error("Pong timed out after ${pongAgeMs}ms.")
+            val inboundAgeMs = activeSession.inboundIdleMilliseconds()
+            val livenessAgeMs = minOf(pongAgeMs, inboundAgeMs)
+            if (lastPongElapsedMs > 0 && livenessAgeMs >= PONG_TIMEOUT_MS) {
+                EdgeLinkLog.warn(
+                    "relay.android.pong_timeout ageMs=$livenessAgeMs pongAgeMs=$pongAgeMs " +
+                        "inboundAgeMs=$inboundAgeMs timeoutMs=$PONG_TIMEOUT_MS"
+                )
+                error("Secure relay timed out after ${livenessAgeMs}ms without inbound activity.")
             }
             activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.STATUS_PING, EmptyBody))
             delay(PING_INTERVAL_MS)

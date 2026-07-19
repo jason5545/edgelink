@@ -1213,7 +1213,14 @@ final class MiLinkPhoneRelayProbe {
             payload.append(sourcePMTPacket())
             payload.append(sourcePCRPacket(base: UInt64(sourceRTPTimestamp)))
         }
-        for packet in sourcePCMPESPackets(pcm: pcm, pts: UInt64(sourceRTPTimestamp)) {
+        let pcmTimeUs = UInt64(sourceRTPPacketsSent) * Self.sourcePCMFrameDurationMicroseconds
+        let includesPCMFormat = sourceRTPPacketsSent % Self.sourcePCMFormatIntervalFrames == 0
+        for packet in sourcePCMPESPackets(
+            pcm: pcm,
+            pts: UInt64(sourceRTPTimestamp),
+            pcmTimeUs: pcmTimeUs,
+            includesPCMFormat: includesPCMFormat
+        ) {
             payload.append(packet)
         }
         sendSourceRTPPayload(payload)
@@ -1234,8 +1241,11 @@ final class MiLinkPhoneRelayProbe {
         var packet = Data([
             0x47, 0x41, 0x00, 0x10 | (sourcePMTContinuityCounter & 0x0f),
             0x00, 0x02, 0xb0, 0x12, 0x00, 0x01, 0xc3, 0x00, 0x00,
-            0xf0, 0x00, 0xf0, 0x00, 0x0f, 0xf1, 0x00, 0xf0, 0x00,
-            0xa4, 0x27, 0x9a, 0xcd
+            // Xiaomi's TS packetizer uses private stream type 0x83 for
+            // audio/raw. Advertising 0x0f routes these bytes through its AAC
+            // elementary-stream parser even when RTSP selected LPCM.
+            0xf0, 0x00, 0xf0, 0x00, 0x83, 0xf1, 0x00, 0xf0, 0x00,
+            0xc8, 0xae, 0x18, 0xf4
         ])
         sourcePMTContinuityCounter &+= 1
         packet.append(contentsOf: repeatElement(0xff, count: Self.mpegTSPacketSize - packet.count))
@@ -1255,15 +1265,28 @@ final class MiLinkPhoneRelayProbe {
         return packet
     }
 
-    private func sourcePCMPESPackets(pcm: Data, pts: UInt64) -> [Data] {
+    private func sourcePCMPESPackets(
+        pcm: Data,
+        pts: UInt64,
+        pcmTimeUs: UInt64,
+        includesPCMFormat: Bool
+    ) -> [Data] {
         precondition(pcm.count == Self.sourcePCMBytesPerFrame)
+        let pcmHeader = sourcePCMAccessUnitHeader(
+            timeUs: pcmTimeUs,
+            includesFormat: includesPCMFormat
+        )
+        let pesPacketLength = UInt16(3 + 5 + pcmHeader.count + pcm.count)
         var pes = Data([
-            0x00, 0x00, 0x01, 0xc0,
-            0x01, 0x4a,
-            0x84, 0x80, 0x07
+            // Match Xiaomi's audio/raw TSPacketizer: private_stream_1.
+            0x00, 0x00, 0x01, 0xbd
+        ])
+        appendUInt16BE(pesPacketLength, to: &pes)
+        pes.append(contentsOf: [
+            0x84, 0x80, 0x05
         ])
         pes.append(contentsOf: sourceEncodedPTS(pts))
-        pes.append(contentsOf: [0xff, 0xff])
+        pes.append(pcmHeader)
         pes.append(pcm)
 
         let firstPayloadCount = Self.mpegTSPacketSize - 4
@@ -1285,6 +1308,33 @@ final class MiLinkPhoneRelayProbe {
         }
         second.append(remainder)
         return [first, second]
+    }
+
+    private func sourcePCMAccessUnitHeader(timeUs: UInt64, includesFormat: Bool) -> Data {
+        // This is the private framing produced by Xiaomi MirrorIO::addPcmHead.
+        // A format-bearing header is 32 bytes; subsequent access units only
+        // need the 18-byte descriptor. Refresh the format periodically so a
+        // restarted Xiaomi sink can resume without flooding logcat per frame.
+        var header: Data
+        if includesFormat {
+            header = Data([
+                0xff, 0x03,
+                0x00, 0x00, 0x00, 0x0e,
+                0x01, 0x10,
+                0x00, 0x00, 0x1f, 0x40,
+                0x00, 0x00, 0x00, 0xa0,
+                0x00, 0x00, 0x00, 0x10,
+                0x00, 0x00, 0x01, 0x40
+            ])
+        } else {
+            header = Data([
+                0xff, 0x02,
+                0x00, 0x00, 0x00, 0x10,
+                0x00, 0x00, 0x01, 0x40
+            ])
+        }
+        appendUInt64BE(timeUs, to: &header)
+        return header
     }
 
     private func sourceEncodedPTS(_ value: UInt64) -> [UInt8] {
@@ -1422,6 +1472,17 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func appendUInt32BE(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 24) & 0xff))
+        data.append(UInt8((value >> 16) & 0xff))
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8(value & 0xff))
+    }
+
+    private func appendUInt64BE(_ value: UInt64, to data: inout Data) {
+        data.append(UInt8((value >> 56) & 0xff))
+        data.append(UInt8((value >> 48) & 0xff))
+        data.append(UInt8((value >> 40) & 0xff))
+        data.append(UInt8((value >> 32) & 0xff))
         data.append(UInt8((value >> 24) & 0xff))
         data.append(UInt8((value >> 16) & 0xff))
         data.append(UInt8((value >> 8) & 0xff))
@@ -2139,6 +2200,8 @@ final class MiLinkPhoneRelayProbe {
     private static let sourceRTPMaxArmDurationSeconds: TimeInterval = 120
     private static let sourceRTPSSRC: UInt32 = 0xed9e_1101
     private static let sourcePCMBytesPerFrame = 320
+    private static let sourcePCMFrameDurationMicroseconds: UInt64 = 20_000
+    private static let sourcePCMFormatIntervalFrames = 50
     private static let sourceProgramHeaderIntervalFrames = 5
     private static let sourcePCMSampleRate: Double = 48_000
     private static let sourcePCMChannels: AVAudioChannelCount = 1
