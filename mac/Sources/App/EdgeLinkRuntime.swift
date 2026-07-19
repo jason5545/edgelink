@@ -3082,7 +3082,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenPrimaryRouteDefaultsKey = "xiaomiScreenPrimaryRouteEnabled"
     private static let xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey = "xiaomiMirrorRTSPDiagnosticEnabled"
     private static let xiaomiMirrorRTSPDiagnosticPort: UInt16 = 7102
-    private static let xiaomiMirrorRTSPDiagnosticLifetimeSeconds: TimeInterval = 45
+    private static let xiaomiMirrorRTSPDiagnosticLifetimeSeconds: TimeInterval = 1800
     private static let xiaomiScreenRecoveryDelayNanoseconds: UInt64 = 150_000_000
     private static let xiaomiScreenRecoveryHighAttemptWarningThreshold = 3
     private static let xiaomiScreenSourceRecoveryMaxAttempts = 2

@@ -233,6 +233,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         listener = nil
         for state in states.values {
             state.mediaSender?.stop(reason: "rtsp_listener_\(reason)")
+            state.timerSyncClient?.stop(reason: "rtsp_listener_\(reason)")
         }
         for connection in connections.values {
             connection.cancel()
@@ -740,6 +741,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         state.peerSetParameterFingerprint = DiagnosticsLog.fingerprint(Data(body.utf8))
         state.peerPresentationURL = Self.parameterValue(named: "wfd_presentation_URL", in: body)
         state.peerClientRTPPorts = Self.parameterValue(named: "wfd_client_rtp_ports", in: body)
+        state.peerTimerServer = Self.parameterValue(named: "wfd_timer_server_port", in: body)
         states[id] = state
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.peer_m4 id=\(id.uuidString) " +
@@ -1290,6 +1292,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             state.mediaSender = sender
             states[id] = state
             sender.start()
+            startTimerSyncIfNeeded(id: id)
             scheduleRTSPSessionKeepaliveIfNeeded(id: id, connection: connection, reason: "mpt_sink_started_\(reason)")
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.mpt_sink_started id=\(id.uuidString) reason=\(reason) " +
@@ -1404,8 +1407,27 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         }
         sender.stop(reason: reason)
         state.mediaSender = nil
+        state.timerSyncClient?.stop(reason: reason)
+        state.timerSyncClient = nil
         states[id] = state
         cancelRTSPSessionKeepalive(id: id, reason: reason)
+    }
+
+    private func startTimerSyncIfNeeded(id: UUID) {
+        guard var state = states[id], state.timerSyncClient == nil else {
+            return
+        }
+        guard let advertised = state.peerTimerServer,
+              let endpoint = XiaomiMirrorTimerSyncClient.parseEndpoint(advertised) else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.timesync.start_skipped id=\(id.uuidString) reason=missing_timer_server_advertisement"
+            )
+            return
+        }
+        let client = XiaomiMirrorTimerSyncClient(sessionID: id, host: endpoint.host, port: endpoint.port)
+        state.timerSyncClient = client
+        states[id] = state
+        client.start()
     }
 
     private func handleOfficialMPTSinkStalled(_ stall: XiaomiMirrorMPTStallSnapshot) {
@@ -1447,6 +1469,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
                 return
             }
             state.mediaSender = nil
+            state.timerSyncClient?.stop(reason: "mpt_stall_\(stall.reason)")
+            state.timerSyncClient = nil
             states[id] = state
             queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self, weak connection] in
                 guard let self,
@@ -1804,6 +1828,8 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private func cleanupConnection(id: UUID, reason: String = "connection_cleanup") {
         cancelRTSPSessionKeepalive(id: id, reason: reason)
         stopMediaIfNeeded(id: id, reason: reason)
+        states[id]?.timerSyncClient?.stop(reason: reason)
+        states[id]?.timerSyncClient = nil
         connections[id]?.cancel()
         connections.removeValue(forKey: id)
         states.removeValue(forKey: id)
@@ -2164,6 +2190,7 @@ private struct RTSPConnectionState {
     var peerSetParameterFingerprint: String?
     var peerPresentationURL: String?
     var peerClientRTPPorts: String?
+    var peerTimerServer: String?
     var setupTransport: RTSPTransportSelection?
     var sentActiveSetup = false
     var sentActivePlay = false
@@ -2182,6 +2209,7 @@ private struct RTSPConnectionState {
     var keepaliveSentCount: UInt64 = 0
     var keepaliveAckCount: UInt64 = 0
     var mediaSender: XiaomiMirrorRTPMediaSender?
+    var timerSyncClient: XiaomiMirrorTimerSyncClient?
 }
 
 private struct RTSPTransportResponse {
@@ -2206,6 +2234,188 @@ private struct RTSPTransportSelection {
         }
         let rtcpPort = clientRTCPPort ?? clientRTPPort + 1
         return "\(clientRTPPort)-\(rtcpPort)"
+    }
+}
+
+private final class XiaomiMirrorTimerSyncClient {
+    static let wireBytes = 40
+
+    private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorTimerSync")
+    private let sessionID: UUID
+    private let host: String
+    private let port: UInt16
+    private var socketFD: Int32 = -1
+    private var readSource: DispatchSourceRead?
+    private var sendTimer: DispatchSourceTimer?
+    private var destinationAddress: sockaddr_in?
+    private var tick: UInt32 = 0
+    private var requestsSent: UInt64 = 0
+    private var repliesReceived: UInt64 = 0
+    private var lastRequestT1Us: Int64 = 0
+    private var lastOffsetUs: Int64 = 0
+    private var started = false
+
+    init(sessionID: UUID, host: String, port: UInt16) {
+        self.sessionID = sessionID
+        self.host = host
+        self.port = port
+    }
+
+    static func parseEndpoint(_ advertised: String) -> (host: String, port: UInt16)? {
+        let parts = advertised.split(separator: ":").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2,
+              let ipValue = UInt32(parts[0]),
+              let portValue = UInt16(parts[1]), portValue > 0 else {
+            return nil
+        }
+        let host = "\((ipValue >> 24) & 0xff).\((ipValue >> 16) & 0xff).\((ipValue >> 8) & 0xff).\(ipValue & 0xff)"
+        return (host, portValue)
+    }
+
+    func start() {
+        queue.async { [weak self] in
+            self?.startOnQueue()
+        }
+    }
+
+    func stop(reason: String) {
+        queue.async { [weak self] in
+            self?.stopOnQueue(reason: reason)
+        }
+    }
+
+    private func startOnQueue() {
+        guard !started else {
+            return
+        }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.timesync.start_failed session=\(sessionID.uuidString) reason=invalid_host host=\(host)"
+            )
+            return
+        }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.timesync.start_failed session=\(sessionID.uuidString) reason=socket errno=\(errno)"
+            )
+            return
+        }
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        socketFD = fd
+        destinationAddress = address
+        started = true
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        readSource.setEventHandler { [weak self] in
+            self?.drainReplies()
+        }
+        readSource.setCancelHandler { [weak self] in
+            guard let self, self.socketFD >= 0 else {
+                return
+            }
+            close(self.socketFD)
+            self.socketFD = -1
+        }
+        self.readSource = readSource
+        readSource.resume()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            self?.sendRequest()
+        }
+        sendTimer = timer
+        timer.resume()
+        DiagnosticsLog.info(
+            "xiaomi.mirror.timesync.started session=\(sessionID.uuidString) server=\(host):\(port) intervalMs=250"
+        )
+    }
+
+    private func stopOnQueue(reason: String) {
+        guard started else {
+            return
+        }
+        started = false
+        sendTimer?.cancel()
+        sendTimer = nil
+        readSource?.cancel()
+        readSource = nil
+        DiagnosticsLog.info(
+            "xiaomi.mirror.timesync.stopped session=\(sessionID.uuidString) reason=\(reason) " +
+                "requests=\(requestsSent) replies=\(repliesReceived) lastOffsetUs=\(lastOffsetUs)"
+        )
+    }
+
+    private func nowUs() -> Int64 {
+        Int64(DispatchTime.now().uptimeNanoseconds / 1000)
+    }
+
+    private func sendRequest() {
+        guard started, socketFD >= 0, var address = destinationAddress else {
+            return
+        }
+        tick &+= 1
+        let t1 = nowUs()
+        var packet = Data(count: Self.wireBytes)
+        packet.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else {
+                return
+            }
+            withUnsafeBytes(of: t1) { t1Bytes in
+                base.copyMemory(from: t1Bytes.baseAddress!, byteCount: 8)
+            }
+            withUnsafeBytes(of: tick) { tickBytes in
+                base.advanced(by: 32).copyMemory(from: tickBytes.baseAddress!, byteCount: 4)
+            }
+        }
+        let sent = packet.withUnsafeBytes { buffer -> Int in
+            withUnsafePointer(to: &address) { addressPtr in
+                addressPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                    sendto(socketFD, buffer.baseAddress, Self.wireBytes, 0, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        if sent == Self.wireBytes {
+            requestsSent += 1
+            lastRequestT1Us = t1
+        } else if requestsSent == 0 || requestsSent % 40 == 0 {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.timesync.send_failed session=\(sessionID.uuidString) errno=\(errno) requests=\(requestsSent)"
+            )
+        }
+    }
+
+    private func drainReplies() {
+        guard started, socketFD >= 0 else {
+            return
+        }
+        var buffer = [UInt8](repeating: 0, count: 64)
+        while true {
+            let received = recv(socketFD, &buffer, buffer.count, 0)
+            if received <= 0 {
+                break
+            }
+            guard received >= Self.wireBytes else {
+                continue
+            }
+            repliesReceived += 1
+            let t4 = nowUs()
+            let t1 = buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: Int64.self) }
+            let t3 = buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 16, as: Int64.self) }
+            let t2 = buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 24, as: Int64.self) }
+            let replyTick = buffer.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 32, as: UInt32.self) }
+            let offset = ((t2 - t1) + (t3 - t4)) / 2
+            lastOffsetUs = offset
+            if repliesReceived == 1 || repliesReceived % 120 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.timesync.sample session=\(sessionID.uuidString) replies=\(repliesReceived) " +
+                        "tick=\(replyTick) offsetUs=\(offset) rttUs=\((t4 - t1) - (t3 - t2)) t1MatchesLast=\(t1 == lastRequestT1Us)"
+                )
+            }
+        }
     }
 }
 
