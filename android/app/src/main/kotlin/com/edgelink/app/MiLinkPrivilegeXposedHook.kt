@@ -1844,7 +1844,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun waitForXiaomiMirrorHidDeviceOpen(device: Any, timeoutMs: Long): Boolean {
         val deadline = SystemClock.uptimeMillis() + timeoutMs
         while (SystemClock.uptimeMillis() <= deadline) {
-            if (xiaomiMirrorHidDevicePtr(device) > 0L) {
+            if (xiaomiMirrorHidDevicePtr(device) != 0L) {
                 return true
             }
             try {
@@ -1854,7 +1854,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 return false
             }
         }
-        return xiaomiMirrorHidDevicePtr(device) > 0L
+        return xiaomiMirrorHidDevicePtr(device) != 0L
     }
 
     private fun xiaomiMirrorHidDevicePtr(device: Any): Long {
