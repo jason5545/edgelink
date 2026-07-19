@@ -2,8 +2,9 @@ import { badRequest, json, type Env, type PairingRecord, type RelaySocketAttachm
 import { hmacSha1Base64 } from "./crypto";
 import { isDeviceId, parseJson } from "./validation";
 
-const DEFAULT_TURN_TTL_SECONDS = 10 * 60;
-const MAX_TURN_TTL_SECONDS = 60 * 60;
+const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
+const MAX_TURN_TTL_SECONDS = 48 * 60 * 60;
+const CLOUDFLARE_TURN_REALM = "turn.cloudflare.com";
 
 export class RelayDO implements DurableObject {
   constructor(
@@ -120,6 +121,10 @@ export class RelayDO implements DurableObject {
       return json({ error: "turn_not_configured" }, { status: 503 });
     }
 
+    if (config.provider === "cloudflare") {
+      return this.issueCloudflareTurnCredentials(config, role);
+    }
+
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAt = issuedAt + config.ttlSeconds;
     const username = `${expiresAt}:${body.deviceId}:${body.hostId}`;
@@ -142,6 +147,66 @@ export class RelayDO implements DurableObject {
       realm: config.realm,
       role,
       iceServers
+    });
+  }
+
+  private async issueCloudflareTurnCredentials(
+    config: CloudflareTurnConfig,
+    role: "host" | "client"
+  ): Promise<Response> {
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(config.keyId)}/credentials/generate-ice-servers`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${config.apiToken}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ ttl: config.ttlSeconds })
+        }
+      );
+    } catch (error) {
+      console.error("Cloudflare TURN credential request failed", error);
+      return json({ error: "turn_upstream_unavailable" }, { status: 502 });
+    }
+
+    if (!response.ok) {
+      console.error("Cloudflare TURN credential request rejected", { status: response.status });
+      return json({ error: "turn_upstream_rejected" }, { status: 502 });
+    }
+
+    const payload = await parseCloudflareTurnResponse(response);
+    if (!payload) {
+      console.error("Cloudflare TURN credential response was invalid");
+      return json({ error: "turn_upstream_invalid_response" }, { status: 502 });
+    }
+
+    const turnServer = payload.iceServers.find((server) =>
+      server.username &&
+      server.credential &&
+      server.urls.some((url) => url.startsWith("turn:") || url.startsWith("turns:"))
+    );
+    if (!turnServer?.username || !turnServer.credential) {
+      console.error("Cloudflare TURN credential response did not contain a TURN server");
+      return json({ error: "turn_upstream_invalid_response" }, { status: 502 });
+    }
+
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const expiresAt = issuedAt + config.ttlSeconds;
+    const turnUrls = turnServer.urls.filter((url) => url.startsWith("turn:") || url.startsWith("turns:"));
+    return json({
+      urls: turnUrls,
+      username: turnServer.username,
+      credential: turnServer.credential,
+      credentialType: "password",
+      ttlSeconds: config.ttlSeconds,
+      issuedAt,
+      expiresAt,
+      realm: CLOUDFLARE_TURN_REALM,
+      role,
+      iceServers: payload.iceServers
     });
   }
 
@@ -197,12 +262,31 @@ const shouldForward = (sender: RelaySocketAttachment, target: RelaySocketAttachm
   return target.role === "host";
 };
 
-const readTurnConfig = (env: Env): {
+interface CloudflareTurnConfig {
+  provider: "cloudflare";
+  keyId: string;
+  apiToken: string;
+  ttlSeconds: number;
+}
+
+interface CoturnConfig {
+  provider: "coturn";
   urls: string[];
   realm: string;
   ttlSeconds: number;
   staticAuthSecret: string;
-} | null => {
+}
+
+interface TurnIceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+  credentialType?: "password";
+}
+
+const readTurnConfig = (env: Env): CloudflareTurnConfig | CoturnConfig | null => {
+  const cloudflareKeyId = env.CLOUDFLARE_TURN_KEY_ID?.trim();
+  const cloudflareApiToken = env.CLOUDFLARE_TURN_KEY_API_TOKEN?.trim();
   const staticAuthSecret = env.TURN_STATIC_AUTH_SECRET?.trim();
   const urls = env.TURN_URLS?.split(",")
     .map((url) => url.trim())
@@ -213,17 +297,79 @@ const readTurnConfig = (env: Env): {
     ? Math.min(Math.max(Math.floor(requestedTtl), 60), MAX_TURN_TTL_SECONDS)
     : DEFAULT_TURN_TTL_SECONDS;
 
+  if (cloudflareKeyId || cloudflareApiToken) {
+    if (!cloudflareKeyId || !cloudflareApiToken) {
+      return null;
+    }
+    return {
+      provider: "cloudflare",
+      keyId: cloudflareKeyId,
+      apiToken: cloudflareApiToken,
+      ttlSeconds
+    };
+  }
+
   if (!staticAuthSecret || urls.length === 0) {
     return null;
   }
 
   return {
+    provider: "coturn",
     urls,
     realm,
     ttlSeconds,
     staticAuthSecret
   };
 };
+
+const parseCloudflareTurnResponse = async (response: Response): Promise<{ iceServers: TurnIceServer[] } | null> => {
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    return null;
+  }
+
+  if (!value || typeof value !== "object" || !("iceServers" in value) || !Array.isArray(value.iceServers)) {
+    return null;
+  }
+
+  const iceServers = value.iceServers
+    .map(normalizeTurnIceServer)
+    .filter((server): server is TurnIceServer => server !== null);
+  return iceServers.length > 0 ? { iceServers } : null;
+};
+
+const normalizeTurnIceServer = (value: unknown): TurnIceServer | null => {
+  if (!value || typeof value !== "object" || !("urls" in value)) {
+    return null;
+  }
+
+  const rawUrls = typeof value.urls === "string"
+    ? [value.urls]
+    : Array.isArray(value.urls)
+      ? value.urls
+      : [];
+  const urls = rawUrls
+    .filter((url): url is string => typeof url === "string")
+    .map((url) => url.trim())
+    .filter((url) => /^(?:stun|turn|turns):/i.test(url) && !isPort53Url(url));
+  if (urls.length === 0) {
+    return null;
+  }
+
+  const username = "username" in value && typeof value.username === "string" ? value.username : undefined;
+  const credential = "credential" in value && typeof value.credential === "string" ? value.credential : undefined;
+  return {
+    urls,
+    ...(username ? { username } : {}),
+    ...(credential ? { credential, credentialType: "password" as const } : {})
+  };
+};
+
+// Port 53 is often intercepted or blocked. EdgeLink keeps Cloudflare's UDP 3478
+// path first, then TCP/TLS fallbacks, without waiting on a misleading DNS port.
+const isPort53Url = (url: string): boolean => /^(?:stun|turn|turns):[^?]+:53(?:\?|$)/i.test(url);
 
 const isPairingRecord = (value: PairingRecord | null): value is PairingRecord =>
   !!value &&

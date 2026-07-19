@@ -2,6 +2,8 @@ export interface Env {
   REGISTRY: DurableObjectNamespace;
   PAIRING: DurableObjectNamespace;
   RELAY: DurableObjectNamespace;
+  CLOUDFLARE_TURN_KEY_ID?: string;
+  CLOUDFLARE_TURN_KEY_API_TOKEN?: string;
   TURN_REALM?: string;
   TURN_URLS?: string;
   TURN_TTL_SECONDS?: string;

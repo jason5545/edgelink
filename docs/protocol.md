@@ -614,27 +614,31 @@ Worker 會把 request route 到 `RelayDO(idFromName(hostId))`，只有 host 本�
 
 ```json
 {
-  "urls": ["turn:172.238.24.219:3478?transport=udp"],
-  "username": "1751941600:949758990:949758990",
-  "credential": "<base64 HMAC-SHA1 password>",
+  "urls": ["turn:turn.cloudflare.com:3478?transport=udp", "turn:turn.cloudflare.com:3478?transport=tcp", "turns:turn.cloudflare.com:443?transport=tcp"],
+  "username": "<Cloudflare ephemeral username>",
+  "credential": "<Cloudflare ephemeral password>",
   "credentialType": "password",
-  "ttlSeconds": 600,
+  "ttlSeconds": 86400,
   "issuedAt": 1751941000,
-  "expiresAt": 1751941600,
-  "realm": "edgelink-turn-tokyo",
+  "expiresAt": 1752027400,
+  "realm": "turn.cloudflare.com",
   "role": "host",
   "iceServers": [
     {
-      "urls": ["turn:172.238.24.219:3478?transport=udp"],
-      "username": "1751941600:949758990:949758990",
-      "credential": "<base64 HMAC-SHA1 password>",
+      "urls": ["turn:turn.cloudflare.com:3478?transport=udp", "turn:turn.cloudflare.com:3478?transport=tcp", "turns:turn.cloudflare.com:443?transport=tcp"],
+      "username": "<Cloudflare ephemeral username>",
+      "credential": "<Cloudflare ephemeral password>",
       "credentialType": "password"
     }
   ]
 }
 ```
 
-credential 到期前 app 可以重取；永久 TURN shared secret 只存在 coturn 與 Worker secret store。
+credential 到期前 app 可以重取。正式環境由 Cloudflare Realtime TURN 的全球 Anycast 節點
+提供 relay；TURN key API token 只存在 Worker secret store，app 不會拿到永久金鑰。Cloudflare
+回傳的 53 port endpoint 會在 Worker 端濾掉，避免部分網路把它攔截成 DNS 而拖慢 ICE；優先走
+UDP 3478，並保留 TCP/TLS fallback。自架 coturn 設定只留作切換期間的保底，Cloudflare 金鑰
+設定完整後不會再使用。
 
 目前 app wiring：
 
