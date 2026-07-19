@@ -2211,13 +2211,19 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             arrayOf(Integer.TYPE),
             XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID
         )
+        val acceptInputState = applyXiaomiMirrorAcceptInputStatus(
+            classLoader = classLoader,
+            status = XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED,
+            displayId = XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID,
+            source = "$source:prime"
+        )
         val setting = runCatching {
             Settings.Secure.putInt(mirror.contentResolver, "synergy_mode", 1)
         }.getOrDefault(false)
         val summary =
             "officialIme{begin=$begin callback=${callback != null} registered=$registered " +
                 "synergy=$synergy display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
-                "setting=$setting}"
+                "$acceptInputState setting=$setting}"
         log("mirror keyboard official ime session source=$source $summary")
         return summary
     }
@@ -2269,9 +2275,18 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     "hashCode" -> System.identityHashCode(proxy)
                     "toString" -> "EdgeLinkMirrorAcceptInputCallback"
                     "onAcceptInputStatus" -> {
+                        val status = (args?.getOrNull(0) as? Number)?.toInt() ?: 0
+                        val displayId =
+                            (args?.getOrNull(1) as? Number)?.toInt() ?: XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID
+                        val acceptInputState = applyXiaomiMirrorAcceptInputStatus(
+                            classLoader = classLoader,
+                            status = status,
+                            displayId = displayId,
+                            source = "callback"
+                        )
                         log(
                             "mirror keyboard official ime acceptInput " +
-                                "status=${args?.getOrNull(0)} displayId=${args?.getOrNull(1)}"
+                                "status=$status displayId=$displayId $acceptInputState"
                         )
                         null
                     }
@@ -2284,6 +2299,52 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             log("mirror keyboard official ime callback create failed: ${error.javaClass.simpleName}: ${error.message}")
             null
         }
+    }
+
+    private fun applyXiaomiMirrorAcceptInputStatus(
+        classLoader: ClassLoader,
+        status: Int,
+        displayId: Int,
+        source: String
+    ): String {
+        val controller = runCatching {
+            val controllerClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_INPUT_CONTROLLER,
+                XIAOMI_MIRROR_INPUT_CONTROLLER_JADX_NAME
+            )
+            val controllerInstance = controllerClass.getMethod("f").invoke(null)
+            controllerInstance.javaClass.getMethod("s", Integer.TYPE).invoke(controllerInstance, displayId)
+            true
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log(
+                "mirror keyboard official ime acceptInput controller failed source=$source " +
+                    "status=$status displayId=$displayId: ${cause.javaClass.simpleName}: ${cause.message}"
+            )
+            false
+        }
+        val inputState = runCatching {
+            val inputStateClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_INPUT_STATE_MANAGER,
+                XIAOMI_MIRROR_INPUT_STATE_MANAGER_JADX_NAME
+            )
+            val inputStateManager = inputStateClass.getMethod("b").invoke(null)
+            inputStateManager.javaClass
+                .getMethod("g", java.lang.Boolean.TYPE)
+                .invoke(inputStateManager, status == XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED)
+            inputStateManager.javaClass.getMethod("e", Integer.TYPE).invoke(inputStateManager, displayId)
+            true
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log(
+                "mirror keyboard official ime acceptInput state failed source=$source " +
+                    "status=$status displayId=$displayId: ${cause.javaClass.simpleName}: ${cause.message}"
+            )
+            false
+        }
+        return "acceptInputState{controller=$controller input=$inputState status=$status displayId=$displayId}"
     }
 
     private fun invokeMirrorManagerBoolean(
@@ -5957,6 +6018,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_HID_MANAGER = "com.android.commands.hid.HidManager"
         private const val XIAOMI_MIRROR_ACCEPT_INPUT_CALLBACK =
             "com.xiaomi.mirror.IMirrorManager\$AcceptInputCallback"
+        private const val XIAOMI_MIRROR_INPUT_CONTROLLER = "o3.a"
+        private const val XIAOMI_MIRROR_INPUT_CONTROLLER_JADX_NAME = "o3.C1223a"
+        private const val XIAOMI_MIRROR_INPUT_STATE_MANAGER = "com.xiaomi.mirror.y"
+        private const val XIAOMI_MIRROR_INPUT_STATE_MANAGER_JADX_NAME = "com.xiaomi.mirror.C0792y"
         private const val XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER = "b4.a"
         private const val XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER_JADX_NAME = "b4.C0554a"
         private const val XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER = "j4.x0"
@@ -5968,6 +6033,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK = "a4.i"
         private const val XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK_JADX_NAME = "a4.InterfaceC0495i"
         private const val XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG = 32
+        private const val XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED = 1
         private const val XIAOMI_MIRROR_INPUT_STATE_HAS_HARDWARE_KEYBOARD = 1
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_OFF = 0
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_ON = 1
