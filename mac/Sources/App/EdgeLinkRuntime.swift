@@ -9,6 +9,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
     private static let xiaomiMirrorKeyboardCommand = "xiaomi.mirror.keyboard"
+    private static let xiaomiMirrorKeyboardReadyCommand = "xiaomi.mirror.keyboardReady"
+    private static let xiaomiMirrorKeyboardReadyRetryInterval: TimeInterval = 1.5
     private static let androidMetaAltLeft = 0x10
     private static let androidMetaAltRight = 0x20
     private static let androidMetaShiftLeft = 0x40
@@ -111,6 +113,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenUserStopped = false
     private var didAutoBindXiaomiDistAudio = false
     private var didAutoQueryXiaomiMirrorDevices = false
+    private var didPrepareXiaomiMirrorKeyboard = false
+    private var xiaomiMirrorKeyboardReadyLastAttemptAt = Date.distantPast
 
     private struct PendingXiaomiScreenFallback {
         let requestId: String
@@ -179,6 +183,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.xiaomiScreenRecoveryAttempt = 0
                 self?.xiaomiScreenLastSourceRecoveryDecodedFrames = nil
                 screenSession.renderXiaomiMirrorFrame(pixelBuffer, width: width, height: height)
+                self?.prepareXiaomiMirrorKeyboardIfNeeded(source: "decoded_frame")
             }
         }
         xiaomiMirrorRTSPDiagnosticSource.onRecoveryRequired = { [weak self] event in
@@ -362,6 +367,8 @@ final class EdgeLinkRuntime: ObservableObject {
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
             xiaomiScreenUserStopped = false
             resetXiaomiScreenRecoveryState(reason: "manual_start")
+            didPrepareXiaomiMirrorKeyboard = false
+            xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
             DiagnosticsLog.info(
                 "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "unknown") " +
@@ -389,6 +396,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     route: xiaomiScreenRoute ?? "unknown",
                     timeoutMs: timeoutMs
                 )
+                prepareXiaomiMirrorKeyboardIfNeeded(source: "screen_route_start")
                 return
             }
             DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "unknown")")
@@ -1011,6 +1019,8 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func stopXiaomiMirrorRTSPDiagnosticSource(reason: String) {
+        didPrepareXiaomiMirrorKeyboard = false
+        xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
         xiaomiMirrorRTSPDiagnosticSource.stop(reason: reason)
     }
 
@@ -1262,6 +1272,8 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func stopXiaomiScreenRouteForUser(reason: String) {
         xiaomiScreenUserStopped = true
+        didPrepareXiaomiMirrorKeyboard = false
+        xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
         pendingXiaomiScreenFallback = nil
@@ -1529,6 +1541,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     @discardableResult
     private func sendXiaomiMirrorKeyboardEvent(_ event: NSEvent, isDown: Bool) -> Bool {
+        prepareXiaomiMirrorKeyboardIfNeeded(source: "key_event")
         guard let androidKeyCode = Self.androidKeyCode(forMacKeyCode: event.keyCode, characters: event.charactersIgnoringModifiers) else {
             DiagnosticsLog.warn(
                 "xiaomi.mac.keyboard_ignored reason=unmapped macKeyCode=\(event.keyCode) down=\(isDown)"
@@ -1550,6 +1563,32 @@ final class EdgeLinkRuntime: ObservableObject {
                 "down=\(isDown) modifiers=\(args["modifiers"] ?? "-")"
         )
         return true
+    }
+
+    private func prepareXiaomiMirrorKeyboardIfNeeded(source: String) {
+        guard !didPrepareXiaomiMirrorKeyboard else {
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(xiaomiMirrorKeyboardReadyLastAttemptAt) >= Self.xiaomiMirrorKeyboardReadyRetryInterval else {
+            return
+        }
+        xiaomiMirrorKeyboardReadyLastAttemptAt = now
+        guard isConnected else {
+            DiagnosticsLog.warn("xiaomi.mac.keyboard_ready_ignored source=\(source) not_connected")
+            return
+        }
+        let requestId = sendMiLinkCommand(
+            command: Self.xiaomiMirrorKeyboardReadyCommand,
+            args: [
+                "source": source,
+                "prepareOnly": "true"
+            ],
+            updatesStatus: false
+        )
+        if let requestId {
+            DiagnosticsLog.info("xiaomi.mac.keyboard_ready_sent source=\(source) requestId=\(requestId)")
+        }
     }
 
     private static func xiaomiMirrorKeyboardArgs(
@@ -1747,7 +1786,7 @@ final class EdgeLinkRuntime: ObservableObject {
                         "command=\(body.command) reason=send_failed"
                 )
             }
-            if body.command != Self.xiaomiMirrorKeyboardCommand {
+            if !Self.isXiaomiMirrorKeyboardCommand(body.command) {
                 xiaomiMiLinkCommandStatus = "小米服務送出失敗"
             }
             DiagnosticsLog.error("xiaomi.mac.command_send_failed requestId=\(body.requestId) command=\(body.command)", error)
@@ -2463,7 +2502,10 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handleMiLinkCommandResult(_ result: MiLinkCommandResultBody) {
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
-        let updatesCommandStatus = result.command != Self.xiaomiMirrorKeyboardCommand
+        let updatesCommandStatus = !Self.isXiaomiMirrorKeyboardCommand(result.command)
+        if result.command == Self.xiaomiMirrorKeyboardReadyCommand {
+            didPrepareXiaomiMirrorKeyboard = result.success
+        }
         if updatesCommandStatus {
             if result.command == "xiaomi.mirror.requestSourceRecovery" {
                 if !isPhoneScreenSessionActive {
@@ -2567,6 +2609,10 @@ final class EdgeLinkRuntime: ObservableObject {
         return result.data["state"] == "pending" ||
             result.data["pending"] == "true" ||
             result.data["providerValue"] == "pending"
+    }
+
+    private static func isXiaomiMirrorKeyboardCommand(_ command: String) -> Bool {
+        command == xiaomiMirrorKeyboardCommand || command == xiaomiMirrorKeyboardReadyCommand
     }
 
     private static func xiaomiMirrorAndroidSourceEndpoint(
