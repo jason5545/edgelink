@@ -5,12 +5,71 @@ import EdgeLinkKit
 import SwiftUI
 import WebRTC
 
+private enum PhoneScreenChromeMetrics {
+    static let topHotZoneHeight: CGFloat = 88
+    static let bottomHotZoneHeight: CGFloat = 104
+    static let topBarHeight: CGFloat = 46
+    static let bottomBarHeight: CGFloat = 58
+    static let horizontalControlInset: CGFloat = 18
+    static let hideDelaySeconds: TimeInterval = 1.15
+    static let initialHideDelaySeconds: TimeInterval = 1.6
+
+    static var expandedHeight: CGFloat {
+        topBarHeight + bottomBarHeight
+    }
+
+    static func effectiveHotZoneHeight(_ baseHeight: CGFloat, for viewHeight: CGFloat) -> CGFloat {
+        min(baseHeight, max(36, viewHeight * 0.24), viewHeight / 2)
+    }
+}
+
+private struct PhoneScreenControlHoverEvent {
+    let location: CGPoint?
+    let bounds: CGRect
+}
+
+private enum PhoneScreenControlRegion {
+    case top
+    case bottom
+    case content
+    case outside
+
+    init(location: CGPoint?, bounds: CGRect) {
+        guard let location, bounds.width > 0, bounds.height > 0, bounds.contains(location) else {
+            self = .outside
+            return
+        }
+
+        let topHotZoneHeight = PhoneScreenChromeMetrics.effectiveHotZoneHeight(
+            PhoneScreenChromeMetrics.topHotZoneHeight,
+            for: bounds.height
+        )
+        let bottomHotZoneHeight = PhoneScreenChromeMetrics.effectiveHotZoneHeight(
+            PhoneScreenChromeMetrics.bottomHotZoneHeight,
+            for: bounds.height
+        )
+
+        if location.y >= bounds.maxY - topHotZoneHeight {
+            self = .top
+        } else if location.y <= bounds.minY + bottomHotZoneHeight {
+            self = .bottom
+        } else {
+            self = .content
+        }
+    }
+
+    var keepsControlsVisible: Bool {
+        self == .top || self == .bottom
+    }
+}
+
 final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
     @Published private(set) var hasRemoteAudio = false
     @Published private(set) var isPinned = false
+    @Published private(set) var areScreenControlsVisible = false
 
     let videoView = PhoneVideoRendererView()
     var onWindowVisibilityChanged: ((Bool) -> Void)?
@@ -51,6 +110,10 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var statsTimer: DispatchSourceTimer?
     private let statsLogger = MacScreenStatsLogger()
     private let mainThreadWatchdog = MainThreadWatchdog()
+    private var screenControlHoverRegion: PhoneScreenControlRegion = .outside
+    private var screenControlHideWorkItem: DispatchWorkItem?
+    private var screenControlEventMonitor: Any?
+    private var areScreenControlsExpandingWindow = false
 
     override init() {
         super.init()
@@ -284,6 +347,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         hasRemoteAudio = false
         cancelPendingPointerMove()
         cancelPendingWheel()
+        resetScreenControls()
         if shouldSendRemoteStop {
             sendEnvelope(type: EnvelopeType.screenStop, body: EmptyBody())
         }
@@ -338,6 +402,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         hasRemoteAudio = false
         cancelPendingPointerMove()
         cancelPendingWheel()
+        resetScreenControls()
 
         let track = remoteVideoTrack
         remoteVideoTrack = nil
@@ -371,6 +436,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     func closeWindow(sendRemoteStop: Bool = true) {
         if let window {
             self.window = nil
+            removeScreenControlEventMonitor()
+            resetScreenControls()
             isClosingWindow = true
             window.delegate = nil
             window.close()
@@ -385,6 +452,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             window.orderOut(nil)
             reportWindowVisibility(false, reason: "stopAndHide")
         }
+        resetScreenControls()
         DiagnosticsLog.info("screen.mac.window_hidden stop_projection=true keep_window=true")
         stop(sendRemoteStop: sendRemoteStop)
     }
@@ -413,15 +481,25 @@ final class MacScreenSession: NSObject, ObservableObject {
         sendControlEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
     }
 
+    func setScreenControlWindowHovered(_ hovered: Bool) {
+        if hovered {
+            return
+        }
+        screenControlHoverRegion = .outside
+        scheduleScreenControlHide(after: 0.25)
+    }
+
     func togglePinned() {
         isPinned.toggle()
         applyPinnedWindowState()
+        revealScreenControlsTemporarily()
         DiagnosticsLog.info("screen.mac.window_pin pinned=\(isPinned)")
     }
 
     private func showWindow() {
         if let window {
             applyPinnedWindowState()
+            installScreenControlEventMonitor(for: window)
             if window.isMiniaturized {
                 window.deminiaturize(nil)
             }
@@ -446,10 +524,145 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.delegate = self
         self.window = window
         applyPinnedWindowState()
+        installScreenControlEventMonitor(for: window)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         reportWindowVisibility(true, reason: "showWindow")
+    }
+
+    private func handleScreenControlHover(_ event: PhoneScreenControlHoverEvent) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.handleScreenControlHover(event)
+            }
+            return
+        }
+
+        let region = PhoneScreenControlRegion(location: event.location, bounds: event.bounds)
+        screenControlHoverRegion = region
+        if region.keepsControlsVisible {
+            showScreenControls()
+        } else {
+            scheduleScreenControlHide()
+        }
+    }
+
+    private func installScreenControlEventMonitor(for window: NSWindow) {
+        removeScreenControlEventMonitor()
+        window.acceptsMouseMovedEvents = true
+        screenControlEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [
+                .leftMouseDown,
+                .leftMouseUp,
+                .leftMouseDragged,
+                .rightMouseDown,
+                .rightMouseUp,
+                .rightMouseDragged,
+                .otherMouseDown,
+                .otherMouseUp,
+                .otherMouseDragged,
+                .mouseMoved,
+                .scrollWheel
+            ]
+        ) { [weak self, weak window] event in
+            guard let self else {
+                return event
+            }
+            guard let window, event.window === window, let contentView = window.contentView else {
+                self.handleScreenControlHover(PhoneScreenControlHoverEvent(location: nil, bounds: .zero))
+                return event
+            }
+
+            self.handleScreenControlHover(
+                PhoneScreenControlHoverEvent(
+                    location: contentView.convert(event.locationInWindow, from: nil),
+                    bounds: contentView.bounds
+                )
+            )
+            return event
+        }
+    }
+
+    private func removeScreenControlEventMonitor() {
+        if let screenControlEventMonitor {
+            NSEvent.removeMonitor(screenControlEventMonitor)
+            self.screenControlEventMonitor = nil
+        }
+    }
+
+    private func showScreenControls() {
+        screenControlHideWorkItem?.cancel()
+        screenControlHideWorkItem = nil
+        if !areScreenControlsVisible {
+            setScreenControlsExpanded(true)
+            areScreenControlsVisible = true
+        }
+    }
+
+    private func revealScreenControlsTemporarily() {
+        screenControlHoverRegion = .outside
+        showScreenControls()
+        scheduleScreenControlHide(after: PhoneScreenChromeMetrics.initialHideDelaySeconds)
+    }
+
+    private func scheduleScreenControlHide(
+        after delay: TimeInterval = PhoneScreenChromeMetrics.hideDelaySeconds
+    ) {
+        screenControlHideWorkItem?.cancel()
+        screenControlHideWorkItem = nil
+        guard !screenControlHoverRegion.keepsControlsVisible else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.hideScreenControlsIfIdle()
+        }
+        screenControlHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func hideScreenControlsIfIdle() {
+        screenControlHideWorkItem?.cancel()
+        screenControlHideWorkItem = nil
+        guard !screenControlHoverRegion.keepsControlsVisible else {
+            return
+        }
+        if areScreenControlsVisible {
+            areScreenControlsVisible = false
+            setScreenControlsExpanded(false)
+        }
+    }
+
+    private func resetScreenControls() {
+        screenControlHideWorkItem?.cancel()
+        screenControlHideWorkItem = nil
+        screenControlHoverRegion = .outside
+        areScreenControlsVisible = false
+        setScreenControlsExpanded(false)
+    }
+
+    private func setScreenControlsExpanded(_ expanded: Bool) {
+        guard areScreenControlsExpandingWindow != expanded else {
+            return
+        }
+        guard let window else {
+            areScreenControlsExpandingWindow = expanded
+            return
+        }
+
+        let delta = PhoneScreenChromeMetrics.expandedHeight
+        var frame = window.frame
+        if expanded {
+            frame.origin.y -= PhoneScreenChromeMetrics.bottomBarHeight
+            frame.size.height += delta
+        } else {
+            frame.origin.y += PhoneScreenChromeMetrics.bottomBarHeight
+            frame.size.height = max(window.minSize.height, frame.size.height - delta)
+        }
+
+        areScreenControlsExpandingWindow = expanded
+        window.setFrame(frame, display: true, animate: false)
     }
 
     private func applyPinnedWindowState() {
@@ -1031,18 +1244,21 @@ extension MacScreenSession: NSWindowDelegate {
             return true
         }
         sender.orderOut(nil)
+        resetScreenControls()
         reportWindowVisibility(false, reason: "windowShouldClose")
         DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
         return false
     }
 
     func windowWillClose(_ notification: Notification) {
+        removeScreenControlEventMonitor()
         guard !isClosingWindow else {
             window = nil
             return
         }
         reportWindowVisibility(false, reason: "windowWillClose")
         stop(sendRemoteStop: true)
+        resetScreenControls()
         window = nil
     }
 
@@ -1050,6 +1266,7 @@ extension MacScreenSession: NSWindowDelegate {
         guard notification.object as? NSWindow === window else {
             return
         }
+        resetScreenControls()
         reportWindowVisibility(false, reason: "miniaturized")
     }
 
@@ -1199,48 +1416,28 @@ struct PhoneScreenView: View {
     @ObservedObject var session: MacScreenSession
 
     var body: some View {
-        ZStack {
-            Color.black
-            PhoneVideoView(videoView: session.videoView)
-                .aspectRatio(aspectRatio, contentMode: .fit)
-            VStack {
-                Spacer()
-                HStack(spacing: 12) {
-                    globalButton(systemName: "chevron.backward", action: "back", help: "Back")
-                    globalButton(systemName: "circle", action: "home", help: "Home")
-                    globalButton(systemName: "rectangle.stack", action: "recents", help: "Recents")
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(.regularMaterial, in: Capsule())
-                .padding(.bottom, 14)
+        VStack(spacing: 0) {
+            if session.areScreenControlsVisible {
+                topControls
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
-            VStack {
-                HStack {
-                    Spacer()
-                    Button {
-                        session.togglePinned()
-                    } label: {
-                        Image(systemName: session.isPinned ? "pin.fill" : "pin")
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.borderless)
-                    .help(session.isPinned ? "Unpin" : "Keep on Top")
-                    .accessibilityLabel(Text(session.isPinned ? "Unpin Phone Window" : "Pin Phone Window"))
-                    .padding(8)
-                    .background(.regularMaterial, in: Circle())
-                    .padding(.top, 12)
-                    .padding(.trailing, 12)
-                }
-                Spacer()
-            }
-            if !session.hasRemoteVideo {
-                Text(session.status)
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
+
+            videoStage
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+
+            if session.areScreenControlsVisible {
+                bottomControls
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .background(Color.black)
+        .clipped()
+        .animation(.easeOut(duration: 0.18), value: session.areScreenControlsVisible)
         .frame(minWidth: 260, minHeight: 360)
+        .onHover { hovered in
+            session.setScreenControlWindowHovered(hovered)
+        }
     }
 
     private var aspectRatio: CGFloat? {
@@ -1250,12 +1447,102 @@ struct PhoneScreenView: View {
         return CGFloat(meta.w) / CGFloat(meta.h)
     }
 
+    private var videoStage: some View {
+        GeometryReader { geometry in
+            let videoFrame = fittedVideoFrame(in: geometry.size)
+
+            ZStack {
+                Color.black
+                PhoneVideoView(videoView: session.videoView)
+                    .frame(width: videoFrame.width, height: videoFrame.height)
+                    .position(x: videoFrame.midX, y: videoFrame.midY)
+
+                if !session.hasRemoteVideo {
+                    Text(session.status)
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                }
+            }
+        }
+    }
+
+    private func fittedVideoFrame(in containerSize: CGSize) -> CGRect {
+        guard
+            let aspectRatio,
+            aspectRatio > 0,
+            containerSize.width > 0,
+            containerSize.height > 0
+        else {
+            return CGRect(origin: .zero, size: containerSize)
+        }
+
+        let containerAspectRatio = containerSize.width / containerSize.height
+        let size: CGSize
+        if containerAspectRatio > aspectRatio {
+            let height = containerSize.height
+            size = CGSize(width: height * aspectRatio, height: height)
+        } else {
+            let width = containerSize.width
+            size = CGSize(width: width, height: width / aspectRatio)
+        }
+
+        return CGRect(
+            x: (containerSize.width - size.width) / 2,
+            y: (containerSize.height - size.height) / 2,
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private var topControls: some View {
+        HStack {
+            Spacer()
+            pinButton
+        }
+        .padding(.horizontal, PhoneScreenChromeMetrics.horizontalControlInset)
+        .frame(height: PhoneScreenChromeMetrics.topBarHeight)
+        .frame(maxWidth: .infinity)
+        .background(.regularMaterial)
+    }
+
+    private var pinButton: some View {
+        Button {
+            session.togglePinned()
+        } label: {
+            Image(systemName: session.isPinned ? "pin.fill" : "pin")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 34, height: 34)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.borderless)
+        .help(session.isPinned ? "Unpin" : "Keep on Top")
+        .accessibilityLabel(Text(session.isPinned ? "Unpin Phone Window" : "Pin Phone Window"))
+        .background(.regularMaterial, in: Circle())
+    }
+
+    private var bottomControls: some View {
+        HStack(spacing: 14) {
+            globalButton(systemName: "rectangle.stack", action: "recents", help: "Recents")
+            globalButton(systemName: "circle", action: "home", help: "Home")
+            globalButton(systemName: "chevron.backward", action: "back", help: "Back")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+        .frame(height: PhoneScreenChromeMetrics.bottomBarHeight)
+        .frame(maxWidth: .infinity)
+        .background(Color.black)
+    }
+
     private func globalButton(systemName: String, action: String, help: String) -> some View {
         Button {
             session.sendGlobal(action)
         } label: {
             Image(systemName: systemName)
-                .frame(width: 28, height: 28)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 32, height: 32)
+                .contentShape(Circle())
         }
         .buttonStyle(.borderless)
         .help(help)
