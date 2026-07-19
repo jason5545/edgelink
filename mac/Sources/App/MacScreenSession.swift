@@ -15,6 +15,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     let videoView = PhoneVideoRendererView()
     var onWindowVisibilityChanged: ((Bool) -> Void)?
     var onSessionActivityChanged: ((Bool) -> Void)?
+    var onXiaomiMirrorKey: ((NSEvent, Bool) -> Bool)?
 
     private let encoder = JSONEncoder()
     private var sendPlaintext: ((Data) -> Void)?
@@ -32,6 +33,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var isClosingWindow = false
     private var isStopping = false
     private var isScreenSessionActive = false
+    private var isRenderingXiaomiMirror = false
     private var microphoneRelayEnabled = false
     private var forwardedKeyCodes = Set<UInt16>()
     private var lastPointerMoveSentAt: TimeInterval = 0
@@ -92,6 +94,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func openAndStart() {
+        isRenderingXiaomiMirror = false
         isScreenSessionActive = true
         onSessionActivityChanged?(true)
         showWindow()
@@ -109,6 +112,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             DiagnosticsLog.warn("screen.mac.meta_ignored inactive_session")
             return
         }
+        isRenderingXiaomiMirror = false
         screenMeta = body
         status = "Connecting"
         showWindow()
@@ -116,6 +120,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func renderXiaomiMirrorFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+        isRenderingXiaomiMirror = true
         if !isScreenSessionActive {
             isScreenSessionActive = true
             onSessionActivityChanged?(true)
@@ -227,6 +232,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
 
         isScreenSessionActive = false
+        isRenderingXiaomiMirror = false
         onSessionActivityChanged?(false)
         status = "Stopped"
         screenMeta = nil
@@ -604,6 +610,16 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
+        if isRenderingXiaomiMirror {
+            let handled = onXiaomiMirrorKey?(event, isDown) ?? false
+            if !handled {
+                DiagnosticsLog.warn(
+                    "screen.mac.xiaomi_key_ignored macKeyCode=\(event.keyCode) down=\(isDown)"
+                )
+            }
+            return handled
+        }
+
         if let specialKey = specialKeyName(for: event) {
             sendKey(specialKey, down: isDown, modifiers: modifiers(from: event))
             return true

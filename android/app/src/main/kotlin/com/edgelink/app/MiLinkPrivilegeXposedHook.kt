@@ -23,10 +23,12 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Modifier
+import java.lang.reflect.Proxy
 import java.net.InetAddress
 import java.util.ArrayList
 import java.util.Collections
 import java.util.HashMap
+import java.util.LinkedHashSet
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
@@ -89,7 +91,8 @@ internal object MiLinkPrivilegeHookPolicy {
         "unregisterMediaRelayCallback",
         "startMediaRelay",
         "stopMediaRelay",
-        "setMediaRelayVolume"
+        "setMediaRelayVolume",
+        "edgeLinkKeyboard"
     )
 
     fun shouldHook(packageName: String?, processName: String?): Boolean =
@@ -297,6 +300,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         var lastSyncRequestUptimeMs: Long = 0L
     )
 
+    private data class XiaomiMirrorKeyboardInjectionResult(
+        val accepted: Boolean,
+        val route: String,
+        val message: String
+    )
+
     private val fakeMirrorSinkSurfaces = ConcurrentHashMap<Int, FakeMirrorSinkSurface>()
     private var lastFakeMirrorAttachUptimeMs: Long = 0L
     private var lastFakeMirrorKeyUptimeMs: Long = 0L
@@ -328,6 +337,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var lastTelecomRelayForceLogUptimeMs: Long = 0L
     private var fakeMirrorAudioStartProbeDepth: Int = 0
     private var telecomRelayFeaturesInstalled: Boolean = false
+    private val xiaomiMirrorKeyboardPressedUsages = LinkedHashSet<Int>()
+    private var xiaomiMirrorKeyboardModifierMask: Int = 0
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
@@ -1296,6 +1307,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val method = param.args.getOrNull(2) as? String
                         val extras = param.args.getOrNull(4) as? Bundle ?: return
+                        if (method == "edgeLinkKeyboard") {
+                            param.result = handleMirrorKeyboardProvider(classLoader, extras)
+                            return
+                        }
                         val sourceRecoveryOnly = extras.booleanCompat("sourceRecoveryOnly")
                         val edgeLinkRecoveryMethod = method == "edgeLinkSourceRecovery"
                         val startShareRecovery = method == "startShare" && extras.booleanCompat("isStart")
@@ -1335,6 +1350,291 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook mirror source recovery provider: ${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    private fun handleMirrorKeyboardProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
+        val keyCode = extras.intCompat("keyCode", -1)
+        val down = extras.booleanCompat("down")
+        val modifiers = extras.intCompat("modifiers", 0)
+        val requestId = extras.getString("requestId").orEmpty()
+        val report = buildXiaomiMirrorKeyboardReport(keyCode, down, modifiers)
+        val injection = if (report != null) {
+            injectXiaomiMirrorKeyboardReport(classLoader, report)
+        } else {
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid",
+                message = "unmapped keyCode=$keyCode"
+            )
+        }
+        log(
+            "mirror keyboard provider requestId=$requestId keyCode=$keyCode down=$down " +
+                "modifiers=$modifiers accepted=${injection.accepted} route=${injection.route} " +
+                "message=${injection.message} report=${report?.hexSummary().orEmpty()}"
+        )
+        return Bundle().apply {
+            putBoolean("edgelinkKeyboardAccepted", injection.accepted)
+            putBoolean("enable", injection.accepted)
+            putInt("value", if (injection.accepted) 0 else -1)
+            putString("route", injection.route)
+            putString("message", injection.message)
+            putString("requestId", requestId)
+            putInt("keyCode", keyCode)
+            putBoolean("down", down)
+            putInt("modifiers", modifiers)
+            putString("reportHex", report?.hexSummary().orEmpty())
+        }
+    }
+
+    private fun buildXiaomiMirrorKeyboardReport(
+        keyCode: Int,
+        down: Boolean,
+        modifiers: Int
+    ): ByteArray? = synchronized(xiaomiMirrorKeyboardPressedUsages) {
+        val modifierBit = androidKeyCodeToHidModifierBit(keyCode)
+        val usage = androidKeyCodeToHidUsage(keyCode)
+        if (modifierBit == 0 && usage == null) {
+            return@synchronized null
+        }
+
+        if (modifierBit != 0) {
+            xiaomiMirrorKeyboardModifierMask = if (down) {
+                xiaomiMirrorKeyboardModifierMask or modifierBit
+            } else {
+                xiaomiMirrorKeyboardModifierMask and modifierBit.inv()
+            }
+        } else if (usage != null) {
+            if (down) {
+                xiaomiMirrorKeyboardPressedUsages.add(usage)
+            } else {
+                xiaomiMirrorKeyboardPressedUsages.remove(usage)
+            }
+        }
+
+        val activeModifierMask = xiaomiMirrorKeyboardModifierMask or androidMetaToHidModifierMask(modifiers)
+        ByteArray(9).also { report ->
+            report[0] = 1
+            report[1] = activeModifierMask.toByte()
+            report[2] = 0
+            xiaomiMirrorKeyboardPressedUsages
+                .take(6)
+                .forEachIndexed { index, pressedUsage ->
+                    report[3 + index] = pressedUsage.toByte()
+                }
+        }
+    }
+
+    private fun injectXiaomiMirrorKeyboardReport(
+        classLoader: ClassLoader,
+        report: ByteArray
+    ): XiaomiMirrorKeyboardInjectionResult {
+        return runCatching {
+            val existing = findXiaomiMirrorHidDevice(classLoader)
+            val device = existing?.first ?: createAndRegisterXiaomiMirrorKeyboardDevice(classLoader)
+            val route = existing?.second ?: "xiaomi.mirror.hid.virtual_keyboard"
+            if (device == null) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = false,
+                    route = "xiaomi.mirror.hid",
+                    message = "device unavailable"
+                )
+            }
+            device.javaClass
+                .getMethod("sendReport", ByteArray::class.java)
+                .invoke(device, report as Any)
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = true,
+                route = route,
+                message = "sendReport bytes=${report.size}"
+            )
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid",
+                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
+            )
+        }
+    }
+
+    private fun findXiaomiMirrorHidDevice(classLoader: ClassLoader): Pair<Any, String>? {
+        runCatching {
+            val holderClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER_JADX_NAME
+            )
+            val holder = holderClass.getMethod("c").invoke(null)
+            val device = holderClass.getMethod("a").invoke(holder)
+            if (device != null) {
+                return device to "xiaomi.mirror.hid.share_pc_device"
+            }
+        }
+        runCatching {
+            val managerClass = findTargetClass(classLoader, XIAOMI_MIRROR_HID_MANAGER)
+            val manager = managerClass.getMethod("getInstance").invoke(null)
+            val device = managerClass.getMethod("getDevice").invoke(manager)
+            if (device != null) {
+                return device to "xiaomi.mirror.hid.manager_device"
+            }
+        }
+        return null
+    }
+
+    private fun createAndRegisterXiaomiMirrorKeyboardDevice(classLoader: ClassLoader): Any? =
+        runCatching {
+            val deviceClass = findTargetClass(classLoader, XIAOMI_MIRROR_HID_DEVICE)
+            val descriptor = xiaomiMirrorKeyboardDescriptor(classLoader)
+            val callbackClass = findTargetClass(classLoader, "$XIAOMI_MIRROR_HID_DEVICE\$ShareDeviceCallback")
+            val callback = Proxy.newProxyInstance(
+                classLoader,
+                arrayOf(callbackClass)
+            ) { _, method, _ ->
+                log("mirror keyboard virtual hid callback=${method?.name.orEmpty()}")
+                null
+            }
+            val constructor = deviceClass.constructors.first { it.parameterTypes.size == 10 }
+            constructor.isAccessible = true
+            val device = constructor.newInstance(
+                2,
+                "Virtual HID",
+                10007,
+                25719,
+                6,
+                descriptor,
+                null,
+                null,
+                null,
+                callback
+            )
+            registerXiaomiMirrorHidDevice(classLoader, device, deviceClass)
+            log("mirror keyboard virtual hid device created descriptorBytes=${descriptor.size}")
+            device
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log("failed to create mirror keyboard virtual hid device: ${cause.javaClass.simpleName}: ${cause.message}")
+            null
+        }
+
+    private fun registerXiaomiMirrorHidDevice(
+        classLoader: ClassLoader,
+        device: Any,
+        deviceClass: Class<*>
+    ) {
+        runCatching {
+            val holderClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER_JADX_NAME
+            )
+            val holder = holderClass.getMethod("c").invoke(null)
+            holderClass.getMethod("d", deviceClass).invoke(holder, device)
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to register share pc hid holder: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+        runCatching {
+            val managerClass = findTargetClass(classLoader, XIAOMI_MIRROR_HID_MANAGER)
+            val manager = managerClass.getMethod("getInstance").invoke(null)
+            managerClass.getMethod("setDevice", deviceClass).invoke(manager, device)
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to register hid manager device: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
+
+    private fun xiaomiMirrorKeyboardDescriptor(classLoader: ClassLoader): ByteArray {
+        val controllerClass = findFirstTargetClass(
+            classLoader,
+            XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER,
+            XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER_JADX_NAME
+        )
+        val descriptorField = controllerClass.getDeclaredField("f14973b")
+        descriptorField.isAccessible = true
+        val descriptor = descriptorField.get(null) as? ByteArray
+            ?: throw IllegalStateException("keyboard descriptor missing")
+        return descriptor.clone()
+    }
+
+    private fun androidKeyCodeToHidUsage(keyCode: Int): Int? =
+        when {
+            keyCode in 29..54 -> keyCode - 29 + 4
+            keyCode in 8..16 -> keyCode - 8 + 30
+            keyCode == 7 -> 39
+            keyCode == 66 -> 40
+            keyCode == 111 -> 41
+            keyCode == 67 -> 42
+            keyCode == 61 -> 43
+            keyCode == 62 -> 44
+            keyCode == 69 -> 45
+            keyCode == 70 -> 46
+            keyCode == 71 -> 47
+            keyCode == 72 -> 48
+            keyCode == 73 -> 49
+            keyCode == 74 -> 51
+            keyCode == 75 -> 52
+            keyCode == 68 -> 53
+            keyCode == 55 -> 54
+            keyCode == 56 -> 55
+            keyCode == 76 -> 56
+            keyCode == 115 -> 57
+            keyCode in 131..142 -> keyCode - 131 + 58
+            keyCode == 120 -> 70
+            keyCode == 116 -> 71
+            keyCode == 121 -> 72
+            keyCode == 124 -> 73
+            keyCode == 122 -> 74
+            keyCode == 92 -> 75
+            keyCode == 112 -> 76
+            keyCode == 123 -> 77
+            keyCode == 93 -> 78
+            keyCode == 22 -> 79
+            keyCode == 21 -> 80
+            keyCode == 20 -> 81
+            keyCode == 19 -> 82
+            else -> null
+        }
+
+    private fun androidKeyCodeToHidModifierBit(keyCode: Int): Int =
+        when (keyCode) {
+            113 -> 0x01
+            59 -> 0x02
+            57 -> 0x04
+            117 -> 0x08
+            114 -> 0x10
+            60 -> 0x20
+            58 -> 0x40
+            118 -> 0x80
+            else -> 0
+        }
+
+    private fun androidMetaToHidModifierMask(metaState: Int): Int {
+        var mask = 0
+        if ((metaState and 0x1) != 0 || (metaState and 0x40) != 0) {
+            mask = mask or 0x02
+        }
+        if ((metaState and 0x80) != 0) {
+            mask = mask or 0x20
+        }
+        if ((metaState and 0x2) != 0 || (metaState and 0x10) != 0) {
+            mask = mask or 0x04
+        }
+        if ((metaState and 0x20) != 0) {
+            mask = mask or 0x40
+        }
+        if ((metaState and 0x1000) != 0 || (metaState and 0x2000) != 0) {
+            mask = mask or 0x01
+        }
+        if ((metaState and 0x4000) != 0) {
+            mask = mask or 0x10
+        }
+        if ((metaState and 0x10000) != 0 || (metaState and 0x20000) != 0) {
+            mask = mask or 0x08
+        }
+        if ((metaState and 0x40000) != 0) {
+            mask = mask or 0x80
+        }
+        return mask
     }
 
     private fun hookMirrorSourceRouteOverrides(classLoader: ClassLoader) {
@@ -4858,6 +5158,21 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             else -> false
         }
 
+    private fun Bundle.intCompat(key: String, defaultValue: Int = 0): Int =
+        when (val value = get(key)) {
+            is Int -> value
+            is Long -> value.toInt()
+            is String -> value.toIntOrNull() ?: defaultValue
+            else -> defaultValue
+        }
+
+    private fun ByteArray.hexSummary(maxBytes: Int = 16): String {
+        val hex = take(maxBytes).joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+        return if (size > maxBytes) "$hex..." else hex
+    }
+
     private fun currentApplicationContext(): Context? =
         runCatching {
             Class.forName("android.app.ActivityThread")
@@ -4941,6 +5256,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
         private const val XIAOMI_MIRROR_CONTROL_SINK = "com.xiaomi.mirrorcontrol.MirrorControlSink"
         private const val XIAOMI_MIRROR_CONTROL_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlSource"
+        private const val XIAOMI_MIRROR_HID_DEVICE = "com.android.commands.hid.Device"
+        private const val XIAOMI_MIRROR_HID_MANAGER = "com.android.commands.hid.HidManager"
+        private const val XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER = "b4.a"
+        private const val XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER_JADX_NAME = "b4.C0554a"
+        private const val XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER = "j4.x0"
+        private const val XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER_JADX_NAME = "j4.C1039x0"
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
         private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"
         private const val XIAOMI_MIRROR_DISPLAY = "r3.AbstractC1397I"

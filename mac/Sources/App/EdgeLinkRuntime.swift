@@ -8,6 +8,15 @@ import Foundation
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
+    private static let xiaomiMirrorKeyboardCommand = "xiaomi.mirror.keyboard"
+    private static let androidMetaAltLeft = 0x10
+    private static let androidMetaAltRight = 0x20
+    private static let androidMetaShiftLeft = 0x40
+    private static let androidMetaShiftRight = 0x80
+    private static let androidMetaCtrlLeft = 0x2_000
+    private static let androidMetaCtrlRight = 0x4_000
+    private static let androidMetaWinLeft = 0x2_0000
+    private static let androidMetaWinRight = 0x4_0000
     private static var allowXiaomiScreenPrimaryRoute: Bool {
         UserDefaults.standard.object(forKey: xiaomiScreenPrimaryRouteDefaultsKey) as? Bool ?? true
     }
@@ -161,6 +170,9 @@ final class EdgeLinkRuntime: ObservableObject {
             Task { @MainActor in
                 self?.isPhoneScreenSessionActive = active
             }
+        }
+        screenSession.onXiaomiMirrorKey = { [weak self] event, isDown in
+            self?.sendXiaomiMirrorKeyboardEvent(event, isDown: isDown) ?? false
         }
         xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [weak self, screenSession] pixelBuffer, width, height in
             Task { @MainActor in
@@ -1486,9 +1498,15 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     @discardableResult
-    private func sendMiLinkCommand(command: String, args: [String: String] = [:]) -> String? {
+    private func sendMiLinkCommand(
+        command: String,
+        args: [String: String] = [:],
+        updatesStatus: Bool = true
+    ) -> String? {
         guard let session = currentSession, isConnected else {
-            xiaomiMiLinkCommandStatus = "小米服務目前未連線"
+            if updatesStatus {
+                xiaomiMiLinkCommandStatus = "小米服務目前未連線"
+            }
             DiagnosticsLog.warn("xiaomi.mac.command_ignored command=\(command) not_connected")
             return nil
         }
@@ -1500,11 +1518,216 @@ final class EdgeLinkRuntime: ObservableObject {
             args: args,
             ts: Int64(Date().timeIntervalSince1970)
         )
-        xiaomiMiLinkCommandStatus = "小米服務執行中"
+        if updatesStatus {
+            xiaomiMiLinkCommandStatus = "小米服務執行中"
+        }
         Task { @MainActor [weak self] in
             await self?.sendMiLinkCommandBody(body, session: session)
         }
         return requestId
+    }
+
+    @discardableResult
+    private func sendXiaomiMirrorKeyboardEvent(_ event: NSEvent, isDown: Bool) -> Bool {
+        guard let androidKeyCode = Self.androidKeyCode(forMacKeyCode: event.keyCode, characters: event.charactersIgnoringModifiers) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.keyboard_ignored reason=unmapped macKeyCode=\(event.keyCode) down=\(isDown)"
+            )
+            return false
+        }
+        let args = Self.xiaomiMirrorKeyboardArgs(
+            androidKeyCode: androidKeyCode,
+            event: event,
+            isDown: isDown
+        )
+        _ = sendMiLinkCommand(
+            command: Self.xiaomiMirrorKeyboardCommand,
+            args: args,
+            updatesStatus: false
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mac.keyboard_sent macKeyCode=\(event.keyCode) androidKeyCode=\(androidKeyCode) " +
+                "down=\(isDown) modifiers=\(args["modifiers"] ?? "-")"
+        )
+        return true
+    }
+
+    private static func xiaomiMirrorKeyboardArgs(
+        androidKeyCode: Int,
+        event: NSEvent,
+        isDown: Bool
+    ) -> [String: String] {
+        var args = [
+            "keyCode": "\(androidKeyCode)",
+            "down": isDown ? "true" : "false",
+            "modifiers": "\(androidMetaState(from: event.modifierFlags, macKeyCode: event.keyCode, isDown: isDown))",
+            "macKeyCode": "\(event.keyCode)"
+        ]
+        if let characters = event.charactersIgnoringModifiers, !characters.isEmpty {
+            args["characters"] = String(characters.prefix(8))
+        }
+        return args
+    }
+
+    private static func androidMetaState(
+        from flags: NSEvent.ModifierFlags,
+        macKeyCode: UInt16,
+        isDown: Bool
+    ) -> Int {
+        let normalized = flags.intersection(.deviceIndependentFlagsMask)
+        var meta = 0
+        if normalized.contains(.shift) {
+            meta |= androidMetaShiftLeft
+        }
+        if normalized.contains(.option) {
+            meta |= androidMetaAltLeft
+        }
+        if normalized.contains(.control) {
+            meta |= androidMetaCtrlLeft
+        }
+        if normalized.contains(.command) {
+            meta |= androidMetaWinLeft
+        }
+
+        switch macKeyCode {
+        case 60:
+            meta = (meta & ~androidMetaShiftLeft) | (isDown ? androidMetaShiftRight : 0)
+        case 61:
+            meta = (meta & ~androidMetaAltLeft) | (isDown ? androidMetaAltRight : 0)
+        case 62:
+            meta = (meta & ~androidMetaCtrlLeft) | (isDown ? androidMetaCtrlRight : 0)
+        case 54:
+            meta = (meta & ~androidMetaWinLeft) | (isDown ? androidMetaWinRight : 0)
+        default:
+            break
+        }
+        return meta
+    }
+
+    private static func androidKeyCode(forMacKeyCode keyCode: UInt16, characters: String?) -> Int? {
+        switch keyCode {
+        case 0: return 29
+        case 1: return 47
+        case 2: return 32
+        case 3: return 34
+        case 4: return 36
+        case 5: return 35
+        case 6: return 54
+        case 7: return 52
+        case 8: return 31
+        case 9: return 50
+        case 11: return 30
+        case 12: return 45
+        case 13: return 51
+        case 14: return 33
+        case 15: return 46
+        case 16: return 53
+        case 17: return 48
+        case 18: return 8
+        case 19: return 9
+        case 20: return 10
+        case 21: return 11
+        case 22: return 13
+        case 23: return 12
+        case 24: return 70
+        case 25: return 16
+        case 26: return 14
+        case 27: return 69
+        case 28: return 15
+        case 29: return 7
+        case 30: return 72
+        case 31: return 43
+        case 32: return 49
+        case 33: return 71
+        case 34: return 37
+        case 35: return 44
+        case 36, 76: return 66
+        case 37: return 40
+        case 38: return 38
+        case 39: return 75
+        case 40: return 39
+        case 41: return 74
+        case 42: return 73
+        case 43: return 55
+        case 44: return 76
+        case 45: return 42
+        case 46: return 41
+        case 47: return 56
+        case 48: return 61
+        case 49: return 62
+        case 50: return 68
+        case 51: return 67
+        case 53: return 111
+        case 54: return 118
+        case 55: return 117
+        case 56: return 59
+        case 57: return 115
+        case 58: return 57
+        case 59: return 113
+        case 60: return 60
+        case 61: return 58
+        case 62: return 114
+        case 96: return 135
+        case 97: return 136
+        case 98: return 137
+        case 99: return 133
+        case 100: return 138
+        case 101: return 139
+        case 103: return 141
+        case 109: return 140
+        case 111: return 142
+        case 114: return 124
+        case 115: return 122
+        case 116: return 92
+        case 117: return 112
+        case 118: return 134
+        case 119: return 123
+        case 120: return 132
+        case 121: return 93
+        case 122: return 131
+        case 123: return 21
+        case 124: return 22
+        case 125: return 20
+        case 126: return 19
+        default:
+            return androidKeyCode(forCharacter: characters)
+        }
+    }
+
+    private static func androidKeyCode(forCharacter characters: String?) -> Int? {
+        guard let normalized = characters?.lowercased(), normalized.unicodeScalars.count == 1,
+              let scalar = normalized.unicodeScalars.first else {
+            return nil
+        }
+        let value = scalar.value
+        if value >= 97 && value <= 122 {
+            return Int(value - 97) + 29
+        }
+        if value >= 49 && value <= 57 {
+            return Int(value - 49) + 8
+        }
+        if value == 48 {
+            return 7
+        }
+        switch scalar {
+        case " ": return 62
+        case "\t": return 61
+        case "\r", "\n": return 66
+        case "\u{7F}": return 67
+        case "`": return 68
+        case "-": return 69
+        case "=": return 70
+        case "[": return 71
+        case "]": return 72
+        case "\\": return 73
+        case ";": return 74
+        case "'": return 75
+        case "/": return 76
+        case ",": return 55
+        case ".": return 56
+        default:
+            return nil
+        }
     }
 
     private func sendMiLinkCommandBody(_ body: MiLinkCommandBody, session: SecureSessionHost) async {
@@ -1524,7 +1747,9 @@ final class EdgeLinkRuntime: ObservableObject {
                         "command=\(body.command) reason=send_failed"
                 )
             }
-            xiaomiMiLinkCommandStatus = "小米服務送出失敗"
+            if body.command != Self.xiaomiMirrorKeyboardCommand {
+                xiaomiMiLinkCommandStatus = "小米服務送出失敗"
+            }
             DiagnosticsLog.error("xiaomi.mac.command_send_failed requestId=\(body.requestId) command=\(body.command)", error)
         }
     }
@@ -2238,14 +2463,17 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handleMiLinkCommandResult(_ result: MiLinkCommandResultBody) {
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
-        if result.command == "xiaomi.mirror.requestSourceRecovery" {
-            if !isPhoneScreenSessionActive {
-                xiaomiMiLinkCommandStatus = result.success ? "小米鏡像來源已刷新" : "小米鏡像來源刷新失敗"
+        let updatesCommandStatus = result.command != Self.xiaomiMirrorKeyboardCommand
+        if updatesCommandStatus {
+            if result.command == "xiaomi.mirror.requestSourceRecovery" {
+                if !isPhoneScreenSessionActive {
+                    xiaomiMiLinkCommandStatus = result.success ? "小米鏡像來源已刷新" : "小米鏡像來源刷新失敗"
+                }
+            } else if isMirrorPending {
+                xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
+            } else {
+                xiaomiMiLinkCommandStatus = result.success ? "小米服務已接手" : "小米服務失敗：\(result.message)"
             }
-        } else if isMirrorPending {
-            xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
-        } else {
-            xiaomiMiLinkCommandStatus = result.success ? "小米服務已接手" : "小米服務失敗：\(result.message)"
         }
         let pending = pendingXiaomiScreenFallback
         let elapsedMs = pending?.requestId == result.requestId ? pending?.elapsedMs : nil
