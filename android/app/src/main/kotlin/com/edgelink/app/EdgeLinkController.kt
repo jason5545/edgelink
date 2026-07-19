@@ -36,6 +36,7 @@ import com.edgelink.core.PhoneActionBody
 import com.edgelink.core.PhoneActionResultBody
 import com.edgelink.core.PhoneCallStatusBody
 import com.edgelink.core.PhoneRelayEndpointBody
+import com.edgelink.core.PhoneRelayMediaBody
 import com.edgelink.core.PhoneRelayStartRequestBody
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
@@ -203,6 +204,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onPhoneActionReceived = { body ->
             if (body.action == "dial" || body.action == "answer") {
                 refreshTurnCredentials("phone_action_${body.action}")
+                startCallRelayBridge(body, reason = "phone_action_received_${body.action}")
             }
             if (body.action == "hangup") {
                 phoneRelayCallSessionActive = false
@@ -217,6 +219,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onPhoneRelayEndpoint = { body ->
             handlePhoneRelayEndpoint(body)
+        },
+        onPhoneRelayMedia = { body ->
+            AndroidCallRelayBridge.handleMedia(body)
         }
     )
 
@@ -464,15 +469,20 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             notifyPhoneRelaySelectionFailed(body.requestId, "invalid_relay_port")
             return
         }
-        val identity = localIdentity
-        if (identity == null) {
-            notifyPhoneRelaySelectionFailed(body.requestId, "no_identity")
-            return
-        }
         if (!EdgeLinkInCallService.hasOngoingCall()) {
             notifyPhoneRelaySelectionFailed(body.requestId, "call_ended_before_relay")
             return
         }
+
+        val relayBody = PhoneActionBody(
+            requestId = body.requestId,
+            action = "answer",
+            relayHost = body.relayHost,
+            relayPort = relayPort,
+            relaySessionId = body.relaySessionId,
+            relayControlPort = body.relayControlPort
+        )
+        startCallRelayBridge(relayBody, reason = "incallui_relay_preconfigure")
 
         val configureResult = runCatching {
             AndroidShizukuSupport.configurePhoneCallRelayHooks(
@@ -505,15 +515,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         phoneRelayCallSessionActive = true
         pendingCallRelayBridgeJob?.cancel()
         pendingCallRelayBridgeJob = null
-        val relayBody = PhoneActionBody(
-            requestId = body.requestId,
-            action = "answer",
-            relayHost = body.relayHost,
-            relayPort = relayPort,
-            relaySessionId = body.relaySessionId,
-            relayControlPort = body.relayControlPort
-        )
-        AndroidCallRelayBridge.start(identity, relayBody, reason = "incallui_relay_selected")
+        startCallRelayBridge(relayBody, reason = "incallui_relay_selected")
         pokePhoneContinuityRelaySelection(body.requestId)
         EdgeLinkLog.info(
             "phone.android.relay_selection_active requestId=${body.requestId} " +
@@ -557,11 +559,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         "${error.javaClass.simpleName}:${error.message.orEmpty()}"
 
     private fun scheduleCallRelayBridgeStart(body: PhoneActionBody) {
-        val identity = localIdentity
-        if (identity == null) {
-            EdgeLinkLog.warn("callrelay.android.bridge_start_skipped action=${body.action} no_identity")
-            return
-        }
         pendingCallRelayBridgeJob?.cancel()
         val delayMs = when (body.action) {
             "answer" -> CALL_RELAY_BRIDGE_ANSWER_DELAY_MS
@@ -570,8 +567,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         pendingCallRelayBridgeJob = scope.launch {
             EdgeLinkLog.info("callrelay.android.bridge_start_delayed action=${body.action} delayMs=$delayMs")
             delay(delayMs)
-            AndroidCallRelayBridge.start(identity, body, reason = "phone_action_result_${body.action}")
+            startCallRelayBridge(body, reason = "phone_action_result_${body.action}")
             pendingCallRelayBridgeJob = null
+        }
+    }
+
+    private fun startCallRelayBridge(body: PhoneActionBody, reason: String) {
+        AndroidCallRelayBridge.start(body, reason) { media ->
+            val activeSession = session ?: return@start
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.PHONE_RELAY_MEDIA, media))
         }
     }
 
@@ -1885,7 +1889,8 @@ private class AndroidCommandDispatcher(
     private val onScreenStartReceived: suspend () -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
     private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit,
-    private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit
+    private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit,
+    private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -1924,6 +1929,11 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.PHONE_RELAY_ENDPOINT -> {
                 val envelope = EnvelopeCodec.decode<PhoneRelayEndpointBody>(plaintext)
                 onPhoneRelayEndpoint(envelope.b)
+                null
+            }
+            EnvelopeTypes.PHONE_RELAY_MEDIA -> {
+                val envelope = EnvelopeCodec.decode<PhoneRelayMediaBody>(plaintext)
+                onPhoneRelayMedia(envelope.b)
                 null
             }
             EnvelopeTypes.MILINK_COMMAND -> {
@@ -2006,8 +2016,6 @@ object EdgeLinkConfig {
     const val workerBaseUrl = "https://edgelink-worker.black-hill-f944.workers.dev"
     const val relayUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect"
     const val pairingWebSocketUrl = "wss://edgelink-worker.black-hill-f944.workers.dev/v1/pair/ws"
-    const val callRelayGatewayHost = "172.238.24.219"
-    const val callRelayGatewayControlPort = 17104
 }
 
 private data class PendingPairing(

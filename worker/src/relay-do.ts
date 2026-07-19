@@ -1,5 +1,4 @@
 import { badRequest, json, type Env, type PairingRecord, type RelaySocketAttachment } from "./types";
-import { hmacSha1Base64 } from "./crypto";
 import { isDeviceId, parseJson } from "./validation";
 
 const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
@@ -92,9 +91,7 @@ export class RelayDO implements DurableObject {
       role
     } satisfies RelaySocketAttachment);
 
-    if (role === "host") {
-      this.closeReplacedHostSockets(sender, body.b.deviceId);
-    }
+    this.closeReplacedRoleSockets(sender, body.b.deviceId, role);
 
     sender.send(JSON.stringify({ t: "relay.ready", b: { role } }));
   }
@@ -121,33 +118,7 @@ export class RelayDO implements DurableObject {
       return json({ error: "turn_not_configured" }, { status: 503 });
     }
 
-    if (config.provider === "cloudflare") {
-      return this.issueCloudflareTurnCredentials(config, role);
-    }
-
-    const issuedAt = Math.floor(Date.now() / 1000);
-    const expiresAt = issuedAt + config.ttlSeconds;
-    const username = `${expiresAt}:${body.deviceId}:${body.hostId}`;
-    const credential = await hmacSha1Base64(config.staticAuthSecret, username);
-    const iceServers = [{
-      urls: config.urls,
-      username,
-      credential,
-      credentialType: "password" as const
-    }];
-
-    return json({
-      urls: config.urls,
-      username,
-      credential,
-      credentialType: "password",
-      ttlSeconds: config.ttlSeconds,
-      issuedAt,
-      expiresAt,
-      realm: config.realm,
-      role,
-      iceServers
-    });
+    return this.issueCloudflareTurnCredentials(config, role);
   }
 
   private async issueCloudflareTurnCredentials(
@@ -210,15 +181,24 @@ export class RelayDO implements DurableObject {
     });
   }
 
-  private closeReplacedHostSockets(sender: WebSocket, deviceId: string): void {
+  private closeReplacedRoleSockets(
+    sender: WebSocket,
+    deviceId: string,
+    role: "host" | "client"
+  ): void {
     for (const socket of this.state.getWebSockets()) {
       if (socket === sender) {
         continue;
       }
 
       const attachment = readAttachment(socket);
-      if (attachment.authenticated && attachment.role === "host" && attachment.deviceId === deviceId) {
-        socket.close(1000, "replaced_by_new_host");
+      if (attachment.authenticated && attachment.role === role && attachment.deviceId === deviceId) {
+        // close() starts the WebSocket closing handshake, but the old socket can
+        // still deliver frames that were already queued. Revoke its attachment
+        // first so those stale secure-channel frames cannot reach the peer and
+        // advance its receive counter out of sync.
+        socket.serializeAttachment({ authenticated: false } satisfies RelaySocketAttachment);
+        socket.close(1000, `replaced_by_new_${role}`);
       }
     }
   }
@@ -263,18 +243,9 @@ const shouldForward = (sender: RelaySocketAttachment, target: RelaySocketAttachm
 };
 
 interface CloudflareTurnConfig {
-  provider: "cloudflare";
   keyId: string;
   apiToken: string;
   ttlSeconds: number;
-}
-
-interface CoturnConfig {
-  provider: "coturn";
-  urls: string[];
-  realm: string;
-  ttlSeconds: number;
-  staticAuthSecret: string;
 }
 
 interface TurnIceServer {
@@ -284,41 +255,22 @@ interface TurnIceServer {
   credentialType?: "password";
 }
 
-const readTurnConfig = (env: Env): CloudflareTurnConfig | CoturnConfig | null => {
+const readTurnConfig = (env: Env): CloudflareTurnConfig | null => {
   const cloudflareKeyId = env.CLOUDFLARE_TURN_KEY_ID?.trim();
   const cloudflareApiToken = env.CLOUDFLARE_TURN_KEY_API_TOKEN?.trim();
-  const staticAuthSecret = env.TURN_STATIC_AUTH_SECRET?.trim();
-  const urls = env.TURN_URLS?.split(",")
-    .map((url) => url.trim())
-    .filter((url) => url.length > 0) ?? [];
-  const realm = env.TURN_REALM?.trim() || "edgelink-turn-tokyo";
   const requestedTtl = Number(env.TURN_TTL_SECONDS ?? DEFAULT_TURN_TTL_SECONDS);
   const ttlSeconds = Number.isFinite(requestedTtl)
     ? Math.min(Math.max(Math.floor(requestedTtl), 60), MAX_TURN_TTL_SECONDS)
     : DEFAULT_TURN_TTL_SECONDS;
 
-  if (cloudflareKeyId || cloudflareApiToken) {
-    if (!cloudflareKeyId || !cloudflareApiToken) {
-      return null;
-    }
-    return {
-      provider: "cloudflare",
-      keyId: cloudflareKeyId,
-      apiToken: cloudflareApiToken,
-      ttlSeconds
-    };
-  }
-
-  if (!staticAuthSecret || urls.length === 0) {
+  if (!cloudflareKeyId || !cloudflareApiToken) {
     return null;
   }
 
   return {
-    provider: "coturn",
-    urls,
-    realm,
+    keyId: cloudflareKeyId,
+    apiToken: cloudflareApiToken,
     ttlSeconds,
-    staticAuthSecret
   };
 };
 

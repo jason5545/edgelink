@@ -137,19 +137,36 @@ class EnvelopeTest {
             EnvelopeTypes.PHONE_RELAY_ENDPOINT,
             PhoneRelayEndpointBody(
                 requestId = "relay-1",
-                relayHost = "172.238.24.219",
-                relayPort = 17104,
-                relaySessionId = "gateway-session-1",
-                relayControlPort = 17104,
+                relayHost = "127.0.0.1",
+                relayPort = 7102,
+                relaySessionId = "cloudflare-session-1",
                 success = true,
                 ts = 1783510257
             )
         )
         val relayEndpoint = EnvelopeCodec.decode<PhoneRelayEndpointBody>(relayEndpointBytes)
         assertEquals(EnvelopeTypes.PHONE_RELAY_ENDPOINT, relayEndpoint.t)
-        assertEquals("172.238.24.219", relayEndpoint.b.relayHost)
-        assertEquals(17104, relayEndpoint.b.relayPort)
-        assertEquals("gateway-session-1", relayEndpoint.b.relaySessionId)
+        assertEquals("127.0.0.1", relayEndpoint.b.relayHost)
+        assertEquals(7102, relayEndpoint.b.relayPort)
+        assertEquals("cloudflare-session-1", relayEndpoint.b.relaySessionId)
+
+        val relayMediaBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.PHONE_RELAY_MEDIA,
+            PhoneRelayMediaBody(
+                sessionId = "cloudflare-session-1",
+                direction = "android_to_mac",
+                kind = "rtp",
+                dataBase64 = "gIA=",
+                bytes = 2,
+                sequence = 7,
+                ts = 1783510257
+            )
+        )
+        val relayMedia = EnvelopeCodec.decode<PhoneRelayMediaBody>(relayMediaBytes)
+        assertEquals(EnvelopeTypes.PHONE_RELAY_MEDIA, relayMedia.t)
+        assertEquals("cloudflare-session-1", relayMedia.b.sessionId)
+        assertEquals("android_to_mac", relayMedia.b.direction)
+        assertEquals(7, relayMedia.b.sequence)
 
         val phoneStatusBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_CALL_STATUS,

@@ -44,9 +44,7 @@ actor SecureSessionHost {
         DiagnosticsLog.info("hs.mac.ack_out reason=\(reason) bytes=\(ack.ack.count)")
         try await channel.send(ack.ack)
 
-        guard let confirm = try await channel.receive() else {
-            throw SecureSessionHostError.closedBeforeHandshake
-        }
+        let confirm = try await receiveHandshakeConfirm(reason: reason)
         DiagnosticsLog.info("hs.mac.confirm_in reason=\(reason) bytes=\(confirm.count)")
         established = try HandshakeSession.finishResponder(
             state: ack.state,
@@ -56,8 +54,21 @@ actor SecureSessionHost {
         DiagnosticsLog.info("hs.mac.established reason=\(reason) hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
     }
 
+    private func receiveHandshakeConfirm(reason: String) async throws -> Data {
+        while let frame = try await channel.receive() {
+            if isHandshakeConfirm(frame) {
+                return frame
+            }
+            DiagnosticsLog.warn(
+                "hs.mac.stale_confirm_frame_ignored reason=\(reason) " +
+                    "hostId=\(identity.deviceId) clientId=\(peer.deviceId) bytes=\(frame.count)"
+            )
+        }
+        throw SecureSessionHostError.closedBeforeHandshake
+    }
+
     func sendPlaintext(_ plaintext: Data) async throws {
-        var session = try requireEstablished()
+        var session = try await waitForEstablished()
         let frame = try session.channel.seal(plaintext)
         established = session
         DiagnosticsLog.info("secure.mac.frame_out plaintext=\(plaintext.count) frame=\(frame.count)")
@@ -90,11 +101,28 @@ actor SecureSessionHost {
         return established
     }
 
+    private func waitForEstablished() async throws -> EstablishedHandshake {
+        for _ in 0..<500 {
+            if let established {
+                return established
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw SecureSessionHostError.notEstablished
+    }
+
     private func isHandshakeHello(_ frame: Data) -> Bool {
         guard let envelope = try? HandshakeWire.decodeSignedPeer(frame) else {
             return false
         }
         return envelope.t == HandshakeType.hello
+    }
+
+    private func isHandshakeConfirm(_ frame: Data) -> Bool {
+        guard let envelope = try? HandshakeWire.decodeConfirm(frame) else {
+            return false
+        }
+        return envelope.t == HandshakeType.confirm
     }
 }
 

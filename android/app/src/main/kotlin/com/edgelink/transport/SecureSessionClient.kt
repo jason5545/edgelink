@@ -3,6 +3,8 @@ package com.edgelink.transport
 import com.edgelink.app.EdgeLinkLog
 import com.edgelink.core.EstablishedHandshake
 import com.edgelink.core.HandshakeSession
+import com.edgelink.core.HandshakeTypes
+import com.edgelink.core.HandshakeWire
 import com.edgelink.core.LocalIdentity
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.SodiumHandshakeCrypto
@@ -24,7 +26,7 @@ class SecureSessionClient(
         EdgeLinkLog.info("hs.android.hello_out bytes=${start.hello.size}")
         channel.send(start.hello)
 
-        val ack = channel.receive() ?: error("Relay closed before hs.ack.")
+        val ack = receiveHandshakeAck()
         EdgeLinkLog.info("hs.android.ack_in bytes=${ack.size}")
         val (confirm, session) = HandshakeSession.finishInitiator(
             state = start.state,
@@ -37,6 +39,19 @@ class SecureSessionClient(
         channel.send(confirm)
         established = session
         EdgeLinkLog.info("hs.android.established clientId=${identity.deviceId} hostId=${peer.deviceId}")
+    }
+
+    private suspend fun receiveHandshakeAck(): ByteArray {
+        while (true) {
+            val frame = channel.receive() ?: error("Relay closed before hs.ack.")
+            val isAck = runCatching {
+                HandshakeWire.decodeSignedPeer(frame).t == HandshakeTypes.ACK
+            }.getOrDefault(false)
+            if (isAck) {
+                return frame
+            }
+            EdgeLinkLog.warn("hs.android.stale_frame_ignored bytes=${frame.size}")
+        }
     }
 
     suspend fun sendPlaintext(plaintext: ByteArray) {

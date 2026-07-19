@@ -2,6 +2,7 @@ package com.edgelink.core
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.util.Base64
 
@@ -80,6 +81,23 @@ class HandshakeTest {
 
         assertArrayEquals(ping, responder.open(initiator.seal(ping)))
         assertArrayEquals(pong, initiator.open(responder.seal(pong)))
+    }
+
+    @Test
+    fun secureChannelToleratesDroppedFrameAndRejectsReplay() {
+        val keys = SecureChannelKeys(
+            initiatorToResponder = ByteArray(32) { 0x11 },
+            responderToInitiator = ByteArray(32) { 0x22 }
+        )
+        val initiator = SecureChannel(keys, SecureChannelRole.INITIATOR)
+        val responder = SecureChannel(keys, SecureChannelRole.RESPONDER)
+        val dropped = initiator.seal("dropped".encodeToByteArray())
+        val delivered = initiator.seal("delivered".encodeToByteArray())
+
+        assertArrayEquals("delivered".encodeToByteArray(), responder.open(delivered))
+        assertThrows(IllegalArgumentException::class.java) {
+            responder.open(dropped)
+        }
     }
 
     @Test

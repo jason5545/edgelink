@@ -69,7 +69,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
     private let turnCredentialClient: TurnCredentialClient
-    private let callRelayGatewayClient: CallRelayGatewayClient
+    private let callRelayCloudflareBridge = CallRelayCloudflareBridge()
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
@@ -88,6 +88,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
+    private var activePhoneRelaySessionId: String?
+    private var phoneRelaySourceSequence = 0
+    private var phoneRelaySourceSendFailed = false
     private var phoneCallStatuses: [String: PhoneCallStatusBody] = [:]
     private var androidMicRelayArmed = false
     private var phoneRelayProbeRunning = false
@@ -149,10 +152,6 @@ final class EdgeLinkRuntime: ObservableObject {
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
         turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
-        callRelayGatewayClient = CallRelayGatewayClient(
-            host: EdgeLinkConfig.callRelayGatewayHost,
-            port: EdgeLinkConfig.callRelayGatewayControlPort
-        )
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
@@ -215,15 +214,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.handleXiaomiMiShareDiscoverySnapshot(snapshot)
             }
         }
-        callRelayGatewayClient.onSourceStart = { [weak self] reason in
-            self?.phoneRelayProbe.startExternalSourceRTP(reason: "gateway_\(reason)") { [weak self] packet in
-                self?.callRelayGatewayClient.sendSourceRTPPacket(packet)
-            }
-        }
-        callRelayGatewayClient.onSourceStop = { [weak self] reason in
-            self?.phoneRelayProbe.stopExternalSourceRTP(reason: "gateway_\(reason)")
-        }
-        callRelayGatewayClient.onPlaybackStats = { [weak self] stats in
+        callRelayCloudflareBridge.onPlaybackStats = { [weak self] stats in
             Task { @MainActor in
                 self?.handleCallRelayGatewayPlaybackStats(stats)
             }
@@ -251,7 +242,7 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayProbe.stop()
         xiaomiMirrorRTSPDiagnosticSource.stop(reason: "runtime_deinit")
         xiaomiMiShareDiscovery.stop()
-        callRelayGatewayClient.close(reason: "runtime_deinit")
+        callRelayCloudflareBridge.stop(reason: "runtime_deinit")
         screenSession.closeWindow(sendRemoteStop: false)
     }
 
@@ -588,7 +579,8 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.setIceServerConfigs([])
         screenSession.setMicrophoneRelayEnabled(false)
         stopPhoneRelayProbe(reason: "disconnect")
-        callRelayGatewayClient.close(reason: "disconnect")
+        callRelayCloudflareBridge.stop(reason: "disconnect")
+        activePhoneRelaySessionId = nil
         incomingCallPresenter.endAll(reason: .failed)
         phoneCallStatuses.removeAll()
         incomingPhoneCallLabel = ""
@@ -819,18 +811,31 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    func runPhoneRelayDebugCall(number rawNumber: String = "800", timeoutSeconds rawTimeout: TimeInterval = 30) {
+    func runPhoneRelayDebugCall(
+        number rawNumber: String = "800",
+        timeoutSeconds rawTimeout: TimeInterval = 30,
+        minimumHoldSeconds rawMinimumHold: TimeInterval = 0
+    ) {
         let number = rawNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? Self.phoneRelayDebugDefaultNumber
             : rawNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         let timeoutSeconds = min(max(rawTimeout, 1), Self.phoneRelayDebugMaxTimeoutSeconds)
+        let minimumHoldSeconds = min(max(rawMinimumHold, 0), timeoutSeconds)
         phoneRelayDebugTask?.cancel()
         phoneRelayDebugTask = Task { [weak self] in
-            await self?.runPhoneRelayDebugCallTask(number: number, timeoutSeconds: timeoutSeconds)
+            await self?.runPhoneRelayDebugCallTask(
+                number: number,
+                timeoutSeconds: timeoutSeconds,
+                minimumHoldSeconds: minimumHoldSeconds
+            )
         }
     }
 
-    private func runPhoneRelayDebugCallTask(number: String, timeoutSeconds: TimeInterval) async {
+    private func runPhoneRelayDebugCallTask(
+        number: String,
+        timeoutSeconds: TimeInterval,
+        minimumHoldSeconds: TimeInterval
+    ) async {
         guard isConnected else {
             DiagnosticsLog.warn("phonerelay.mac.debug_call_ignored numberFp=\(Self.fingerprint(number)) not_connected")
             phoneRelayDebugTask = nil
@@ -847,7 +852,8 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayDebugValidGatewayStats = nil
         DiagnosticsLog.info(
             "phonerelay.mac.debug_call_start session=\(sessionID.uuidString) " +
-                "numberFp=\(Self.fingerprint(number)) timeoutMs=\(Int(timeoutSeconds * 1000))"
+                "numberFp=\(Self.fingerprint(number)) timeoutMs=\(Int(timeoutSeconds * 1000)) " +
+                "minimumHoldMs=\(Int(minimumHoldSeconds * 1000))"
         )
 
         guard let dialRequestID = dialPhone(number: number) else {
@@ -857,7 +863,8 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         phoneRelayDebugDialRequestID = dialRequestID
 
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(timeoutSeconds)
         while !Task.isCancelled && Date() < deadline {
             if let dialError = phoneRelayDebugDialError {
                 DiagnosticsLog.warn(
@@ -867,8 +874,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 phoneRelayDebugTask = nil
                 return
             }
+            let heldLongEnough = Date().timeIntervalSince(startedAt) >= minimumHoldSeconds
             if let gatewayStats = phoneRelayDebugValidGatewayStats,
-               gatewayStats.hasValidStream {
+               gatewayStats.hasValidStream,
+               heldLongEnough {
                 DiagnosticsLog.info("phonerelay.mac.debug_call_valid_gateway_stream \(gatewayStats.diagnosticSummary)")
                 hangUpPhoneCall()
                 phoneRelayDebugTask = nil
@@ -876,7 +885,8 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             if let stats = phoneRelayDebugValidStats,
                stats.sessionID == sessionID,
-               stats.hasValidStream {
+               stats.hasValidStream,
+               heldLongEnough {
                 DiagnosticsLog.info("phonerelay.mac.debug_call_valid_stream \(stats.diagnosticSummary)")
                 hangUpPhoneCall()
                 phoneRelayDebugTask = nil
@@ -933,11 +943,18 @@ final class EdgeLinkRuntime: ObservableObject {
             let number = queryItems.first { $0.name == "number" }?.value ?? Self.phoneRelayDebugDefaultNumber
             let timeout = queryItems.first { $0.name == "timeout" || $0.name == "timeoutSeconds" }?.value
                 .flatMap(TimeInterval.init) ?? Self.phoneRelayDebugMaxTimeoutSeconds
+            let minimumHold = queryItems.first { $0.name == "hold" || $0.name == "holdSeconds" }?.value
+                .flatMap(TimeInterval.init) ?? 0
             DiagnosticsLog.info(
                 "runtime.mac.url_debug_phone_relay numberFp=\(Self.fingerprint(number)) " +
-                    "timeoutMs=\(Int(min(max(timeout, 1), Self.phoneRelayDebugMaxTimeoutSeconds) * 1000))"
+                    "timeoutMs=\(Int(min(max(timeout, 1), Self.phoneRelayDebugMaxTimeoutSeconds) * 1000)) " +
+                    "minimumHoldMs=\(Int(min(max(minimumHold, 0), timeout) * 1000))"
             )
-            runPhoneRelayDebugCall(number: number, timeoutSeconds: timeout)
+            runPhoneRelayDebugCall(
+                number: number,
+                timeoutSeconds: timeout,
+                minimumHoldSeconds: minimumHold
+            )
         case "view-phone-screen", "phone-screen", "screen":
             DiagnosticsLog.info("runtime.mac.url_view_phone_screen")
             viewPhoneScreen()
@@ -1932,12 +1949,6 @@ final class EdgeLinkRuntime: ObservableObject {
                 guard let self else {
                     return
                 }
-                let credential = await self.ensureTurnCredentials(reason: "phone_action_\(action)")
-                if credential != nil {
-                    DiagnosticsLog.info("phone.mac.turn_credentials_ready action=\(action)")
-                } else {
-                    DiagnosticsLog.warn("phone.mac.turn_credentials_missing action=\(action)")
-                }
                 let endpoint = await self.preparePhoneRelayEndpoint(action: action)
                 let body = PhoneActionBody(
                     requestId: requestId,
@@ -1963,9 +1974,7 @@ final class EdgeLinkRuntime: ObservableObject {
         )
         pendingPhoneActions[requestId] = body
         if action == "hangup" {
-            stopPhoneRelayProbe(reason: "phone_action_hangup")
-            phoneRelayProbe.stopExternalSourceRTP(reason: "phone_action_hangup")
-            callRelayGatewayClient.close(reason: "phone_action_hangup")
+            stopPhoneCallRelayAudio(reason: "phone_action_hangup")
         }
 
         Task { @MainActor [weak self] in
@@ -1975,37 +1984,22 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func preparePhoneRelayEndpoint(action: String) async -> PhoneRelayEndpoint {
-        guard let identity = localIdentity else {
-            return localPhoneRelayEndpoint(action: action, reason: "no_identity")
-        }
-        do {
-            let gatewaySession = try await callRelayGatewayClient.startSession(identity: identity)
-            DiagnosticsLog.info(
-                "phone.mac.relay_endpoint action=\(action) mode=gateway " +
-                    "host=\(gatewaySession.relayHost) port=\(gatewaySession.relayPort) " +
-                    "sessionId=\(gatewaySession.sessionId)"
-            )
-            return PhoneRelayEndpoint(
-                host: gatewaySession.relayHost,
-                port: gatewaySession.relayPort,
-                sessionId: gatewaySession.sessionId,
-                controlPort: Int(EdgeLinkConfig.callRelayGatewayControlPort)
-            )
-        } catch {
-            DiagnosticsLog.error("phone.mac.gateway_endpoint_failed action=\(action)", error)
-            return localPhoneRelayEndpoint(action: action, reason: "gateway_failed")
-        }
-    }
-
-    private func localPhoneRelayEndpoint(action: String, reason: String) -> PhoneRelayEndpoint {
-        let relayHost = Self.phoneRelayAdvertisedHost()
-        ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)_\(reason)")
-        phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)_\(reason)")
+        let sessionId = UUID().uuidString
+        activePhoneRelaySessionId = sessionId
+        phoneRelaySourceSequence = 0
+        phoneRelaySourceSendFailed = false
+        callRelayCloudflareBridge.start(sessionId: sessionId)
+        ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)_cloudflare")
+        phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)_cloudflare")
         DiagnosticsLog.info(
-            "phone.mac.relay_endpoint action=\(action) mode=lan_fallback " +
-                "host=\(relayHost ?? "none") port=\(Self.phoneRelayProbePort) reason=\(reason)"
+            "phone.mac.relay_endpoint action=\(action) mode=cloudflare_secure " +
+                "phoneLocal=127.0.0.1:\(Self.phoneRelayProbePort) sessionId=\(sessionId)"
         )
-        return PhoneRelayEndpoint(host: relayHost, port: Int(Self.phoneRelayProbePort))
+        return PhoneRelayEndpoint(
+            host: "127.0.0.1",
+            port: Int(Self.phoneRelayProbePort),
+            sessionId: sessionId
+        )
     }
 
     private func sendPhoneActionBody(_ body: PhoneActionBody, session: SecureSessionHost) async {
@@ -2020,9 +2014,7 @@ final class EdgeLinkRuntime: ObservableObject {
         } catch {
             pendingPhoneActions.removeValue(forKey: body.requestId)
             if body.action == "dial" || body.action == "answer" {
-                stopPhoneRelayProbe(reason: "phone_action_send_failed_\(body.action)")
-                phoneRelayProbe.stopExternalSourceRTP(reason: "phone_action_send_failed_\(body.action)")
-                callRelayGatewayClient.close(reason: "phone_action_send_failed_\(body.action)")
+                stopPhoneCallRelayAudio(reason: "phone_action_send_failed_\(body.action)")
             }
             phoneCallStatus = "\(Self.localizedPhoneAction(body.action))失敗"
             DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(body.requestId) action=\(body.action)", error)
@@ -2039,12 +2031,6 @@ final class EdgeLinkRuntime: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else {
                 return
-            }
-            let credential = await self.ensureTurnCredentials(reason: "phone_relay_start")
-            if credential != nil {
-                DiagnosticsLog.info("phone.mac.turn_credentials_ready action=phone_relay_start")
-            } else {
-                DiagnosticsLog.warn("phone.mac.turn_credentials_missing action=phone_relay_start")
             }
             let endpoint = await self.preparePhoneRelayEndpoint(action: "phone_relay_start")
             let success = endpoint.host != nil
@@ -2083,6 +2069,77 @@ final class EdgeLinkRuntime: ObservableObject {
             isPhoneCallActive = false
             phoneCallStatus = "接手機通話失敗"
             DiagnosticsLog.error("phone.mac.relay_endpoint_send_failed requestId=\(body.requestId)", error)
+        }
+    }
+
+    private func handlePhoneRelayMedia(_ body: PhoneRelayMediaBody) {
+        guard body.sessionId == activePhoneRelaySessionId else {
+            DiagnosticsLog.info(
+                "callrelay.mac.cloudflare_media_ignored sessionId=\(body.sessionId) " +
+                    "active=\(activePhoneRelaySessionId ?? "none") kind=\(body.kind)"
+            )
+            return
+        }
+
+        if body.kind == "rtp" {
+            callRelayCloudflareBridge.handle(body)
+            return
+        }
+        guard body.kind == "status", let event = body.event else {
+            return
+        }
+        DiagnosticsLog.info("callrelay.mac.cloudflare_status sessionId=\(body.sessionId) event=\(event)")
+        switch event {
+        case "source_start":
+            phoneRelayProbe.startExternalSourceRTP(reason: "cloudflare_source_start") { [weak self] packet in
+                Task { @MainActor in
+                    await self?.sendPhoneRelaySourcePacket(packet)
+                }
+            }
+        case "source_stop", "bridge_failed", "bridge_stopped":
+            phoneRelayProbe.stopExternalSourceRTP(reason: "cloudflare_\(event)")
+        default:
+            break
+        }
+    }
+
+    private func sendPhoneRelaySourcePacket(_ packet: Data) async {
+        guard !phoneRelaySourceSendFailed,
+              let session = currentSession,
+              let sessionId = activePhoneRelaySessionId else {
+            return
+        }
+        phoneRelaySourceSequence += 1
+        let sequence = phoneRelaySourceSequence
+        let body = PhoneRelayMediaBody(
+            sessionId: sessionId,
+            direction: "mac_to_android",
+            kind: "rtp",
+            dataBase64: packet.base64EncodedString(),
+            bytes: packet.count,
+            sequence: sequence,
+            ts: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        do {
+            let data = try encoder.encode(Envelope(t: EnvelopeType.phoneRelayMedia, b: body))
+            try await session.sendPlaintext(data)
+            if sequence == 1 || sequence % 100 == 0 {
+                DiagnosticsLog.info(
+                    "callrelay.mac.cloudflare_rtp_out sessionId=\(sessionId) " +
+                        "count=\(sequence) bytes=\(packet.count)"
+                )
+            }
+        } catch {
+            guard activePhoneRelaySessionId == sessionId, !phoneRelaySourceSendFailed else {
+                return
+            }
+            phoneRelaySourceSendFailed = true
+            DiagnosticsLog.error(
+                "callrelay.mac.cloudflare_rtp_send_failed sessionId=\(sessionId) " +
+                    "count=\(sequence)",
+                error
+            )
+            phoneRelayProbe.stopExternalSourceRTP(reason: "cloudflare_send_failed")
         }
     }
 
@@ -2342,6 +2399,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handlePhoneRelayStartRequest(request)
                         }
                     },
+                    onPhoneRelayMedia: { [weak self] media in
+                        Task { @MainActor in
+                            self?.handlePhoneRelayMedia(media)
+                        }
+                    },
                     onPhoneCallStatus: { [weak self] status in
                         Task { @MainActor in
                             self?.handlePhoneCallStatus(status)
@@ -2439,7 +2501,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 currentSession = nil
                 screenSession.clearSender()
                 screenSession.handleTransportInterrupted()
-                stopPhoneRelayProbe(reason: "transport_interrupted")
+                stopPhoneCallRelayAudio(reason: "transport_interrupted")
                 androidMicRelayArmed = false
                 isPhoneCallActive = false
                 connectionStatus = "Disconnected"
@@ -2959,7 +3021,10 @@ final class EdgeLinkRuntime: ObservableObject {
     private func stopPhoneCallRelayAudio(reason: String) {
         stopPhoneRelayProbe(reason: reason)
         phoneRelayProbe.stopExternalSourceRTP(reason: reason)
-        callRelayGatewayClient.close(reason: reason)
+        callRelayCloudflareBridge.stop(reason: reason)
+        activePhoneRelaySessionId = nil
+        phoneRelaySourceSequence = 0
+        phoneRelaySourceSendFailed = false
     }
 
     private func handleAndroidMicStatus(_ status: AndroidMicStatusBody) {
@@ -3136,8 +3201,6 @@ enum EdgeLinkConfig {
     static let workerBaseURL = URL(string: "https://edgelink-worker.black-hill-f944.workers.dev")!
     static let relayURL = URL(string: "wss://edgelink-worker.black-hill-f944.workers.dev/v1/connect")!
     static let pairingWebSocketURL = URL(string: "wss://edgelink-worker.black-hill-f944.workers.dev/v1/pair/ws")!
-    static let callRelayGatewayHost = "172.238.24.219"
-    static let callRelayGatewayControlPort: UInt16 = 17104
 }
 
 private struct PhoneRelayEndpoint {

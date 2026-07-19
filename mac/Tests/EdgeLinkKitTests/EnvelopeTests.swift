@@ -146,10 +146,9 @@ final class EnvelopeTests: XCTestCase {
                 t: EnvelopeType.phoneRelayEndpoint,
                 b: PhoneRelayEndpointBody(
                     requestId: "relay-1",
-                    relayHost: "172.238.24.219",
-                    relayPort: 17104,
-                    relaySessionId: "gateway-session-1",
-                    relayControlPort: 17104,
+                    relayHost: "127.0.0.1",
+                    relayPort: 7102,
+                    relaySessionId: "cloudflare-session-1",
                     success: true,
                     ts: 1_783_510_257
                 )
@@ -157,9 +156,29 @@ final class EnvelopeTests: XCTestCase {
         )
         let relayEndpoint = try decoder.decode(Envelope<PhoneRelayEndpointBody>.self, from: relayEndpointData)
         XCTAssertEqual(relayEndpoint.t, "phone.relay.endpoint")
-        XCTAssertEqual(relayEndpoint.b.relayHost, "172.238.24.219")
-        XCTAssertEqual(relayEndpoint.b.relayPort, 17104)
-        XCTAssertEqual(relayEndpoint.b.relaySessionId, "gateway-session-1")
+        XCTAssertEqual(relayEndpoint.b.relayHost, "127.0.0.1")
+        XCTAssertEqual(relayEndpoint.b.relayPort, 7102)
+        XCTAssertEqual(relayEndpoint.b.relaySessionId, "cloudflare-session-1")
+
+        let relayMediaData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.phoneRelayMedia,
+                b: PhoneRelayMediaBody(
+                    sessionId: "cloudflare-session-1",
+                    direction: "android_to_mac",
+                    kind: "rtp",
+                    dataBase64: "gIA=",
+                    bytes: 2,
+                    sequence: 7,
+                    ts: 1_783_510_257
+                )
+            )
+        )
+        let relayMedia = try decoder.decode(Envelope<PhoneRelayMediaBody>.self, from: relayMediaData)
+        XCTAssertEqual(relayMedia.t, "phone.relay.media")
+        XCTAssertEqual(relayMedia.b.sessionId, "cloudflare-session-1")
+        XCTAssertEqual(relayMedia.b.direction, "android_to_mac")
+        XCTAssertEqual(relayMedia.b.sequence, 7)
 
         let phoneStatusData = try encoder.encode(
             Envelope(

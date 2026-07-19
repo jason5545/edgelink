@@ -32,6 +32,7 @@ private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val ANDROID_UIDS_PER_USER = 100_000
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 private const val PHONE_RELAY_DEFAULT_PORT = 7_102
+private const val PHONE_RELAY_SINK_RTSP_PORT = 15_550
 private const val PHONE_DTMF_KEY_DELAY_MS = 120L
 private const val MIRROR_SCREEN_REMOTE_TTL_MS = 180_000L
 private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
@@ -425,8 +426,9 @@ object AndroidShizukuSupport {
         relayPort: Int?
     ): ShizukuOperationResult = withService(context) { service ->
         val endpointPort = relayPort?.takeIf { it in 1..65_535 } ?: PHONE_RELAY_DEFAULT_PORT
-        val peerHost = MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(relayHost)
         val localHost = preferredLocalIPv4Address()
+        val peerHost = localHost ?: MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(relayHost)
+        val sinkPort = PHONE_RELAY_SINK_RTSP_PORT
         val commands = mutableListOf<Array<String>>()
 
         fun setProp(key: String, value: String) {
@@ -441,16 +443,17 @@ object AndroidShizukuSupport {
         setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PROPERTY, "1")
         setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY, "1")
         setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY, "both")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY, endpointPort.toString())
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY, sinkPort.toString())
         setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY, "1")
         peerHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY, it) }
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY, endpointPort.toString())
+        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY, sinkPort.toString())
         localHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY, it) }
         setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY, endpointPort.toString())
 
         val results = commands.map { command -> service.runCommandResult(command) }
         results.toOperationResult(
-            "phone:relay_hooks peer=${peerHost ?: "default"}:$endpointPort local=${localHost ?: "default"}"
+            "phone:relay_hooks peer=${peerHost ?: "default"}:$sinkPort " +
+                "local=${localHost ?: "default"}:$endpointPort"
         )
     }
 

@@ -88,6 +88,20 @@ final class HandshakeTests: XCTestCase {
         XCTAssertEqual(try initiator.open(try responder.seal(pong)), pong)
     }
 
+    func testSecureChannelToleratesDroppedFrameAndRejectsReplay() throws {
+        let keys = SecureChannelKeys(
+            initiatorToResponder: Data(repeating: 0x11, count: 32),
+            responderToInitiator: Data(repeating: 0x22, count: 32)
+        )
+        var initiator = SecureChannel(keys: keys, role: .initiator)
+        var responder = SecureChannel(keys: keys, role: .responder)
+        let dropped = try initiator.seal(Data("dropped".utf8))
+        let delivered = try initiator.seal(Data("delivered".utf8))
+
+        XCTAssertEqual(try responder.open(delivered), Data("delivered".utf8))
+        XCTAssertThrowsError(try responder.open(dropped))
+    }
+
     func testHandshakeWireRoundTrip() throws {
         let peer = HandshakePeer(
             deviceId: "137245816",

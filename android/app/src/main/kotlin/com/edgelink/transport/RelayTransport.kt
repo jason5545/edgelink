@@ -75,7 +75,12 @@ private class OkHttpRelayByteChannel(
     private val authText: String
 ) : WebSocketListener(), ByteChannel {
     private val ready = CompletableDeferred<Unit>()
-    private val incoming = Channel<ByteArray>(Channel.BUFFERED)
+    // SecureChannel uses an implicit receive counter, so dropping even one
+    // WebSocket message makes every following frame fail authentication. The
+    // default buffered channel only holds 64 messages and phone audio can burst
+    // past that in a couple of seconds. Keep the reliable WebSocket stream
+    // lossless here and let the suspending receive loop drain it in order.
+    private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
     private var webSocket: WebSocket? = null
 
     fun attach(socket: WebSocket) {
@@ -107,7 +112,10 @@ private class OkHttpRelayByteChannel(
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
         EdgeLinkLog.info("relay.transport.binary_in hostId=$hostId deviceId=$deviceId bytes=${bytes.size}")
-        incoming.trySend(bytes.toByteArray())
+        val result = incoming.trySend(bytes.toByteArray())
+        if (result.isFailure) {
+            EdgeLinkLog.warn("relay.transport.binary_queue_failed hostId=$hostId deviceId=$deviceId")
+        }
     }
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

@@ -26,6 +26,11 @@ public struct FrameCounter: Sendable {
         defer { value += 1 }
         return value
     }
+
+    public mutating func advance(to nextValue: UInt64) {
+        precondition(nextValue >= value)
+        value = nextValue
+    }
 }
 
 public enum SecureChannelRole: Sendable {
@@ -57,7 +62,7 @@ public struct SecureChannel: Sendable {
     }
 
     public mutating func seal(_ plaintext: Data) throws -> Data {
-        try SecureFrame.seal(
+        try SecureFrame.sealVersioned(
             plaintext: plaintext,
             key: sendKey,
             direction: sendDirection,
@@ -66,13 +71,20 @@ public struct SecureChannel: Sendable {
     }
 
     public mutating func open(_ frame: Data) throws -> Data {
-        try SecureFrame.open(
+        let opened = try SecureFrame.openVersioned(
             frame: frame,
             key: receiveKey,
             direction: receiveDirection,
-            counter: receiveCounter.next()
+            minimumCounter: receiveCounter.value
         )
+        receiveCounter.advance(to: opened.counter + 1)
+        return opened.plaintext
     }
+}
+
+public struct OpenedSecureFrame: Sendable {
+    public let counter: UInt64
+    public let plaintext: Data
 }
 
 public enum SecureFrame {
@@ -100,6 +112,53 @@ public enum SecureFrame {
             throw SecureFrameError.frameTooLarge
         }
         return UInt32(ciphertextAndTag.count).bigEndianData + ciphertextAndTag
+    }
+
+    public static func sealVersioned(
+        plaintext: Data,
+        key: Data,
+        direction: SecureChannelDirection,
+        counter: UInt64
+    ) throws -> Data {
+        let legacyFrame = try seal(
+            plaintext: plaintext,
+            key: key,
+            direction: direction,
+            counter: counter
+        )
+        return legacyFrame.prefix(4) + counter.bigEndianData + legacyFrame.dropFirst(4)
+    }
+
+    public static func openVersioned(
+        frame: Data,
+        key: Data,
+        direction: SecureChannelDirection,
+        minimumCounter: UInt64
+    ) throws -> OpenedSecureFrame {
+        guard frame.count >= 12 else {
+            throw SecureFrameError.truncatedFrame
+        }
+        let length = Int(UInt32(bigEndianData: frame.prefix(4)))
+        guard length <= maxCiphertextAndTagLength else {
+            throw SecureFrameError.frameTooLarge
+        }
+        guard frame.count == 12 + length, length >= 16 else {
+            throw SecureFrameError.truncatedFrame
+        }
+        let counter = UInt64(bigEndianData: frame.dropFirst(4).prefix(8))
+        guard counter >= minimumCounter else {
+            throw SecureFrameError.replayedFrame
+        }
+        let legacyFrame = frame.prefix(4) + frame.dropFirst(12)
+        return OpenedSecureFrame(
+            counter: counter,
+            plaintext: try open(
+                frame: legacyFrame,
+                key: key,
+                direction: direction,
+                counter: counter
+            )
+        )
     }
 
     public static func open(frame: Data, key: Data, direction: SecureChannelDirection, counter: UInt64) throws -> Data {
@@ -134,6 +193,7 @@ public enum SecureFrame {
 public enum SecureFrameError: Error {
     case frameTooLarge
     case truncatedFrame
+    case replayedFrame
 }
 
 private extension UInt32 {
@@ -145,5 +205,17 @@ private extension UInt32 {
     init(bigEndianData data: Data.SubSequence) {
         precondition(data.count == 4)
         self = data.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+}
+
+private extension UInt64 {
+    var bigEndianData: Data {
+        var value = bigEndian
+        return Data(bytes: &value, count: MemoryLayout<UInt64>.size)
+    }
+
+    init(bigEndianData data: Data.SubSequence) {
+        precondition(data.count == 8)
+        self = data.reduce(0) { ($0 << 8) | UInt64($1) }
     }
 }
