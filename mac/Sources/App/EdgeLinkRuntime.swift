@@ -103,6 +103,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var turnCredentialTask: Task<TurnCredentialSnapshot?, Never>?
     private var pendingXiaomiScreenFallback: PendingXiaomiScreenFallback?
     private var pendingXiaomiScreenFallbackTask: Task<Void, Never>?
+    private var deferredViewPhoneScreenTask: Task<Void, Never>?
     private var xiaomiScreenRecoveryTask: Task<Void, Never>?
     private var xiaomiScreenRecoveryAttempt = 0
     private var xiaomiScreenLastSessionRebuildAt = Date.distantPast
@@ -319,6 +320,10 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     func viewPhoneScreen() {
+        viewPhoneScreen(allowRouteDeferral: true)
+    }
+
+    private func viewPhoneScreen(allowRouteDeferral: Bool) {
         guard isConnected else {
             DiagnosticsLog.warn("screen.mac.start_ignored not_connected")
             return
@@ -328,6 +333,16 @@ final class EdgeLinkRuntime: ObservableObject {
             from: latestMiLinkStatus,
             preferredRoute: preferredScreenRoute
         )
+        if xiaomiScreenRoute?.hasPrefix("xiaomi.") != true,
+           !screenSession.isUsingXiaomiMirrorRoute,
+           allowRouteDeferral,
+           latestMiLinkStatus == nil,
+           !isPhoneScreenSessionActive {
+            scheduleDeferredViewPhoneScreen()
+            return
+        }
+        deferredViewPhoneScreenTask?.cancel()
+        deferredViewPhoneScreenTask = nil
         if xiaomiScreenRoute?.hasPrefix("xiaomi.") == true || screenSession.isUsingXiaomiMirrorRoute {
             guard Self.allowXiaomiScreenPrimaryRoute else {
                 screenSession.setXiaomiMirrorRouteActive(false)
@@ -428,6 +443,27 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         screenSession.setXiaomiMirrorRouteActive(false)
         startEdgeLinkPhoneScreen(reason: "generic")
+    }
+
+    private func scheduleDeferredViewPhoneScreen() {
+        guard deferredViewPhoneScreenTask == nil else {
+            return
+        }
+        xiaomiMiLinkCommandStatus = "等待小米鏡像路由…"
+        DiagnosticsLog.info("xiaomi.mac.screen_route_deferred reason=awaiting_milink_status")
+        deferredViewPhoneScreenTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await MainActor.run {
+                guard let self else {
+                    return
+                }
+                self.deferredViewPhoneScreenTask = nil
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_route_deferred_timeout hasStatus=\(self.latestMiLinkStatus != nil)"
+                )
+                self.viewPhoneScreen(allowRouteDeferral: false)
+            }
+        }
     }
 
     private func armPendingXiaomiScreenCommand(
@@ -2565,6 +2601,12 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleMiLinkStatus(_ status: MiLinkStatusBody) {
         latestMiLinkStatus = status
         autoWarmXiaomiServicesIfNeeded(status)
+        if deferredViewPhoneScreenTask != nil {
+            deferredViewPhoneScreenTask?.cancel()
+            deferredViewPhoneScreenTask = nil
+            DiagnosticsLog.info("xiaomi.mac.screen_route_deferred_resolved reason=milink_status")
+            viewPhoneScreen(allowRouteDeferral: false)
+        }
         DiagnosticsLog.info(
             "milink.mac.status available=\(status.available) route=\(status.route) " +
                 "officialDiscoveryRequired=\(status.officialDiscoveryRequired) " +
@@ -2582,10 +2624,25 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handleMiLinkFrame(_ frame: MiLinkFrameBody) {
         latestMiLinkFrame = frame
+        if frame.route == "xiaomi.mirror.cast" {
+            do {
+                guard let data = Data(base64Encoded: frame.dataBase64) else {
+                    throw XiaomiMirrorCastFrameError.invalidBase64
+                }
+                let configuration = try XiaomiMirrorScreenConfiguration.decodeOfficialFrame(data)
+                screenSession.handleXiaomiMirrorScreenConfiguration(configuration)
+            } catch {
+                DiagnosticsLog.error("milink.mac.xiaomi_cast_frame_decode_failed", error)
+            }
+        }
         DiagnosticsLog.info(
             "milink.mac.frame_received clientNo=\(frame.clientNo) seq=\(frame.sequence) " +
                 "bytes=\(frame.bytes) hasNext=\(frame.hasNext) route=\(frame.route)"
         )
+    }
+
+    private enum XiaomiMirrorCastFrameError: Error {
+        case invalidBase64
     }
 
     private func handleMiLinkCommandResult(_ result: MiLinkCommandResultBody) {

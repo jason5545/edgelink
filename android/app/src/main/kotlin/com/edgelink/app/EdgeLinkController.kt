@@ -88,6 +88,8 @@ private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
 private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
 private const val CALL_RELAY_SELECTION_LATCH_TTL_MS = 30_000L
+private const val XIAOMI_MIRROR_CAST_ROUTE = "xiaomi.mirror.cast"
+private const val XIAOMI_MIRROR_CAST_CLIENT = "com.xiaomi.mirror/cast"
 private const val CALL_RELAY_SELECTION_REQUEST_TIMEOUT_MS = 10_000L
 
 private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.elapsedRealtimeNanos()): Long =
@@ -144,6 +146,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
     }
+    private val xiaomiMirrorScreenConfigReporter = EdgeLinkXiaomiMirrorScreenConfigReporter(
+        context = appContext,
+        onFrame = ::onXiaomiMirrorCastFrame
+    )
     private val screenSession = AndroidScreenSession(
         context = appContext,
         sendPlaintext = ::sendPlaintext,
@@ -233,6 +239,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     @Volatile
     private var latestMiLinkStatus: MiLinkStatusBody? = null
     @Volatile
+    private var latestXiaomiMirrorCastFrame: ByteArray? = null
+    private val xiaomiMirrorCastSequence = AtomicInteger(0)
+    @Volatile
     private var latestTurnCredentials: TurnCredentialsResponse? = null
     @Volatile
     private var phoneRelayCallSessionActive = false
@@ -290,6 +299,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             }
         }
         micActivityMonitor.start()
+        xiaomiMirrorScreenConfigReporter.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
         }.onFailure { error ->
@@ -311,6 +321,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkInCallService.setCallsIdleListener(null)
         EdgeLinkInCallService.setCallStatusListener(null)
         micActivityMonitor.stop()
+        xiaomiMirrorScreenConfigReporter.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
         pendingCallRelayBridgeJob?.cancel()
@@ -420,6 +431,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         )
         EdgeLinkLog.info("phone.android.relay_selection_requested requestId=$requestId reason=$reason $callState")
         sendEnvelope(EnvelopeTypes.PHONE_RELAY_START, body)
+    }
+
+    fun onXiaomiMirrorCastFrame(frame: ByteArray) {
+        val retainedFrame = frame.copyOf()
+        latestXiaomiMirrorCastFrame = retainedFrame
+        EdgeLinkLog.info("xiaomi.mirror.cast_frame_received bytes=${retainedFrame.size}")
+        val identity = localIdentity ?: return
+        sendXiaomiMirrorCastFrame(retainedFrame, identity, reason = "live")
     }
 
     private suspend fun handlePhoneRelayEndpoint(body: PhoneRelayEndpointBody) {
@@ -1453,6 +1472,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 session = nextSession
                 refreshTurnCredentials("relay_connected")
                 sendLatestMiLinkStatus(nextSession, identity)
+                latestXiaomiMirrorCastFrame?.let { frame ->
+                    sendXiaomiMirrorCastFrame(frame, identity, reason = "cached")
+                }
                 micActivityMonitor.sendCurrent("session_connected")
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
@@ -1703,6 +1725,23 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private suspend fun sendLatestMiLinkStatus(activeSession: SecureSessionClient, identity: LocalIdentity) {
         val status = latestMiLinkStatus ?: return
         sendMiLinkStatus(activeSession, identity, status, reason = "cached")
+    }
+
+    private fun sendXiaomiMirrorCastFrame(frame: ByteArray, identity: LocalIdentity, reason: String) {
+        val body = MiLinkFrameBody(
+            sourceDeviceId = identity.deviceId,
+            route = XIAOMI_MIRROR_CAST_ROUTE,
+            clientNo = XIAOMI_MIRROR_CAST_CLIENT,
+            sequence = xiaomiMirrorCastSequence.incrementAndGet(),
+            dataBase64 = Base64.getEncoder().encodeToString(frame),
+            bytes = frame.size,
+            hasNext = false,
+            ts = System.currentTimeMillis() / 1_000L
+        )
+        sendEnvelope(EnvelopeTypes.MILINK_FRAME, body)
+        EdgeLinkLog.info(
+            "xiaomi.mirror.cast_frame_sent reason=$reason seq=${body.sequence} bytes=${body.bytes}"
+        )
     }
 
     private suspend fun refreshAndSendMiLinkStatus(

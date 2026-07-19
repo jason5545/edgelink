@@ -63,6 +63,134 @@ private enum PhoneScreenControlRegion {
     }
 }
 
+private enum PhoneScreenOrientation: String {
+    case portrait
+    case landscape
+
+    init?(width: Int, height: Int) {
+        guard width > 0, height > 0, width != height else {
+            return nil
+        }
+        self = width > height ? .landscape : .portrait
+    }
+}
+
+struct XiaomiMirrorScreenConfiguration: Equatable {
+    let screenID: Int
+    let configuration: Int
+    let acknowledgement: Bool
+    let width: Int
+    let height: Int
+    let isLandscape: Bool
+    let realWidth: Int
+    let realHeight: Int
+
+    var presentationWidth: Int {
+        width > 0 ? width : realWidth
+    }
+
+    var presentationHeight: Int {
+        height > 0 ? height : realHeight
+    }
+
+    static func decodeOfficialFrame(_ data: Data) throws -> Self {
+        guard data.count >= 5, data[data.startIndex] == 5 else {
+            throw DecodeError.invalidFrame
+        }
+        let lengthStart = data.startIndex + 1
+        let payloadLength = data[lengthStart..<(lengthStart + 4)].enumerated().reduce(UInt32(0)) { value, item in
+            value | (UInt32(item.element) << UInt32(item.offset * 8))
+        }
+        guard payloadLength <= data.count - 5 else {
+            throw DecodeError.invalidLength
+        }
+
+        var reader = ProtobufReader(data: data, offset: data.startIndex + 5, limit: data.startIndex + 5 + Int(payloadLength))
+        var screenID = 0
+        var configuration = 0
+        var acknowledgement = false
+        var width = 0
+        var height = 0
+        var isLandscape = false
+        var realWidth = 0
+        var realHeight = 0
+
+        while !reader.isAtEnd {
+            let key = try reader.readVarint()
+            let field = Int(key >> 3)
+            let wireType = Int(key & 0x07)
+            switch (field, wireType) {
+            case (2, 0): screenID = Int(try reader.readVarint())
+            case (3, 0): configuration = Int(try reader.readVarint())
+            case (4, 0): acknowledgement = try reader.readVarint() != 0
+            case (6, 0): width = Int(try reader.readVarint())
+            case (7, 0): height = Int(try reader.readVarint())
+            case (14, 0): isLandscape = try reader.readVarint() != 0
+            case (23, 0): realWidth = Int(try reader.readVarint())
+            case (24, 0): realHeight = Int(try reader.readVarint())
+            default: try reader.skip(wireType: wireType)
+            }
+        }
+
+        return Self(
+            screenID: screenID,
+            configuration: configuration,
+            acknowledgement: acknowledgement,
+            width: width,
+            height: height,
+            isLandscape: isLandscape,
+            realWidth: realWidth,
+            realHeight: realHeight
+        )
+    }
+
+    private enum DecodeError: Error {
+        case invalidFrame
+        case invalidLength
+        case malformedProtobuf
+    }
+
+    private struct ProtobufReader {
+        let data: Data
+        var offset: Int
+        let limit: Int
+
+        var isAtEnd: Bool { offset >= limit }
+
+        mutating func readVarint() throws -> UInt64 {
+            var result: UInt64 = 0
+            for shift in stride(from: 0, through: 63, by: 7) {
+                guard offset < limit else { throw DecodeError.malformedProtobuf }
+                let byte = data[offset]
+                offset += 1
+                result |= UInt64(byte & 0x7f) << UInt64(shift)
+                if byte & 0x80 == 0 { return result }
+            }
+            throw DecodeError.malformedProtobuf
+        }
+
+        mutating func skip(wireType: Int) throws {
+            switch wireType {
+            case 0:
+                _ = try readVarint()
+            case 1:
+                try advance(8)
+            case 2:
+                try advance(Int(try readVarint()))
+            case 5:
+                try advance(4)
+            default:
+                throw DecodeError.malformedProtobuf
+            }
+        }
+
+        private mutating func advance(_ count: Int) throws {
+            guard count >= 0, offset + count <= limit else { throw DecodeError.malformedProtobuf }
+            offset += count
+        }
+    }
+}
+
 final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
     @Published private(set) var screenMeta: ScreenMetaBody?
@@ -114,6 +242,8 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var screenControlHideWorkItem: DispatchWorkItem?
     private var screenControlEventMonitor: Any?
     private var areScreenControlsExpandingWindow = false
+    private var windowVideoOrientation: PhoneScreenOrientation?
+    private var xiaomiScreenConfiguration: XiaomiMirrorScreenConfiguration?
 
     override init() {
         super.init()
@@ -225,13 +355,98 @@ final class MacScreenSession: NSObject, ObservableObject {
             isScreenSessionActive = true
             onSessionActivityChanged?(true)
         }
-        screenMeta = ScreenMetaBody(w: width, h: height, scale: 1, dpi: 0)
+        let presentationWidth = xiaomiScreenConfiguration?.presentationWidth ?? width
+        let presentationHeight = xiaomiScreenConfiguration?.presentationHeight ?? height
+        let nextMeta = ScreenMetaBody(w: presentationWidth, h: presentationHeight, scale: 1, dpi: 0)
+        if screenMeta != nextMeta {
+            screenMeta = nextMeta
+        }
         hasRemoteVideo = true
         status = "Xiaomi Mirror"
         if window?.isVisible != true {
             showWindow()
         }
-        videoView.renderPixelBuffer(pixelBuffer)
+        updateWindowForVideoOrientation(
+            width: presentationWidth,
+            height: presentationHeight,
+            route: "xiaomi_official_cast"
+        )
+        let crop = xiaomiMirrorCrop(
+            bufferWidth: width,
+            bufferHeight: height,
+            presentationWidth: presentationWidth,
+            presentationHeight: presentationHeight
+        )
+        videoView.renderPixelBuffer(pixelBuffer, crop: crop)
+    }
+
+    func handleXiaomiMirrorScreenConfiguration(_ configuration: XiaomiMirrorScreenConfiguration) {
+        guard !configuration.acknowledgement,
+              configuration.configuration == 0 || configuration.configuration == 1,
+              configuration.presentationWidth > 0,
+              configuration.presentationHeight > 0 else {
+            DiagnosticsLog.info(
+                "screen.mac.xiaomi_configuration_ignored screen=\(configuration.screenID) " +
+                    "configuration=\(configuration.configuration) ack=\(configuration.acknowledgement)"
+            )
+            return
+        }
+        xiaomiScreenConfiguration = configuration
+        let nextMeta = ScreenMetaBody(
+            w: configuration.presentationWidth,
+            h: configuration.presentationHeight,
+            scale: 1,
+            dpi: 0
+        )
+        if screenMeta != nextMeta {
+            screenMeta = nextMeta
+        }
+        if window?.isVisible == true {
+            updateWindowForVideoOrientation(
+                width: configuration.presentationWidth,
+                height: configuration.presentationHeight,
+                route: "xiaomi_official_cast"
+            )
+        }
+        DiagnosticsLog.info(
+            "screen.mac.xiaomi_configuration_applied screen=\(configuration.screenID) " +
+                "configuration=\(configuration.configuration) " +
+                "size=\(configuration.width)x\(configuration.height) " +
+                "real=\(configuration.realWidth)x\(configuration.realHeight) " +
+                "isLandscape=\(configuration.isLandscape)"
+        )
+    }
+
+    private func xiaomiMirrorCrop(
+        bufferWidth: Int,
+        bufferHeight: Int,
+        presentationWidth: Int,
+        presentationHeight: Int
+    ) -> CGRect? {
+        guard bufferWidth > 0, bufferHeight > 0, presentationWidth > 0, presentationHeight > 0 else {
+            return nil
+        }
+        let bufferAspect = CGFloat(bufferWidth) / CGFloat(bufferHeight)
+        let presentationAspect = CGFloat(presentationWidth) / CGFloat(presentationHeight)
+        guard abs(bufferAspect - presentationAspect) > 0.01 else {
+            return nil
+        }
+        if presentationAspect > bufferAspect {
+            let cropHeight = CGFloat(bufferWidth) / presentationAspect
+            return CGRect(
+                x: 0,
+                y: (CGFloat(bufferHeight) - cropHeight) / 2,
+                width: CGFloat(bufferWidth),
+                height: cropHeight
+            ).integral
+        }
+        let cropWidth = CGFloat(bufferHeight) * presentationAspect
+        return CGRect(
+            x: (CGFloat(bufferWidth) - cropWidth) / 2,
+            y: 0,
+            width: cropWidth,
+            height: CGFloat(bufferHeight)
+        ).integral
     }
 
     func handleOffer(_ body: RtcSdpBody) {
@@ -343,6 +558,8 @@ final class MacScreenSession: NSObject, ObservableObject {
         onSessionActivityChanged?(false)
         status = "Stopped"
         screenMeta = nil
+        xiaomiScreenConfiguration = nil
+        windowVideoOrientation = nil
         hasRemoteVideo = false
         hasRemoteAudio = false
         cancelPendingPointerMove()
@@ -511,8 +728,21 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
 
         let content = PhoneScreenView(session: self)
+        let initialOrientation = screenMeta.flatMap {
+            PhoneScreenOrientation(width: $0.w, height: $0.h)
+        } ?? .portrait
+        let initialContentSize: NSSize
+        if initialOrientation == .landscape, let meta = screenMeta, meta.w > 0, meta.h > 0 {
+            let width: CGFloat = 820
+            initialContentSize = NSSize(
+                width: width,
+                height: max(360, width * CGFloat(meta.h) / CGFloat(meta.w))
+            )
+        } else {
+            initialContentSize = NSSize(width: 420, height: 820)
+        }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 820),
+            contentRect: NSRect(origin: .zero, size: initialContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -523,12 +753,109 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.center()
         window.delegate = self
         self.window = window
+        windowVideoOrientation = initialOrientation
         applyPinnedWindowState()
         installScreenControlEventMonitor(for: window)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         reportWindowVisibility(true, reason: "showWindow")
+    }
+
+    private func updateWindowForVideoOrientation(
+        width: Int,
+        height: Int,
+        route: String
+    ) {
+        guard
+            let orientation = PhoneScreenOrientation(width: width, height: height),
+            let window,
+            windowVideoOrientation != orientation
+        else {
+            return
+        }
+
+        let previousOrientation = windowVideoOrientation
+        windowVideoOrientation = orientation
+        guard !window.styleMask.contains(.fullScreen), let contentView = window.contentView else {
+            return
+        }
+
+        let chromeHeight = areScreenControlsExpandingWindow
+            ? PhoneScreenChromeMetrics.expandedHeight
+            : 0
+        let currentStageSize = NSSize(
+            width: contentView.bounds.width,
+            height: max(1, contentView.bounds.height - chromeHeight)
+        )
+        let preservedLongEdge = max(currentStageSize.width, currentStageSize.height)
+        let videoAspectRatio = CGFloat(width) / CGFloat(height)
+        var targetStageSize: NSSize
+        if orientation == .landscape {
+            targetStageSize = NSSize(
+                width: preservedLongEdge,
+                height: preservedLongEdge / videoAspectRatio
+            )
+        } else {
+            targetStageSize = NSSize(
+                width: preservedLongEdge * videoAspectRatio,
+                height: preservedLongEdge
+            )
+        }
+
+        let screen = window.screen ?? NSScreen.main
+        if let visibleFrame = screen?.visibleFrame {
+            let frameDecoration = NSSize(
+                width: max(0, window.frame.width - contentView.bounds.width),
+                height: max(0, window.frame.height - contentView.bounds.height)
+            )
+            let availableStageSize = NSSize(
+                width: max(1, visibleFrame.width - frameDecoration.width),
+                height: max(1, visibleFrame.height - frameDecoration.height - chromeHeight)
+            )
+            let fitScale = min(
+                1,
+                availableStageSize.width / targetStageSize.width,
+                availableStageSize.height / targetStageSize.height
+            )
+            targetStageSize.width *= fitScale
+            targetStageSize.height *= fitScale
+        }
+
+        let targetContentRect = NSRect(
+            origin: .zero,
+            size: NSSize(
+                width: targetStageSize.width,
+                height: targetStageSize.height + chromeHeight
+            )
+        )
+        let targetFrameSize = window.frameRect(forContentRect: targetContentRect).size
+        let currentCenter = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        var targetFrame = NSRect(
+            x: currentCenter.x - targetFrameSize.width / 2,
+            y: currentCenter.y - targetFrameSize.height / 2,
+            width: targetFrameSize.width,
+            height: targetFrameSize.height
+        )
+
+        if let visibleFrame = screen?.visibleFrame {
+            targetFrame.origin.x = min(
+                max(targetFrame.origin.x, visibleFrame.minX),
+                visibleFrame.maxX - targetFrame.width
+            )
+            targetFrame.origin.y = min(
+                max(targetFrame.origin.y, visibleFrame.minY),
+                visibleFrame.maxY - targetFrame.height
+            )
+        }
+
+        DiagnosticsLog.info(
+            "screen.mac.window_video_orientation_changed route=\(route) " +
+                "from=\(previousOrientation?.rawValue ?? "unknown") to=\(orientation.rawValue) " +
+                "video=\(width)x\(height) content=" +
+                "\(Int(targetContentRect.width.rounded()))x\(Int(targetContentRect.height.rounded()))"
+        )
+        window.setFrame(targetFrame, display: true, animate: true)
     }
 
     private func handleScreenControlHover(_ event: PhoneScreenControlHoverEvent) {
@@ -2000,6 +2327,11 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
         recordReceivedFrameAndGap()
         renderPixelBuffer(pixelBuffer, crop: nil, rotation: 0)
+    }
+
+    func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer, crop: CGRect?) {
+        recordReceivedFrameAndGap()
+        renderPixelBuffer(pixelBuffer, crop: crop, rotation: 0)
     }
 
     private func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer, crop: CGRect?, rotation: Int) {

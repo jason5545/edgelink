@@ -116,6 +116,13 @@
         <action android:name="com.edgelink.app.PHONE_RELAY_SELECTED" />
       </intent-filter>
     </receiver>
+    <receiver
+      android:name=".EdgeLinkXiaomiMirrorCastReceiver"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME" />
+      </intent-filter>
+    </receiver>
     <provider
       android:name="rikka.shizuku.ShizukuProvider"
       android:authorities="${applicationId}.shizuku"

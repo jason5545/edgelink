@@ -55,6 +55,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val TELECOM_PACKAGE = "com.android.server.telecom"
     const val PHONE_RELAY_SELECTED_ACTION = "com.edgelink.app.PHONE_RELAY_SELECTED"
     const val PHONE_RELAY_SELECTED_REASON_EXTRA = "reason"
+    const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
+    const val XIAOMI_MIRROR_CAST_FRAME_EXTRA = "frame"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
@@ -1204,6 +1206,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun hookMirrorScreenRouteDiagnostics(classLoader: ClassLoader) {
+        hookMirrorOfficialScreenConfiguration(classLoader)
         hookMirrorTerminalAddressOverride(classLoader)
         hookMirrorSourceRecoveryProvider(classLoader)
         hookMirrorSourceRouteOverrides(classLoader)
@@ -1216,6 +1219,111 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorControlNativeDiagnostics(classLoader)
         hookMirrorAdvConnectionLifecycle(classLoader)
         hookMirrorLyraGateDiagnostics(classLoader)
+    }
+
+    private fun hookMirrorOfficialScreenConfiguration(classLoader: ClassLoader) {
+        runCatching {
+            val managerClass = findTargetClass(classLoader, XIAOMI_MIRROR_MESSAGE_MANAGER)
+            val methods = managerClass.declaredMethods.filter { method ->
+                method.name == "notifyDisplayChanged" || method.name == "notifyDisplayCreated"
+            }
+            check(methods.isNotEmpty()) { "official display notification methods not found" }
+            methods.forEach { method ->
+                XposedBridge.hookMethod(
+                    method,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val isCreated = method.name == "notifyDisplayCreated"
+                            val display = param.args.getOrNull(if (isCreated) 1 else 0) ?: return
+                            val screenId = runCatching {
+                                (callTargetMethod(display, "getScreenId") as Number).toInt()
+                            }.getOrNull() ?: return
+                            if (screenId != XIAOMI_MIRROR_MAIN_SCREEN_ID) {
+                                return
+                            }
+                            val remoteId = runCatching {
+                                callTargetMethod(display, "A") as? String
+                            }.getOrNull()
+                            log(
+                                "mirror official screen config observed kind=${if (isCreated) "onCreate" else "sizeChanged"} " +
+                                    "screen=$screenId remoteId=${remoteId.orEmpty()} " +
+                                    "sourceSession=${shouldForceMirrorSourceSession()}"
+                            )
+                            bridgeOfficialScreenConfiguration(
+                                classLoader = classLoader,
+                                display = display,
+                                terminal = if (isCreated) param.args.getOrNull(0) else null,
+                                isCreated = isCreated
+                            )
+                        }
+                    }
+                )
+            }
+            log("mirror official screen configuration hooks installed count=${methods.size}")
+        }.onFailure { error ->
+            log("failed to hook official mirror screen configuration: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun bridgeOfficialScreenConfiguration(
+        classLoader: ClassLoader,
+        display: Any,
+        terminal: Any?,
+        isCreated: Boolean
+    ) {
+        runCatching {
+            val screenId = (callTargetMethod(display, "getScreenId") as Number).toInt()
+            val displayConfig = callTargetMethod(display, "c")
+                ?: error("display config unavailable")
+            val messageClass = findTargetClass(classLoader, XIAOMI_MIRROR_SCREEN_CONFIGURATION_MESSAGE)
+            val message = if (isCreated) {
+                val deviceId = runCatching {
+                    terminal?.let { callTargetMethod(it, "h") as? String }
+                }.getOrNull() ?: MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID
+                val port = (callTargetMethod(display, "getPort") as Number).toInt()
+                messageClass.methods.first { method ->
+                    method.name == "generateOnCreateMsg" && method.parameterTypes.size == 4
+                }.invoke(null, deviceId, screenId, port, displayConfig)
+            } else {
+                messageClass.methods.first { method ->
+                    method.name == "generateSizeChangedMsg" && method.parameterTypes.size == 2
+                }.invoke(null, screenId, displayConfig)
+            }
+            val converterClass = findTargetClass(classLoader, XIAOMI_MIRROR_MESSAGE_CONVERT)
+            val converter = converterClass.getDeclaredConstructor().newInstance()
+            val frame = converterClass.methods.first { method ->
+                method.name == "encodeMsg" &&
+                    method.parameterTypes.size == 2 &&
+                    method.parameterTypes[1] == java.lang.Boolean.TYPE
+            }.invoke(converter, message, false) as? ByteArray
+                ?: error("official encoder returned no frame")
+            check(frame.size >= 5 && frame[0].toInt() == XIAOMI_MIRROR_SCREEN_CONFIGURATION_TYPE) {
+                "unexpected official frame type=${frame.firstOrNull()?.toInt()} bytes=${frame.size}"
+            }
+            broadcastOfficialScreenConfiguration(frame)
+            val width = runCatching { (callTargetMethod(displayConfig, "y") as Number).toInt() }.getOrNull()
+            val height = runCatching { (callTargetMethod(displayConfig, "s") as Number).toInt() }.getOrNull()
+            log(
+                "mirror official screen config bridged kind=${if (isCreated) "onCreate" else "sizeChanged"} " +
+                    "screen=$screenId size=${width ?: 0}x${height ?: 0} bytes=${frame.size}"
+            )
+        }.onFailure { error ->
+            log("failed to bridge official mirror screen configuration: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun broadcastOfficialScreenConfiguration(frame: ByteArray) {
+        val context = currentApplicationContext()
+            ?: error("application context unavailable")
+        val intent = Intent(MiLinkPrivilegeHookPolicy.XIAOMI_MIRROR_CAST_FRAME_ACTION)
+            .setPackage(MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE)
+            .setClassName(
+                MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE,
+                "${MiLinkPrivilegeHookPolicy.EDGE_LINK_PACKAGE}.EdgeLinkXiaomiMirrorCastReceiver"
+            )
+            .putExtra(MiLinkPrivilegeHookPolicy.XIAOMI_MIRROR_CAST_FRAME_EXTRA, frame)
+            .putExtra("ts", System.currentTimeMillis())
+        context.sendBroadcast(intent)
     }
 
     private fun hookMirrorTerminalAddressOverride(classLoader: ClassLoader) {
@@ -6361,6 +6469,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_FUSION_UTILS = "o4.B"
         private const val XIAOMI_MIRROR_REMOTE_DEVICE_INFO = "com.xiaomi.mirror.RemoteDeviceInfo"
         private const val XIAOMI_MIRROR_TERMINAL = "com.xiaomi.mirror.g0"
+        private const val XIAOMI_MIRROR_MESSAGE_MANAGER = "com.xiaomi.mirror.message.MessageManagerImpl"
+        private const val XIAOMI_MIRROR_SCREEN_CONFIGURATION_MESSAGE =
+            "com.xiaomi.mirror.message.ScreenConfigurationChangedMessage"
+        private const val XIAOMI_MIRROR_MESSAGE_CONVERT = "com.xiaomi.mirror.message.MessageConvert"
+        private const val XIAOMI_MIRROR_SCREEN_CONFIGURATION_TYPE = 5
+        private const val XIAOMI_MIRROR_MAIN_SCREEN_ID = 0
         private const val XIAOMI_MIRROR_SINK_VIEW = "com.xiaomi.mirror.sink.SinkView"
         private const val XIAOMI_MIRROR_SINK_VIEW_SURFACE_CALLBACK = "com.xiaomi.mirror.sink.SinkView\$a"
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE = "com.xiaomi.mirror.connection.C0701g"
