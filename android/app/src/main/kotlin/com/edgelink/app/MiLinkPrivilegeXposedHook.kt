@@ -96,7 +96,9 @@ internal object MiLinkPrivilegeHookPolicy {
         "startMediaRelay",
         "stopMediaRelay",
         "setMediaRelayVolume",
-        "edgeLinkKeyboard"
+        "edgeLinkKeyboard",
+        "edgeLinkPointer",
+        "edgeLinkGlobal"
     )
 
     fun shouldHook(packageName: String?, processName: String?): Boolean =
@@ -351,6 +353,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var telecomRelayFeaturesInstalled: Boolean = false
     private val xiaomiMirrorKeyboardPressedUsages = LinkedHashSet<Int>()
     private var xiaomiMirrorKeyboardModifierMask: Int = 0
+    private var xiaomiMirrorPointerButtonMask: Int = 0
     private val xiaomiMirrorKeyboardShareLock = Any()
     private var xiaomiMirrorKeyboardShareManagerPrepared: Boolean = false
     private var xiaomiMirrorKeyboardShareSocket: Any? = null
@@ -1370,6 +1373,14 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             param.result = handleMirrorKeyboardProvider(classLoader, extras)
                             return
                         }
+                        if (method == "edgeLinkPointer") {
+                            param.result = handleMirrorPointerProvider(classLoader, extras)
+                            return
+                        }
+                        if (method == "edgeLinkGlobal") {
+                            param.result = handleMirrorGlobalProvider(classLoader, extras)
+                            return
+                        }
                         val sourceRecoveryOnly = extras.booleanCompat("sourceRecoveryOnly")
                         val edgeLinkRecoveryMethod = method == "edgeLinkSourceRecovery"
                         val startShareRecovery = method == "startShare" && extras.booleanCompat("isStart")
@@ -1445,6 +1456,86 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             putBoolean("down", down)
             putInt("modifiers", modifiers)
             putString("reportHex", report?.hexSummary().orEmpty())
+        }
+    }
+
+    private fun handleMirrorPointerProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
+        val requestId = extras.getString("requestId").orEmpty()
+        val action = extras.getString("action").orEmpty()
+        val x = extras.intCompat("x", 0)
+        val y = extras.intCompat("y", 0)
+        val screenWidth = extras.intCompat("screenWidth", 0)
+        val screenHeight = extras.intCompat("screenHeight", 0)
+        val wheelDy = extras.intCompat("wheelDy", 0)
+        val reports = buildXiaomiMirrorPointerReports(
+            action = action,
+            x = x,
+            y = y,
+            screenWidth = screenWidth,
+            screenHeight = screenHeight,
+            wheelDy = wheelDy
+        )
+        val injection = if (reports.isNotEmpty()) {
+            injectXiaomiMirrorPointerReports(classLoader, reports)
+        } else {
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "unsupported pointer action=$action wheelDy=$wheelDy"
+            )
+        }
+        log(
+            "mirror pointer provider requestId=$requestId action=$action x=$x y=$y " +
+                "screen=${screenWidth}x$screenHeight wheelDy=$wheelDy reports=${reports.size} " +
+                "accepted=${injection.accepted} route=${injection.route} message=${injection.message} " +
+                "report=${reports.firstOrNull()?.hexSummary().orEmpty()}"
+        )
+        return Bundle().apply {
+            putBoolean("edgelinkPointerAccepted", injection.accepted)
+            putBoolean("enable", injection.accepted)
+            putInt("value", if (injection.accepted) 0 else -1)
+            putString("route", injection.route)
+            putString("message", injection.message)
+            putString("requestId", requestId)
+            putString("action", action)
+            putInt("x", x)
+            putInt("y", y)
+            putInt("screenWidth", screenWidth)
+            putInt("screenHeight", screenHeight)
+            putInt("wheelDy", wheelDy)
+            putInt("reports", reports.size)
+            putString("reportHex", reports.firstOrNull()?.hexSummary().orEmpty())
+        }
+    }
+
+    private fun handleMirrorGlobalProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
+        val requestId = extras.getString("requestId").orEmpty()
+        val action = extras.getString("action").orEmpty()
+        val reports = buildXiaomiMirrorGlobalReports(action)
+        val injection = if (reports.isNotEmpty()) {
+            injectXiaomiMirrorGlobalReports(classLoader, reports)
+        } else {
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid.global",
+                message = "unsupported global action=$action"
+            )
+        }
+        log(
+            "mirror global provider requestId=$requestId action=$action reports=${reports.size} " +
+                "accepted=${injection.accepted} route=${injection.route} message=${injection.message} " +
+                "report=${reports.firstOrNull()?.hexSummary().orEmpty()}"
+        )
+        return Bundle().apply {
+            putBoolean("edgelinkGlobalAccepted", injection.accepted)
+            putBoolean("enable", injection.accepted)
+            putInt("value", if (injection.accepted) 0 else -1)
+            putString("route", injection.route)
+            putString("message", injection.message)
+            putString("requestId", requestId)
+            putString("action", action)
+            putInt("reports", reports.size)
+            putString("reportHex", reports.firstOrNull()?.hexSummary().orEmpty())
         }
     }
 
@@ -1552,6 +1643,180 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private fun buildXiaomiMirrorPointerReports(
+        action: String,
+        x: Int,
+        y: Int,
+        screenWidth: Int,
+        screenHeight: Int,
+        wheelDy: Int
+    ): List<ByteArray> = synchronized(xiaomiMirrorKeyboardShareLock) {
+        val pointerX = xiaomiMirrorPointerAxis(x, screenWidth)
+        val pointerY = xiaomiMirrorPointerAxis(y, screenHeight)
+        when (action) {
+            "down" -> {
+                xiaomiMirrorPointerButtonMask = 0x01
+                listOf(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
+            }
+            "up" -> {
+                xiaomiMirrorPointerButtonMask = 0x00
+                listOf(xiaomiMirrorTouchReport(touching = false, pointerX, pointerY))
+            }
+            "move" -> if (xiaomiMirrorPointerButtonMask != 0) {
+                listOf(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
+            } else {
+                emptyList()
+            }
+            "rightUp", "wheel" -> emptyList()
+            else -> emptyList()
+        }
+    }
+
+    private fun xiaomiMirrorPointerAxis(value: Int, size: Int): Int {
+        if (size <= 1) {
+            return value.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX)
+        }
+        val clamped = value.coerceIn(0, size - 1)
+        return ((clamped.toLong() * XIAOMI_MIRROR_POINTER_AXIS_MAX) / (size - 1)).toInt()
+    }
+
+    private fun xiaomiMirrorTouchReport(touching: Boolean, x: Int, y: Int): ByteArray =
+        ByteArray(8).also { report ->
+            report[0] = XIAOMI_MIRROR_POINTER_REPORT_ID.toByte()
+            report[1] = (if (touching) 0x03 else 0x00).toByte()
+            report[2] = 0x01.toByte()
+            writeLittleEndianUInt16(report, 3, x.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX))
+            writeLittleEndianUInt16(report, 5, y.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX))
+            report[7] = (if (touching) 0x01 else 0x00).toByte()
+        }
+
+    private fun buildXiaomiMirrorGlobalReports(action: String): List<ByteArray> {
+        val usage = when (action) {
+            "back" -> XIAOMI_MIRROR_GLOBAL_USAGE_BACK
+            "home" -> XIAOMI_MIRROR_GLOBAL_USAGE_HOME
+            "recents" -> XIAOMI_MIRROR_GLOBAL_USAGE_RECENTS
+            else -> return emptyList()
+        }
+        return listOf(
+            xiaomiMirrorConsumerControlReport(usage),
+            xiaomiMirrorConsumerControlReport(0)
+        )
+    }
+
+    private fun xiaomiMirrorConsumerControlReport(usage: Int): ByteArray =
+        ByteArray(3).also { report ->
+            report[0] = XIAOMI_MIRROR_GLOBAL_REPORT_ID.toByte()
+            writeLittleEndianUInt16(report, 1, usage.coerceIn(0, XIAOMI_MIRROR_GLOBAL_USAGE_MAX))
+        }
+
+    private fun writeLittleEndianUInt16(bytes: ByteArray, offset: Int, value: Int) {
+        bytes[offset] = (value and 0xff).toByte()
+        bytes[offset + 1] = ((value ushr 8) and 0xff).toByte()
+    }
+
+    private fun injectXiaomiMirrorPointerReports(
+        classLoader: ClassLoader,
+        reports: List<ByteArray>
+    ): XiaomiMirrorKeyboardInjectionResult {
+        return runCatching {
+            val shareSession = ensureXiaomiMirrorOfficialKeyboardShareSession(classLoader, "pointer")
+            val device = ensureXiaomiMirrorKeyboardDevice(classLoader)
+            if (device == null) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = false,
+                    route = "xiaomi.mirror.hid.pointer",
+                    message = "device unavailable $shareSession"
+                )
+            }
+            if (!waitForXiaomiMirrorHidDeviceOpen(device.first, XIAOMI_MIRROR_HID_OPEN_TIMEOUT_MS)) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = false,
+                    route = device.second,
+                    message = "pointer device not open ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
+                        "${xiaomiMirrorUhidAccessSummary()} $shareSession"
+                )
+            }
+            var sentCount = 0
+            for (report in reports) {
+                if (!sendXiaomiMirrorHidReport(classLoader, device.first, report)) {
+                    return XiaomiMirrorKeyboardInjectionResult(
+                        accepted = false,
+                        route = device.second,
+                        message = "pointer sendReport timeout sent=$sentCount/${reports.size} " +
+                            "ptr=${xiaomiMirrorHidDevicePtr(device.first)}"
+                    )
+                }
+                sentCount += 1
+            }
+            val afterInputState = markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "pointer_after")
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = true,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "sendReport count=$sentCount ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
+                    "$afterInputState $shareSession"
+            )
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
+            )
+        }
+    }
+
+    private fun injectXiaomiMirrorGlobalReports(
+        classLoader: ClassLoader,
+        reports: List<ByteArray>
+    ): XiaomiMirrorKeyboardInjectionResult {
+        return runCatching {
+            val shareSession = ensureXiaomiMirrorOfficialKeyboardShareSession(classLoader, "global")
+            val device = ensureXiaomiMirrorKeyboardDevice(classLoader)
+            if (device == null) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = false,
+                    route = "xiaomi.mirror.hid.global",
+                    message = "device unavailable $shareSession"
+                )
+            }
+            if (!waitForXiaomiMirrorHidDeviceOpen(device.first, XIAOMI_MIRROR_HID_OPEN_TIMEOUT_MS)) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = false,
+                    route = device.second,
+                    message = "global device not open ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
+                        "${xiaomiMirrorUhidAccessSummary()} $shareSession"
+                )
+            }
+            markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "global")
+            var sentCount = 0
+            for (report in reports) {
+                if (!sendXiaomiMirrorHidReport(classLoader, device.first, report)) {
+                    return XiaomiMirrorKeyboardInjectionResult(
+                        accepted = false,
+                        route = device.second,
+                        message = "global sendReport timeout sent=$sentCount/${reports.size} " +
+                            "ptr=${xiaomiMirrorHidDevicePtr(device.first)}"
+                    )
+                }
+                sentCount += 1
+            }
+            val afterInputState = markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "global_after")
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = true,
+                route = "xiaomi.mirror.hid.global",
+                message = "sendReport count=$sentCount ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
+                    "$afterInputState $shareSession"
+            )
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid.global",
+                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
+            )
+        }
+    }
+
     private fun prepareXiaomiMirrorKeyboard(
         classLoader: ClassLoader,
         source: String
@@ -1644,7 +1909,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private fun createAndRegisterXiaomiMirrorKeyboardDevice(classLoader: ClassLoader): Any? =
         runCatching {
             val deviceClass = findTargetClass(classLoader, XIAOMI_MIRROR_HID_DEVICE)
-            val descriptor = xiaomiMirrorKeyboardDescriptor(classLoader)
+            val descriptor = xiaomiMirrorCompositeHidDescriptor(classLoader)
             val callbackClass = findTargetClass(classLoader, "$XIAOMI_MIRROR_HID_DEVICE\$ShareDeviceCallback")
             val callback = Proxy.newProxyInstance(
                 classLoader,
@@ -1913,6 +2178,28 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private fun xiaomiMirrorCompositeHidDescriptor(classLoader: ClassLoader): ByteArray {
+        var descriptor = xiaomiMirrorKeyboardDescriptor(classLoader)
+        val keyboardBytes = descriptor.size
+        var pointerBytes = 0
+        var globalBytes = 0
+        if (!looksLikePointerHidDescriptor(descriptor)) {
+            val pointer = standardXiaomiMirrorPointerDescriptor()
+            descriptor += pointer
+            pointerBytes = pointer.size
+        }
+        if (!looksLikeGlobalHidDescriptor(descriptor)) {
+            val global = standardXiaomiMirrorGlobalDescriptor()
+            descriptor += global
+            globalBytes = global.size
+        }
+        log(
+            "mirror hid descriptor composite keyboardBytes=$keyboardBytes " +
+                "pointerBytes=$pointerBytes globalBytes=$globalBytes bytes=${descriptor.size}"
+        )
+        return descriptor
+    }
+
     private fun xiaomiMirrorKeyboardDescriptor(classLoader: ClassLoader): ByteArray {
         val controllerClass = findFirstTargetClass(
             classLoader,
@@ -1971,6 +2258,20 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             containsByteSequence(descriptor, 0x19, 0xE0) &&
             containsByteSequence(descriptor, 0x29, 0xE7)
 
+    private fun looksLikePointerHidDescriptor(descriptor: ByteArray): Boolean =
+        descriptor.size in 40..512 &&
+            containsByteSequence(descriptor, 0x09, 0x30) &&
+            containsByteSequence(descriptor, 0x09, 0x31) &&
+            (
+                containsByteSequence(descriptor, 0x05, 0x01, 0x09, 0x02) ||
+                    containsByteSequence(descriptor, 0x05, 0x0d, 0x09, 0x04)
+                )
+
+    private fun looksLikeGlobalHidDescriptor(descriptor: ByteArray): Boolean =
+        descriptor.size in 40..768 &&
+            containsByteSequence(descriptor, 0x05, 0x0c) &&
+            containsByteSequence(descriptor, 0x09, 0x01)
+
     private fun containsByteSequence(bytes: ByteArray, vararg sequence: Int): Boolean {
         if (sequence.isEmpty()) {
             return true
@@ -2026,6 +2327,69 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             0x05, 0x07,
             0x19, 0x00,
             0x29, 0x65,
+            0x81, 0x00,
+            0xC0
+        ).map { value -> value.toByte() }.toByteArray()
+
+    private fun standardXiaomiMirrorPointerDescriptor(): ByteArray =
+        intArrayOf(
+            0x05, 0x0d,
+            0x09, 0x04,
+            0xA1, 0x01,
+            0x85, XIAOMI_MIRROR_POINTER_REPORT_ID,
+            0x09, 0x22,
+            0xA1, 0x02,
+            0x09, 0x42,
+            0x09, 0x32,
+            0x15, 0x00,
+            0x25, 0x01,
+            0x75, 0x01,
+            0x95, 0x02,
+            0x81, 0x02,
+            0x95, 0x06,
+            0x81, 0x03,
+            0x75, 0x08,
+            0x95, 0x01,
+            0x09, 0x51,
+            0x25, 0x7f,
+            0x81, 0x02,
+            0x05, 0x01,
+            0x09, 0x30,
+            0x09, 0x31,
+            0x15, 0x00,
+            0x16, 0x00, 0x00,
+            0x26, 0xff, 0x7f,
+            0x75, 0x10,
+            0x95, 0x02,
+            0x81, 0x02,
+            0xC0,
+            0x05, 0x0d,
+            0x09, 0x54,
+            0x15, 0x00,
+            0x25, 0x01,
+            0x75, 0x08,
+            0x95, 0x01,
+            0x81, 0x02,
+            0x09, 0x55,
+            0x25, 0x01,
+            0x75, 0x08,
+            0x95, 0x01,
+            0xB1, 0x02,
+            0xC0
+        ).map { value -> value.toByte() }.toByteArray()
+
+    private fun standardXiaomiMirrorGlobalDescriptor(): ByteArray =
+        intArrayOf(
+            0x05, 0x0c,
+            0x09, 0x01,
+            0xA1, 0x01,
+            0x85, XIAOMI_MIRROR_GLOBAL_REPORT_ID,
+            0x15, 0x00,
+            0x26, 0xff, 0x03,
+            0x19, 0x00,
+            0x2A, 0xff, 0x03,
+            0x75, 0x10,
+            0x95, 0x01,
             0x81, 0x00,
             0xC0
         ).map { value -> value.toByte() }.toByteArray()
@@ -6038,6 +6402,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_OFF = 0
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_ON = 1
         private const val XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID = -100
+        private const val XIAOMI_MIRROR_POINTER_REPORT_ID = 2
+        private const val XIAOMI_MIRROR_GLOBAL_REPORT_ID = 3
+        private const val XIAOMI_MIRROR_POINTER_AXIS_MAX = 32_767
+        private const val XIAOMI_MIRROR_GLOBAL_USAGE_MAX = 0x03ff
+        private const val XIAOMI_MIRROR_GLOBAL_USAGE_HOME = 0x0223
+        private const val XIAOMI_MIRROR_GLOBAL_USAGE_BACK = 0x0224
+        private const val XIAOMI_MIRROR_GLOBAL_USAGE_RECENTS = 0x029f
         private const val XIAOMI_MIRROR_UHID_GID = 3011
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
         private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"

@@ -16,6 +16,11 @@ final class MacScreenSession: NSObject, ObservableObject {
     var onWindowVisibilityChanged: ((Bool) -> Void)?
     var onSessionActivityChanged: ((Bool) -> Void)?
     var onXiaomiMirrorKey: ((NSEvent, Bool) -> Bool)?
+    var onXiaomiMirrorPointer: ((CtrlPointerBody) -> Bool)?
+    var onXiaomiMirrorGlobal: ((String) -> Bool)?
+    var isUsingXiaomiMirrorRoute: Bool {
+        isXiaomiMirrorRouteActive || isRenderingXiaomiMirror
+    }
 
     private let encoder = JSONEncoder()
     private var sendPlaintext: ((Data) -> Void)?
@@ -33,6 +38,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var isClosingWindow = false
     private var isStopping = false
     private var isScreenSessionActive = false
+    private var isXiaomiMirrorRouteActive = false
     private var isRenderingXiaomiMirror = false
     private var microphoneRelayEnabled = false
     private var forwardedKeyCodes = Set<UInt16>()
@@ -59,6 +65,14 @@ final class MacScreenSession: NSObject, ObservableObject {
     func setSender(_ sender: @escaping (Data) -> Void) {
         sendPlaintext = sender
         if isScreenSessionActive && peerConnection == nil {
+            if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+                status = "Xiaomi Mirror"
+                DiagnosticsLog.info(
+                    "screen.mac.resume_suppressed reason=xiaomi_mirror_route " +
+                        "routeActive=\(isXiaomiMirrorRouteActive) rendering=\(isRenderingXiaomiMirror)"
+                )
+                return
+            }
             status = "Starting"
             DiagnosticsLog.info("screen.mac.resume_start_after_reconnect")
             sendEnvelope(type: EnvelopeType.screenStart, body: EmptyBody())
@@ -93,7 +107,21 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
     }
 
+    func setXiaomiMirrorRouteActive(_ active: Bool) {
+        guard isXiaomiMirrorRouteActive != active else {
+            return
+        }
+        isXiaomiMirrorRouteActive = active
+        if active {
+            status = "Xiaomi Mirror"
+        } else {
+            isRenderingXiaomiMirror = false
+        }
+        DiagnosticsLog.info("screen.mac.xiaomi_route_active active=\(active)")
+    }
+
     func openAndStart() {
+        setXiaomiMirrorRouteActive(false)
         isRenderingXiaomiMirror = false
         isScreenSessionActive = true
         onSessionActivityChanged?(true)
@@ -112,6 +140,14 @@ final class MacScreenSession: NSObject, ObservableObject {
             DiagnosticsLog.warn("screen.mac.meta_ignored inactive_session")
             return
         }
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            DiagnosticsLog.warn(
+                "screen.mac.meta_ignored reason=xiaomi_mirror_route " +
+                    "w=\(body.w) h=\(body.h) routeActive=\(isXiaomiMirrorRouteActive) " +
+                    "rendering=\(isRenderingXiaomiMirror)"
+            )
+            return
+        }
         isRenderingXiaomiMirror = false
         screenMeta = body
         status = "Connecting"
@@ -120,6 +156,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func renderXiaomiMirrorFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+        setXiaomiMirrorRouteActive(true)
         isRenderingXiaomiMirror = true
         if !isScreenSessionActive {
             isScreenSessionActive = true
@@ -137,6 +174,13 @@ final class MacScreenSession: NSObject, ObservableObject {
     func handleOffer(_ body: RtcSdpBody) {
         guard isScreenSessionActive else {
             DiagnosticsLog.warn("screen.mac.offer_ignored inactive_session")
+            return
+        }
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            DiagnosticsLog.warn(
+                "screen.mac.offer_ignored reason=xiaomi_mirror_route bytes=\(body.sdp.count) " +
+                    "routeActive=\(isXiaomiMirrorRouteActive) rendering=\(isRenderingXiaomiMirror)"
+            )
             return
         }
         showWindow()
@@ -232,7 +276,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
 
         isScreenSessionActive = false
-        isRenderingXiaomiMirror = false
+        setXiaomiMirrorRouteActive(false)
         onSessionActivityChanged?(false)
         status = "Stopped"
         screenMeta = nil
@@ -354,6 +398,16 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     func sendGlobal(_ action: String) {
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            markControlSent(kind: "xiaomi:global:\(action)", shouldLog: false)
+            let handled = onXiaomiMirrorGlobal?(action) ?? false
+            if handled {
+                DiagnosticsLog.info("screen.mac.control_out kind=xiaomi:global:\(action)")
+            } else {
+                DiagnosticsLog.warn("screen.mac.xiaomi_global_ignored action=\(action)")
+            }
+            return
+        }
         markControlSent(kind: "global:\(action)", shouldLog: false)
         DiagnosticsLog.info("screen.mac.global_out action=\(action)")
         sendControlEnvelope(type: EnvelopeType.ctrlGlobal, body: CtrlGlobalBody(action: action))
@@ -581,6 +635,14 @@ final class MacScreenSession: NSObject, ObservableObject {
         guard isScreenSessionActive, sendPlaintext != nil else {
             return
         }
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            DiagnosticsLog.info(
+                "screen.mac.restart_suppressed reason=xiaomi_mirror_route " +
+                    "requestedReason=\(reason) routeActive=\(isXiaomiMirrorRouteActive) " +
+                    "rendering=\(isRenderingXiaomiMirror)"
+            )
+            return
+        }
         DiagnosticsLog.info("screen.mac.restart_requested reason=\(reason)")
         stop(sendRemoteStop: true)
         isScreenSessionActive = true
@@ -605,12 +667,11 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         flushPendingPointerMove()
-        markControlSent(kind: "pointer:\(action)", shouldLog: true)
-        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendPointerBody(body, kind: "pointer:\(action)", shouldLog: true)
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
-        if isRenderingXiaomiMirror {
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
             let handled = onXiaomiMirrorKey?(event, isDown) ?? false
             if !handled {
                 DiagnosticsLog.warn(
@@ -691,8 +752,7 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func sendPointerMoveNow(_ body: CtrlPointerBody, now: TimeInterval) {
         lastPointerMoveSentAt = now
-        markControlSent(kind: "pointer:move", shouldLog: false)
-        sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
+        sendPointerBody(body, kind: "pointer:move", shouldLog: false)
     }
 
     private func sendCoalescedWheel(_ body: CtrlPointerBody) {
@@ -729,8 +789,24 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
         pendingWheel = nil
-        markControlSent(kind: "pointer:wheel", shouldLog: false)
         DiagnosticsLog.info("screen.mac.wheel_out dy=\(body.wheelDy ?? 0)")
+        sendPointerBody(body, kind: "pointer:wheel", shouldLog: false)
+    }
+
+    private func sendPointerBody(_ body: CtrlPointerBody, kind: String, shouldLog: Bool) {
+        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            let handled = onXiaomiMirrorPointer?(body) ?? false
+            if handled {
+                markControlSent(kind: "xiaomi:\(kind)", shouldLog: shouldLog)
+            } else {
+                DiagnosticsLog.warn(
+                    "screen.mac.xiaomi_pointer_ignored action=\(body.action) " +
+                        "x=\(body.x) y=\(body.y) wheelDy=\(body.wheelDy ?? 0)"
+                )
+            }
+            return
+        }
+        markControlSent(kind: kind, shouldLog: shouldLog)
         sendControlEnvelope(type: EnvelopeType.ctrlPointer, body: body)
     }
 

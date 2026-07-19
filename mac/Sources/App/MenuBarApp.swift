@@ -570,7 +570,7 @@ private func xiaomiMiLinkSummary(_ status: MiLinkStatusBody?) -> String? {
     let services = status.services ?? []
     let available = services.filter(\.available)
     guard status.available || !available.isEmpty else {
-        return "Mi 優先：未就緒，使用 EdgeLink fallback"
+        return "Mi 優先：未就緒"
     }
 
     let names = available
@@ -591,7 +591,7 @@ private func xiaomiMiLinkSummary(_ status: MiLinkStatusBody?) -> String? {
         }
     let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? names
     if uniqueNames.isEmpty {
-        return "Mi 優先：探測中，使用 EdgeLink fallback"
+        return "Mi 優先：探測中"
     }
     return "Mi 優先：" + uniqueNames.joined(separator: " / ")
 }

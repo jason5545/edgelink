@@ -10,6 +10,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let securePongTimeoutSeconds: TimeInterval = 15
     private static let xiaomiMirrorKeyboardCommand = "xiaomi.mirror.keyboard"
     private static let xiaomiMirrorKeyboardReadyCommand = "xiaomi.mirror.keyboardReady"
+    private static let xiaomiMirrorPointerCommand = "xiaomi.mirror.pointer"
+    private static let xiaomiMirrorGlobalCommand = "xiaomi.mirror.global"
     private static let xiaomiMirrorKeyboardReadyRetryInterval: TimeInterval = 1.5
     private static let androidMetaAltLeft = 0x10
     private static let androidMetaAltRight = 0x20
@@ -178,6 +180,12 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.onXiaomiMirrorKey = { [weak self] event, isDown in
             self?.sendXiaomiMirrorKeyboardEvent(event, isDown: isDown) ?? false
         }
+        screenSession.onXiaomiMirrorPointer = { [weak self] body in
+            self?.sendXiaomiMirrorPointer(body) ?? false
+        }
+        screenSession.onXiaomiMirrorGlobal = { [weak self] action in
+            self?.sendXiaomiMirrorGlobal(action) ?? false
+        }
         xiaomiMirrorRTSPDiagnosticSource.onDecodedFrame = { [weak self, screenSession] pixelBuffer, width, height in
             Task { @MainActor in
                 self?.xiaomiScreenRecoveryAttempt = 0
@@ -320,8 +328,9 @@ final class EdgeLinkRuntime: ObservableObject {
             from: latestMiLinkStatus,
             preferredRoute: preferredScreenRoute
         )
-        if xiaomiScreenRoute?.hasPrefix("xiaomi.") == true {
+        if xiaomiScreenRoute?.hasPrefix("xiaomi.") == true || screenSession.isUsingXiaomiMirrorRoute {
             guard Self.allowXiaomiScreenPrimaryRoute else {
+                screenSession.setXiaomiMirrorRouteActive(false)
                 xiaomiMiLinkCommandStatus = "小米鏡像已停用"
                 DiagnosticsLog.warn(
                     "xiaomi.mac.screen_no_fallback route=\(xiaomiScreenRoute ?? "unknown") " +
@@ -335,6 +344,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 return
             }
             if let pending = pendingXiaomiScreenFallback {
+                screenSession.setXiaomiMirrorRouteActive(true)
                 xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
                 DiagnosticsLog.info(
                     "xiaomi.mac.screen_start_gate reason=pending requestId=\(pending.requestId) " +
@@ -343,6 +353,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 return
             }
             if xiaomiScreenRecoveryTask != nil {
+                screenSession.setXiaomiMirrorRouteActive(true)
                 xiaomiMiLinkCommandStatus = "小米鏡像恢復中"
                 DiagnosticsLog.info(
                     "xiaomi.mac.screen_start_gate reason=recovering " +
@@ -351,16 +362,27 @@ final class EdgeLinkRuntime: ObservableObject {
                 return
             }
             if isPhoneScreenSessionActive {
-                screenSession.showActiveWindow()
-                isPhoneScreenViewerVisible = true
-                hasViewedPhoneScreen = true
-                xiaomiScreenUserStopped = false
-                DiagnosticsLog.info(
-                    "xiaomi.mac.screen_start_gate reason=active_show_existing " +
-                        "route=\(xiaomiScreenRoute ?? "unknown")"
+                if screenSession.isUsingXiaomiMirrorRoute {
+                    screenSession.setXiaomiMirrorRouteActive(true)
+                    screenSession.showActiveWindow()
+                    isPhoneScreenViewerVisible = true
+                    hasViewedPhoneScreen = true
+                    xiaomiScreenUserStopped = false
+                    DiagnosticsLog.info(
+                        "xiaomi.mac.screen_start_gate reason=active_show_existing " +
+                            "route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")"
+                    )
+                    return
+                }
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_webrtc_session_replaced route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active") " +
+                        "reason=xiaomi_route_no_webrtc_fallback"
                 )
-                return
+                screenSession.hideWindowAndStop(sendRemoteStop: isConnected)
+                isPhoneScreenSessionActive = false
+                isPhoneScreenViewerVisible = false
             }
+            screenSession.setXiaomiMirrorRouteActive(true)
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
@@ -371,7 +393,7 @@ final class EdgeLinkRuntime: ObservableObject {
             xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
             DiagnosticsLog.info(
-                "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "unknown") " +
+                "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active") " +
                     "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
                     "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
                     "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
@@ -393,16 +415,18 @@ final class EdgeLinkRuntime: ObservableObject {
                 armPendingXiaomiScreenCommand(
                     requestId: requestId,
                     command: command,
-                    route: xiaomiScreenRoute ?? "unknown",
+                    route: xiaomiScreenRoute ?? "xiaomi.mirror.active",
                     timeoutMs: timeoutMs
                 )
                 prepareXiaomiMirrorKeyboardIfNeeded(source: "screen_route_start")
                 return
             }
-            DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "unknown")")
+            screenSession.setXiaomiMirrorRouteActive(false)
+            DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")")
             xiaomiMiLinkCommandStatus = "小米鏡像指令未送出"
             return
         }
+        screenSession.setXiaomiMirrorRouteActive(false)
         startEdgeLinkPhoneScreen(reason: "generic")
     }
 
@@ -434,6 +458,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     return
                 }
                 self.pendingXiaomiScreenFallbackTask = nil
+                self.pendingXiaomiScreenFallback = nil
                 self.xiaomiMiLinkCommandStatus = "小米鏡像未回應"
                 DiagnosticsLog.warn(
                     "xiaomi.mac.screen_no_fallback requestId=\(requestId) command=\(pending.command) " +
@@ -446,6 +471,20 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func startEdgeLinkPhoneScreen(reason: String) {
+        let preferredScreenRoute = latestMiLinkStatus?.preferredRoutes?["screen"]
+        if Self.xiaomiScreenRouteCandidate(
+            from: latestMiLinkStatus,
+            preferredRoute: preferredScreenRoute
+        )?.hasPrefix("xiaomi.") == true || screenSession.isUsingXiaomiMirrorRoute {
+            screenSession.setXiaomiMirrorRouteActive(true)
+            xiaomiMiLinkCommandStatus = "小米鏡像路由中"
+            DiagnosticsLog.warn(
+                "screen.mac.webrtc_start_blocked reason=xiaomi_route_no_webrtc_fallback " +
+                    "requestedReason=\(reason) preferredRoute=\(preferredScreenRoute ?? "unknown")"
+            )
+            return
+        }
+        screenSession.setXiaomiMirrorRouteActive(false)
         Task { [weak self] in
             guard let self else {
                 return
@@ -1563,6 +1602,55 @@ final class EdgeLinkRuntime: ObservableObject {
                 "down=\(isDown) modifiers=\(args["modifiers"] ?? "-")"
         )
         return true
+    }
+
+    @discardableResult
+    private func sendXiaomiMirrorPointer(_ body: CtrlPointerBody) -> Bool {
+        let meta = screenSession.screenMeta
+        var args = [
+            "action": body.action,
+            "x": "\(body.x)",
+            "y": "\(body.y)",
+            "screenWidth": "\(meta?.w ?? 0)",
+            "screenHeight": "\(meta?.h ?? 0)"
+        ]
+        if let wheelDy = body.wheelDy {
+            args["wheelDy"] = "\(wheelDy)"
+        }
+        let requestId = sendMiLinkCommand(
+            command: Self.xiaomiMirrorPointerCommand,
+            args: args,
+            updatesStatus: false
+        )
+        if let requestId {
+            DiagnosticsLog.info(
+                "xiaomi.mac.pointer_sent requestId=\(requestId) action=\(body.action) " +
+                    "x=\(body.x) y=\(body.y) wheelDy=\(body.wheelDy ?? 0) " +
+                    "screen=\(meta?.w ?? 0)x\(meta?.h ?? 0)"
+            )
+            return true
+        }
+        DiagnosticsLog.warn(
+            "xiaomi.mac.pointer_ignored action=\(body.action) x=\(body.x) y=\(body.y) not_sent"
+        )
+        return false
+    }
+
+    @discardableResult
+    private func sendXiaomiMirrorGlobal(_ action: String) -> Bool {
+        let requestId = sendMiLinkCommand(
+            command: Self.xiaomiMirrorGlobalCommand,
+            args: ["action": action],
+            updatesStatus: false
+        )
+        if let requestId {
+            DiagnosticsLog.info(
+                "xiaomi.mac.global_sent requestId=\(requestId) action=\(action)"
+            )
+            return true
+        }
+        DiagnosticsLog.warn("xiaomi.mac.global_ignored action=\(action) not_sent")
+        return false
     }
 
     private func prepareXiaomiMirrorKeyboardIfNeeded(source: String) {

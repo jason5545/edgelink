@@ -45,6 +45,8 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY -> requestMirrorSourceRecovery(body)
                     COMMAND_MIRROR_KEYBOARD_READY -> prepareMirrorKeyboard(body)
                     COMMAND_MIRROR_KEYBOARD -> sendMirrorKeyboard(body)
+                    COMMAND_MIRROR_POINTER -> sendMirrorPointer(body)
+                    COMMAND_MIRROR_GLOBAL -> sendMirrorGlobal(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
                     COMMAND_SYNERGY_STATUS -> querySynergyStatus()
                     COMMAND_SYNERGY_SHOW_RELAY_DATA -> callSynergyRelay(body, transactionShowRelayData, "showRelayData")
@@ -273,12 +275,13 @@ class AndroidMiLinkCommandBridge(
             }
             return CommandResult(
                 success = false,
-                route = "edgelink.screen",
-                message = "no linked Xiaomi mirror remote device; use EdgeLink screen fallback",
+                route = "xiaomi.mirror.unavailable",
+                message = "no linked Xiaomi mirror remote device; Xiaomi screen route has no WebRTC fallback",
                 data = mapOf(
                     "remoteDevices" to "0",
                     "requestedRemoteDeviceId" to requestedDeviceId,
-                    "fallback" to "edgelink.screen"
+                    "fallback" to "",
+                    "fallbackSuppressed" to "true"
                 )
             )
         }
@@ -343,9 +346,9 @@ class AndroidMiLinkCommandBridge(
         val openResult = (openCall as MirrorProviderDeadlineResult.Completed).result
         return CommandResult(
             success = openResult.success,
-            route = if (openResult.success) "xiaomi.mirror" else "edgelink.screen",
+            route = if (openResult.success) "xiaomi.mirror" else "xiaomi.mirror.failed",
             message = "start=${startResult.message}; open=${openResult.message}; " +
-                "selected=${selection.source}; remoteDevices=${selection.count}",
+                "selected=${selection.source}; remoteDevices=${selection.count}; noWebRTCFallback=true",
             data = startResult.data + mapOf(
                 "startValue" to startResult.data["value"].orEmpty(),
                 "openValue" to openResult.data["value"].orEmpty(),
@@ -354,7 +357,8 @@ class AndroidMiLinkCommandBridge(
                 "requestedRemoteDeviceId" to requestedDeviceId,
                 "remoteDevices" to selection.count.toString(),
                 "sample" to selection.sample,
-                "fallback" to if (openResult.success) "" else "edgelink.screen"
+                "fallback" to "",
+                "fallbackSuppressed" to (!openResult.success).toString()
             )
         )
     }
@@ -590,6 +594,123 @@ class AndroidMiLinkCommandBridge(
         }
     }
 
+    private fun sendMirrorPointer(body: MiLinkCommandBody): CommandResult {
+        val action = body.args["action"].orEmpty()
+        val x = body.args["x"]?.toIntOrNull()
+            ?: return CommandResult(
+                success = false,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "pointer missing x"
+            )
+        val y = body.args["y"]?.toIntOrNull()
+            ?: return CommandResult(
+                success = false,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "pointer missing y"
+            )
+        val screenWidth = body.args["screenWidth"]?.toIntOrNull() ?: 0
+        val screenHeight = body.args["screenHeight"]?.toIntOrNull() ?: 0
+        val wheelDy = body.args["wheelDy"]?.toIntOrNull() ?: 0
+        val result = callMirrorProviderWithDeadline(
+            method = "edgeLinkPointer",
+            deadlineMs = mirrorKeyboardProviderDeadlineMs
+        ) {
+            val providerResult = appContext.contentResolver.callMirrorProvider(
+                "edgeLinkPointer",
+                Bundle().apply {
+                    putString("action", action)
+                    putInt("x", x)
+                    putInt("y", y)
+                    putInt("screenWidth", screenWidth)
+                    putInt("screenHeight", screenHeight)
+                    putInt("wheelDy", wheelDy)
+                    putString("requestId", body.requestId)
+                    putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
+                }
+            )
+            val accepted = providerResult?.getBoolean("edgelinkPointerAccepted", false) == true
+            CommandResult(
+                success = accepted,
+                route = "xiaomi.mirror.hid.pointer",
+                message = "pointer accepted=$accepted keys=${providerResult?.keySummary().orEmpty()}",
+                data = mapOf(
+                    "accepted" to accepted.toString(),
+                    "action" to action,
+                    "x" to x.toString(),
+                    "y" to y.toString(),
+                    "screenWidth" to screenWidth.toString(),
+                    "screenHeight" to screenHeight.toString(),
+                    "wheelDy" to wheelDy.toString(),
+                    "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
+                    "providerRoute" to providerResult?.getString("route").orEmpty(),
+                    "providerMessage" to providerResult?.getString("message").orEmpty()
+                )
+            )
+        }
+        return when (result) {
+            is MirrorProviderDeadlineResult.Completed -> result.result
+            is MirrorProviderDeadlineResult.Pending -> CommandResult(
+                success = false,
+                route = "xiaomi.mirror.hid.pointer.pending",
+                message = "pointer pending>${result.deadlineMs}ms",
+                data = mapOf(
+                    "pendingMethod" to "edgeLinkPointer",
+                    "pendingDeadlineMs" to result.deadlineMs.toString(),
+                    "action" to action,
+                    "x" to x.toString(),
+                    "y" to y.toString()
+                )
+            )
+        }
+    }
+
+    private fun sendMirrorGlobal(body: MiLinkCommandBody): CommandResult {
+        val action = body.args["action"].orEmpty()
+        val result = callMirrorProviderWithDeadline(
+            method = "edgeLinkGlobal",
+            deadlineMs = mirrorKeyboardProviderDeadlineMs
+        ) {
+            val providerResult = appContext.contentResolver.callMirrorProvider(
+                "edgeLinkGlobal",
+                Bundle().apply {
+                    putString("action", action)
+                    putString("requestId", body.requestId)
+                    putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
+                }
+            )
+            val accepted = providerResult?.getBoolean("edgelinkGlobalAccepted", false) == true
+            CommandResult(
+                success = accepted,
+                route = "xiaomi.mirror.hid.global",
+                message = "global accepted=$accepted keys=${providerResult?.keySummary().orEmpty()}",
+                data = mapOf(
+                    "accepted" to accepted.toString(),
+                    "action" to action,
+                    "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
+                    "providerRoute" to providerResult?.getString("route").orEmpty(),
+                    "providerMessage" to providerResult?.getString("message").orEmpty()
+                )
+            )
+        }
+        return when (result) {
+            is MirrorProviderDeadlineResult.Completed -> result.result
+            is MirrorProviderDeadlineResult.Pending -> CommandResult(
+                success = false,
+                route = "xiaomi.mirror.hid.global.pending",
+                message = "global pending>${result.deadlineMs}ms",
+                data = mapOf(
+                    "pendingMethod" to "edgeLinkGlobal",
+                    "pendingDeadlineMs" to result.deadlineMs.toString(),
+                    "action" to action
+                )
+            )
+        }
+    }
+
     private fun prepareMirrorKeyboard(body: MiLinkCommandBody): CommandResult {
         val result = callMirrorProviderWithDeadline(
             method = "edgeLinkKeyboard",
@@ -716,8 +837,8 @@ class AndroidMiLinkCommandBridge(
         ).joinToString("; ")
         return CommandResult(
             success = false,
-            route = "edgelink.screen",
-            message = "$prefix; fallback=edgelink.screen",
+            route = "xiaomi.mirror.pending",
+            message = "$prefix; noWebRTCFallback=true",
             data = mapOf(
                 "remoteDeviceId" to selection.deviceId,
                 "selectedDeviceId" to selection.deviceId,
@@ -727,10 +848,12 @@ class AndroidMiLinkCommandBridge(
                 "sample" to selection.sample,
                 "value" to "pending",
                 "providerValue" to "pending",
-                "pending" to "false",
+                "pending" to "true",
+                "state" to "pending",
                 "pendingMethod" to method,
                 "pendingDeadlineMs" to deadlineMs.toString(),
-                "fallback" to "edgelink.screen"
+                "fallback" to "",
+                "fallbackSuppressed" to "true"
             ) + (startResult?.data?.let { mapOf("startValue" to it["value"].orEmpty()) } ?: emptyMap())
         )
     }
@@ -882,7 +1005,7 @@ class AndroidMiLinkCommandBridge(
             }
         return CommandResult(
             success = false,
-            route = if (accepted) "xiaomi.mirror.pending" else "edgelink.screen",
+            route = if (accepted) "xiaomi.mirror.pending" else "xiaomi.mirror.unavailable",
             message = "debugFakeRemote=true; $method pending>${deadlineMs}ms; " +
                 listOfNotNull(
                     sourceShareResult?.let { "sourceShare=${it.message}" },
@@ -895,14 +1018,15 @@ class AndroidMiLinkCommandBridge(
                 "value" to "pending",
                 "providerValue" to "pending",
                 "pending" to accepted.toString(),
-                "state" to if (accepted) "pending" else "fallback",
+                "state" to if (accepted) "pending" else "unavailable",
                 "pendingMethod" to method,
                 "pendingDeadlineMs" to deadlineMs.toString(),
                 "query" to queryResult.message,
                 "queryCount" to queryCount.toString(),
                 "arm" to armResult.success.toString(),
                 "debugFakeRemote" to "true",
-                "fallback" to if (accepted) "" else "edgelink.screen"
+                "fallback" to "",
+                "fallbackSuppressed" to (!accepted).toString()
             ) + sourceEndpointData +
                 (startResult?.data?.let { mapOf("startValue" to it["value"].orEmpty()) } ?: emptyMap()) +
                 (sourceShareResult?.data?.let { mapOf("sourceShareValue" to it["value"].orEmpty()) } ?: emptyMap())
@@ -1081,9 +1205,12 @@ class AndroidMiLinkCommandBridge(
         if (deviceId.isBlank()) {
             return CommandResult(
                 success = false,
-                route = "edgelink.screen",
-                message = "$method remoteDeviceId missing; use EdgeLink screen fallback",
-                data = mapOf("fallback" to "edgelink.screen")
+                route = "xiaomi.mirror.unavailable",
+                message = "$method remoteDeviceId missing; Xiaomi screen route has no WebRTC fallback",
+                data = mapOf(
+                    "fallback" to "",
+                    "fallbackSuppressed" to "true"
+                )
             )
         }
         val extras = body.args.toBundle().apply {
@@ -1509,6 +1636,8 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_KEYBOARD_READY = "xiaomi.mirror.keyboardReady"
         const val COMMAND_MIRROR_KEYBOARD = "xiaomi.mirror.keyboard"
+        const val COMMAND_MIRROR_POINTER = "xiaomi.mirror.pointer"
+        const val COMMAND_MIRROR_GLOBAL = "xiaomi.mirror.global"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"
         const val COMMAND_SYNERGY_STATUS = "xiaomi.synergy.status"
         const val COMMAND_SYNERGY_SHOW_RELAY_DATA = "xiaomi.synergy.showRelayData"
