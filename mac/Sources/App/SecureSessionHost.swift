@@ -6,6 +6,7 @@ actor SecureSessionHost {
     private let identity: LocalIdentity
     private let peer: PinnedPeer
     private let dispatcher: CommandDispatcher
+    private let sendGate = SecureSessionSendGate()
     private var established: EstablishedHandshake?
     private var lastInboundActivityAt = Date.distantPast
     private var framesSent: UInt64 = 0
@@ -72,14 +73,21 @@ actor SecureSessionHost {
     }
 
     func sendPlaintext(_ plaintext: Data) async throws {
-        var session = try await waitForEstablished()
-        let frame = try session.channel.seal(plaintext)
-        established = session
-        framesSent &+= 1
-        if framesSent <= 3 || framesSent % 100 == 0 {
-            DiagnosticsLog.info("secure.mac.frame_out count=\(framesSent) plaintext=\(plaintext.count) frame=\(frame.count)")
+        await sendGate.lock()
+        do {
+            var session = try await waitForEstablished()
+            let frame = try session.channel.seal(plaintext)
+            established = session
+            framesSent &+= 1
+            if framesSent <= 3 || framesSent % 100 == 0 {
+                DiagnosticsLog.info("secure.mac.frame_out count=\(framesSent) plaintext=\(plaintext.count) frame=\(frame.count)")
+            }
+            try await channel.send(frame)
+            await sendGate.unlock()
+        } catch {
+            await sendGate.unlock()
+            throw error
         }
-        try await channel.send(frame)
     }
 
     func receiveLoop() async throws {
@@ -144,4 +152,29 @@ actor SecureSessionHost {
 enum SecureSessionHostError: Error {
     case closedBeforeHandshake
     case notEstablished
+}
+
+private actor SecureSessionSendGate {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func lock() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func unlock() {
+        guard !waiters.isEmpty else {
+            isLocked = false
+            return
+        }
+
+        waiters.removeFirst().resume()
+    }
 }

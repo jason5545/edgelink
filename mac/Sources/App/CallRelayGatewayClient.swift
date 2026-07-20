@@ -90,6 +90,14 @@ private final class CallRelayMPEGTSPlayer {
     private var pcmBytes = 0
     private var pesPacketCount = 0
     private var validStreamReported = false
+    private var pcmCaptureHandle: FileHandle?
+    private var pcmCaptureBytes = 0
+    private let pcmCapturePath = "/private/tmp/edgelink-downlink.pcm"
+    private let pcmCaptureLimitBytes = 8 * 1024 * 1024
+
+    private var pcmCaptureEnabled: Bool {
+        UserDefaults.standard.object(forKey: "phoneRelayDownlinkPCMCaptureEnabled") as? Bool ?? true
+    }
 
     func writeRTPPacket(_ packet: Data) -> CallRelayGatewayPlaybackStats? {
         guard let payload = rtpPayload(in: packet),
@@ -102,6 +110,7 @@ private final class CallRelayMPEGTSPlayer {
         guard !pcmPayload.isEmpty else {
             return nil
         }
+        writePCMCapture(pcmPayload)
         if audioEngine?.isRunning != true {
             start()
         }
@@ -156,6 +165,40 @@ private final class CallRelayMPEGTSPlayer {
         pcmBytes = 0
         pesPacketCount = 0
         validStreamReported = false
+        stopPCMCapture()
+    }
+
+    private func writePCMCapture(_ payload: Data) {
+        guard pcmCaptureEnabled, pcmCaptureBytes < pcmCaptureLimitBytes else {
+            return
+        }
+        if pcmCaptureHandle == nil {
+            FileManager.default.createFile(atPath: pcmCapturePath, contents: nil)
+            pcmCaptureHandle = FileHandle(forWritingAtPath: pcmCapturePath)
+            pcmCaptureBytes = 0
+        }
+        guard let handle = pcmCaptureHandle else {
+            return
+        }
+        let remaining = pcmCaptureLimitBytes - pcmCaptureBytes
+        let chunk = payload.count > remaining ? payload.prefix(remaining) : payload
+        do {
+            try handle.write(contentsOf: chunk)
+            pcmCaptureBytes += chunk.count
+        } catch {
+            stopPCMCapture()
+        }
+    }
+
+    private func stopPCMCapture() {
+        if pcmCaptureHandle != nil {
+            DiagnosticsLog.info(
+                "callrelay.mac.downlink_pcm_capture_stop path=\(pcmCapturePath) bytes=\(pcmCaptureBytes)"
+            )
+        }
+        try? pcmCaptureHandle?.close()
+        pcmCaptureHandle = nil
+        pcmCaptureBytes = 0
     }
 
     private func start() {

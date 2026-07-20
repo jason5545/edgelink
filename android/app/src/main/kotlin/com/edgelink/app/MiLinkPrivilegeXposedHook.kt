@@ -4,6 +4,11 @@ import android.content.Context
 import android.content.ContentProvider
 import android.content.Intent
 import android.graphics.SurfaceTexture
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCrypto
 import android.media.MediaFormat
@@ -26,6 +31,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
 import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.ArrayList
 import java.util.Collections
 import java.util.HashMap
@@ -34,6 +41,9 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+import kotlin.math.sin
 
 internal object MiLinkPrivilegeHookPolicy {
     const val EDGE_LINK_PACKAGE = "com.edgelink.app"
@@ -53,6 +63,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val TELECOM_PACKAGE = "com.android.server.telecom"
+    const val AUDIOMONITOR_PACKAGE = "com.miui.audiomonitor"
     const val PHONE_RELAY_SELECTED_ACTION = "com.edgelink.app.PHONE_RELAY_SELECTED"
     const val PHONE_RELAY_SELECTED_REASON_EXTRA = "reason"
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
@@ -112,7 +123,11 @@ internal object MiLinkPrivilegeHookPolicy {
         shouldHookInCallUi(packageName, processName) ||
         shouldHookAndroidPhone(packageName, processName) ||
         shouldHookAndroidSystem(packageName, processName) ||
-        shouldHookTelecomSystem(packageName, processName)
+        shouldHookTelecomSystem(packageName, processName) ||
+        shouldHookAudioMonitor(packageName, processName)
+
+    fun shouldHookAudioMonitor(packageName: String?, processName: String?): Boolean =
+        packageName == AUDIOMONITOR_PACKAGE
 
     fun shouldHookRuntime(packageName: String?, processName: String?): Boolean =
         packageName == MILINK_PACKAGE && processName == MILINK_RUNTIME_PROCESS
@@ -398,6 +413,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookTelecomSystem(lpparam.packageName, lpparam.processName)) {
             hookTelecomRelayFeatures(lpparam.classLoader, "handleLoadPackage")
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(lpparam.packageName, lpparam.processName)) {
+            hookAudioMonitorRelayInjector()
+            hookAudioMonitorDistAudioRelay(lpparam.classLoader)
         }
     }
 
@@ -865,6 +884,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             methodName = "getSynergyDeviceList",
             label = "RelayStateService"
         )
+        hookAndroidPhoneRelayCallState(classLoader)
     }
 
     private fun hookAndroidPhoneRelayDeviceList(
@@ -892,6 +912,498 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }.onFailure { error ->
             log("failed to hook Android phone relay list label=$label: ${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    private fun hookAndroidPhoneRelayCallState(classLoader: ClassLoader) {
+        val connectionClass = runCatching {
+            findTargetClass(classLoader, "android.telecom.Connection")
+        }.getOrElse { error ->
+            log("failed to hook Android phone relay call state: ${error.javaClass.simpleName}: ${error.message}")
+            return
+        }
+        listOf(
+            "isCallRelayed",
+            "isCallRelaying",
+            "isCallRelayAnswered",
+            "hasRelayDeviceId"
+        ).forEach { methodName ->
+            runCatching {
+                XposedHelpers.findAndHookMethod(
+                    ANDROID_PHONE_RELAY_UTILS,
+                    classLoader,
+                    methodName,
+                    connectionClass,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!shouldForceTelecomRelay()) {
+                                return
+                            }
+                            param.setResult(true)
+                            logAndroidPhoneRelayCallStateForced(methodName)
+                        }
+                    }
+                )
+                log("Android phone relay call state hook installed method=$methodName")
+            }.onFailure { error ->
+                log("failed to hook Android phone relay call state method=$methodName: ${error.javaClass.simpleName}: ${error.message}")
+            }
+        }
+    }
+
+    private fun logAndroidPhoneRelayCallStateForced(methodName: String) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastTelecomRelayForceLogUptimeMs < TELECOM_RELAY_FORCE_LOG_THROTTLE_MS) {
+            return
+        }
+        lastTelecomRelayForceLogUptimeMs = now
+        log("Android phone force relay call state method=$methodName")
+    }
+
+    private val relayInjectorStarted = AtomicBoolean(false)
+    private var relayInjectorTrack: AudioTrack? = null
+    private var relayInjectorWriter: Thread? = null
+    private val relayInjectorStop = AtomicBoolean(false)
+
+    private fun hookAudioMonitorRelayInjector() {
+        if (!relayInjectorStarted.compareAndSet(false, true)) {
+            return
+        }
+        log("audiomonitor relay injector worker installed")
+        thread(name = "EdgeLinkRelayInjector") {
+            while (true) {
+                runCatching {
+                    val active = shouldForceMirrorCallRelay()
+                    val distAudioActive = distAudioStream != null
+                    if (active && !distAudioActive && relayInjectorTrack == null) {
+                        startRelayInjector()
+                    } else if ((!active || distAudioActive) && relayInjectorTrack != null) {
+                        stopRelayInjector()
+                    }
+                }.onFailure { error ->
+                    log("audiomonitor relay injector loop error: ${error.javaClass.simpleName}: ${error.message}")
+                }
+                Thread.sleep(400)
+            }
+        }
+    }
+
+    private fun startRelayInjector() {
+        val context = currentApplicationContext()
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            log("audiomonitor relay injector no audio manager")
+            return
+        }
+        val telephonyDevice = audioManager
+            .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+        val sampleRate = RELAY_INJECT_SAMPLE_RATE
+        val minBuffer = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .setFlags(RELAY_INJECT_AUDIO_FLAGS)
+            .build()
+        val format = AudioFormat.Builder()
+            .setSampleRate(sampleRate)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .build()
+        val track = runCatching {
+            AudioTrack.Builder()
+                .setAudioAttributes(attributes)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(minBuffer * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        }.getOrElse { error ->
+            log("audiomonitor relay injector track create failed: ${error.javaClass.simpleName}: ${error.message}")
+            return
+        }
+        if (telephonyDevice != null) {
+            runCatching { track.preferredDevice = telephonyDevice }
+        }
+        runCatching { track.play() }
+        relayInjectorTrack = track
+        relayInjectorStop.set(false)
+        log(
+            "audiomonitor relay injector started telephonyDevice=${telephonyDevice != null} " +
+                "state=${track.state} rate=$sampleRate"
+        )
+        relayInjectorWriter = thread(name = "EdgeLinkRelayInjectorWriter") {
+            runRelayInjectorTone(track, sampleRate)
+        }
+    }
+
+    private fun runRelayInjectorTone(track: AudioTrack, sampleRate: Int) {
+        val frameCount = sampleRate / 50
+        val pcm = ShortArray(frameCount)
+            val frequency = readSystemProperty(RELAY_INJECT_TONE_HZ_PROPERTY)
+                .toDoubleOrNull() ?: RELAY_INJECT_TONE_HZ
+        var phase = 0.0
+        val phaseStep = 2.0 * Math.PI * frequency / sampleRate
+        while (!relayInjectorStop.get() && relayInjectorTrack === track) {
+            for (index in pcm.indices) {
+                pcm[index] = (sin(phase) * RELAY_INJECT_TONE_AMPLITUDE).toInt().toShort()
+                phase += phaseStep
+                if (phase > 2.0 * Math.PI) {
+                    phase -= 2.0 * Math.PI
+                }
+            }
+            val bytes = ByteArray(pcm.size * 2)
+            for (index in pcm.indices) {
+                val value = pcm[index].toInt()
+                bytes[index * 2] = (value and 0xff).toByte()
+                bytes[index * 2 + 1] = (value shr 8 and 0xff).toByte()
+            }
+            runCatching { track.write(bytes, 0, bytes.size) }
+        }
+    }
+
+    private fun stopRelayInjector() {
+        relayInjectorStop.set(true)
+        runCatching { relayInjectorWriter?.join(800) }
+        relayInjectorWriter = null
+        runCatching { relayInjectorTrack?.stop() }
+        runCatching { relayInjectorTrack?.release() }
+        relayInjectorTrack = null
+        log("audiomonitor relay injector stopped")
+    }
+
+    private val distAudioRelayWorkerStarted = AtomicBoolean(false)
+    @Volatile private var distAudioStream: Any? = null
+    @Volatile private var distAudioManagerRef: Any? = null
+    @Volatile private var distAudioRouteRef: Any? = null
+    @Volatile private var distAudioSetupInFlight = false
+    @Volatile private var audioMonitorClassLoader: ClassLoader? = null
+    private var lastDistAudioSetupAttemptUptimeMs = 0L
+    private val distAudioSocketServerStarted = AtomicBoolean(false)
+
+    private fun distAudioClass(name: String): Class<*> {
+        val classLoader = audioMonitorClassLoader
+            ?: throw ClassNotFoundException("$name (no audiomonitor classloader)")
+        return Class.forName(name, false, classLoader)
+    }
+
+    private fun hookAudioMonitorDistAudioRelay(classLoader: ClassLoader) {
+        audioMonitorClassLoader = classLoader
+        hookDistAudioDecryptPassthrough(classLoader)
+        startDistAudioSocketServerIfNeeded()
+        if (!distAudioRelayWorkerStarted.compareAndSet(false, true)) {
+            return
+        }
+        log("audiomonitor dist audio relay worker installed")
+        thread(name = "EdgeLinkDistAudioRelay") {
+            while (true) {
+                runCatching {
+                    val active = shouldForceMirrorCallRelay()
+                    val now = SystemClock.uptimeMillis()
+                    if (active && distAudioStream == null && !distAudioSetupInFlight &&
+                        now - lastDistAudioSetupAttemptUptimeMs >= DIST_AUDIO_SETUP_RETRY_MS
+                    ) {
+                        distAudioSetupInFlight = true
+                        lastDistAudioSetupAttemptUptimeMs = now
+                        try {
+                            setupDistAudioRelay()
+                        } finally {
+                            distAudioSetupInFlight = false
+                        }
+                    } else if (!active && (distAudioStream != null || distAudioManagerRef != null)) {
+                        teardownDistAudioRelay("latch_inactive")
+                    }
+                }.onFailure { error ->
+                    log("audiomonitor dist audio relay loop error: ${error.javaClass.simpleName}: ${error.message}")
+                }
+                Thread.sleep(400)
+            }
+        }
+    }
+
+    private fun hookDistAudioDecryptPassthrough(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                DIST_AUDIO_AES_UTIL_CLASS,
+                classLoader,
+                "decrypt",
+                ByteArray::class.java,
+                ByteArray::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!shouldForceMirrorCallRelay()) {
+                            return
+                        }
+                        param.result = param.args[0]
+                    }
+                }
+            )
+            log("audiomonitor dist audio decrypt passthrough hook installed")
+        }.onFailure { error ->
+            log("failed to hook dist audio decrypt: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun setupDistAudioRelay() {
+        val context = currentApplicationContext()
+        if (context == null) {
+            log("audiomonitor dist audio setup skipped: no context")
+            return
+        }
+        val managerClass = distAudioClass(DIST_AUDIO_MANAGER_CLASS)
+        val manager = managerClass.getMethod("getInstance", Context::class.java).invoke(null, context)
+        val resourceManagerClass = distAudioClass(DIST_AUDIO_RESOURCE_MANAGER_CLASS)
+        val resourceManager =
+            resourceManagerClass.getMethod("getInstance", Context::class.java).invoke(null, context)
+        val hardwareInfoClass = distAudioClass(DIST_HARDWARE_INFO_CLASS)
+        val micHardware = buildDistHardwareInfo("MIC", DIST_AUDIO_MIC_DH_ID)
+        val speakerHardware = buildDistHardwareInfo("SPEAKER", DIST_AUDIO_SPEAKER_DH_ID)
+        seedDistAudioAssociation(resourceManagerClass, resourceManager, micHardware)
+        resourceManagerClass
+            .getMethod("onDistAudioDeviceOnline", hardwareInfoClass)
+            .invoke(resourceManager, micHardware)
+        resourceManagerClass
+            .getMethod("onDistAudioDeviceOnline", hardwareInfoClass)
+            .invoke(resourceManager, speakerHardware)
+        val deviceInfo = resourceManagerClass
+            .getMethod("getDevice", String::class.java)
+            .invoke(resourceManager, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+        if (deviceInfo == null) {
+            log("audiomonitor dist audio setup failed: device not registered")
+            return
+        }
+        val route = buildDistAudioRoute(deviceInfo)
+        distAudioManagerRef = manager
+        distAudioRouteRef = route
+        log("audiomonitor dist audio connect start")
+        managerClass
+            .getMethod("connectDistAudioDevice", distAudioClass(DIST_AUDIO_ROUTE_CLASS))
+            .invoke(manager, route)
+        val stream = managerClass.getField("mDistAudioStream").get(manager)
+        if (stream == null) {
+            log("audiomonitor dist audio connect finished without stream")
+            return
+        }
+        distAudioStream = stream
+        runCatching {
+            stream.javaClass.getMethod("startAudioDownlinkStream").invoke(stream)
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("audiomonitor dist audio start downlink failed: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+        log("audiomonitor dist audio relay connected")
+    }
+
+    private fun buildDistHardwareInfo(dhTypeName: String, dhId: String): Any {
+        val builderClass = distAudioClass(DIST_HARDWARE_INFO_BUILDER_CLASS)
+        val builder = builderClass.getDeclaredConstructor().newInstance()
+        val dhTypeClass = distAudioClass(DIST_DH_TYPE_CLASS)
+        val dhType = dhTypeClass.getField(dhTypeName).get(null)
+        builderClass
+            .getMethod("setDeviceId", String::class.java)
+            .invoke(builder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+        builderClass
+            .getMethod("setDeviceName", String::class.java)
+            .invoke(builder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+        builderClass
+            .getMethod("setDeviceType", Integer.TYPE)
+            .invoke(builder, DIST_AUDIO_FAKE_DEVICE_TYPE)
+        builderClass.getMethod("setDhId", String::class.java).invoke(builder, dhId)
+        builderClass
+            .getMethod("setDhOwner", String::class.java)
+            .invoke(builder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+        builderClass.getMethod("setDhType", dhTypeClass).invoke(builder, dhType)
+        builderClass.getMethod("setDhAttr", String::class.java).invoke(builder, DIST_AUDIO_DH_ATTR)
+        return builderClass.getMethod("build").invoke(builder)
+    }
+
+    private fun seedDistAudioAssociation(
+        resourceManagerClass: Class<*>,
+        resourceManager: Any,
+        micHardware: Any
+    ) {
+        runCatching {
+            val associationBuilderClass = distAudioClass(DIST_ASSOCIATION_INFO_BUILDER_CLASS)
+            val builder = associationBuilderClass.getDeclaredConstructor().newInstance()
+            associationBuilderClass
+                .getMethod("setRemoteDeviceId", String::class.java)
+                .invoke(builder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+            associationBuilderClass
+                .getMethod("setRemoteDeviceType", Integer.TYPE)
+                .invoke(builder, DIST_AUDIO_FAKE_DEVICE_TYPE)
+            associationBuilderClass
+                .getMethod("setStatus", Integer.TYPE)
+                .invoke(builder, 1)
+            associationBuilderClass
+                .getMethod("setHardwareInfo", distAudioClass(DIST_HARDWARE_INFO_CLASS))
+                .invoke(builder, micHardware)
+            val localDeviceId = resourceManagerClass
+                .getMethod("getLocalDeviceId")
+                .invoke(resourceManager) as? String
+            if (!localDeviceId.isNullOrBlank() && localDeviceId != "null") {
+                associationBuilderClass
+                    .getMethod("setLocalDeviceId", String::class.java)
+                    .invoke(builder, localDeviceId)
+            }
+            val localDeviceType = resourceManagerClass
+                .getMethod("getLocalDeviceType")
+                .invoke(resourceManager) as? Int
+            if (localDeviceType != null && localDeviceType >= 0) {
+                associationBuilderClass
+                    .getMethod("setLocalDeviceType", Integer.TYPE)
+                    .invoke(builder, localDeviceType)
+            }
+            val association = associationBuilderClass.getMethod("build").invoke(builder)
+            resourceManagerClass
+                .getMethod("addAssociationInfo", distAudioClass(DIST_ASSOCIATION_INFO_CLASS))
+                .invoke(resourceManager, association)
+            log("audiomonitor dist audio association seeded local=$localDeviceId type=$localDeviceType")
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("audiomonitor dist audio association seed failed: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
+
+    private fun buildDistAudioRoute(deviceInfo: Any): Any {
+        val routeBuilderClass = distAudioClass(DIST_AUDIO_ROUTE_BUILDER_CLASS)
+        val builder = routeBuilderClass.getDeclaredConstructor().newInstance()
+        routeBuilderClass
+            .getMethod("setDistAudioDeviceInfo", distAudioClass(DIST_AUDIO_DEVICE_INFO_CLASS))
+            .invoke(builder, deviceInfo)
+        val attributes = AudioAttributes.Builder()
+            .setFlags(DIST_AUDIO_ROUTE_FLAGS)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        val format = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(DIST_AUDIO_ROUTE_SAMPLE_RATE)
+            .setChannelMask(DIST_AUDIO_ROUTE_CHANNEL_MASK)
+            .build()
+        routeBuilderClass
+            .getMethod("setAudioAttributes", AudioAttributes::class.java)
+            .invoke(builder, attributes)
+        routeBuilderClass
+            .getMethod("setPlayerFormat", AudioFormat::class.java)
+            .invoke(builder, format)
+        routeBuilderClass
+            .getMethod("setRecorderFormat", AudioFormat::class.java)
+            .invoke(builder, format)
+        return routeBuilderClass.getMethod("build").invoke(builder)
+    }
+
+    private fun startDistAudioSocketServerIfNeeded() {
+        if (!distAudioSocketServerStarted.compareAndSet(false, true)) {
+            return
+        }
+        thread(name = "EdgeLinkDistAudioSocket") {
+            var server: ServerSocket? = null
+            while (true) {
+                if (server == null) {
+                    server = runCatching {
+                        ServerSocket(DIST_AUDIO_SOCKET_PORT, 4, InetAddress.getByName("127.0.0.1"))
+                    }
+                        .getOrElse { error ->
+                            log("audiomonitor dist audio socket bind failed: ${error.javaClass.simpleName}: ${error.message}")
+                            null
+                        }
+                    if (server == null) {
+                        Thread.sleep(3_000)
+                        continue
+                    }
+                    log("audiomonitor dist audio socket listening port=$DIST_AUDIO_SOCKET_PORT")
+                }
+                val activeServer = server ?: continue
+                val client = runCatching { activeServer.accept() }
+                    .getOrElse { error ->
+                        log("audiomonitor dist audio socket accept failed: ${error.javaClass.simpleName}: ${error.message}")
+                        runCatching { activeServer.close() }
+                        server = null
+                        null
+                    } ?: continue
+                runCatching { client.tcpNoDelay = true }
+                log("audiomonitor dist audio socket client connected")
+                runDistAudioClient(client)
+                log("audiomonitor dist audio socket client disconnected")
+            }
+        }
+    }
+
+    private fun runDistAudioClient(socket: Socket) {
+        runCatching {
+            socket.inputStream.use { input ->
+                val buffer = ByteArray(DIST_AUDIO_PCM_CHUNK_BYTES)
+                var activeStream: Any? = null
+                var playMethod: java.lang.reflect.Method? = null
+                var pts = 0L
+                var pcmBytesPlayed = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) {
+                        break
+                    }
+                    if (read == 0) {
+                        continue
+                    }
+                    val stream = distAudioStream
+                    if (stream == null) {
+                        activeStream = null
+                        playMethod = null
+                        continue
+                    }
+                    if (activeStream !== stream) {
+                        activeStream = stream
+                        playMethod = runCatching {
+                            stream.javaClass.getMethod(
+                                "playCastAudioData",
+                                ByteArray::class.java,
+                                java.lang.Long.TYPE
+                            )
+                        }.getOrNull()
+                        pts = SystemClock.elapsedRealtimeNanos() / 1_000
+                        pcmBytesPlayed = 0
+                        if (playMethod == null) {
+                            log("audiomonitor dist audio socket no playCastAudioData")
+                        }
+                    }
+                    val method = playMethod ?: continue
+                    runCatching {
+                        method.invoke(stream, buffer.copyOf(read), pts)
+                    }.onFailure { error ->
+                        val cause = error.cause ?: error
+                        log("audiomonitor dist audio play failed: ${cause.javaClass.simpleName}: ${cause.message}")
+                    }
+                    pcmBytesPlayed += read
+                    if (pcmBytesPlayed == read.toLong() || pcmBytesPlayed % 320_000L < read) {
+                        log("audiomonitor dist audio pcm played bytes=$pcmBytesPlayed")
+                    }
+                    pts += read / 2 * 1_000_000L / DIST_AUDIO_PCM_SAMPLE_RATE
+                }
+            }
+        }.onFailure { error ->
+            log("audiomonitor dist audio socket client error: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun teardownDistAudioRelay(reason: String) {
+        val manager = distAudioManagerRef
+        val route = distAudioRouteRef
+        if (manager != null && route != null) {
+            runCatching {
+                manager.javaClass
+                    .getMethod("disconnectDistAudioDevice", distAudioClass(DIST_AUDIO_ROUTE_CLASS))
+                    .invoke(manager, route)
+            }.onFailure { error ->
+                val cause = error.cause ?: error
+                log("audiomonitor dist audio disconnect failed: ${cause.javaClass.simpleName}: ${cause.message}")
+            }
+        }
+        distAudioStream = null
+        distAudioManagerRef = null
+        distAudioRouteRef = null
+        log("audiomonitor dist audio relay stopped reason=$reason")
     }
 
     private fun hookTelecomRelayFeatures(classLoader: ClassLoader, source: String) {
@@ -6459,6 +6971,40 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private companion object {
+        private const val RELAY_INJECT_SAMPLE_RATE = 16_000
+        private const val RELAY_INJECT_AUDIO_FLAGS = 0x900
+        private const val RELAY_INJECT_TONE_HZ_PROPERTY = "debug.edgelink.relay_tone_hz"
+        private const val RELAY_INJECT_TONE_HZ = 880.0
+        private const val RELAY_INJECT_TONE_AMPLITUDE = 12_000
+        private const val DIST_AUDIO_MANAGER_CLASS = "com.miui.audiomonitor.distaudio.service.IDistAudioManager"
+        private const val DIST_AUDIO_RESOURCE_MANAGER_CLASS =
+            "com.miui.audiomonitor.distaudio.resource.ResourceManager"
+        private const val DIST_AUDIO_ROUTE_CLASS = "com.miui.audiomonitor.distaudio.data.DistAudioRoute"
+        private const val DIST_AUDIO_ROUTE_BUILDER_CLASS =
+            "com.miui.audiomonitor.distaudio.data.DistAudioRoute\$Builder"
+        private const val DIST_AUDIO_DEVICE_INFO_CLASS =
+            "com.miui.audiomonitor.distaudio.data.DistAudioDeviceInfo"
+        private const val DIST_AUDIO_AES_UTIL_CLASS =
+            "com.miui.audiomonitor.distaudio.utils.AesEcbPkcd5Util"
+        private const val DIST_HARDWARE_INFO_CLASS = "com.xiaomi.dist.hardware.data.HardwareInfo"
+        private const val DIST_HARDWARE_INFO_BUILDER_CLASS =
+            "com.xiaomi.dist.hardware.data.HardwareInfo\$Builder"
+        private const val DIST_DH_TYPE_CLASS = "com.xiaomi.dist.hardware.data.DHType"
+        private const val DIST_ASSOCIATION_INFO_CLASS = "com.xiaomi.dist.hardware.data.AssociationInfo"
+        private const val DIST_ASSOCIATION_INFO_BUILDER_CLASS =
+            "com.xiaomi.dist.hardware.data.AssociationInfo\$Builder"
+        private const val DIST_AUDIO_DH_ATTR =
+            "{\"version\":1,\"defaults\":{\"params\":[{\"bitDepth\":16,\"channels\":1,\"sampleRate\":16000}]}}"
+        private const val DIST_AUDIO_MIC_DH_ID = "edgelink-mac-mi-pad-mic"
+        private const val DIST_AUDIO_SPEAKER_DH_ID = "edgelink-mac-mi-pad-speaker"
+        private const val DIST_AUDIO_FAKE_DEVICE_TYPE = 4
+        private const val DIST_AUDIO_ROUTE_FLAGS = 0x900
+        private const val DIST_AUDIO_ROUTE_SAMPLE_RATE = 8_000
+        private const val DIST_AUDIO_ROUTE_CHANNEL_MASK = 12
+        private const val DIST_AUDIO_SOCKET_PORT = 19_307
+        private const val DIST_AUDIO_PCM_SAMPLE_RATE = 16_000
+        private const val DIST_AUDIO_PCM_CHUNK_BYTES = 1_280
+        private const val DIST_AUDIO_SETUP_RETRY_MS = 5_000L
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val ANDROID_MEDIA_CODEC = "android.media.MediaCodec"
         private const val MILINK_PRIVILEGED_PACKAGE_MANAGER = "com.milink.base.utils.p"
@@ -6549,6 +7095,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             "com.android.services.telephony.relay.RelayService\$1"
         private const val ANDROID_PHONE_RELAY_STATE_SERVICE_BINDER =
             "com.android.services.telephony.relay.RelayStateService\$1"
+        private const val ANDROID_PHONE_RELAY_UTILS =
+            "com.android.services.telephony.relay.phonecall.RelayUtils\$Relay"
         private const val XIAOMI_JSON_CODEC = "C0.d"
         private const val FAKE_MIRROR_ATTACH_THROTTLE_MS = 3_000L
         private const val FAKE_MIRROR_KEY_THROTTLE_MS = 3_000L

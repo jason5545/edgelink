@@ -987,7 +987,7 @@ final class MiLinkPhoneRelayProbe {
                 if data.isEmpty {
                     self.stopSourceRTP(reason: "mpegts_eof")
                 } else {
-                    self.sendSourcePCMTransport(data)
+                    self.sendSourceMPEGTS(data)
                 }
             }
         }
@@ -1028,12 +1028,24 @@ final class MiLinkPhoneRelayProbe {
                 "-loglevel", "error",
                 "-re",
                 "-f", "lavfi",
-                "-i", "anullsrc=channel_layout=mono:sample_rate=8000",
+                "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
                 "-ac", "1",
-                "-ar", "8000",
-                "-f", "s16le",
-                "pipe:1"
-            ]
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "64k",
+            ] + Self.sourceMPEGTSOutputArguments
+        case .tone:
+            return [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-re",
+                "-f", "lavfi",
+                "-i", "sine=frequency=880:sample_rate=48000",
+                "-ac", "1",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "64k",
+            ] + Self.sourceMPEGTSOutputArguments
         case .microphone:
             return [
                 "-hide_banner",
@@ -1042,11 +1054,10 @@ final class MiLinkPhoneRelayProbe {
                 "-ar", "\(Int(Self.sourcePCMSampleRate))",
                 "-ac", "\(Int(Self.sourcePCMChannels))",
                 "-i", "pipe:0",
-                "-ac", "1",
-                "-ar", "8000",
-                "-f", "s16le",
-                "pipe:1"
-            ]
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "64k",
+            ] + Self.sourceMPEGTSOutputArguments
         }
     }
 
@@ -1172,8 +1183,10 @@ final class MiLinkPhoneRelayProbe {
             try sourceRTPInput.write(contentsOf: data)
             sourcePCMBytesWritten += data.count
             if sourcePCMBytesWritten == data.count || sourcePCMBytesWritten % 96_000 < data.count {
+                let stats = Self.sourcePCMSignalStats(data)
                 DiagnosticsLog.info(
-                    "phonerelay.mac.source_microphone_pcm_write bytes=\(data.count) total=\(sourcePCMBytesWritten)"
+                    "phonerelay.mac.source_microphone_pcm_write bytes=\(data.count) total=\(sourcePCMBytesWritten) " +
+                        "samples=\(stats.samples) nonzero=\(stats.nonzero) maxAbs=\(stats.maxAbs) avgAbs=\(stats.averageAbs)"
                 )
             }
         } catch {
@@ -1197,6 +1210,175 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
+    // Keep the exact AAC/MPEG-TS packetization used by the last known-good
+    // phone uplink. Cloudflare carries these RTP packets unchanged.
+    private func sendSourceMPEGTS(_ data: Data) {
+        sourceRTPBuffer.append(data)
+        while true {
+            guard let syncIndex = sourceRTPBuffer.firstIndex(of: 0x47) else {
+                sourceRTPBuffer.removeAll(keepingCapacity: true)
+                return
+            }
+            if syncIndex != sourceRTPBuffer.startIndex {
+                sourceRTPBuffer.removeSubrange(sourceRTPBuffer.startIndex..<syncIndex)
+            }
+            guard sourceRTPBuffer.count >= Self.mpegTSPacketSize else {
+                return
+            }
+            guard let packetCount = nextSourceRTPPacketCount() else {
+                return
+            }
+            if packetCount <= 0 {
+                sourceRTPBuffer.removeFirst()
+                continue
+            }
+            let payloadBytes = packetCount * Self.mpegTSPacketSize
+            let payload = Data(sourceRTPBuffer.prefix(payloadBytes))
+            sourceRTPBuffer.removeSubrange(
+                ..<sourceRTPBuffer.index(sourceRTPBuffer.startIndex, offsetBy: payloadBytes)
+            )
+            sendSourceRTPPayload(payload)
+        }
+    }
+
+    private func nextSourceRTPPacketCount() -> Int? {
+        let availablePackets = sourceRTPBuffer.count / Self.mpegTSPacketSize
+        var leadingPackets = 0
+        while leadingPackets < availablePackets {
+            let packetOffset = leadingPackets * Self.mpegTSPacketSize
+            guard sourceTSPacketIsAligned(at: packetOffset) else {
+                return leadingPackets > 0 ? leadingPackets : 0
+            }
+            if sourceTSPacketStartsPES(at: packetOffset) {
+                break
+            }
+            leadingPackets += 1
+            if leadingPackets >= Self.sourceMPEGTSPacketsPerRTPPacket {
+                return leadingPackets
+            }
+        }
+
+        guard leadingPackets < availablePackets else {
+            return leadingPackets > 0 ? leadingPackets : nil
+        }
+        guard let pesPacketCount = completeSourcePESPacketCount(startPacketIndex: leadingPackets) else {
+            return leadingPackets > 0 ? leadingPackets : nil
+        }
+        if leadingPackets == 0 {
+            return pesPacketCount
+        }
+        if leadingPackets + pesPacketCount <= Self.sourceMPEGTSPacketsPerRTPPacket {
+            return leadingPackets + pesPacketCount
+        }
+        return leadingPackets
+    }
+
+    private func completeSourcePESPacketCount(startPacketIndex: Int) -> Int? {
+        let startOffset = startPacketIndex * Self.mpegTSPacketSize
+        guard sourceTSPacketStartsPES(at: startOffset),
+              let pid = sourceTSPacketPID(at: startOffset),
+              let payloadOffset = sourceTSPayloadOffset(at: startOffset),
+              let declaredPESLength = sourcePESDeclaredLength(payloadOffset: payloadOffset) else {
+            return 1
+        }
+        guard declaredPESLength > 0 else {
+            return min(
+                Self.sourceMPEGTSPacketsPerRTPPacket,
+                sourceRTPBuffer.count / Self.mpegTSPacketSize - startPacketIndex
+            )
+        }
+
+        let requiredPayloadBytes = 6 + declaredPESLength
+        var accumulatedPayloadBytes = 0
+        var packetIndex = startPacketIndex
+        while true {
+            let packetOffset = packetIndex * Self.mpegTSPacketSize
+            guard sourceTSPacketIsAligned(at: packetOffset),
+                  sourceTSPacketPID(at: packetOffset) == pid else {
+                return max(packetIndex - startPacketIndex, 1)
+            }
+            if packetIndex > startPacketIndex && sourceTSPacketStartsPES(at: packetOffset) {
+                return max(packetIndex - startPacketIndex, 1)
+            }
+            if let payloadOffset = sourceTSPayloadOffset(at: packetOffset) {
+                accumulatedPayloadBytes += packetOffset + Self.mpegTSPacketSize - payloadOffset
+            }
+            packetIndex += 1
+            if accumulatedPayloadBytes >= requiredPayloadBytes {
+                return packetIndex - startPacketIndex
+            }
+            guard sourceRTPBuffer.count >= (packetIndex + 1) * Self.mpegTSPacketSize else {
+                return nil
+            }
+        }
+    }
+
+    private func sourceTSPacketIsAligned(at packetOffset: Int) -> Bool {
+        guard sourceRTPBuffer.count >= packetOffset + Self.mpegTSPacketSize else {
+            return false
+        }
+        return sourceTSByte(at: packetOffset) == 0x47
+    }
+
+    private func sourceTSPacketPID(at packetOffset: Int) -> UInt16? {
+        guard sourceTSPacketIsAligned(at: packetOffset),
+              let byte1 = sourceTSByte(at: packetOffset + 1),
+              let byte2 = sourceTSByte(at: packetOffset + 2) else {
+            return nil
+        }
+        return (UInt16(byte1 & 0x1f) << 8) | UInt16(byte2)
+    }
+
+    private func sourceTSPacketStartsPES(at packetOffset: Int) -> Bool {
+        guard sourceTSPacketIsAligned(at: packetOffset),
+              let byte1 = sourceTSByte(at: packetOffset + 1),
+              (byte1 & 0x40) != 0,
+              let payloadOffset = sourceTSPayloadOffset(at: packetOffset),
+              payloadOffset + 6 <= packetOffset + Self.mpegTSPacketSize,
+              sourceTSByte(at: payloadOffset) == 0x00,
+              sourceTSByte(at: payloadOffset + 1) == 0x00,
+              sourceTSByte(at: payloadOffset + 2) == 0x01 else {
+            return false
+        }
+        return true
+    }
+
+    private func sourceTSPayloadOffset(at packetOffset: Int) -> Int? {
+        guard sourceTSPacketIsAligned(at: packetOffset),
+              let byte3 = sourceTSByte(at: packetOffset + 3) else {
+            return nil
+        }
+        let adaptationFieldControl = (byte3 >> 4) & 0x03
+        switch adaptationFieldControl {
+        case 1:
+            return packetOffset + 4
+        case 3:
+            guard let adaptationLength = sourceTSByte(at: packetOffset + 4) else {
+                return nil
+            }
+            let payloadOffset = packetOffset + 5 + Int(adaptationLength)
+            return payloadOffset < packetOffset + Self.mpegTSPacketSize ? payloadOffset : nil
+        default:
+            return nil
+        }
+    }
+
+    private func sourcePESDeclaredLength(payloadOffset: Int) -> Int? {
+        guard payloadOffset + 6 <= sourceRTPBuffer.count,
+              let high = sourceTSByte(at: payloadOffset + 4),
+              let low = sourceTSByte(at: payloadOffset + 5) else {
+            return nil
+        }
+        return (Int(high) << 8) | Int(low)
+    }
+
+    private func sourceTSByte(at offset: Int) -> UInt8? {
+        guard offset >= 0, offset < sourceRTPBuffer.count else {
+            return nil
+        }
+        return sourceRTPBuffer[sourceRTPBuffer.index(sourceRTPBuffer.startIndex, offsetBy: offset)]
+    }
+
     private func sendSourcePCMTransport(_ data: Data) {
         sourceRTPBuffer.append(data)
         while sourceRTPBuffer.count >= Self.sourcePCMBytesPerFrame {
@@ -1207,6 +1389,7 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func sendSourcePCMFrame(_ pcm: Data) {
+        let signalStats = Self.sourcePCMSignalStats(pcm)
         var payload = Data()
         if sourceRTPPacketsSent % Self.sourceProgramHeaderIntervalFrames == 0 {
             payload.append(sourcePATPacket())
@@ -1223,7 +1406,35 @@ final class MiLinkPhoneRelayProbe {
         ) {
             payload.append(packet)
         }
+        if sourceRTPPacketsSent % 50 == 0 {
+            DiagnosticsLog.info(
+                "phonerelay.mac.source_pcm_level frame=\(sourceRTPPacketsSent) " +
+                    "samples=\(signalStats.samples) nonzero=\(signalStats.nonzero) " +
+                    "maxAbs=\(signalStats.maxAbs) avgAbs=\(signalStats.averageAbs) gain=1.00"
+            )
+        }
         sendSourceRTPPayload(payload)
+    }
+
+    private static func sourcePCMSignalStats(_ pcm: Data) -> (samples: Int, nonzero: Int, maxAbs: Int, averageAbs: Int) {
+        var sampleCount = 0
+        var nonzero = 0
+        var maxAbs = 0
+        var absoluteTotal: Int64 = 0
+        pcm.withUnsafeBytes { rawBuffer in
+            let samples = rawBuffer.bindMemory(to: Int16.self)
+            sampleCount = samples.count
+            for sample in samples {
+                let absolute = abs(Int(sample))
+                if absolute > 0 {
+                    nonzero += 1
+                }
+                maxAbs = max(maxAbs, absolute)
+                absoluteTotal += Int64(absolute)
+            }
+        }
+        let averageAbs = sampleCount > 0 ? Int(absoluteTotal / Int64(sampleCount)) : 0
+        return (sampleCount, nonzero, maxAbs, averageAbs)
     }
 
     private func sourcePATPacket() -> Data {
@@ -2199,6 +2410,17 @@ final class MiLinkPhoneRelayProbe {
     private static let sourceRTPRequestArmDurationSeconds: TimeInterval = 15
     private static let sourceRTPMaxArmDurationSeconds: TimeInterval = 120
     private static let sourceRTPSSRC: UInt32 = 0xed9e_1101
+    private static let sourceMPEGTSPacketsPerRTPPacket = 5
+    private static let sourceMPEGTSOutputArguments = [
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        "-flush_packets", "1",
+        "-mpegts_start_pid", "4352",
+        "-mpegts_pmt_start_pid", "4096",
+        "-pes_payload_size", "320",
+        "-f", "mpegts",
+        "pipe:1"
+    ]
     private static let sourcePCMBytesPerFrame = 320
     private static let sourcePCMFrameDurationMicroseconds: UInt64 = 20_000
     private static let sourcePCMFormatIntervalFrames = 50
@@ -2229,11 +2451,14 @@ final class MiLinkPhoneRelayProbe {
 private enum SourceRTPAudioMode: String {
     case silent
     case microphone
+    case tone
 
     init(defaultsValue: String?) {
         switch defaultsValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "mic", "microphone", "input", "mac_microphone", "mac-microphone":
             self = .microphone
+        case "tone", "beep", "sine":
+            self = .tone
         case "silent", "off", "none", "disabled":
             self = .silent
         default:

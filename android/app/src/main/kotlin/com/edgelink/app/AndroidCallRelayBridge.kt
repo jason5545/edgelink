@@ -37,6 +37,8 @@ import kotlin.math.abs
 object AndroidCallRelayBridge {
     private const val DEFAULT_LOCAL_RTSP_PORT = 7_102
     private const val DEFAULT_LOCAL_SINK_RTSP_PORT = 15_550
+    private const val RTSP_KICKSTART_DELAY_MS = 800L
+    private const val RTSP_PLAY_RESPONSE_TIMEOUT_MS = 2_500L
     private const val ANDROID_TO_MAC = "android_to_mac"
     private const val MAC_TO_ANDROID = "mac_to_android"
 
@@ -139,6 +141,7 @@ object AndroidCallRelayBridge {
                 }
             }
             sendStatus("bridge_starting")
+            AndroidDistAudioUplinkForwarder.start(reason = startReason)
             try {
                 localBridge.run()
             } catch (error: CancellationException) {
@@ -146,11 +149,12 @@ object AndroidCallRelayBridge {
             } catch (error: Throwable) {
                 EdgeLinkLog.warn(
                     "callrelay.android.bridge_failed sessionId=$relaySessionId reason=$startReason " +
-                        "error=${error.javaClass.simpleName}:${error.message.orEmpty()}",
+                            "error=${error.javaClass.simpleName}:${error.message.orEmpty()}",
                     error
                 )
                 sendStatus("bridge_failed")
             } finally {
+                AndroidDistAudioUplinkForwarder.stop(reason = "bridge_exit")
                 sourceRTPQueue.close()
                 sourceRTPJob.cancelAndJoin()
                 sendStatus("source_stop")
@@ -181,10 +185,11 @@ object AndroidCallRelayBridge {
             if (packet == null) {
                 EdgeLinkLog.warn(
                     "callrelay.android.source_rtp_cloudflare_invalid sessionId=$relaySessionId " +
-                        "count=$sourceRtpPackets"
+                            "count=$sourceRtpPackets"
                 )
                 return
             }
+            AndroidDistAudioUplinkForwarder.handleSourceRTP(packet)
             localBridge.sendSourceRTP(packet)
         }
 
@@ -243,6 +248,7 @@ object AndroidCallRelayBridge {
         private var sentOptions = false
         private var sentSinkSETUP = false
         private var sentPLAY = false
+        private var playSentAtMs = 0L
         private var sessionHeader: String? = null
         private var presentationURL: String? = null
         private var rtpPackets = 0
@@ -305,6 +311,7 @@ object AndroidCallRelayBridge {
             sentOptions = false
             sentSinkSETUP = false
             sentPLAY = false
+            playSentAtMs = 0L
             sessionHeader = null
             presentationURL = null
         }
@@ -352,7 +359,25 @@ object AndroidCallRelayBridge {
         private suspend fun readRTSPLoop() {
             val input = checkNotNull(socket).getInputStream()
             val scratch = ByteArray(4096)
+            val connectedAt = android.os.SystemClock.elapsedRealtime()
+            var receivedAny = false
             while (currentCoroutineContext().isActive) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (!receivedAny && !sentOptions && now - connectedAt >= RTSP_KICKSTART_DELAY_MS) {
+                    EdgeLinkLog.info(
+                        "callrelay.android.local_rtsp_kickstart sessionId=$relaySessionId"
+                    )
+                    sendOptionsIfNeeded("connect_kickstart")
+                }
+                if (sentPLAY && playSentAtMs > 0 &&
+                    pendingRequests.containsValue("PLAY") &&
+                    now - playSentAtMs >= RTSP_PLAY_RESPONSE_TIMEOUT_MS
+                ) {
+                    EdgeLinkLog.info(
+                        "callrelay.android.local_rtsp_play_timeout sessionId=$relaySessionId"
+                    )
+                    throw java.io.IOException("RTSP PLAY response timeout")
+                }
                 val read = try {
                     withContext(Dispatchers.IO) { input.read(scratch) }
                 } catch (_: SocketTimeoutException) {
@@ -362,6 +387,7 @@ object AndroidCallRelayBridge {
                     return
                 }
                 if (read > 0) {
+                    receivedAny = true
                     processTCPData(scratch.copyOf(read))
                 }
             }
@@ -544,6 +570,7 @@ object AndroidCallRelayBridge {
                 return
             }
             sentPLAY = true
+            playSentAtMs = android.os.SystemClock.elapsedRealtime()
             val headers = sessionHeader?.let { listOf("Session" to it) } ?: emptyList()
             sendRTSPRequest(
                 method = "PLAY",
@@ -1006,7 +1033,7 @@ object AndroidCallRelayBridge {
             }
             sentGetParameters = true
             val body = listOf(
-                "wfd_audio_codecs_v2",
+                "wfd_audio_codecs",
                 "audio_sample_time_ms",
                 "wfd_client_rtp_ports",
                 "wfd_content_protection"
@@ -1034,11 +1061,9 @@ object AndroidCallRelayBridge {
             sentSelectedParameters = true
             val body = listOf(
                 "wfd_video_formats: none",
-                // Xiaomi's v2 table maps type 0 / index 3 to LPCM, 8 kHz,
-                // 16-bit, mono. This must match the Mac microphone RTP stream.
-                // The legacy AAC selection makes the native sink configure
-                // itself for 48 kHz stereo and silently render zero audio.
-                "wfd_audio_codecs_v2: $CALL_AUDIO_CODEC_V2_SELECTION",
+                // Match the last known-good Mac microphone path: ffmpeg emits
+                // AAC-LC in MPEG-TS and Cloudflare transports the RTP unchanged.
+                "wfd_audio_codecs: AAC 00000001 00",
                 "audio_sample_time_ms: 20",
                 "wfd_client_rtp_ports: RTP/AVP/UDP;unicast $sinkPort 0 mode=play",
                 "wfd_content_protection: none",
@@ -1343,7 +1368,6 @@ private const val MAX_PENDING_SOURCE_RTP_PACKETS = 150
 private const val SOURCE_RTP_QUEUE_CAPACITY = 50
 private const val RTCP_REPORT_INTERVAL_MS = 1_000L
 private const val NTP_UNIX_EPOCH_OFFSET_SECONDS = 2_208_988_800L
-private const val CALL_AUDIO_CODEC_V2_SELECTION = "0 3"
 private val CRLFCRLF = byteArrayOf(13, 10, 13, 10)
 
 private fun preferredLocalIPv4Address(): String? =
