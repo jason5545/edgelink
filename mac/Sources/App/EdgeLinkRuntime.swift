@@ -202,9 +202,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.handleXiaomiMirrorRTSPRecoveryRequired(event)
             }
         }
-        xiaomiMirrorRTSPDiagnosticSource.onPeerStop = { [weak self] reason, sessionID in
+        xiaomiMirrorRTSPDiagnosticSource.onPeerStop = { [weak self] reason, sessionID, generation in
             Task { @MainActor in
-                self?.handleXiaomiMirrorPeerStop(reason: reason, sessionID: sessionID)
+                self?.handleXiaomiMirrorPeerStop(
+                    reason: reason,
+                    sessionID: sessionID,
+                    generation: generation
+                )
             }
         }
         xiaomiMirrorRTSPDiagnosticSource.onCloudflareMirrorOutboundDatagram = { [weak self] packet, sessionId in
@@ -403,6 +407,10 @@ final class EdgeLinkRuntime: ObservableObject {
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
+            if xiaomiMirrorRTSPDiagnosticSource.hasActiveSession() {
+                stopXiaomiMirrorRTSPDiagnosticSource(reason: "screen_route_recall")
+                DiagnosticsLog.info("xiaomi.mac.screen_recall_previous_session_stopped")
+            }
             let cloudflareMirrorSessionId = startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: "manual_start")
             xiaomiScreenUserStopped = false
             resetXiaomiScreenRecoveryState(reason: "manual_start")
@@ -1426,7 +1434,14 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
-    private func handleXiaomiMirrorPeerStop(reason: String, sessionID: UUID) {
+    private func handleXiaomiMirrorPeerStop(reason: String, sessionID: UUID, generation: UInt64) {
+        guard xiaomiMirrorRTSPDiagnosticSource.shouldHonorPeerStop(generation: generation) else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_peer_stop_ignored session=\(sessionID.uuidString) reason=\(reason) " +
+                    "generation=\(generation) cause=stale_or_replaced_session"
+            )
+            return
+        }
         stopXiaomiScreenRouteForUser(reason: reason)
         screenSession.hideWindowAndStop(sendRemoteStop: false)
         isPhoneScreenSessionActive = false

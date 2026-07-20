@@ -94,7 +94,7 @@ private struct XiaomiMirrorHEVCParameterSets {
 final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onRecoveryRequired: ((XiaomiMirrorRTSPRecoveryEvent) -> Void)?
-    var onPeerStop: ((String, UUID) -> Void)?
+    var onPeerStop: ((String, UUID, UInt64) -> Void)?
     var onCloudflareMirrorOutboundDatagram: ((Data, String) -> Void)?
 
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
@@ -103,6 +103,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private var listenerReady = false
     private var connections: [UUID: NWConnection] = [:]
     private var states: [UUID: RTSPConnectionState] = [:]
+    private var sessionLifecycle = SessionLifecycleFence<UUID>()
     private var stopWorkItem: DispatchWorkItem?
     private var activeClientRetryWorkItems: [UUID: DispatchWorkItem] = [:]
     private var rtspKeepaliveWorkItems: [UUID: DispatchWorkItem] = [:]
@@ -137,6 +138,18 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
 
     func isListenerReady() -> Bool {
         performOnQueue { listenerReady }
+    }
+
+    func hasActiveSession() -> Bool {
+        performOnQueue {
+            sessionLifecycle.hasActiveSessions || cloudflareMirrorReceiver != nil
+        }
+    }
+
+    func shouldHonorPeerStop(generation: UInt64) -> Bool {
+        performOnQueue {
+            sessionLifecycle.shouldHonorStop(from: generation)
+        }
     }
 
     func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
@@ -415,6 +428,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         state.activeClientRetryAttempt = retryAttempt
         connections[id] = connection
         states[id] = state
+        sessionLifecycle.register(id)
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.active_client_start id=\(id.uuidString) host=\(trimmedHost) port=\(port) " +
                 "advertisedHost=\(self.advertisedHost ?? "none") lifetime=\(Int(lifetime)) retryAttempt=\(retryAttempt) " +
@@ -429,6 +443,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
 
     private func stopOnQueue(reason: String) {
         let hadListener = listener != nil || !connections.isEmpty
+        sessionLifecycle.reset()
         stopWorkItem?.cancel()
         stopWorkItem = nil
         for workItem in activeClientRetryWorkItems.values {
@@ -443,7 +458,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         listener = nil
         listenerReady = false
         for state in states.values {
-            state.mediaSender?.stop(reason: "rtsp_listener_\(reason)")
+            state.mediaSender?.stopAndWait(reason: "rtsp_listener_\(reason)")
             state.timerSyncClient?.stop(reason: "rtsp_listener_\(reason)")
         }
         stopCloudflareMirrorRTPReceiverOnQueue(reason: reason)
@@ -495,6 +510,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         var state = RTSPConnectionState()
         state.mode = "listener"
         states[id] = state
+        sessionLifecycle.register(id)
         DiagnosticsLog.info(
             "xiaomi.mirror.rtsp.connection id=\(id.uuidString) endpoint=\(Self.endpointDescription(connection.endpoint))"
         )
@@ -722,12 +738,17 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             if isOfficialMPTRoute {
                 switch triggerMethod {
                 case "TEARDOWN":
+                    let peerStopGeneration = sessionLifecycle.generation
                     DiagnosticsLog.info(
                         "xiaomi.mirror.rtsp.peer_trigger_teardown id=\(id.uuidString) " +
                             "officialAction=stop_sink"
                     )
-                    onPeerStop?("peer_trigger_teardown", id)
                     cleanupConnection(id: id, reason: "peer_trigger_teardown")
+                    notifyPeerStopIfCurrent(
+                        reason: "peer_trigger_teardown",
+                        id: id,
+                        generation: peerStopGeneration
+                    )
                     return
                 case "PAUSE":
                     DiagnosticsLog.info(
@@ -762,8 +783,13 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             sendResponse(id: id, connection: connection, cseq: message.cseq, session: session(for: id))
             stopMediaIfNeeded(id: id, reason: method.lowercased())
             if method == "TEARDOWN" {
-                onPeerStop?("peer_rtsp_teardown", id)
+                let peerStopGeneration = sessionLifecycle.generation
                 cleanupConnection(id: id)
+                notifyPeerStopIfCurrent(
+                    reason: "peer_rtsp_teardown",
+                    id: id,
+                    generation: peerStopGeneration
+                )
             }
         default:
             DiagnosticsLog.warn(
@@ -1637,7 +1663,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         guard var state = states[id], let sender = state.mediaSender else {
             return
         }
-        sender.stop(reason: reason)
+        sender.stopAndWait(reason: reason)
         state.mediaSender = nil
         state.timerSyncClient?.stop(reason: reason)
         state.timerSyncClient = nil
@@ -2126,6 +2152,19 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         connections[id]?.cancel()
         connections.removeValue(forKey: id)
         states.removeValue(forKey: id)
+        sessionLifecycle.remove(id)
+    }
+
+    private func notifyPeerStopIfCurrent(reason: String, id: UUID, generation: UInt64) {
+        guard sessionLifecycle.shouldHonorStop(from: generation) else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.rtsp.peer_stop_ignored id=\(id.uuidString) reason=\(reason) " +
+                    "eventGeneration=\(generation) currentGeneration=\(sessionLifecycle.generation) " +
+                    "activeSessions=\(sessionLifecycle.activeSessionCount)"
+            )
+            return
+        }
+        onPeerStop?(reason, id, generation)
     }
 
     private func scheduleAutoStop(lifetime: TimeInterval) {
@@ -2882,6 +2921,15 @@ private final class XiaomiMirrorRTPMediaSender {
         queue.async {
             self.stopOnQueue(reason: reason)
         }
+    }
+
+    func stopAndWait(reason: String) {
+        queue.sync {
+            self.stopOnQueue(reason: reason)
+        }
+        // Dispatch source cancellation closes the MPT socket on this same queue.
+        // A second barrier makes the port reusable before a replacement session starts.
+        queue.sync {}
     }
 
     func startExternalRTPReceiver(reason: String) {
