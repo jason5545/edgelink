@@ -7,7 +7,9 @@ public final class LyraMeshSocket: @unchecked Sendable {
         case invalidEndpoint
     }
 
-    public var onFrame: ((LyraMeshPack.Frame, NWEndpoint) -> Void)?
+    public typealias ReplyHandler = (LyraMeshPack.Frame) throws -> Void
+
+    public var onFrame: ((LyraMeshPack.Frame, NWEndpoint, ReplyHandler) -> Void)?
     public var onRawDatagram: ((Data, NWEndpoint) -> Void)?
     public var onStateChanged: ((NWListener.State) -> Void)?
 
@@ -81,8 +83,12 @@ public final class LyraMeshSocket: @unchecked Sendable {
             newConnection.start(queue: queue)
             connection = newConnection
         }
-        let datagram = try LyraMeshPack.encode(frame)
+        let datagram = LyraMeshDatagram.encode(tick: Self.tick(), payload: try LyraMeshPack.encode(frame))
         connection.send(content: datagram, completion: .idempotent)
+    }
+
+    public static func tick() -> UInt32 {
+        UInt32(DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
     private func accept(_ connection: NWConnection) {
@@ -107,8 +113,17 @@ public final class LyraMeshSocket: @unchecked Sendable {
             if let content, !content.isEmpty {
                 let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
                 self.onRawDatagram?(content, endpoint)
-                if let decoded = try? LyraMeshPack.decode(content) {
-                    self.onFrame?(decoded.frame, endpoint)
+                if let payload = try? LyraMeshDatagram.decode(content),
+                   let decoded = try? LyraMeshPack.decode(payload)
+                {
+                    let reply: ReplyHandler = { responseFrame in
+                        let datagram = LyraMeshDatagram.encode(
+                            tick: Self.tick(),
+                            payload: try LyraMeshPack.encode(responseFrame)
+                        )
+                        connection.send(content: datagram, completion: .idempotent)
+                    }
+                    self.onFrame?(decoded.frame, endpoint, reply)
                 }
             }
             if error == nil {

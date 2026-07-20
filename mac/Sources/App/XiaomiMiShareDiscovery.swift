@@ -39,6 +39,7 @@ final class XiaomiMiShareDiscovery: NSObject {
 
     private let browser = NetServiceBrowser()
     private let meshSocket = LyraMeshSocket()
+    private var meshResponder: LyraMeshResponder?
     private var lyraPublisher: XiaomiLyraMDNSPublisher?
     private var discoveredServices: [String: NetService] = [:]
     private var peersByServiceName: [String: XiaomiMiShareDiscoveredPeer] = [:]
@@ -95,15 +96,16 @@ final class XiaomiMiShareDiscovery: NSObject {
         meshSocket.onRawDatagram = { datagram, endpoint in
             DiagnosticsLog.info(
                 "xiaomi.mishare.mesh_rx endpoint=\(endpoint.debugDescription) bytes=\(datagram.count) " +
-                    "hex=\(datagram.prefix(64).map { String(format: "%02x", $0) }.joined())"
+                    "hex=\(datagram.prefix(512).map { String(format: "%02x", $0) }.joined())"
             )
         }
-        meshSocket.onFrame = { frame, endpoint in
-            DiagnosticsLog.info(
-                "xiaomi.mishare.mesh_frame endpoint=\(endpoint.debugDescription) packType=\(frame.packType) " +
-                    "ext=\(frame.extendedHeader.count) payload=\(frame.payload.count)"
-            )
-        }
+        let responder = LyraMeshResponder(
+            socket: meshSocket,
+            deviceIdHexProvider: { [weak self] in self?.publishedDeviceIdHex },
+            displayNameProvider: { [weak self] in self?.publishedDisplayName ?? "EdgeLink Mac" }
+        )
+        responder.attach()
+        meshResponder = responder
         meshSocket.onStateChanged = { [weak self] state in
             DiagnosticsLog.info("xiaomi.mishare.mesh_socket_state state=\(String(describing: state))")
             guard let self, case .ready = state else { return }

@@ -146,3 +146,66 @@ Inner message field detail (partially recovered, to be completed):
 5. Whether the phone accepts a UDP mesh from a Mac AppData peer without any
    account — Phase 0.3 on-device test.
 6. LogiConnFrame fields 2/3/4 semantics (net ids, flag) — confirm with live capture.
+
+## Live-session findings (2026-07-20 evening)
+
+### UDP mesh = KCP
+
+The 24-byte outer header on the mesh UDP socket is a standard KCP header:
+`conv=0x12345678` (fixed magic, validated by
+`MiplayTransportSession::CheckFirstPacket`), `cmd` 0x51=IKCP_CMD_PUSH /
+0x52=IKCP_CMD_ACK, `frg`, `wnd=0x1000`, `ts`, `sn`, `una`, `len`.
+Payload = TransPackMesh frame as documented above. The phone KCP-ACKs our
+replies → transport accepted; failures are application-layer.
+
+### PhysConn sync exchange (observed live)
+
+Phone → Mac: PhysConnFrame{1: phys_conn_id (random u32), 2: 1 (=role client),
+3: PhysConnSyncDeviceInfoRequestFrame{1: ts_ms, 2: DeviceInfo, 3: 256, 5: 128,
+6: NetworkInfo{1: 256, 2: 56, 3: 1, 5: ""}, 7: {}}}.
+Expected reply (from `PhysConnProtocol::SetSyncDeviceInfoResponseFrame`
+0x1d04e4 + `ConvertToPb` 0x1d0670 + response serializer 0x20b404):
+MiConnectFrame.version=0; PhysConnFrame{1: same phys_conn_id, 2: 2 (role server),
+4: PhysConnSyncDeviceInfoResponseFrame{1: ts_ms, 2: DeviceInfo, 3: u32, 4: string,
+5: u32, 6: repeated NetworkInfo}}.
+
+DeviceInfo field map (live + serializer):
+2: device_id string, 3: device_type (1=phone, 14=MacBook), 4: uid hash ASCII
+("61F2"), 5: varint flag=1, 6: display_name, 8: os version string ("OS3.0"),
+9: conn_medium_types bitmask (phone: 0x410A3), 10: submsg {1: fixed32},
+11: rom version string, 12: submsg {1: 1}.
+
+### Trust injection works; link addr is the current blocker
+
+- Xposed hook `hookMiShareLyraTrustInjection` (MiLinkPrivilegeXposedHook.kt)
+  captures MiShare's ServiceListener via NetworkingManager.addServiceListener and
+  injects synthetic onServiceOnline (config JSON
+  /data/local/tmp/edgelink-mishare-inject.json). Phone MiShare UI lists our Mac. ✅
+- The native stack also accepts our ad as same-account trusted because our AppData
+  replays the phone's own uid-hash bytes ("61F2") — `trusted_types=1`,
+  `DeviceManager::AddDeviceInfo` fires. ✅
+- PhysConn sync request/response completes (KCP ACKs). ✅
+- Channel open then fails: `onChannelCreateFailed err_code=15011`,
+  `LogiStateRequestIdle::CheckConnReuseAndConflict: "logical conn no device
+  link addr"` — the LogiConn layer has NO link address for us.
+  Root cause: our mDNS ad lacks the `DebugInfo`/`MediumType`/`CH` TXT keys.
+  Phone ads carry `DebugInfo={msg:hello, ifname:wlan0, v4:<obfuscated-ip>,
+  v6:<obfuscated-ip>}` — the link addr comes from there.
+
+### DebugInfo IP obfuscation — PrivacyUtils::EncryptIpAddr (libmicontinuity 0xeae9e8)
+
+For the substring strictly between the first and last separator ('.' for v4,
+':' for v6): every digit char c (0x30-0x39) is replaced with c-0x0D.
+Example: "10.5.51.78" → "10." + "(.($" + ".78". A per-process random bit
+(offset 0x1005a58) gates whether obfuscation is applied at all, so plain IPs
+also appear in the wild — we can publish plain IPs first.
+
+### Log access
+
+- `adb logcat -d | grep "EdgeLinkMiLinkHook"` (module logs route through tag
+  VectorLegacyBridge on this ROM's Vector Xposed variant — `logcat -s` does NOT work).
+- Native lyra logs: tag prefixes lyra-*; verbose level via
+  ContinuityRuntimeNative.nativeSetLogLevel(1), boosted from the
+  com.xiaomi.mi_connect_service hook.
+- Mac mesh diagnostics: ~/Library/Application Support/EdgeLink/diagnostics.log,
+  keys xiaomi.mishare.mesh_rx / mesh_sync_request / mesh_sync_response.

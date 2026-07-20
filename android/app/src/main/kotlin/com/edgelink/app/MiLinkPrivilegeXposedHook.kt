@@ -405,6 +405,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(lpparam.packageName, lpparam.processName)) {
             hookMiConnectNetworkingPermission(lpparam.classLoader)
+            boostMiConnectNativeLogging(lpparam.classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookInCallUi(lpparam.packageName, lpparam.processName)) {
             hookInCallUiRelayExperiment(lpparam.classLoader)
@@ -6885,6 +6886,19 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 .getMethod("get", String::class.java, String::class.java)
                 .invoke(null, name, "") as? String
         }.getOrNull().orEmpty()
+
+    private fun boostMiConnectNativeLogging(classLoader: ClassLoader) {
+        runCatching {
+            val runtimeNative = XposedHelpers.findClass(
+                "com.xiaomi.continuity.nativelib.ContinuityRuntimeNative",
+                classLoader
+            )
+            XposedHelpers.callStaticMethod(runtimeNative, "nativeSetLogLevel", 1)
+            log("miconnect: native log level set to 1")
+        }.onFailure {
+            log("miconnect: set native log level failed: ${it.message}")
+        }
+    }
 
     private fun hookMiShareLyraTrustInjection(classLoader: ClassLoader) {
         runCatching {

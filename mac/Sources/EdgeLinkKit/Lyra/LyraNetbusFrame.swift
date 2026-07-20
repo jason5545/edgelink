@@ -445,3 +445,174 @@ public struct LogiConnInnerFrame: Equatable, Sendable {
         self.init(frameType: frameType, payload: payload)
     }
 }
+
+public enum LyraMeshDatagram {
+    public static let magic: UInt32 = 0x12345678
+    public static let headerWord: UInt32 = 0x10000051
+    public static let headerLength = 24
+
+    public enum DatagramError: Error, Equatable, Sendable {
+        case truncated
+        case badMagic
+    }
+
+    public static func encode(tick: UInt32, payload: Data) -> Data {
+        var data = Data(capacity: headerLength + payload.count)
+        data.append(contentsOf: [0x78, 0x56, 0x34, 0x12])
+        data.append(contentsOf: [0x51, 0x00, 0x00, 0x10])
+        data.append(contentsOf: [
+            UInt8(tick & 0xFF),
+            UInt8((tick >> 8) & 0xFF),
+            UInt8((tick >> 16) & 0xFF),
+            UInt8((tick >> 24) & 0xFF)
+        ])
+        data.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+        let length = UInt32(payload.count)
+        data.append(contentsOf: [
+            UInt8(length & 0xFF),
+            UInt8((length >> 8) & 0xFF),
+            UInt8((length >> 16) & 0xFF),
+            UInt8((length >> 24) & 0xFF)
+        ])
+        data.append(payload)
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> Data {
+        let bytes = Array(data)
+        guard bytes.count >= headerLength else {
+            throw DatagramError.truncated
+        }
+        guard bytes[0] == 0x78, bytes[1] == 0x56, bytes[2] == 0x34, bytes[3] == 0x12 else {
+            throw DatagramError.badMagic
+        }
+        let length = Int(bytes[20]) | (Int(bytes[21]) << 8) | (Int(bytes[22]) << 16) | (Int(bytes[23]) << 24)
+        guard bytes.count >= headerLength + length else {
+            throw DatagramError.truncated
+        }
+        return Data(bytes[headerLength..<(headerLength + length)])
+    }
+}
+
+public struct LyraDeviceInfo: Equatable, Sendable {
+    public var deviceId: String
+    public var deviceType: UInt32
+    public var uidHash: String
+    public var displayName: String
+    public var osVersion: String
+    public var connMediumTypes: UInt32
+    public var romVersion: String
+
+    public init(
+        deviceId: String,
+        deviceType: UInt32,
+        uidHash: String,
+        displayName: String,
+        osVersion: String,
+        connMediumTypes: UInt32,
+        romVersion: String
+    ) {
+        self.deviceId = deviceId
+        self.deviceType = deviceType
+        self.uidHash = uidHash
+        self.displayName = displayName
+        self.osVersion = osVersion
+        self.connMediumTypes = connMediumTypes
+        self.romVersion = romVersion
+    }
+
+    public func serialized() -> Data {
+        var data = Data()
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(deviceId.utf8), to: &data)
+        LyraProtoWriter.appendVarintField(3, value: UInt64(deviceType), to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(4, value: Data(uidHash.utf8), to: &data)
+        LyraProtoWriter.appendVarintField(5, value: 1, to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(6, value: Data(displayName.utf8), to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(8, value: Data(osVersion.utf8), to: &data)
+        LyraProtoWriter.appendVarintField(9, value: UInt64(connMediumTypes), to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(11, value: Data(romVersion.utf8), to: &data)
+        var wifiCapabilities = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &wifiCapabilities)
+        LyraProtoWriter.appendLengthDelimitedField(12, value: wifiCapabilities, to: &data)
+        return data
+    }
+}
+
+public struct PhysConnSyncDeviceInfoResponse: Equatable, Sendable {
+    public var timestampMs: UInt64
+    public var deviceInfo: LyraDeviceInfo
+    public var field3: UInt32
+    public var field5: UInt32
+    public var networkInfo: Data?
+
+    public init(timestampMs: UInt64, deviceInfo: LyraDeviceInfo, field3: UInt32 = 256, field5: UInt32 = 128, networkInfo: Data? = nil) {
+        self.timestampMs = timestampMs
+        self.deviceInfo = deviceInfo
+        self.field3 = field3
+        self.field5 = field5
+        self.networkInfo = networkInfo
+    }
+
+    public func serialized() -> Data {
+        var data = Data()
+        LyraProtoWriter.appendVarintField(1, value: timestampMs, to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: deviceInfo.serialized(), to: &data)
+        LyraProtoWriter.appendVarintField(3, value: UInt64(field3), to: &data)
+        LyraProtoWriter.appendVarintField(5, value: UInt64(field5), to: &data)
+        if let networkInfo {
+            LyraProtoWriter.appendLengthDelimitedField(6, value: networkInfo, to: &data)
+        }
+        return data
+    }
+}
+
+public struct PhysConnSyncDeviceInfoRequest: Equatable, Sendable {
+    public let timestampMs: UInt64
+    public let deviceId: String?
+    public let deviceType: UInt32?
+    public let connMediumTypes: UInt32?
+    public let rawDeviceInfo: Data
+    public let trailingFields: [LyraProtoReader.Field]
+
+    public init?(parsing data: Data) {
+        guard let fields = try? LyraProtoReader.readFields(from: data) else {
+            return nil
+        }
+        var timestampMs: UInt64 = 0
+        var deviceId: String?
+        var deviceType: UInt32?
+        var connMediumTypes: UInt32?
+        var rawDeviceInfo = Data()
+        var trailing: [LyraProtoReader.Field] = []
+        for field in fields {
+            switch (field.number, field.wireType) {
+            case (1, 0):
+                timestampMs = field.varintValue ?? 0
+            case (2, 2):
+                rawDeviceInfo = field.lengthDelimitedValue ?? Data()
+                if let deviceFields = try? LyraProtoReader.readFields(from: rawDeviceInfo) {
+                    for deviceField in deviceFields {
+                        switch (deviceField.number, deviceField.wireType) {
+                        case (2, 2):
+                            deviceId = deviceField.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) }
+                        case (3, 0):
+                            deviceType = UInt32(deviceField.varintValue ?? 0)
+                        case (9, 0):
+                            connMediumTypes = UInt32(deviceField.varintValue ?? 0)
+                        default:
+                            continue
+                        }
+                    }
+                }
+            default:
+                trailing.append(field)
+            }
+        }
+        self.timestampMs = timestampMs
+        self.deviceId = deviceId
+        self.deviceType = deviceType
+        self.connMediumTypes = connMediumTypes
+        self.rawDeviceInfo = rawDeviceInfo
+        self.trailingFields = trailing
+    }
+}
