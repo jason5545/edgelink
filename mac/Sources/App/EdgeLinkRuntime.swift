@@ -2496,7 +2496,7 @@ final class EdgeLinkRuntime: ObservableObject {
                         guard let self else {
                             return
                         }
-                        if media.kind == "rtp" {
+                        if media.kind == "rtp" || media.kind == "rtp_batch" {
                             xiaomiMirrorRTSPDiagnosticSource.handleCloudflareMirrorMedia(media)
                             return
                         }
@@ -2541,6 +2541,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 isConnected = true
                 connectionStatus = "Connected"
                 retryDelay = 1_000_000_000
+                resumeXiaomiMirrorAfterReconnectIfNeeded()
 
                 let clipboardTask = Task { await clipboardLoop(session: session) }
                 let notificationTask = Task { await macNotificationLoop(identity: identity, session: session) }
@@ -2599,6 +2600,18 @@ final class EdgeLinkRuntime: ObservableObject {
         if isConnected {
             connectionStatus = "Connected"
         }
+    }
+
+    private func resumeXiaomiMirrorAfterReconnectIfNeeded() {
+        guard isPhoneScreenSessionActive, !xiaomiScreenUserStopped else {
+            return
+        }
+        DiagnosticsLog.info("xiaomi.mac.screen_resume_after_reconnect")
+        xiaomiScreenRecoveryTask?.cancel()
+        xiaomiScreenRecoveryTask = nil
+        isPhoneScreenSessionActive = false
+        isPhoneScreenViewerVisible = false
+        viewPhoneScreen(allowRouteDeferral: false)
     }
 
     private func secureKeepaliveLoop(

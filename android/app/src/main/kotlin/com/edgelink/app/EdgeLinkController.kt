@@ -578,14 +578,28 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun startCallRelayBridge(body: PhoneActionBody, reason: String) {
         AndroidCallRelayBridge.start(body, reason) { media ->
             val activeSession = session ?: return@start
-            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.PHONE_RELAY_MEDIA, media))
+            runCatching {
+                activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.PHONE_RELAY_MEDIA, media))
+            }.onFailure { error ->
+                EdgeLinkLog.warn(
+                    "callrelay.android.media_send_failed kind=${media.kind} " +
+                        "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
         }
     }
 
     private fun startMiLinkMirrorCloudBridge(request: AndroidMiLinkMirrorCloudBridgeRequest) {
         AndroidMiLinkMirrorMediaBridge.start(request) { media: MiLinkMirrorMediaBody ->
             val activeSession = session ?: return@start
-            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_MIRROR_MEDIA, media))
+            runCatching {
+                activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_MIRROR_MEDIA, media))
+            }.onFailure { error ->
+                EdgeLinkLog.warn(
+                    "xiaomi.mirror.android.cloudflare_media_send_failed kind=${media.kind} " +
+                        "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
         }
     }
 

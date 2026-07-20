@@ -32,6 +32,9 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val DEFAULT_LOCAL_RTSP_PORT = 7_102
     private const val RTSP_KICKSTART_DELAY_MS = 800L
     private const val RTSP_PLAY_RESPONSE_TIMEOUT_MS = 2_500L
+    private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
+    private const val RTP_BATCH_MAX_DELAY_MS = 10L
+    private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
     private const val ANDROID_TO_MAC = "android_to_mac"
     private const val MAC_TO_ANDROID = "mac_to_android"
     private const val OFFICIAL_RTSP_USER_AGENT = "stagefright/1.1 (Linux;Android 4.1)"
@@ -57,8 +60,17 @@ object AndroidMiLinkMirrorMediaBridge {
             .distinct()
         scope.launch {
             lifecycleMutex.withLock {
-                if (activeSessionId == sessionId && activeJob?.isActive == true) {
-                    EdgeLinkLog.info("xiaomi.mirror.android.cloudflare_bridge_reuse sessionId=$sessionId")
+                val existing = activeSession
+                if (existing != null && activeJob?.isActive == true) {
+                    if (activeSessionId == sessionId) {
+                        EdgeLinkLog.info("xiaomi.mirror.android.cloudflare_bridge_reuse sessionId=$sessionId")
+                        return@withLock
+                    }
+                    existing.retarget(sessionId, sendMedia)
+                    activeSessionId = sessionId
+                    EdgeLinkLog.info(
+                        "xiaomi.mirror.android.cloudflare_bridge_adopt sessionId=$sessionId reason=${request.reason}"
+                    )
                     return@withLock
                 }
                 activeJob?.cancelAndJoin()
@@ -110,11 +122,28 @@ object AndroidMiLinkMirrorMediaBridge {
     }
 
     private class MirrorMediaBridgeSession(
-        private val sessionId: String,
+        sessionId: String,
         private val localRtspPorts: List<Int>,
         private val startReason: String,
-        private val sendMedia: suspend (MiLinkMirrorMediaBody) -> Unit
+        sendMedia: suspend (MiLinkMirrorMediaBody) -> Unit
     ) {
+        @Volatile
+        private var sessionId: String = sessionId
+
+        @Volatile
+        private var sendMedia: suspend (MiLinkMirrorMediaBody) -> Unit = sendMedia
+
+        private val rtpBatchQueue = kotlinx.coroutines.channels.Channel<ByteArray>(
+            capacity = RTP_BATCH_QUEUE_CAPACITY,
+            onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+        )
+        private var rtpBatchesSent = 0
+        private var rtpBatchDatagramsDropped = 0
+
+        fun retarget(newSessionId: String, newSendMedia: suspend (MiLinkMirrorMediaBody) -> Unit) {
+            sessionId = newSessionId
+            sendMedia = newSendMedia
+        }
         private val pendingRequests = mutableMapOf<String, String>()
         private val rtspCharset: Charset = Charsets.ISO_8859_1
         private var socket: Socket? = null
@@ -148,6 +177,7 @@ object AndroidMiLinkMirrorMediaBridge {
                     "port=${udp.localPort} reason=$startReason"
             )
             val udpJob = launch { receiveRTP(udp) }
+            val batchJob = launch { flushRTPBatches() }
             try {
                 while (currentCoroutineContext().isActive) {
                     try {
@@ -185,6 +215,8 @@ object AndroidMiLinkMirrorMediaBridge {
                 sendStatus("bridge_failed")
             } finally {
                 udpJob.cancel()
+                rtpBatchQueue.close()
+                batchJob.cancelAndJoin()
                 runCatching { udp.close() }
                 writer = null
                 socket = null
@@ -324,14 +356,62 @@ object AndroidMiLinkMirrorMediaBridge {
                             "bytes=${data.size} ${rtpSummary(data)} fp=${EdgeLinkLog.fingerprint(data)}"
                     )
                 }
+                if (rtpBatchQueue.trySend(data).isFailure) {
+                    rtpBatchDatagramsDropped += 1
+                    if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
+                        EdgeLinkLog.warn(
+                            "xiaomi.mirror.android.cloudflare_rtp_batch_queue_full sessionId=$sessionId " +
+                                "dropped=$rtpBatchDatagramsDropped"
+                        )
+                    }
+                }
+            }
+        }
+
+        private suspend fun flushRTPBatches() {
+            val scratch = java.io.ByteArrayOutputStream(RTP_BATCH_MAX_PAYLOAD_BYTES + 64)
+            var pending: ByteArray? = null
+            while (currentCoroutineContext().isActive) {
+                val first = pending ?: rtpBatchQueue.receiveCatching().getOrNull() ?: return
+                pending = null
+                scratch.reset()
+                var datagrams = 0
+                var payloadBytes = 0
+                var next: ByteArray? = first
+                while (next != null) {
+                    if (payloadBytes + next.size + 2 > RTP_BATCH_MAX_PAYLOAD_BYTES && datagrams > 0) {
+                        pending = next
+                        break
+                    }
+                    scratch.write(next.size shr 8 and 0xff)
+                    scratch.write(next.size and 0xff)
+                    scratch.write(next)
+                    payloadBytes += next.size + 2
+                    datagrams += 1
+                    next = kotlinx.coroutines.withTimeoutOrNull(RTP_BATCH_MAX_DELAY_MS) {
+                        rtpBatchQueue.receiveCatching().getOrNull()
+                    }
+                }
+                if (datagrams == 0) {
+                    continue
+                }
+                val packed = scratch.toByteArray()
+                rtpBatchesSent += 1
+                if (rtpBatchesSent == 1 || rtpBatchesSent % 100 == 0) {
+                    EdgeLinkLog.info(
+                        "xiaomi.mirror.android.cloudflare_rtp_batch_out sessionId=$sessionId " +
+                            "count=$rtpBatchesSent datagrams=$datagrams bytes=${packed.size} " +
+                            "fp=${EdgeLinkLog.fingerprint(packed)}"
+                    )
+                }
                 sendMedia(
                     MiLinkMirrorMediaBody(
                         sessionId = sessionId,
                         direction = ANDROID_TO_MAC,
-                        kind = "rtp",
-                        dataBase64 = Base64.getEncoder().encodeToString(data),
-                        bytes = data.size,
-                        sequence = rtpPackets,
+                        kind = "rtp_batch",
+                        dataBase64 = Base64.getEncoder().encodeToString(packed),
+                        bytes = packed.size,
+                        sequence = rtpBatchesSent,
                         ts = System.currentTimeMillis()
                     )
                 )

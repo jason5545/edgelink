@@ -263,7 +263,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             return
         }
         guard body.direction == "android_to_mac",
-              body.kind == "rtp",
+              body.kind == "rtp" || body.kind == "rtp_batch",
               let dataBase64 = body.dataBase64,
               let packet = Data(base64Encoded: dataBase64),
               let receiver = cloudflareMirrorReceiver else {
@@ -278,8 +278,26 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             DiagnosticsLog.info(
                 "xiaomi.mirror.cloudflare.rtp_in sessionId=\(body.sessionId) " +
                     "count=\(cloudflareMirrorPacketsReceived) sequence=\(body.sequence.map(String.init) ?? "none") " +
-                    "bytes=\(packet.count) fp=\(DiagnosticsLog.fingerprint(packet))"
+                    "bytes=\(packet.count) kind=\(body.kind) fp=\(DiagnosticsLog.fingerprint(packet))"
             )
+        }
+        if body.kind == "rtp_batch" {
+            var offset = 0
+            while offset + 2 <= packet.count,
+                  let datagramLength = packet.readUInt16BE(at: offset),
+                  offset + 2 + Int(datagramLength) <= packet.count {
+                let start = offset + 2
+                let end = start + Int(datagramLength)
+                receiver.pushExternalRTPPacket(packet.subdata(in: start..<end), sequence: body.sequence)
+                offset = end
+            }
+            if offset != packet.count {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.cloudflare.rtp_batch_malformed sessionId=\(body.sessionId) " +
+                        "bytes=\(packet.count) consumed=\(offset)"
+                )
+            }
+            return
         }
         receiver.pushExternalRTPPacket(packet, sequence: body.sequence)
     }
