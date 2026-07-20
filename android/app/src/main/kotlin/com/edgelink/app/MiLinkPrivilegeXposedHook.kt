@@ -55,6 +55,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MI_CONNECT_PROCESS = "com.xiaomi.mi_connect_service"
+    const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
     const val INCALLUI_PACKAGE = "com.android.incallui"
     const val INCALLUI_PROCESS = "com.android.incallui"
     const val ANDROID_PHONE_PACKAGE = "com.android.phone"
@@ -123,10 +124,14 @@ internal object MiLinkPrivilegeHookPolicy {
         shouldHookAndroidPhone(packageName, processName) ||
         shouldHookAndroidSystem(packageName, processName) ||
         shouldHookTelecomSystem(packageName, processName) ||
-        shouldHookAudioMonitor(packageName, processName)
+        shouldHookAudioMonitor(packageName, processName) ||
+        shouldHookMiShare(packageName, processName)
 
     fun shouldHookAudioMonitor(packageName: String?, processName: String?): Boolean =
         packageName == AUDIOMONITOR_PACKAGE
+
+    fun shouldHookMiShare(packageName: String?, processName: String?): Boolean =
+        packageName == XIAOMI_MISHARE_PACKAGE
 
     fun shouldHookRuntime(packageName: String?, processName: String?): Boolean =
         packageName == MILINK_PACKAGE && processName == MILINK_RUNTIME_PROCESS
@@ -415,6 +420,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(lpparam.packageName, lpparam.processName)) {
             hookAudioMonitorDistAudioRelay(lpparam.classLoader)
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookMiShare(lpparam.packageName, lpparam.processName)) {
+            hookMiShareLyraTrustInjection(lpparam.classLoader)
         }
     }
 
@@ -6877,6 +6885,62 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 .getMethod("get", String::class.java, String::class.java)
                 .invoke(null, name, "") as? String
         }.getOrNull().orEmpty()
+
+    private fun hookMiShareLyraTrustInjection(classLoader: ClassLoader) {
+        runCatching {
+            val runtimeNative = XposedHelpers.findClass(
+                "com.xiaomi.continuity.nativelib.ContinuityRuntimeNative",
+                classLoader
+            )
+            XposedHelpers.callStaticMethod(runtimeNative, "nativeSetLogLevel", 1)
+            log("mishare trust injection: native log level set to 1")
+        }.onFailure {
+            log("mishare trust injection: set native log level failed: ${it.message}")
+        }
+
+        val managerClass = runCatching {
+            XposedHelpers.findClass("com.xiaomi.continuity.networking.NetworkingManager", classLoader)
+        }.getOrNull()
+        if (managerClass == null) {
+            log("mishare trust injection: NetworkingManager not found, skip")
+            return
+        }
+
+        var hookedCount = 0
+        for (method in managerClass.declaredMethods) {
+            if (method.name != "addServiceListener" || method.parameterTypes.size != 2) {
+                continue
+            }
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val serviceListener = param.args[1] ?: return
+                    registerMiShareServiceListener(classLoader, param.args[0], serviceListener)
+                }
+            })
+            hookedCount += 1
+        }
+        log("mishare trust injection: addServiceListener hookedCount=$hookedCount")
+    }
+
+    private fun registerMiShareServiceListener(
+        classLoader: ClassLoader,
+        serviceFilter: Any?,
+        serviceListener: Any
+    ): Boolean {
+        val filterName = runCatching {
+            val serviceName = XposedHelpers.callMethod(serviceFilter, "getServiceFilter")
+            XposedHelpers.callMethod(serviceName, "getName") as? String
+        }.getOrNull()
+        log("mishare trust injection: addServiceListener filter=$filterName listener=$serviceListener")
+        if (filterName != MiShareTrustInjection.SERVICE_NAME) {
+            return false
+        }
+        log("mishare trust injection: captured listener=$serviceListener")
+        MiShareTrustInjection.registerListener(classLoader, serviceListener) { message ->
+            log("mishare trust injection: $message")
+        }
+        return true
+    }
 
     private fun log(message: String) {
         XposedBridge.log("EdgeLinkMiLinkHook: $message")

@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "device_id": "721572C3",
+  "device_name": "MacBook Pro",
+  "device_type": 14,
+  "medium_types": 128,
+  "trusted_types": 1,
+  "service_name": "miLyraShare",
+  "service_package": "com.edgelink.mac",
+  "service_data_b64": "AkEOchVyw2HyAAUZPxcOBwoDAckhAQEgIwAjArFFAgtNYWNCb29rIFBybw=="
+}

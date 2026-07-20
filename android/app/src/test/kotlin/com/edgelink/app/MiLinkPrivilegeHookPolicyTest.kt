@@ -488,4 +488,26 @@ class MiLinkPrivilegeHookPolicyTest {
             )
         )
     }
+
+    @Test
+    fun hooksMiShareConnectivityPackage() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHook(
+                packageName = "com.miui.mishare.connectivity",
+                processName = "com.miui.mishare.connectivity"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookMiShare(
+                packageName = "com.miui.mishare.connectivity",
+                processName = "com.miui.mishare.connectivity"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookMiShare(
+                packageName = "com.miui.mishare",
+                processName = "com.miui.mishare"
+            )
+        )
+    }
 }

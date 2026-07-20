@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="enabled" value="true" />
+    <string name="device_id">721572C3</string>
+    <string name="device_name">MacBook Pro</string>
+    <int name="device_type" value="14" />
+    <int name="medium_types" value="128" />
+    <int name="trusted_types" value="1" />
+    <string name="service_name">miLyraShare</string>
+    <string name="service_package">com.edgelink.mac</string>
+    <string name="service_data_b64">AkEOchVyw2HyAAUZPxcOBwoDAckhAQEgIwAjArFFAgtNYWNCb29rIFBybw==</string>
+</map>

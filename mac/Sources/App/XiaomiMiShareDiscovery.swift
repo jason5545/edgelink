@@ -38,6 +38,7 @@ final class XiaomiMiShareDiscovery: NSObject {
     var onSnapshotChanged: ((XiaomiMiShareDiscoverySnapshot) -> Void)?
 
     private let browser = NetServiceBrowser()
+    private let meshSocket = LyraMeshSocket()
     private var lyraPublisher: XiaomiLyraMDNSPublisher?
     private var discoveredServices: [String: NetService] = [:]
     private var peersByServiceName: [String: XiaomiMiShareDiscoveredPeer] = [:]
@@ -64,7 +65,7 @@ final class XiaomiMiShareDiscovery: NSObject {
         isBrowsing = true
         DiagnosticsLog.info("xiaomi.mishare.discovery_browser_started type=\(Self.serviceType)")
 
-        publish(deviceIdHex: deviceIdHex, displayName: publishedDisplayName ?? "EdgeLink Mac")
+        startMeshSocket()
         emitSnapshot()
     }
 
@@ -75,6 +76,7 @@ final class XiaomiMiShareDiscovery: NSObject {
     private func stop(emitsSnapshot: Bool) {
         browser.stop()
         lyraPublisher?.stop()
+        meshSocket.stop()
         for service in discoveredServices.values {
             service.delegate = nil
             service.stop()
@@ -89,12 +91,41 @@ final class XiaomiMiShareDiscovery: NSObject {
         }
     }
 
+    private func startMeshSocket() {
+        meshSocket.onRawDatagram = { datagram, endpoint in
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_rx endpoint=\(endpoint.debugDescription) bytes=\(datagram.count) " +
+                    "hex=\(datagram.prefix(64).map { String(format: "%02x", $0) }.joined())"
+            )
+        }
+        meshSocket.onFrame = { frame, endpoint in
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_frame endpoint=\(endpoint.debugDescription) packType=\(frame.packType) " +
+                    "ext=\(frame.extendedHeader.count) payload=\(frame.payload.count)"
+            )
+        }
+        meshSocket.onStateChanged = { [weak self] state in
+            DiagnosticsLog.info("xiaomi.mishare.mesh_socket_state state=\(String(describing: state))")
+            guard let self, case .ready = state else { return }
+            DispatchQueue.main.async {
+                guard let deviceIdHex = self.publishedDeviceIdHex else { return }
+                self.publish(deviceIdHex: deviceIdHex, displayName: self.publishedDisplayName ?? "EdgeLink Mac")
+            }
+        }
+        do {
+            try meshSocket.start()
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_socket_start_failed", error)
+        }
+    }
+
     private func publish(deviceIdHex: String, displayName: String) {
         do {
             let appData = try XiaomiMiShareDiscoveryAppData.buildBase64(
                 deviceIdHex: deviceIdHex,
                 displayName: displayName,
-                accountIdHex: "61F2"
+                accountIdHex: "61F2",
+                meshPort: meshSocket.boundPort
             )
             let publisher = XiaomiLyraMDNSPublisher(deviceIdHex: deviceIdHex, appDataBase64: appData)
             try publisher.start()

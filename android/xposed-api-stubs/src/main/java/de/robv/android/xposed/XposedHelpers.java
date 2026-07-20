@@ -12,4 +12,16 @@ public final class XposedHelpers {
     ) {
         throw new UnsupportedOperationException("Xposed API stub");
     }
+
+    public static Class<?> findClass(String className, ClassLoader classLoader) {
+        throw new UnsupportedOperationException("Xposed API stub");
+    }
+
+    public static Object callMethod(Object obj, String methodName, Object... args) {
+        throw new UnsupportedOperationException("Xposed API stub");
+    }
+
+    public static Object callStaticMethod(Class<?> clazz, String methodName, Object... args) {
+        throw new UnsupportedOperationException("Xposed API stub");
+    }
 }

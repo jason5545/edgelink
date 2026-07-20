@@ -62,6 +62,27 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         XCTAssertEqual(payload.displayName, "MacBook Pro")
     }
 
+    func testBuildsAppDataWithMeshPort() throws {
+        let data = try XiaomiMiShareDiscoveryAppData.build(
+            deviceIdHex: "A1B2C3D4",
+            displayName: "EdgeLink Mac",
+            meshPort: 0xE897
+        )
+        let payload = XiaomiMiShareDiscoveryAppData(data: data)
+
+        XCTAssertEqual(payload.meshPort, 0xE897)
+        XCTAssertEqual(Array(data)[19...20], [0xE8, 0x97])
+    }
+
+    func testParsesCapturedPhoneAppDataMeshPort() throws {
+        let phone = try XCTUnwrap(
+            XiaomiMiShareDiscoveryAppData(
+                base64Encoded: "AkEBi8VLY2HyAAUZPxMDBwoDAeiXAQEgIwAjAqRGAhnnsKHnkZ7miJDnmoRQT0NPIEY4IFVsdHJh"
+            )
+        )
+        XCTAssertEqual(phone.meshPort, 0xE897)
+    }
+
     func testRejectsInvalidPublisherInputs() {
         XCTAssertThrowsError(
             try XiaomiMiShareDiscoveryAppData.build(deviceIdHex: "not-id", displayName: "EdgeLink Mac")
