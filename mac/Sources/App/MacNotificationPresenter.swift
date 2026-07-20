@@ -10,7 +10,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
 
     private let center: UNUserNotificationCenter?
     private let delegate = MacNotificationCenterDelegate()
-    private let toastPresenter = MacRemoteNotificationToastPresenter()
     var onCopyVerificationCode: (@Sendable (String) -> Void)? {
         get { delegate.onCopyVerificationCode }
         set { delegate.onCopyVerificationCode = newValue }
@@ -69,7 +68,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 content.threadIdentifier = "edgelink.remote.\(body.sourceDeviceId ?? "unknown")"
                 content.userInfo = [
                     "edgelinkDoNotForward": true,
-                    "edgelinkRemoteNotification": true,
                     "edgelinkNotificationId": body.id,
                     "sourceDeviceId": body.sourceDeviceId ?? "",
                     "sourcePlatform": body.sourcePlatform ?? ""
@@ -97,7 +95,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
                     trigger: nil
                 )
                 try await center.add(request)
-                toastPresenter.show(body, iconPNGData: iconPNGData)
                 DiagnosticsLog.info("notification.mac.remote_shown id=\(body.id) app=\(body.app)")
             } catch {
                 DiagnosticsLog.error("notification.mac.remote_show_failed id=\(body.id)", error)
@@ -114,7 +111,6 @@ final class MacNotificationPresenter: @unchecked Sendable {
         let identifier = requestIdentifier(id: body.id, sourceDeviceId: body.sourceDeviceId)
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
         center.removeDeliveredNotifications(withIdentifiers: [identifier])
-        toastPresenter.remove(id: body.id)
         DiagnosticsLog.info("notification.mac.remote_removed id=\(body.id)")
     }
 
@@ -234,10 +230,7 @@ private final class MacNotificationCenterDelegate: NSObject, UNUserNotificationC
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        if notification.request.content.userInfo["edgelinkRemoteNotification"] as? Bool == true {
-            return [.list, .sound]
-        }
-        return [.banner, .list, .sound]
+        [.banner, .list, .sound]
     }
 
     func userNotificationCenter(
