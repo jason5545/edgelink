@@ -25,8 +25,15 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+data class AndroidMiLinkMirrorCloudBridgeRequest(
+    val sessionId: String,
+    val localRtspPorts: List<Int>,
+    val reason: String
+)
+
 class AndroidMiLinkCommandBridge(
-    context: Context
+    context: Context,
+    private val onMirrorCloudBridgeRequested: (AndroidMiLinkMirrorCloudBridgeRequest) -> Unit = {}
 ) {
     private val appContext = context.applicationContext
 
@@ -859,10 +866,13 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun startFakeMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
+        val cloudMirrorSessionId = body.args["mirrorSessionId"]
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
                 context = appContext,
-                peerHost = body.args["peerHost"],
+                peerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"],
                 peerPort = body.args["peerPort"]?.toIntOrNull()
             )
         }.getOrElse { error ->
@@ -876,6 +886,15 @@ class AndroidMiLinkCommandBridge(
         )
         val sourceListenHost = preferredLocalIPv4Address().orEmpty()
         val sourceListenPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 } ?: 7_102
+        if (cloudMirrorSessionId != null) {
+            onMirrorCloudBridgeRequested(
+                AndroidMiLinkMirrorCloudBridgeRequest(
+                    sessionId = cloudMirrorSessionId,
+                    localRtspPorts = listOf(sourceListenPort, 7_102).distinct(),
+                    reason = "startMainDisplay"
+                )
+            )
+        }
         val queryResult = runCatching {
             queryMirrorRemoteDevices(fakeBody)
         }.getOrElse { error ->
@@ -898,7 +917,8 @@ class AndroidMiLinkCommandBridge(
                 queryResult = queryResult,
                 armResult = armResult,
                 sourceListenHost = sourceListenHost,
-                sourceListenPort = sourceListenPort
+                sourceListenPort = sourceListenPort,
+                cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
         val sourceShareResult = (sourceShareCall as MirrorProviderDeadlineResult.Completed).result
@@ -908,10 +928,11 @@ class AndroidMiLinkCommandBridge(
                 data = sourceShareResult.data + mapOf(
                     "query" to queryResult.message,
                     "arm" to armResult.success.toString(),
-                    "debugFakeRemote" to "true",
-                    "sourceRole" to "android_server",
-                    "sourceListenHost" to sourceListenHost,
-                    "sourceListenPort" to sourceListenPort.toString()
+                    "debugFakeRemote" to "true"
+                ) + mirrorMediaTransportData(
+                    cloudMirrorSessionId = cloudMirrorSessionId,
+                    sourceListenHost = sourceListenHost,
+                    sourceListenPort = sourceListenPort
                 )
             )
         }
@@ -928,7 +949,10 @@ class AndroidMiLinkCommandBridge(
                 deadlineMs = startCall.deadlineMs,
                 queryResult = queryResult,
                 armResult = armResult,
-                sourceShareResult = sourceShareResult
+                sourceShareResult = sourceShareResult,
+                sourceListenHost = sourceListenHost,
+                sourceListenPort = sourceListenPort,
+                cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
         val startResult = (startCall as MirrorProviderDeadlineResult.Completed).result
@@ -941,6 +965,10 @@ class AndroidMiLinkCommandBridge(
                     "query" to queryResult.message,
                     "arm" to armResult.success.toString(),
                     "debugFakeRemote" to "true"
+                ) + mirrorMediaTransportData(
+                    cloudMirrorSessionId = cloudMirrorSessionId,
+                    sourceListenHost = sourceListenHost,
+                    sourceListenPort = sourceListenPort
                 )
             )
         }
@@ -958,7 +986,10 @@ class AndroidMiLinkCommandBridge(
                 queryResult = queryResult,
                 armResult = armResult,
                 startResult = startResult,
-                sourceShareResult = sourceShareResult
+                sourceShareResult = sourceShareResult,
+                sourceListenHost = sourceListenHost,
+                sourceListenPort = sourceListenPort,
+                cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
         val openResult = (openCall as MirrorProviderDeadlineResult.Completed).result
@@ -975,6 +1006,10 @@ class AndroidMiLinkCommandBridge(
                 "query" to queryResult.message,
                 "arm" to armResult.success.toString(),
                 "debugFakeRemote" to "true"
+            ) + mirrorMediaTransportData(
+                cloudMirrorSessionId = cloudMirrorSessionId,
+                sourceListenHost = sourceListenHost,
+                sourceListenPort = sourceListenPort
             )
         )
     }
@@ -988,18 +1023,20 @@ class AndroidMiLinkCommandBridge(
         startResult: CommandResult? = null,
         sourceShareResult: CommandResult? = null,
         sourceListenHost: String? = null,
-        sourceListenPort: Int? = null
+        sourceListenPort: Int? = null,
+        cloudMirrorSessionId: String? = null
     ): CommandResult {
         val queryCount = queryResult.data["count"]?.toIntOrNull() ?: 0
         val hasSourceEndpoint = method == "startShare" && !sourceListenHost.isNullOrBlank() && sourceListenPort != null
-        val accepted = armResult.success && (queryCount > 0 || hasSourceEndpoint)
+        val hasCloudBridge = !cloudMirrorSessionId.isNullOrBlank() && sourceListenPort != null
+        val accepted = armResult.success && (queryCount > 0 || hasSourceEndpoint || hasCloudBridge)
         val sourceEndpointData =
-            if (accepted && hasSourceEndpoint) {
-                mapOf(
-                    "sourceRole" to "android_server",
-                    "sourceListenHost" to sourceListenHost,
-                    "sourceListenPort" to sourceListenPort.toString()
-                )
+            if (accepted) {
+                mirrorMediaTransportData(
+                    cloudMirrorSessionId = cloudMirrorSessionId,
+                    sourceListenHost = sourceListenHost,
+                    sourceListenPort = sourceListenPort
+                ).takeIf { it.isNotEmpty() || hasSourceEndpoint } ?: emptyMap()
             } else {
                 emptyMap()
             }
@@ -1031,6 +1068,31 @@ class AndroidMiLinkCommandBridge(
                 (startResult?.data?.let { mapOf("startValue" to it["value"].orEmpty()) } ?: emptyMap()) +
                 (sourceShareResult?.data?.let { mapOf("sourceShareValue" to it["value"].orEmpty()) } ?: emptyMap())
         )
+    }
+
+    private fun mirrorMediaTransportData(
+        cloudMirrorSessionId: String?,
+        sourceListenHost: String?,
+        sourceListenPort: Int?
+    ): Map<String, String> {
+        if (!cloudMirrorSessionId.isNullOrBlank()) {
+            return mapOf(
+                "sourceRole" to "android_cloud_bridge",
+                "cloudBridge" to "true",
+                "mediaTransport" to "cloudflare",
+                "mirrorSessionId" to cloudMirrorSessionId,
+                "sourceListenHost" to sourceListenHost.orEmpty(),
+                "sourceListenPort" to (sourceListenPort?.toString() ?: "")
+            )
+        }
+        if (!sourceListenHost.isNullOrBlank() && sourceListenPort != null) {
+            return mapOf(
+                "sourceRole" to "android_server",
+                "sourceListenHost" to sourceListenHost,
+                "sourceListenPort" to sourceListenPort.toString()
+            )
+        }
+        return emptyMap()
     }
 
     private fun callMirrorDeviceProviderWithDeadline(

@@ -3,6 +3,7 @@ import CoreMedia
 import CoreVideo
 import CryptoKit
 import Darwin
+import EdgeLinkKit
 import Foundation
 import Network
 import VideoToolbox
@@ -90,10 +91,11 @@ private struct XiaomiMirrorHEVCParameterSets {
     let pps: Data
 }
 
-final class XiaomiMirrorRTSPDiagnosticSource {
+final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onRecoveryRequired: ((XiaomiMirrorRTSPRecoveryEvent) -> Void)?
     var onPeerStop: ((String, UUID) -> Void)?
+    var onCloudflareMirrorOutboundDatagram: ((Data, String) -> Void)?
 
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
@@ -105,6 +107,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
     private var rtspKeepaliveWorkItems: [UUID: DispatchWorkItem] = [:]
     private var port: UInt16 = 7102
     private var advertisedHost: String?
+    private var cloudflareMirrorSessionId: String?
+    private var cloudflareMirrorReceiverID: UUID?
+    private var cloudflareMirrorReceiver: XiaomiMirrorRTPMediaSender?
+    private var cloudflareMirrorHEVCParameterSets: XiaomiMirrorHEVCParameterSets?
+    private var cloudflareMirrorPacketsReceived: UInt64 = 0
 
     private let sourceRTPPort: UInt16 = 19_002
     private let officialMPTClientPort: UInt16 = 15_550
@@ -143,6 +150,185 @@ final class XiaomiMirrorRTSPDiagnosticSource {
         performOnQueue {
             self.stopOnQueue(reason: reason)
         }
+    }
+
+    func startCloudflareMirrorRTPReceiver(sessionId: String, lifetime: TimeInterval, reason: String) {
+        performOnQueue {
+            self.startCloudflareMirrorRTPReceiverOnQueue(
+                sessionId: sessionId,
+                lifetime: lifetime,
+                reason: reason
+            )
+        }
+    }
+
+    func handleCloudflareMirrorMedia(_ body: MiLinkMirrorMediaBody) {
+        performOnQueue {
+            self.handleCloudflareMirrorMediaOnQueue(body)
+        }
+    }
+
+    func stopCloudflareMirrorRTPReceiver(reason: String) {
+        performOnQueue {
+            self.stopCloudflareMirrorRTPReceiverOnQueue(reason: reason)
+        }
+    }
+
+    private func startCloudflareMirrorRTPReceiverOnQueue(
+        sessionId: String,
+        lifetime: TimeInterval,
+        reason: String
+    ) {
+        if cloudflareMirrorSessionId == sessionId, cloudflareMirrorReceiver != nil {
+            scheduleAutoStop(lifetime: lifetime)
+            DiagnosticsLog.info(
+                "xiaomi.mirror.cloudflare.receiver_reuse sessionId=\(sessionId) " +
+                    "reason=\(reason) packets=\(cloudflareMirrorPacketsReceived)"
+            )
+            return
+        }
+
+        stopCloudflareMirrorRTPReceiverOnQueue(reason: "replace_\(reason)")
+        let receiverID = UUID(uuidString: sessionId) ?? UUID()
+        do {
+            let receiver = try XiaomiMirrorRTPMediaSender(
+                transportMode: .mpt,
+                destinationHost: "127.0.0.1",
+                destinationRTPPort: 1,
+                destinationRTCPPort: 1,
+                localRTPPort: 0,
+                localRTCPPort: 0,
+                sessionID: receiverID,
+                mptSinkOnly: true,
+                onDecodedFrame: { [weak self] pixelBuffer, width, height in
+                    self?.onDecodedFrame?(pixelBuffer, width, height)
+                },
+                onMPTMediaStalled: { [weak self] stall in
+                    self?.queue.async {
+                        self?.handleCloudflareMirrorStalled(stall)
+                    }
+                },
+                initialHEVCParameterSets: cloudflareMirrorHEVCParameterSets,
+                onMPTHEVCParameterSets: { [weak self] parameterSets in
+                    self?.queue.async {
+                        self?.cloudflareMirrorHEVCParameterSets = parameterSets
+                        DiagnosticsLog.info(
+                            "xiaomi.mirror.cloudflare.hevc_parameter_sets_cached sessionId=\(sessionId) " +
+                                "vps=\(parameterSets.vps.count) sps=\(parameterSets.sps.count) pps=\(parameterSets.pps.count)"
+                        )
+                    }
+                }
+            )
+            cloudflareMirrorSessionId = sessionId
+            cloudflareMirrorReceiverID = receiverID
+            cloudflareMirrorReceiver = receiver
+            cloudflareMirrorPacketsReceived = 0
+            receiver.onExternalDatagramSend = { [weak self] packet in
+                self?.queue.async {
+                    guard let self, self.cloudflareMirrorSessionId == sessionId else {
+                        return
+                    }
+                    self.onCloudflareMirrorOutboundDatagram?(packet, sessionId)
+                }
+            }
+            receiver.startExternalRTPReceiver(reason: reason)
+            scheduleAutoStop(lifetime: lifetime)
+            DiagnosticsLog.info(
+                "xiaomi.mirror.cloudflare.receiver_start sessionId=\(sessionId) " +
+                    "receiverId=\(receiverID.uuidString) reason=\(reason) lifetime=\(Int(lifetime))"
+            )
+        } catch {
+            DiagnosticsLog.error(
+                "xiaomi.mirror.cloudflare.receiver_start_failed sessionId=\(sessionId) reason=\(reason)",
+                error
+            )
+        }
+    }
+
+    private func handleCloudflareMirrorMediaOnQueue(_ body: MiLinkMirrorMediaBody) {
+        guard body.sessionId == cloudflareMirrorSessionId else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.cloudflare.media_ignored sessionId=\(body.sessionId) " +
+                    "active=\(cloudflareMirrorSessionId ?? "none") kind=\(body.kind)"
+            )
+            return
+        }
+        if body.kind == "status" {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.cloudflare.status sessionId=\(body.sessionId) event=\(body.event ?? "none")"
+            )
+            if body.event == "source_stop" || body.event == "bridge_failed" || body.event == "bridge_stopped" {
+                stopCloudflareMirrorRTPReceiverOnQueue(reason: "android_\(body.event ?? body.kind)")
+            }
+            return
+        }
+        guard body.direction == "android_to_mac",
+              body.kind == "rtp",
+              let dataBase64 = body.dataBase64,
+              let packet = Data(base64Encoded: dataBase64),
+              let receiver = cloudflareMirrorReceiver else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.cloudflare.media_invalid sessionId=\(body.sessionId) " +
+                    "direction=\(body.direction) kind=\(body.kind) bytes=\(body.bytes.map(String.init) ?? "none")"
+            )
+            return
+        }
+        cloudflareMirrorPacketsReceived += 1
+        if cloudflareMirrorPacketsReceived == 1 || cloudflareMirrorPacketsReceived % 100 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.cloudflare.rtp_in sessionId=\(body.sessionId) " +
+                    "count=\(cloudflareMirrorPacketsReceived) sequence=\(body.sequence.map(String.init) ?? "none") " +
+                    "bytes=\(packet.count) fp=\(DiagnosticsLog.fingerprint(packet))"
+            )
+        }
+        receiver.pushExternalRTPPacket(packet, sequence: body.sequence)
+    }
+
+    private func stopCloudflareMirrorRTPReceiverOnQueue(reason: String) {
+        guard let receiver = cloudflareMirrorReceiver else {
+            cloudflareMirrorSessionId = nil
+            cloudflareMirrorReceiverID = nil
+            cloudflareMirrorPacketsReceived = 0
+            return
+        }
+        let sessionId = cloudflareMirrorSessionId ?? "none"
+        receiver.stop(reason: "cloudflare_\(reason)")
+        DiagnosticsLog.info(
+            "xiaomi.mirror.cloudflare.receiver_stop sessionId=\(sessionId) " +
+                "reason=\(reason) packets=\(cloudflareMirrorPacketsReceived)"
+        )
+        cloudflareMirrorSessionId = nil
+        cloudflareMirrorReceiverID = nil
+        cloudflareMirrorReceiver = nil
+        cloudflareMirrorPacketsReceived = 0
+    }
+
+    private func handleCloudflareMirrorStalled(_ stall: XiaomiMirrorMPTStallSnapshot) {
+        guard cloudflareMirrorReceiverID == stall.sessionID else {
+            return
+        }
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.cloudflare.stalled sessionId=\(cloudflareMirrorSessionId ?? "none") " +
+                "reason=\(stall.reason) elapsedMediaSeconds=\(Self.formatSeconds(stall.elapsedMediaSeconds)) " +
+                "elapsedFrameSeconds=\(Self.formatOptionalSeconds(stall.elapsedFrameSeconds)) " +
+                "inboundRTP=\(stall.inboundRTP) decodedFrames=\(stall.decodedFrames)"
+        )
+        onRecoveryRequired?(
+            XiaomiMirrorRTSPRecoveryEvent(
+                sessionID: stall.sessionID,
+                trigger: "cloudflare_mirror_stall",
+                reason: stall.reason,
+                retryAttempt: 0,
+                host: nil,
+                port: nil,
+                elapsedMediaSeconds: stall.elapsedMediaSeconds,
+                elapsedFrameSeconds: stall.elapsedFrameSeconds,
+                datagramsReceived: stall.datagramsReceived,
+                pushReceived: stall.pushReceived,
+                inboundRTP: stall.inboundRTP,
+                decodedFrames: stall.decodedFrames
+            )
+        )
     }
 
     private func startOnQueue(port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
@@ -235,6 +421,7 @@ final class XiaomiMirrorRTSPDiagnosticSource {
             state.mediaSender?.stop(reason: "rtsp_listener_\(reason)")
             state.timerSyncClient?.stop(reason: "rtsp_listener_\(reason)")
         }
+        stopCloudflareMirrorRTPReceiverOnQueue(reason: reason)
         for connection in connections.values {
             connection.cancel()
         }
@@ -1921,10 +2108,11 @@ final class XiaomiMirrorRTSPDiagnosticSource {
 
     private func stopOnQueueIfIdle(reason: String) {
         let activeMedia = states.values.filter { $0.mediaSender != nil }.count
-        guard connections.isEmpty && activeMedia == 0 else {
+        let activeCloud = cloudflareMirrorReceiver != nil
+        guard connections.isEmpty && activeMedia == 0 && !activeCloud else {
             DiagnosticsLog.info(
                 "xiaomi.mirror.rtsp.listener_stop_deferred reason=\(reason) " +
-                    "connections=\(connections.count) activeMedia=\(activeMedia)"
+                    "connections=\(connections.count) activeMedia=\(activeMedia) activeCloud=\(activeCloud)"
             )
             scheduleAutoStop(lifetime: 30)
             return
@@ -2574,7 +2762,9 @@ private final class XiaomiMirrorRTPMediaSender {
     private var lastMPTDecodedFrameUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTFrameStallDecoderResetUptimeNanoseconds: UInt64 = 0
     private var mptSinkFrameStallDecoderResetCount: UInt64 = 0
+    private var externalRTPReceiverStarted = false
     private var stopped = false
+    var onExternalDatagramSend: ((Data) -> Void)?
 
     init(
         transportMode: XiaomiMirrorRTSPTransportMode,
@@ -2658,6 +2848,41 @@ private final class XiaomiMirrorRTPMediaSender {
         queue.async {
             self.stopOnQueue(reason: reason)
         }
+    }
+
+    func startExternalRTPReceiver(reason: String) {
+        queue.async {
+            self.startExternalRTPReceiverOnQueue(reason: reason)
+        }
+    }
+
+    func pushExternalRTPPacket(_ packet: Data, sequence: Int?) {
+        queue.async {
+            guard self.mptSinkOnly, self.externalRTPReceiverStarted, !self.stopped else {
+                return
+            }
+            self.kcpDatagramsReceived += 1
+            self.recordMPTMediaPacketActivity(reason: "cloudflare_datagram")
+            self.handleKCPDatagram(packet)
+        }
+    }
+
+    private func startExternalRTPReceiverOnQueue(reason: String) {
+        guard mptSinkOnly, !stopped else {
+            return
+        }
+        guard !externalRTPReceiverStarted else {
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.external_receiver_reuse session=\(sessionID.uuidString) reason=\(reason)"
+            )
+            return
+        }
+        externalRTPReceiverStarted = true
+        startMPTSinkPacketWatchdog()
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.external_receiver_start session=\(sessionID.uuidString) " +
+                "reason=\(reason) payload=RTP/PT33/MP2T/HEVC"
+        )
     }
 
     private func startOnQueue() {
@@ -3684,6 +3909,10 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func sendMPTDatagram(_ packet: Data) -> Bool {
+        if let onExternalDatagramSend {
+            onExternalDatagramSend(packet)
+            return true
+        }
         guard mptSocketFD >= 0, var destination = mptDestinationAddress else {
             return false
         }
@@ -3789,10 +4018,11 @@ private final class XiaomiMirrorRTPMediaSender {
 
     private func stopOnQueue(reason: String) {
         guard !stopped || connection != nil || rtcpConnection != nil || frameTimer != nil ||
-            rtcpTimer != nil || mptSinkPacketWatchdogTimer != nil else {
+            rtcpTimer != nil || mptSinkPacketWatchdogTimer != nil || externalRTPReceiverStarted else {
             return
         }
         stopped = true
+        externalRTPReceiverStarted = false
         frameTimer?.cancel()
         frameTimer = nil
         rtcpTimer?.cancel()

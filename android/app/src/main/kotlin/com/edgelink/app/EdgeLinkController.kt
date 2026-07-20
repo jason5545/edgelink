@@ -25,6 +25,7 @@ import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
 import com.edgelink.core.MiLinkCommandBody
 import com.edgelink.core.MiLinkFrameBody
+import com.edgelink.core.MiLinkMirrorMediaBody
 import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
 import com.edgelink.core.NotificationRemoveBody
@@ -143,7 +144,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
-    private val miLinkCommandBridge = AndroidMiLinkCommandBridge(appContext)
+    private val miLinkCommandBridge = AndroidMiLinkCommandBridge(appContext) { request ->
+        startMiLinkMirrorCloudBridge(request)
+    }
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
     }
@@ -579,6 +582,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    private fun startMiLinkMirrorCloudBridge(request: AndroidMiLinkMirrorCloudBridgeRequest) {
+        AndroidMiLinkMirrorMediaBridge.start(request) { media: MiLinkMirrorMediaBody ->
+            val activeSession = session ?: return@start
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_MIRROR_MEDIA, media))
+        }
+    }
+
     override fun onPointer(body: InputPointerBody) {
         sendEnvelope(EnvelopeTypes.INPUT_POINTER, body)
     }
@@ -689,6 +699,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         latestTurnCredentials = null
         session?.close()
         session = null
+        AndroidMiLinkMirrorMediaBridge.stop("disconnect")
         screenSession.stop()
         stateFlow.update {
             it.copy(
@@ -1399,6 +1410,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             "relay.android.connection_start reason=$reason hostId=${peer.deviceId} clientId=${identity.deviceId} autoReconnect=${stateFlow.value.autoReconnectEnabled}"
         )
         connectionJob?.cancel()
+        AndroidMiLinkMirrorMediaBridge.stop("connection_restart")
         screenSession.stop()
         session?.close()
         session = null
@@ -1519,6 +1531,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 }
                 EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
+                AndroidMiLinkMirrorMediaBridge.stop("relay_disconnected")
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
                 stateFlow.update {
@@ -1941,6 +1954,11 @@ private class AndroidCommandDispatcher(
                 onPhoneRelayMedia(envelope.b)
                 null
             }
+            EnvelopeTypes.MILINK_MIRROR_MEDIA -> {
+                val envelope = EnvelopeCodec.decode<MiLinkMirrorMediaBody>(plaintext)
+                AndroidMiLinkMirrorMediaBridge.handleMedia(envelope.b)
+                null
+            }
             EnvelopeTypes.MILINK_COMMAND -> {
                 val envelope = EnvelopeCodec.decode<MiLinkCommandBody>(plaintext)
                 val result = miLinkCommandBridge.handle(envelope.b)
@@ -1952,6 +1970,7 @@ private class AndroidCommandDispatcher(
                 null
             }
             EnvelopeTypes.SCREEN_STOP -> {
+                AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
                 screenSession.stop()
                 null
             }

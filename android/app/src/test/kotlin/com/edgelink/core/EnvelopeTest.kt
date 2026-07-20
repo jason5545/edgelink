@@ -168,6 +168,24 @@ class EnvelopeTest {
         assertEquals("android_to_mac", relayMedia.b.direction)
         assertEquals(7, relayMedia.b.sequence)
 
+        val mirrorMediaBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.MILINK_MIRROR_MEDIA,
+            MiLinkMirrorMediaBody(
+                sessionId = "mirror-session-1",
+                direction = "android_to_mac",
+                kind = "rtp",
+                dataBase64 = "gIA=",
+                bytes = 2,
+                sequence = 8,
+                ts = 1783510258
+            )
+        )
+        val mirrorMedia = EnvelopeCodec.decode<MiLinkMirrorMediaBody>(mirrorMediaBytes)
+        assertEquals(EnvelopeTypes.MILINK_MIRROR_MEDIA, mirrorMedia.t)
+        assertEquals("mirror-session-1", mirrorMedia.b.sessionId)
+        assertEquals("android_to_mac", mirrorMedia.b.direction)
+        assertEquals(8, mirrorMedia.b.sequence)
+
         val phoneStatusBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_CALL_STATUS,
             PhoneCallStatusBody(

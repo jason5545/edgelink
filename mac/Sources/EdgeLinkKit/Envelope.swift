@@ -45,6 +45,7 @@ public enum EnvelopeType {
     public static let phoneCallStatus = "phone.call.status"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
+    public static let miLinkMirrorMedia = "milink.mirror.media"
     public static let miLinkCommand = "milink.command"
     public static let miLinkCommandResult = "milink.command.result"
     public static let androidMicStatus = "android.mic.status"
@@ -374,6 +375,37 @@ public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
 }
 
 public struct PhoneRelayMediaBody: Codable, Equatable, Sendable {
+    public let sessionId: String
+    public let direction: String
+    public let kind: String
+    public let dataBase64: String?
+    public let bytes: Int?
+    public let sequence: Int?
+    public let event: String?
+    public let ts: Int64
+
+    public init(
+        sessionId: String,
+        direction: String,
+        kind: String,
+        dataBase64: String? = nil,
+        bytes: Int? = nil,
+        sequence: Int? = nil,
+        event: String? = nil,
+        ts: Int64
+    ) {
+        self.sessionId = sessionId
+        self.direction = direction
+        self.kind = kind
+        self.dataBase64 = dataBase64
+        self.bytes = bytes
+        self.sequence = sequence
+        self.event = event
+        self.ts = ts
+    }
+}
+
+public struct MiLinkMirrorMediaBody: Codable, Equatable, Sendable {
     public let sessionId: String
     public let direction: String
     public let kind: String

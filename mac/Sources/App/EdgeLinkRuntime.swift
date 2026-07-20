@@ -117,6 +117,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastSourceRecoveryRequestID: String?
     private var xiaomiScreenLastSourceRecoveryDecodedFrames: UInt64?
     private var xiaomiScreenUserStopped = false
+    private var activeXiaomiMirrorCloudflareSessionId: String?
+    private var xiaomiMirrorCloudflareDatagramsSent: UInt64 = 0
     private var didAutoBindXiaomiDistAudio = false
     private var didAutoQueryXiaomiMirrorDevices = false
     private var didPrepareXiaomiMirrorKeyboard = false
@@ -202,6 +204,11 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiMirrorRTSPDiagnosticSource.onPeerStop = { [weak self] reason, sessionID in
             Task { @MainActor in
                 self?.handleXiaomiMirrorPeerStop(reason: reason, sessionID: sessionID)
+            }
+        }
+        xiaomiMirrorRTSPDiagnosticSource.onCloudflareMirrorOutboundDatagram = { [weak self] packet, sessionId in
+            Task { @MainActor in
+                self?.sendXiaomiMirrorCloudflareDatagram(packet, sessionId: sessionId)
             }
         }
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
@@ -393,6 +400,7 @@ final class EdgeLinkRuntime: ObservableObject {
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
+            let cloudflareMirrorSessionId = startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: "manual_start")
             xiaomiScreenUserStopped = false
             resetXiaomiScreenRecoveryState(reason: "manual_start")
             didPrepareXiaomiMirrorKeyboard = false
@@ -405,7 +413,9 @@ final class EdgeLinkRuntime: ObservableObject {
                     "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
                     "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) gatedByOfficialApp=false " +
                     "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
-                    "xiaomiMirrorDeviceId=none timeoutMs=\(timeoutMs)"
+                    "xiaomiMirrorDeviceId=none timeoutMs=\(timeoutMs) " +
+                    "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
+                    "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
             )
             var args: [String: String] = [:]
             if let peerHost {
@@ -413,6 +423,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             args["peerPort"] = String(peerPort)
             args["forceFakeRemote"] = "true"
+            addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
             let requestId = sendMiLinkCommand(
                 command: command,
                 args: args
@@ -428,6 +439,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 return
             }
             screenSession.setXiaomiMirrorRouteActive(false)
+            activeXiaomiMirrorCloudflareSessionId = nil
+            xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "screen_command_failed")
             DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")")
             xiaomiMiLinkCommandStatus = "小米鏡像指令未送出"
             return
@@ -565,6 +578,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenRecoveryAttempt = 0
         resetXiaomiScreenRecoveryState(reason: "disconnect")
         xiaomiScreenUserStopped = false
+        activeXiaomiMirrorCloudflareSessionId = nil
         stopXiaomiMirrorRTSPDiagnosticSource(reason: "disconnect")
         didAutoBindXiaomiDistAudio = false
         didAutoQueryXiaomiMirrorDevices = false
@@ -1143,6 +1157,40 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    private func startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: String) -> String? {
+        guard Self.xiaomiMirrorCloudflareMediaEnabled() else {
+            activeXiaomiMirrorCloudflareSessionId = nil
+            xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "\(reason)_disabled")
+            return nil
+        }
+        let sessionId = UUID().uuidString
+        activeXiaomiMirrorCloudflareSessionId = sessionId
+        DiagnosticsLog.info(
+            "xiaomi.mirror.cloudflare.session_created reason=\(reason) sessionId=\(sessionId)"
+        )
+        return sessionId
+    }
+
+    private func addXiaomiMirrorCloudflareArgs(to args: inout [String: String], sessionId: String?) {
+        guard let sessionId else {
+            return
+        }
+        args["mediaTransport"] = "cloudflare"
+        args["mirrorSessionId"] = sessionId
+        args["rtpEnvelope"] = EnvelopeType.miLinkMirrorMedia
+    }
+
+    private func xiaomiMirrorCloudflareSessionIdForRecovery(rebuildSession: Bool, reason: String) -> String? {
+        guard Self.xiaomiMirrorCloudflareMediaEnabled() else {
+            activeXiaomiMirrorCloudflareSessionId = nil
+            return nil
+        }
+        if rebuildSession || activeXiaomiMirrorCloudflareSessionId == nil {
+            return startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: reason)
+        }
+        return activeXiaomiMirrorCloudflareSessionId
+    }
+
     private func handleXiaomiMirrorRTSPRecoveryRequired(_ event: XiaomiMirrorRTSPRecoveryEvent) {
         guard !xiaomiScreenUserStopped else {
             DiagnosticsLog.info(
@@ -1259,6 +1307,10 @@ final class EdgeLinkRuntime: ObservableObject {
         let peerHost = Self.xiaomiMirrorAdvertisedHost()
         let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
         let shouldRebuildSession = Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt)
+        let cloudflareMirrorSessionId = xiaomiMirrorCloudflareSessionIdForRecovery(
+            rebuildSession: shouldRebuildSession,
+            reason: shouldRebuildSession ? "session_rebuild" : "source_recovery"
+        )
         if shouldRebuildSession {
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = Self.xiaomiScreenSessionRebuildTimeoutMs
@@ -1275,11 +1327,14 @@ final class EdgeLinkRuntime: ObservableObject {
             if let peerHost {
                 args["peerHost"] = peerHost
             }
+            addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
                     "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
                     "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
-                    "action=session_rebuild timeoutMs=\(timeoutMs)"
+                    "action=session_rebuild timeoutMs=\(timeoutMs) " +
+                    "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
+                    "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
             )
             guard let requestId = sendMiLinkCommand(command: command, args: args) else {
                 xiaomiMiLinkCommandStatus = "小米鏡像重建指令未送出"
@@ -1323,11 +1378,14 @@ final class EdgeLinkRuntime: ObservableObject {
         if let peerHost {
             args["peerHost"] = peerHost
         }
+        addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
         DiagnosticsLog.warn(
             "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
                 "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
                 "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
-                "action=source_only_keep_rtsp"
+                "action=source_only_keep_rtsp " +
+                "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
+                "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
         )
         guard let requestId = sendMiLinkCommand(command: command, args: args) else {
             xiaomiMiLinkCommandStatus = "小米鏡像恢復指令未送出"
@@ -1373,6 +1431,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenRecoveryTask = nil
         xiaomiScreenRecoveryAttempt = 0
         resetXiaomiScreenRecoveryState(reason: reason)
+        activeXiaomiMirrorCloudflareSessionId = nil
         stopXiaomiMirrorRTSPDiagnosticSource(reason: reason)
         DiagnosticsLog.info(
             "xiaomi.mac.screen_stop_cleanup reason=\(reason) recoverySuppressed=true"
@@ -2370,6 +2429,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 currentChannel = connectedChannel
                 currentChannelGeneration = channelGeneration
 
+                let callRelayCloudflareBridge = callRelayCloudflareBridge
+                let xiaomiMirrorRTSPDiagnosticSource = xiaomiMirrorRTSPDiagnosticSource
                 let dispatcher = CommandDispatcher(
                     clipboardSync: clipboardSync,
                     notificationPresenter: notificationPresenter,
@@ -2404,7 +2465,7 @@ final class EdgeLinkRuntime: ObservableObject {
                             return
                         }
                         if media.kind == "rtp" {
-                            self.callRelayCloudflareBridge.handle(media)
+                            callRelayCloudflareBridge.handle(media)
                             return
                         }
                         Task { @MainActor in
@@ -2429,6 +2490,18 @@ final class EdgeLinkRuntime: ObservableObject {
                     onMiLinkFrame: { [weak self] frame in
                         Task { @MainActor in
                             self?.handleMiLinkFrame(frame)
+                        }
+                    },
+                    onMiLinkMirrorMedia: { [weak self] media in
+                        guard let self else {
+                            return
+                        }
+                        if media.kind == "rtp" {
+                            xiaomiMirrorRTSPDiagnosticSource.handleCloudflareMirrorMedia(media)
+                            return
+                        }
+                        Task { @MainActor in
+                            self.handleMiLinkMirrorMedia(media)
                         }
                     },
                     onMiLinkCommandResult: { [weak self] result in
@@ -2715,6 +2788,62 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
+    private func sendXiaomiMirrorCloudflareDatagram(_ packet: Data, sessionId: String) {
+        guard let session = currentSession, isConnected else {
+            return
+        }
+        xiaomiMirrorCloudflareDatagramsSent += 1
+        let sentCount = xiaomiMirrorCloudflareDatagramsSent
+        let body = MiLinkMirrorMediaBody(
+            sessionId: sessionId,
+            direction: "mac_to_android",
+            kind: "rtp",
+            dataBase64: packet.base64EncodedString(),
+            bytes: packet.count,
+            ts: Int64(Date().timeIntervalSince1970)
+        )
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.miLinkMirrorMedia, b: body))
+                try await session.sendPlaintext(data)
+                if sentCount == 1 || sentCount % 500 == 0 {
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.cloudflare.datagram_out sessionId=\(sessionId) " +
+                            "count=\(sentCount) bytes=\(packet.count)"
+                    )
+                }
+            } catch {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.cloudflare.datagram_send_failed sessionId=\(sessionId) count=\(sentCount)"
+                )
+            }
+        }
+    }
+
+    private func handleMiLinkMirrorMedia(_ body: MiLinkMirrorMediaBody) {
+        xiaomiMirrorRTSPDiagnosticSource.handleCloudflareMirrorMedia(body)
+        guard body.kind == "status", let event = body.event else {
+            return
+        }
+        DiagnosticsLog.info("xiaomi.mirror.cloudflare.status_ui sessionId=\(body.sessionId) event=\(event)")
+        switch event {
+        case "bridge_starting", "local_rtsp_connected":
+            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+        case "bridge_ready":
+            xiaomiMiLinkCommandStatus = "小米鏡像串流準備中"
+        case "source_start":
+            xiaomiMiLinkCommandStatus = "小米鏡像串流中"
+        case "bridge_failed":
+            xiaomiMiLinkCommandStatus = "小米鏡像橋接失敗"
+        case "bridge_stopped", "source_stop":
+            if !xiaomiScreenUserStopped {
+                xiaomiMiLinkCommandStatus = "小米鏡像已停止"
+            }
+        default:
+            break
+        }
+    }
+
     private enum XiaomiMirrorCastFrameError: Error {
         case invalidBase64
     }
@@ -2773,6 +2902,24 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
 
+        if let cloudSessionId = Self.xiaomiMirrorCloudflareSessionId(from: result) {
+            activeXiaomiMirrorCloudflareSessionId = cloudSessionId
+            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+            xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+                sessionId: cloudSessionId,
+                lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+                reason: "xiaomi_command_result"
+            )
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_pending_cloudflare requestId=\(result.requestId) command=\(pending.command) " +
+                    "route=\(pending.route) elapsedMs=\(pending.elapsedMs) sessionId=\(cloudSessionId) " +
+                    "data=\(Self.formatDiagnosticsData(result.data))"
+            )
+            if isMirrorPending {
+                return
+            }
+        }
+
         if isMirrorPending, let sourceEndpoint = Self.xiaomiMirrorAndroidSourceEndpoint(from: result) {
             xiaomiMiLinkCommandStatus = "小米鏡像連線中"
             DiagnosticsLog.info(
@@ -2806,6 +2953,8 @@ final class EdgeLinkRuntime: ObservableObject {
             )
         } else {
             xiaomiMiLinkCommandStatus = "小米鏡像失敗"
+            activeXiaomiMirrorCloudflareSessionId = nil
+            xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "command_result_failed")
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_no_fallback requestId=\(result.requestId) command=\(pending.command) " +
                     "route=\(pending.route) reason=result_failed elapsedMs=\(pending.elapsedMs) " +
@@ -2848,6 +2997,17 @@ final class EdgeLinkRuntime: ObservableObject {
             return nil
         }
         return (rawHost, portValue)
+    }
+
+    private static func xiaomiMirrorCloudflareSessionId(from result: MiLinkCommandResultBody) -> String? {
+        guard result.command == "xiaomi.mirror.startMainDisplay",
+              result.data["mediaTransport"] == "cloudflare",
+              result.data["sourceRole"] == "android_cloud_bridge" || result.data["cloudBridge"] == "true",
+              let sessionId = result.data["mirrorSessionId"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionId.isEmpty else {
+            return nil
+        }
+        return sessionId
     }
 
     private static func xiaomiScreenRouteCandidate(
@@ -3157,6 +3317,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102
     private static let xiaomiScreenPrimaryRouteDefaultsKey = "xiaomiScreenPrimaryRouteEnabled"
+    private static let xiaomiMirrorCloudflareMediaDefaultsKey = "xiaomiMirrorCloudflareMediaEnabled"
     private static let xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey = "xiaomiMirrorRTSPDiagnosticEnabled"
     private static let xiaomiMirrorRTSPDiagnosticPort: UInt16 = 7102
     private static let xiaomiMirrorRTSPDiagnosticLifetimeSeconds: TimeInterval = 1800
@@ -3173,6 +3334,10 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private static func xiaomiMirrorRTSPDiagnosticEnabled() -> Bool {
         UserDefaults.standard.object(forKey: xiaomiMirrorRTSPDiagnosticEnabledDefaultsKey) as? Bool ?? true
+    }
+
+    private static func xiaomiMirrorCloudflareMediaEnabled() -> Bool {
+        UserDefaults.standard.object(forKey: xiaomiMirrorCloudflareMediaDefaultsKey) as? Bool ?? true
     }
 
     private static func phoneRelayProbePeerPort() -> UInt16 {

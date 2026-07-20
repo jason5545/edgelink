@@ -180,6 +180,26 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(relayMedia.b.direction, "android_to_mac")
         XCTAssertEqual(relayMedia.b.sequence, 7)
 
+        let mirrorMediaData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.miLinkMirrorMedia,
+                b: MiLinkMirrorMediaBody(
+                    sessionId: "mirror-session-1",
+                    direction: "android_to_mac",
+                    kind: "rtp",
+                    dataBase64: "gIA=",
+                    bytes: 2,
+                    sequence: 8,
+                    ts: 1_783_510_258
+                )
+            )
+        )
+        let mirrorMedia = try decoder.decode(Envelope<MiLinkMirrorMediaBody>.self, from: mirrorMediaData)
+        XCTAssertEqual(mirrorMedia.t, "milink.mirror.media")
+        XCTAssertEqual(mirrorMedia.b.sessionId, "mirror-session-1")
+        XCTAssertEqual(mirrorMedia.b.direction, "android_to_mac")
+        XCTAssertEqual(mirrorMedia.b.sequence, 8)
+
         let phoneStatusData = try encoder.encode(
             Envelope(
                 t: EnvelopeType.phoneCallStatus,

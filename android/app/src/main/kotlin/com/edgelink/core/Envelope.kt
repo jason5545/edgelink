@@ -44,6 +44,7 @@ object EnvelopeTypes {
     const val PHONE_CALL_STATUS = "phone.call.status"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
+    const val MILINK_MIRROR_MEDIA = "milink.mirror.media"
     const val MILINK_COMMAND = "milink.command"
     const val MILINK_COMMAND_RESULT = "milink.command.result"
     const val ANDROID_MIC_STATUS = "android.mic.status"
@@ -231,6 +232,18 @@ data class PhoneRelayEndpointBody(
 
 @Serializable
 data class PhoneRelayMediaBody(
+    val sessionId: String,
+    val direction: String,
+    val kind: String,
+    val dataBase64: String? = null,
+    val bytes: Int? = null,
+    val sequence: Int? = null,
+    val event: String? = null,
+    val ts: Long
+)
+
+@Serializable
+data class MiLinkMirrorMediaBody(
     val sessionId: String,
     val direction: String,
     val kind: String,
