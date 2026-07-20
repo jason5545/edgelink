@@ -1034,18 +1034,6 @@ final class MiLinkPhoneRelayProbe {
                 "-profile:a", "aac_low",
                 "-b:a", "64k",
             ] + Self.sourceMPEGTSOutputArguments
-        case .tone:
-            return [
-                "-hide_banner",
-                "-loglevel", "error",
-                "-re",
-                "-f", "lavfi",
-                "-i", "sine=frequency=880:sample_rate=48000",
-                "-ac", "1",
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", "64k",
-            ] + Self.sourceMPEGTSOutputArguments
         case .microphone:
             return [
                 "-hide_banner",
@@ -2451,14 +2439,9 @@ final class MiLinkPhoneRelayProbe {
 private enum SourceRTPAudioMode: String {
     case silent
     case microphone
-    case tone
 
     init(defaultsValue: String?) {
         switch defaultsValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "mic", "microphone", "input", "mac_microphone", "mac-microphone":
-            self = .microphone
-        case "tone", "beep", "sine":
-            self = .tone
         case "silent", "off", "none", "disabled":
             self = .silent
         default:

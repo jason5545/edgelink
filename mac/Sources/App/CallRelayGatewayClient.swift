@@ -96,7 +96,7 @@ private final class CallRelayMPEGTSPlayer {
     private let pcmCaptureLimitBytes = 8 * 1024 * 1024
 
     private var pcmCaptureEnabled: Bool {
-        UserDefaults.standard.object(forKey: "phoneRelayDownlinkPCMCaptureEnabled") as? Bool ?? true
+        UserDefaults.standard.object(forKey: "phoneRelayDownlinkPCMCaptureEnabled") as? Bool ?? false
     }
 
     func writeRTPPacket(_ packet: Data) -> CallRelayGatewayPlaybackStats? {

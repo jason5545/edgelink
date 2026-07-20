@@ -43,7 +43,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
-import kotlin.math.sin
 
 internal object MiLinkPrivilegeHookPolicy {
     const val EDGE_LINK_PACKAGE = "com.edgelink.app"
@@ -415,7 +414,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             hookTelecomRelayFeatures(lpparam.classLoader, "handleLoadPackage")
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(lpparam.packageName, lpparam.processName)) {
-            hookAudioMonitorRelayInjector()
             hookAudioMonitorDistAudioRelay(lpparam.classLoader)
         }
     }
@@ -959,120 +957,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         log("Android phone force relay call state method=$methodName")
     }
 
-    private val relayInjectorStarted = AtomicBoolean(false)
-    private var relayInjectorTrack: AudioTrack? = null
-    private var relayInjectorWriter: Thread? = null
-    private val relayInjectorStop = AtomicBoolean(false)
-
-    private fun hookAudioMonitorRelayInjector() {
-        if (!relayInjectorStarted.compareAndSet(false, true)) {
-            return
-        }
-        log("audiomonitor relay injector worker installed")
-        thread(name = "EdgeLinkRelayInjector") {
-            while (true) {
-                runCatching {
-                    val active = shouldForceMirrorCallRelay()
-                    val distAudioActive = distAudioStream != null
-                    if (active && !distAudioActive && relayInjectorTrack == null) {
-                        startRelayInjector()
-                    } else if ((!active || distAudioActive) && relayInjectorTrack != null) {
-                        stopRelayInjector()
-                    }
-                }.onFailure { error ->
-                    log("audiomonitor relay injector loop error: ${error.javaClass.simpleName}: ${error.message}")
-                }
-                Thread.sleep(400)
-            }
-        }
-    }
-
-    private fun startRelayInjector() {
-        val context = currentApplicationContext()
-        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        if (audioManager == null) {
-            log("audiomonitor relay injector no audio manager")
-            return
-        }
-        val telephonyDevice = audioManager
-            .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            .firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
-        val sampleRate = RELAY_INJECT_SAMPLE_RATE
-        val minBuffer = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .setFlags(RELAY_INJECT_AUDIO_FLAGS)
-            .build()
-        val format = AudioFormat.Builder()
-            .setSampleRate(sampleRate)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .build()
-        val track = runCatching {
-            AudioTrack.Builder()
-                .setAudioAttributes(attributes)
-                .setAudioFormat(format)
-                .setBufferSizeInBytes(minBuffer * 2)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-        }.getOrElse { error ->
-            log("audiomonitor relay injector track create failed: ${error.javaClass.simpleName}: ${error.message}")
-            return
-        }
-        if (telephonyDevice != null) {
-            runCatching { track.preferredDevice = telephonyDevice }
-        }
-        runCatching { track.play() }
-        relayInjectorTrack = track
-        relayInjectorStop.set(false)
-        log(
-            "audiomonitor relay injector started telephonyDevice=${telephonyDevice != null} " +
-                "state=${track.state} rate=$sampleRate"
-        )
-        relayInjectorWriter = thread(name = "EdgeLinkRelayInjectorWriter") {
-            runRelayInjectorTone(track, sampleRate)
-        }
-    }
-
-    private fun runRelayInjectorTone(track: AudioTrack, sampleRate: Int) {
-        val frameCount = sampleRate / 50
-        val pcm = ShortArray(frameCount)
-            val frequency = readSystemProperty(RELAY_INJECT_TONE_HZ_PROPERTY)
-                .toDoubleOrNull() ?: RELAY_INJECT_TONE_HZ
-        var phase = 0.0
-        val phaseStep = 2.0 * Math.PI * frequency / sampleRate
-        while (!relayInjectorStop.get() && relayInjectorTrack === track) {
-            for (index in pcm.indices) {
-                pcm[index] = (sin(phase) * RELAY_INJECT_TONE_AMPLITUDE).toInt().toShort()
-                phase += phaseStep
-                if (phase > 2.0 * Math.PI) {
-                    phase -= 2.0 * Math.PI
-                }
-            }
-            val bytes = ByteArray(pcm.size * 2)
-            for (index in pcm.indices) {
-                val value = pcm[index].toInt()
-                bytes[index * 2] = (value and 0xff).toByte()
-                bytes[index * 2 + 1] = (value shr 8 and 0xff).toByte()
-            }
-            runCatching { track.write(bytes, 0, bytes.size) }
-        }
-    }
-
-    private fun stopRelayInjector() {
-        relayInjectorStop.set(true)
-        runCatching { relayInjectorWriter?.join(800) }
-        relayInjectorWriter = null
-        runCatching { relayInjectorTrack?.stop() }
-        runCatching { relayInjectorTrack?.release() }
-        relayInjectorTrack = null
-        log("audiomonitor relay injector stopped")
-    }
 
     private val distAudioRelayWorkerStarted = AtomicBoolean(false)
     @Volatile private var distAudioStream: Any? = null
@@ -6971,11 +6855,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private companion object {
-        private const val RELAY_INJECT_SAMPLE_RATE = 16_000
-        private const val RELAY_INJECT_AUDIO_FLAGS = 0x900
-        private const val RELAY_INJECT_TONE_HZ_PROPERTY = "debug.edgelink.relay_tone_hz"
-        private const val RELAY_INJECT_TONE_HZ = 880.0
-        private const val RELAY_INJECT_TONE_AMPLITUDE = 12_000
         private const val DIST_AUDIO_MANAGER_CLASS = "com.miui.audiomonitor.distaudio.service.IDistAudioManager"
         private const val DIST_AUDIO_RESOURCE_MANAGER_CLASS =
             "com.miui.audiomonitor.distaudio.resource.ResourceManager"
