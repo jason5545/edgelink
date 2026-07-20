@@ -62,6 +62,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let registrar: WorkerDeviceRegistrar
     private let relayTransport: RelayTransport
     private let pairingTransport: PairingTransport
+    private let lanTransport = LANTransport()
     private let clipboardSync = ClipboardSync()
     private let notificationPresenter = MacNotificationPresenter()
     private let incomingCallPresenter = MacIncomingCallPresenter()
@@ -233,6 +234,7 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         observeSystemSleepWake()
         verificationCodeBridge.warmObservers()
+        lanTransport.startReachabilityProbe()
         task = Task { await run() }
         startXiaomiMirrorRTSPDiagnosticSourceOnLaunchIfNeeded()
     }
@@ -246,6 +248,7 @@ final class EdgeLinkRuntime: ObservableObject {
         pendingXiaomiScreenFallbackTask?.cancel()
         xiaomiScreenRecoveryTask?.cancel()
         currentChannel?.close()
+        lanTransport.stopReachabilityProbe()
         phoneRelayProbe.stop()
         xiaomiMirrorRTSPDiagnosticSource.stop(reason: "runtime_deinit")
         xiaomiMiShareDiscovery.stop()
@@ -423,6 +426,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             args["peerPort"] = String(peerPort)
             args["forceFakeRemote"] = "true"
+            addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
             addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
             let requestId = sendMiLinkCommand(
                 command: command,
@@ -1180,6 +1184,16 @@ final class EdgeLinkRuntime: ObservableObject {
         args["rtpEnvelope"] = EnvelopeType.miLinkMirrorMedia
     }
 
+    private func addXiaomiMirrorLANProbeArgs(to args: inout [String: String], peerHost: String?) {
+        guard Self.xiaomiMirrorRTSPDiagnosticEnabled(),
+              peerHost?.isEmpty == false,
+              lanTransport.isReachabilityProbeReady,
+              xiaomiMirrorRTSPDiagnosticSource.isListenerReady() else {
+            return
+        }
+        args["lanProbePort"] = String(LANTransport.reachabilityProbePort)
+    }
+
     private func xiaomiMirrorCloudflareSessionIdForRecovery(rebuildSession: Bool, reason: String) -> String? {
         guard Self.xiaomiMirrorCloudflareMediaEnabled() else {
             activeXiaomiMirrorCloudflareSessionId = nil
@@ -1327,6 +1341,7 @@ final class EdgeLinkRuntime: ObservableObject {
             if let peerHost {
                 args["peerHost"] = peerHost
             }
+            addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
             addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
@@ -1378,6 +1393,7 @@ final class EdgeLinkRuntime: ObservableObject {
         if let peerHost {
             args["peerHost"] = peerHost
         }
+        addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
         addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
         DiagnosticsLog.warn(
             "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
@@ -2016,7 +2032,10 @@ final class EdgeLinkRuntime: ObservableObject {
                     relayHost: endpoint.host,
                     relayPort: endpoint.port,
                     relaySessionId: endpoint.sessionId,
-                    relayControlPort: endpoint.controlPort
+                    relayControlPort: endpoint.controlPort,
+                    lanHost: endpoint.lanHost,
+                    lanPort: endpoint.lanPort,
+                    lanProbePort: endpoint.lanProbePort
                 )
                 self.pendingPhoneActions[requestId] = body
                 await self.sendPhoneActionBody(body, session: session)
@@ -2050,15 +2069,43 @@ final class EdgeLinkRuntime: ObservableObject {
         callRelayCloudflareBridge.start(sessionId: sessionId)
         ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)_cloudflare")
         phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)_cloudflare")
+        let lanCandidateReady = await waitForPhoneRelayLANCandidateReady()
+        let lanHost = lanCandidateReady
+            ? Self.phoneRelayAdvertisedHost()
+            : nil
         DiagnosticsLog.info(
             "phone.mac.relay_endpoint action=\(action) mode=cloudflare_secure " +
-                "phoneLocal=127.0.0.1:\(Self.phoneRelayProbePort) sessionId=\(sessionId)"
+                "phoneLocal=127.0.0.1:\(Self.phoneRelayProbePort) sessionId=\(sessionId) " +
+                "lanCandidate=\(lanHost ?? "none"):\(Self.phoneRelayProbePort) " +
+                "lanProbePort=\(lanHost == nil ? 0 : Int(LANTransport.reachabilityProbePort))"
         )
         return PhoneRelayEndpoint(
             host: "127.0.0.1",
             port: Int(Self.phoneRelayProbePort),
-            sessionId: sessionId
+            sessionId: sessionId,
+            lanHost: lanHost,
+            lanPort: lanHost == nil ? nil : Int(Self.phoneRelayProbePort),
+            lanProbePort: lanHost == nil ? nil : Int(LANTransport.reachabilityProbePort)
         )
+    }
+
+    private func waitForPhoneRelayLANCandidateReady() async -> Bool {
+        for attempt in 0...12 {
+            if phoneRelayProbeRunning,
+               phoneRelayProbe.isTCPListenerReady(),
+               lanTransport.isReachabilityProbeReady {
+                return true
+            }
+            guard attempt < 12, !Task.isCancelled else {
+                return false
+            }
+            do {
+                try await Task.sleep(nanoseconds: 25_000_000)
+            } catch {
+                return false
+            }
+        }
+        return false
     }
 
     private func sendPhoneActionBody(_ body: PhoneActionBody, session: SecureSessionHost) async {
@@ -2099,6 +2146,9 @@ final class EdgeLinkRuntime: ObservableObject {
                 relayPort: endpoint.port,
                 relaySessionId: endpoint.sessionId,
                 relayControlPort: endpoint.controlPort,
+                lanHost: endpoint.lanHost,
+                lanPort: endpoint.lanPort,
+                lanProbePort: endpoint.lanProbePort,
                 success: success,
                 error: success ? nil : "relay_endpoint_unavailable",
                 ts: Int64(Date().timeIntervalSince1970)
@@ -2121,7 +2171,9 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.info(
                 "phone.mac.relay_endpoint_sent requestId=\(body.requestId) success=\(body.success) " +
                     "relay=\(body.relayHost ?? "none"):\(body.relayPort.map(String.init) ?? "none") " +
-                    "sessionId=\(body.relaySessionId ?? "none")"
+                    "sessionId=\(body.relaySessionId ?? "none") " +
+                    "lan=\(body.lanHost ?? "none"):\(body.lanPort.map(String.init) ?? "none") " +
+                    "lanProbePort=\(body.lanProbePort.map(String.init) ?? "none")"
             )
         } catch {
             stopPhoneCallRelayAudio(reason: "phone_relay_endpoint_send_failed")
@@ -3398,12 +3450,26 @@ private struct PhoneRelayEndpoint {
     let port: Int
     let sessionId: String?
     let controlPort: Int?
+    let lanHost: String?
+    let lanPort: Int?
+    let lanProbePort: Int?
 
-    init(host: String?, port: Int, sessionId: String? = nil, controlPort: Int? = nil) {
+    init(
+        host: String?,
+        port: Int,
+        sessionId: String? = nil,
+        controlPort: Int? = nil,
+        lanHost: String? = nil,
+        lanPort: Int? = nil,
+        lanProbePort: Int? = nil
+    ) {
         self.host = host
         self.port = port
         self.sessionId = sessionId
         self.controlPort = controlPort
+        self.lanHost = lanHost
+        self.lanPort = lanPort
+        self.lanProbePort = lanProbePort
     }
 }
 

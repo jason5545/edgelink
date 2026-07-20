@@ -104,7 +104,10 @@ final class EnvelopeTests: XCTestCase {
                     relayHost: "10.0.0.42",
                     relayPort: 7102,
                     relaySessionId: "session-1",
-                    relayControlPort: 17104
+                    relayControlPort: 17104,
+                    lanHost: "192.168.50.10",
+                    lanPort: 7102,
+                    lanProbePort: 7103
                 )
             )
         )
@@ -116,6 +119,16 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(phoneAction.b.relayPort, 7102)
         XCTAssertEqual(phoneAction.b.relaySessionId, "session-1")
         XCTAssertEqual(phoneAction.b.relayControlPort, 17104)
+        XCTAssertEqual(phoneAction.b.lanHost, "192.168.50.10")
+        XCTAssertEqual(phoneAction.b.lanPort, 7102)
+        XCTAssertEqual(phoneAction.b.lanProbePort, 7103)
+
+        let legacyPhoneActionData = Data(
+            #"{"t":"phone.action","b":{"requestId":"legacy-call","action":"dial","relayHost":"127.0.0.1","relayPort":7102}}"#.utf8
+        )
+        let legacyPhoneAction = try decoder.decode(Envelope<PhoneActionBody>.self, from: legacyPhoneActionData)
+        XCTAssertNil(legacyPhoneAction.b.lanHost)
+        XCTAssertNil(legacyPhoneAction.b.lanProbePort)
 
         let phoneResultData = try encoder.encode(
             Envelope(
@@ -149,6 +162,9 @@ final class EnvelopeTests: XCTestCase {
                     relayHost: "127.0.0.1",
                     relayPort: 7102,
                     relaySessionId: "cloudflare-session-1",
+                    lanHost: "192.168.50.10",
+                    lanPort: 7102,
+                    lanProbePort: 7103,
                     success: true,
                     ts: 1_783_510_257
                 )
@@ -159,6 +175,8 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(relayEndpoint.b.relayHost, "127.0.0.1")
         XCTAssertEqual(relayEndpoint.b.relayPort, 7102)
         XCTAssertEqual(relayEndpoint.b.relaySessionId, "cloudflare-session-1")
+        XCTAssertEqual(relayEndpoint.b.lanHost, "192.168.50.10")
+        XCTAssertEqual(relayEndpoint.b.lanProbePort, 7103)
 
         let relayMediaData = try encoder.encode(
             Envelope(

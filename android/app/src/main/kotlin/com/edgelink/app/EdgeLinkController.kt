@@ -49,6 +49,7 @@ import com.edgelink.core.SmsSendBody
 import com.edgelink.core.SmsSendResultBody
 import com.edgelink.core.WorkerDeviceRegistrar
 import com.edgelink.transport.ByteChannel
+import com.edgelink.transport.LANTransport
 import com.edgelink.transport.PairingTransport
 import com.edgelink.transport.RelayTransport
 import com.edgelink.transport.SecureSessionClient
@@ -477,21 +478,26 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             return
         }
 
-        val relayBody = PhoneActionBody(
-            requestId = body.requestId,
-            action = "answer",
-            relayHost = body.relayHost,
-            relayPort = relayPort,
-            relaySessionId = body.relaySessionId,
-            relayControlPort = body.relayControlPort
+        val relayBody = LANTransport.preferLAN(
+            PhoneActionBody(
+                requestId = body.requestId,
+                action = "answer",
+                relayHost = body.relayHost,
+                relayPort = relayPort,
+                relaySessionId = body.relaySessionId,
+                relayControlPort = body.relayControlPort,
+                lanHost = body.lanHost,
+                lanPort = body.lanPort,
+                lanProbePort = body.lanProbePort
+            )
         )
         startCallRelayBridge(relayBody, reason = "incallui_relay_preconfigure")
 
         val configureResult = runCatching {
             AndroidShizukuSupport.configurePhoneCallRelayHooks(
                 appContext,
-                relayHost = body.relayHost,
-                relayPort = relayPort
+                relayHost = relayBody.relayHost,
+                relayPort = relayBody.relayPort
             )
         }.getOrElse { error ->
             EdgeLinkLog.warn("phone.android.relay_selection_configure_failed requestId=${body.requestId}", error)
@@ -522,7 +528,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         pokePhoneContinuityRelaySelection(body.requestId)
         EdgeLinkLog.info(
             "phone.android.relay_selection_active requestId=${body.requestId} " +
-                "relay=${body.relayHost ?: "none"}:$relayPort sessionId=${body.relaySessionId ?: "none"}"
+                "relay=${relayBody.relayHost ?: "none"}:${relayBody.relayPort ?: -1} " +
+                "sessionId=${relayBody.relaySessionId ?: "none"}"
         )
     }
 
@@ -1956,9 +1963,10 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.PHONE_ACTION -> {
                 val envelope = EnvelopeCodec.decode<PhoneActionBody>(plaintext)
-                onPhoneActionReceived(envelope.b)
-                val result = phoneCallController.handle(envelope.b)
-                onPhoneActionResult(envelope.b, result)
+                val routedBody = LANTransport.preferLAN(envelope.b)
+                onPhoneActionReceived(routedBody)
+                val result = phoneCallController.handle(routedBody)
+                onPhoneActionResult(routedBody, result)
                 null
             }
             EnvelopeTypes.PHONE_RELAY_ENDPOINT -> {

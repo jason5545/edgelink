@@ -295,6 +295,9 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
     public let relayPort: Int?
     public let relaySessionId: String?
     public let relayControlPort: Int?
+    public let lanHost: String?
+    public let lanPort: Int?
+    public let lanProbePort: Int?
 
     public init(
         requestId: String,
@@ -303,7 +306,10 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         relayHost: String? = nil,
         relayPort: Int? = nil,
         relaySessionId: String? = nil,
-        relayControlPort: Int? = nil
+        relayControlPort: Int? = nil,
+        lanHost: String? = nil,
+        lanPort: Int? = nil,
+        lanProbePort: Int? = nil
     ) {
         self.requestId = requestId
         self.action = action
@@ -312,6 +318,9 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         self.relayPort = relayPort
         self.relaySessionId = relaySessionId
         self.relayControlPort = relayControlPort
+        self.lanHost = lanHost
+        self.lanPort = lanPort
+        self.lanProbePort = lanProbePort
     }
 }
 
@@ -349,6 +358,9 @@ public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
     public let relayPort: Int?
     public let relaySessionId: String?
     public let relayControlPort: Int?
+    public let lanHost: String?
+    public let lanPort: Int?
+    public let lanProbePort: Int?
     public let success: Bool
     public let error: String?
     public let ts: Int64
@@ -359,6 +371,9 @@ public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
         relayPort: Int? = nil,
         relaySessionId: String? = nil,
         relayControlPort: Int? = nil,
+        lanHost: String? = nil,
+        lanPort: Int? = nil,
+        lanProbePort: Int? = nil,
         success: Bool = true,
         error: String? = nil,
         ts: Int64
@@ -368,6 +383,9 @@ public struct PhoneRelayEndpointBody: Codable, Equatable, Sendable {
         self.relayPort = relayPort
         self.relaySessionId = relaySessionId
         self.relayControlPort = relayControlPort
+        self.lanHost = lanHost
+        self.lanPort = lanPort
+        self.lanProbePort = lanProbePort
         self.success = success
         self.error = error
         self.ts = ts

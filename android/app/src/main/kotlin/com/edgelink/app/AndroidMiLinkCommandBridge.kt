@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.Parcel
 import com.edgelink.core.MiLinkCommandBody
 import com.edgelink.core.MiLinkCommandResultBody
+import com.edgelink.transport.LANTransport
 import com.xiaomi.mirror.RemoteDeviceInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -371,9 +372,7 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun requestMirrorSourceRecovery(body: MiLinkCommandBody): CommandResult {
-        val cloudMirrorSessionId = body.args["mirrorSessionId"]
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
+        val cloudMirrorSessionId = selectCloudMirrorSessionId(body, reason = "source_recovery")
         val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
         val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
@@ -878,9 +877,7 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun startFakeMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
-        val cloudMirrorSessionId = body.args["mirrorSessionId"]
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
+        val cloudMirrorSessionId = selectCloudMirrorSessionId(body, reason = "start_main_display")
         val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
         val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
@@ -1114,6 +1111,26 @@ class AndroidMiLinkCommandBridge(
             )
         }
         return emptyMap()
+    }
+
+    private suspend fun selectCloudMirrorSessionId(
+        body: MiLinkCommandBody,
+        reason: String
+    ): String? {
+        val cloudSessionId = body.args["mirrorSessionId"]
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
+            ?: return null
+        val peerHost = body.args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() }
+        val peerPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
+        val probePort = body.args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
+        val useLAN = peerPort != null && LANTransport.isReachable(peerHost, probePort)
+        EdgeLinkLog.info(
+            "xiaomi.mirror.android.media_route reason=$reason " +
+                "transport=${if (useLAN) "lan" else "cloudflare"} " +
+                "peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+        )
+        return cloudSessionId.takeUnless { useLAN }
     }
 
     private fun callMirrorDeviceProviderWithDeadline(

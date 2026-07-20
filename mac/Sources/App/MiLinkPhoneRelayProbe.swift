@@ -31,6 +31,8 @@ final class MiLinkPhoneRelayProbe {
 
     private let queue = DispatchQueue(label: "EdgeLink.MiLinkPhoneRelayProbe")
     private var tcpListener: NWListener?
+    private let listenerStateLock = NSLock()
+    private var tcpListenerReady = false
     private var udpListener: NWListener?
     private var rtpListeners: [UInt16: NWListener] = [:]
     private var connections: [UUID: NWConnection] = [:]
@@ -84,6 +86,9 @@ final class MiLinkPhoneRelayProbe {
 
     func start(port: UInt16 = 7102, peerHost: String? = nil, peerPort: UInt16 = 7102) throws {
         stop()
+        listenerStateLock.withLock {
+            tcpListenerReady = false
+        }
         self.port = port
         let trimmedPeerHost = peerHost?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmedPeerHost, !trimmedPeerHost.isEmpty {
@@ -175,7 +180,14 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
+    func isTCPListenerReady() -> Bool {
+        listenerStateLock.withLock { tcpListenerReady }
+    }
+
     func stop() {
+        listenerStateLock.withLock {
+            tcpListenerReady = false
+        }
         let hadActiveProbe = tcpListener != nil || udpListener != nil || !rtpListeners.isEmpty || !connections.isEmpty
         let activePort = port
         peerSourceHost = nil
@@ -209,8 +221,16 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func configureTCPListener(_ listener: NWListener) {
-        listener.stateUpdateHandler = { [weak self] state in
-            self?.handleListenerState("tcp", port: self?.port, state)
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener else {
+                return
+            }
+            self.handleListenerState(
+                "tcp",
+                port: self.port,
+                state,
+                isCurrentTCPListener: self.tcpListener === listener
+            )
         }
         listener.newConnectionHandler = { [weak self] connection in
             self?.acceptTCPConnection(connection)
@@ -238,14 +258,34 @@ final class MiLinkPhoneRelayProbe {
         }
     }
 
-    private func handleListenerState(_ proto: String, port listenerPort: UInt16?, _ state: NWListener.State) {
+    private func handleListenerState(
+        _ proto: String,
+        port listenerPort: UInt16?,
+        _ state: NWListener.State,
+        isCurrentTCPListener: Bool = false
+    ) {
         let listenerPortText = listenerPort.map(String.init) ?? "unknown"
         switch state {
         case .ready:
+            if isCurrentTCPListener {
+                listenerStateLock.withLock {
+                    tcpListenerReady = true
+                }
+            }
             DiagnosticsLog.info("phonerelay.mac.probe_listener_ready proto=\(proto) port=\(listenerPortText)")
         case .failed(let error):
+            if isCurrentTCPListener {
+                listenerStateLock.withLock {
+                    tcpListenerReady = false
+                }
+            }
             DiagnosticsLog.warn("phonerelay.mac.probe_listener_failed proto=\(proto) port=\(listenerPortText) error=\(error)")
         case .cancelled:
+            if isCurrentTCPListener {
+                listenerStateLock.withLock {
+                    tcpListenerReady = false
+                }
+            }
             DiagnosticsLog.info("phonerelay.mac.probe_listener_cancelled proto=\(proto) port=\(listenerPortText)")
         default:
             break

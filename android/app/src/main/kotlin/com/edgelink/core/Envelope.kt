@@ -199,7 +199,10 @@ data class PhoneActionBody(
     val relayHost: String? = null,
     val relayPort: Int? = null,
     val relaySessionId: String? = null,
-    val relayControlPort: Int? = null
+    val relayControlPort: Int? = null,
+    val lanHost: String? = null,
+    val lanPort: Int? = null,
+    val lanProbePort: Int? = null
 )
 
 @Serializable
@@ -225,6 +228,9 @@ data class PhoneRelayEndpointBody(
     val relayPort: Int? = null,
     val relaySessionId: String? = null,
     val relayControlPort: Int? = null,
+    val lanHost: String? = null,
+    val lanPort: Int? = null,
+    val lanProbePort: Int? = null,
     val success: Boolean = true,
     val error: String? = null,
     val ts: Long

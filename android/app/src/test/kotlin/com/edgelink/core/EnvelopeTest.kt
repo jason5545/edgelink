@@ -105,7 +105,10 @@ class EnvelopeTest {
                 relayHost = "10.0.0.42",
                 relayPort = 7102,
                 relaySessionId = "session-1",
-                relayControlPort = 17104
+                relayControlPort = 17104,
+                lanHost = "192.168.50.10",
+                lanPort = 7102,
+                lanProbePort = 7103
             )
         )
         val phoneAction = EnvelopeCodec.decode<PhoneActionBody>(phoneActionBytes)
@@ -116,6 +119,16 @@ class EnvelopeTest {
         assertEquals(7102, phoneAction.b.relayPort)
         assertEquals("session-1", phoneAction.b.relaySessionId)
         assertEquals(17104, phoneAction.b.relayControlPort)
+        assertEquals("192.168.50.10", phoneAction.b.lanHost)
+        assertEquals(7102, phoneAction.b.lanPort)
+        assertEquals(7103, phoneAction.b.lanProbePort)
+
+        val legacyPhoneAction = EnvelopeCodec.decode<PhoneActionBody>(
+            """{"t":"phone.action","b":{"requestId":"legacy-call","action":"dial","relayHost":"127.0.0.1","relayPort":7102}}"""
+                .encodeToByteArray()
+        )
+        assertEquals(null, legacyPhoneAction.b.lanHost)
+        assertEquals(null, legacyPhoneAction.b.lanProbePort)
 
         val phoneResultBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_ACTION_RESULT,
@@ -140,6 +153,9 @@ class EnvelopeTest {
                 relayHost = "127.0.0.1",
                 relayPort = 7102,
                 relaySessionId = "cloudflare-session-1",
+                lanHost = "192.168.50.10",
+                lanPort = 7102,
+                lanProbePort = 7103,
                 success = true,
                 ts = 1783510257
             )
@@ -149,6 +165,8 @@ class EnvelopeTest {
         assertEquals("127.0.0.1", relayEndpoint.b.relayHost)
         assertEquals(7102, relayEndpoint.b.relayPort)
         assertEquals("cloudflare-session-1", relayEndpoint.b.relaySessionId)
+        assertEquals("192.168.50.10", relayEndpoint.b.lanHost)
+        assertEquals(7103, relayEndpoint.b.lanProbePort)
 
         val relayMediaBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_RELAY_MEDIA,

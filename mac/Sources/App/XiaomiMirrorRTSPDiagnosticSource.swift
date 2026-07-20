@@ -100,6 +100,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
     private var listener: NWListener?
+    private var listenerReady = false
     private var connections: [UUID: NWConnection] = [:]
     private var states: [UUID: RTSPConnectionState] = [:]
     private var stopWorkItem: DispatchWorkItem?
@@ -132,6 +133,10 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         try performOnQueue {
             try self.startOnQueue(port: port, advertisedHost: advertisedHost, lifetime: lifetime)
         }
+    }
+
+    func isListenerReady() -> Bool {
+        performOnQueue { listenerReady }
     }
 
     func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
@@ -372,6 +377,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         self.port = port
         self.advertisedHost = host
         self.listener = listener
+        listenerReady = false
         configure(listener)
         scheduleAutoStop(lifetime: lifetime)
         DiagnosticsLog.info(
@@ -435,6 +441,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         rtspKeepaliveWorkItems.removeAll()
         listener?.cancel()
         listener = nil
+        listenerReady = false
         for state in states.values {
             state.mediaSender?.stop(reason: "rtsp_listener_\(reason)")
             state.timerSyncClient?.stop(reason: "rtsp_listener_\(reason)")
@@ -451,22 +458,31 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     }
 
     private func configure(_ listener: NWListener) {
-        listener.stateUpdateHandler = { [weak self] state in
-            self?.handleListenerState(state)
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let listener else {
+                return
+            }
+            self?.handleListenerState(listener, state: state)
         }
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
     }
 
-    private func handleListenerState(_ state: NWListener.State) {
+    private func handleListenerState(_ source: NWListener, state: NWListener.State) {
+        guard listener === source else {
+            return
+        }
         switch state {
         case .ready:
+            listenerReady = true
             DiagnosticsLog.info("xiaomi.mirror.rtsp.listener_ready port=\(port)")
         case .failed(let error):
+            listenerReady = false
             DiagnosticsLog.error("xiaomi.mirror.rtsp.listener_failed port=\(port)", error)
             stopOnQueue(reason: "listener_failed")
         case .cancelled:
+            listenerReady = false
             DiagnosticsLog.info("xiaomi.mirror.rtsp.listener_cancelled port=\(port)")
         default:
             break
