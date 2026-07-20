@@ -24,10 +24,7 @@ class EdgeLinkForegroundService : Service() {
         super.onCreate()
         EdgeLinkLog.configure(applicationContext)
         AndroidNotificationPresenter.createChannels(applicationContext)
-        startForeground(
-            EDGE_LINK_SERVICE_NOTIFICATION_ID,
-            AndroidNotificationPresenter.serviceNotification(applicationContext, "Starting")
-        )
+        updateForegroundNotification("Starting")
 
         controller = EdgeLinkRuntimeHolder.getOrCreate(applicationContext)
         notificationJob = scope.launch {
@@ -37,13 +34,24 @@ class EdgeLinkForegroundService : Service() {
                 } else {
                     localizedStatus(state.connectionStatus)
                 }
-                startForeground(
-                    EDGE_LINK_SERVICE_NOTIFICATION_ID,
-                    AndroidNotificationPresenter.serviceNotification(applicationContext, status)
-                )
+                updateForegroundNotification(status)
             }
         }
         EdgeLinkLog.info("service.android.foreground_started")
+    }
+
+    private fun updateForegroundNotification(status: String) {
+        runCatching {
+            startForeground(
+                EDGE_LINK_SERVICE_NOTIFICATION_ID,
+                AndroidNotificationPresenter.serviceNotification(applicationContext, status)
+            )
+        }.onFailure { error ->
+            EdgeLinkLog.warn(
+                "service.android.foreground_update_failed status=$status " +
+                    "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

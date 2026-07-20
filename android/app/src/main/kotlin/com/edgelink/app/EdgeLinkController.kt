@@ -700,6 +700,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         session?.close()
         session = null
         AndroidMiLinkMirrorMediaBridge.stop("disconnect")
+        AndroidMirrorScreenRemoteKeeper.stop("disconnect")
         screenSession.stop()
         stateFlow.update {
             it.copy(
@@ -1411,6 +1412,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         )
         connectionJob?.cancel()
         AndroidMiLinkMirrorMediaBridge.stop("connection_restart")
+        AndroidMirrorScreenRemoteKeeper.stop("connection_restart")
         screenSession.stop()
         session?.close()
         session = null
@@ -1532,6 +1534,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
                 AndroidMiLinkMirrorMediaBridge.stop("relay_disconnected")
+                AndroidMirrorScreenRemoteKeeper.stop("relay_disconnected")
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
                 stateFlow.update {
@@ -1971,6 +1974,7 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.SCREEN_STOP -> {
                 AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
+                AndroidMirrorScreenRemoteKeeper.stop("screen_stop")
                 screenSession.stop()
                 null
             }

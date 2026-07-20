@@ -1888,6 +1888,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         val sourceRecoveryOnly = extras.booleanCompat("sourceRecoveryOnly")
                         val edgeLinkRecoveryMethod = method == "edgeLinkSourceRecovery"
                         val startShareRecovery = method == "startShare" && extras.booleanCompat("isStart")
+                        if (startShareRecovery &&
+                            MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) &&
+                            shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            closeStaleFakeMirrorControlSource("provider_start_share")
+                        }
                         if ((!edgeLinkRecoveryMethod && !startShareRecovery) ||
                             !extras.booleanCompat("recovery") ||
                             !MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) ||
@@ -1898,6 +1904,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         armFakeMirrorSourceRouteWindow()
                         val reason = extras.getString("recoveryReason").orEmpty().ifBlank { "mac_stall" }
                         val attempt = extras.getString("recoveryAttempt").orEmpty().ifBlank { "?" }
+                        closeStaleFakeMirrorControlSource("provider_recovery:$reason")
                         val sourceResult = requestFakeMirrorSourceIDR("provider_recovery:$reason")
                         val codecResult = requestLiveMirrorHEVCEncoderSync("provider_recovery:$reason")
                         scheduleFakeMirrorSourceIDRBurst("provider_recovery:$reason")
@@ -4330,6 +4337,27 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         lastFakeMirrorControlSource = source
         lastFakeMirrorControlSourceUptimeMs = SystemClock.uptimeMillis()
         log("mirror source remembered reason=$reason ${mirrorControlSourceRecoverySummary(source)}")
+    }
+
+    private fun closeStaleFakeMirrorControlSource(reason: String) {
+        val source = lastFakeMirrorControlSource ?: return
+        if (readReflectiveFieldAny(source, "run_capture") as? Boolean != false) {
+            return
+        }
+        val summary = mirrorControlSourceRecoverySummary(source)
+        lastFakeMirrorControlSource = null
+        lastFakeMirrorControlSourceUptimeMs = 0L
+        Handler(Looper.getMainLooper()).post {
+            runCatching {
+                source.javaClass.getMethod("closeMirror").invoke(source)
+                log("mirror stale source closed reason=$reason $summary")
+            }.onFailure { error ->
+                log(
+                    "mirror stale source close failed reason=$reason " +
+                        "${error.javaClass.simpleName}: ${error.message} $summary"
+                )
+            }
+        }
     }
 
     private fun requestFakeMirrorSourceIDR(reason: String): String {

@@ -371,16 +371,28 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun requestMirrorSourceRecovery(body: MiLinkCommandBody): CommandResult {
+        val cloudMirrorSessionId = body.args["mirrorSessionId"]
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
+        val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
+        val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
                 context = appContext,
-                peerHost = body.args["peerHost"],
-                peerPort = body.args["peerPort"]?.toIntOrNull()
+                peerHost = armPeerHost,
+                peerPort = armPeerPort
             )
         }.getOrElse { error ->
             ShizukuOperationResult(
                 success = false,
                 message = "mirror:screen_remote exception=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+        }
+        if (armResult.success) {
+            AndroidMirrorScreenRemoteKeeper.noteSessionArmed(
+                context = appContext,
+                peerHost = armPeerHost,
+                peerPort = armPeerPort
             )
         }
         val result = callMirrorProviderWithDeadline(
@@ -869,16 +881,25 @@ class AndroidMiLinkCommandBridge(
         val cloudMirrorSessionId = body.args["mirrorSessionId"]
             ?.trim()
             ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
+        val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
+        val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
                 context = appContext,
-                peerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"],
-                peerPort = body.args["peerPort"]?.toIntOrNull()
+                peerHost = armPeerHost,
+                peerPort = armPeerPort
             )
         }.getOrElse { error ->
             ShizukuOperationResult(
                 success = false,
                 message = "mirror:screen_remote exception=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+        }
+        if (armResult.success) {
+            AndroidMirrorScreenRemoteKeeper.noteSessionArmed(
+                context = appContext,
+                peerHost = armPeerHost,
+                peerPort = armPeerPort
             )
         }
         val fakeBody = body.copy(
