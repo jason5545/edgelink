@@ -176,19 +176,29 @@ final class LyraMeshResponder {
             }
         }
         var transKey = Data()
+        var channelId: UInt32 = 0
         if let pdFields = try? LyraProtoReader.readFields(from: privateData) {
-            for field in pdFields where field.number == 3 && field.wireType == 2 {
-                if let value = field.lengthDelimitedValue {
+            for field in pdFields where field.wireType == 2 {
+                if field.number == 3, let value = field.lengthDelimitedValue {
                     transKey = Self.parseColonHexKey(value) ?? value
+                } else if field.number == 10, let value = field.lengthDelimitedValue,
+                          let innerFields = try? LyraProtoReader.readFields(from: value)
+                {
+                    for innerField in innerFields where innerField.number == 1 && innerField.wireType == 0 {
+                        channelId = UInt32(innerField.varintValue ?? 0)
+                    }
                 }
             }
         }
         if !transKey.isEmpty {
             phoneTransKey = transKey
         }
+        if channelId != 0 {
+            peerChannelId = channelId
+        }
         DiagnosticsLog.info(
             "xiaomi.mishare.mesh_logi_request service=\(serviceName) " +
-                "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count)"
+                "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count) channelId=\(channelId)"
         )
     }
 
@@ -274,7 +284,7 @@ final class LyraMeshResponder {
 
         let endpointDescription = endpoint.debugDescription
         let logiConnId = logiConn.logiConnId
-        let remoteNetId = logiConn.remoteNetId
+        let remoteNetId = logiConn.localNetId
 
         let socket = LyraChannelSocket()
         socket.onRawDatagram = { datagram, from in
@@ -441,7 +451,7 @@ final class LyraMeshResponder {
             let responseLogiConn = LogiConnFrame(
                 logiConnId: logiConn.logiConnId,
                 localNetId: 1,
-                remoteNetId: logiConn.remoteNetId,
+                remoteNetId: logiConn.localNetId,
                 flag: true,
                 inner: encryptedInner
             )
@@ -513,7 +523,7 @@ final class LyraMeshResponder {
 
         DiagnosticsLog.info(
             "xiaomi.mishare.mesh_logi_sync_info from=\(endpoint.debugDescription) " +
-                "logiConnId=\(logiConn.logiConnId) remoteNetId=\(logiConn.remoteNetId) " +
+                "logiConnId=\(logiConn.logiConnId) peerNetId=\(logiConn.localNetId) " +
                 "session=\(sessionId) trust=\(trustLevel) uidFeatureBytes=\(uidFeature.count)"
         )
 
@@ -544,7 +554,7 @@ final class LyraMeshResponder {
         let responseLogiConn = LogiConnFrame(
             logiConnId: logiConn.logiConnId,
             localNetId: 1,
-            remoteNetId: logiConn.remoteNetId,
+            remoteNetId: logiConn.localNetId,
             inner: responseInner.serialized()
         )
         let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
@@ -654,7 +664,7 @@ final class LyraMeshResponder {
         let responseLogiConn = LogiConnFrame(
             logiConnId: logiConn.logiConnId,
             localNetId: 1,
-            remoteNetId: logiConn.remoteNetId,
+            remoteNetId: logiConn.localNetId,
             inner: responseInner.serialized()
         )
         let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])

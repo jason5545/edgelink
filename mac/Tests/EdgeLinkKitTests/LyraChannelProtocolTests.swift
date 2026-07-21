@@ -119,6 +119,11 @@ final class LyraChannelProtocolTests: XCTestCase {
         let bytes = keyString.split(separator: ":").compactMap { UInt8($0, radix: 16) }
         XCTAssertEqual(bytes.count, 32)
         XCTAssertEqual(Data(bytes).prefix(4), Data([0xC9, 0x00, 0x9D, 0x01]))
+        let channelBlob = pdFields.first { $0.number == 10 && $0.wireType == 2 }?.lengthDelimitedValue
+        XCTAssertEqual(channelBlob?.count, 70)
+        let innerFields = try! LyraProtoReader.readFields(from: channelBlob!)
+        let channelId = innerFields.first { $0.number == 1 && $0.wireType == 0 }?.varintValue
+        XCTAssertEqual(channelId, 25)
     }
 }
 

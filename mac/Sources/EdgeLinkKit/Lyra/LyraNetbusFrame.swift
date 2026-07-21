@@ -240,9 +240,9 @@ public struct LogiConnFrame: Equatable, Sendable {
 
     public func serialized() -> Data {
         var data = Data()
-        LyraProtoWriter.appendVarintField(1, value: UInt64(logiConnId), to: &data)
-        LyraProtoWriter.appendVarintField(2, value: UInt64(localNetId), to: &data)
-        LyraProtoWriter.appendVarintField(3, value: UInt64(remoteNetId), to: &data)
+        LyraProtoWriter.appendVarintField(1, value: UInt64(localNetId), to: &data)
+        LyraProtoWriter.appendVarintField(2, value: UInt64(remoteNetId), to: &data)
+        LyraProtoWriter.appendVarintField(3, value: UInt64(logiConnId), to: &data)
         if flag {
             LyraProtoWriter.appendBoolField(4, value: true, to: &data)
         }
@@ -263,9 +263,9 @@ public struct LogiConnFrame: Equatable, Sendable {
         var inner = Data()
         for field in fields {
             switch (field.number, field.wireType) {
-            case (1, 0): logiConnId = UInt32(field.varintValue ?? 0)
-            case (2, 0): localNetId = UInt32(field.varintValue ?? 0)
-            case (3, 0): remoteNetId = UInt32(field.varintValue ?? 0)
+            case (1, 0): localNetId = UInt32(field.varintValue ?? 0)
+            case (2, 0): remoteNetId = UInt32(field.varintValue ?? 0)
+            case (3, 0): logiConnId = UInt32(field.varintValue ?? 0)
             case (4, 0): flag = (field.varintValue ?? 0) != 0
             case (5, 2): inner = field.lengthDelimitedValue ?? Data()
             default: continue
