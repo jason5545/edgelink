@@ -209,3 +209,119 @@ also appear in the wild — we can publish plain IPs first.
   com.xiaomi.mi_connect_service hook.
 - Mac mesh diagnostics: ~/Library/Application Support/EdgeLink/diagnostics.log,
   keys xiaomi.mishare.mesh_rx / mesh_sync_request / mesh_sync_response.
+
+## Live-session findings (2026-07-21)
+
+### Environment gotchas
+
+- **AP client isolation kills everything silently.** mDNS (multicast) passes, all
+  peer unicast (KCP mesh, ping) is dropped → phys sync never arrives, and even the
+  official 小米互联服务 app fails ("no trusted device" for clipboard, transfers fail).
+  Verify with `adb shell ping <mac-ip>` before debugging protocol.
+- The official Mac app does **not** advertise `_lyra-mdns` at all (Mac→phone
+  visibility comes from BLE + same-account cloud/REMOTE). Its lyra discovery/
+  advertising is **app_focus gated**: `DiscoveryPlatformBase::IsAllowDiscovery:81
+  not allow, app_focus=0` — the window must be focused or it goes dark.
+- Our ad now carries `DebugInfo` (plain IPs OK), `MediumType=256`, `CH=<wifi ch>`;
+  phone ad also has a `TS=<ms>` key (not required from us).
+
+### KCP session state (critical)
+
+`LyraMeshDatagram` is standard KCP (conv 0x12345678, cmd 0x51 PUSH / 0x52 ACK).
+**Every PUSH on a conv needs its own incrementing sn and correct una.** Early
+builds sent sn=0/una=0 forever; the phone KCP-ACKed them but its app layer
+silently discarded every PUSH after the first → looked like "app-layer rejection"
+with retry loops. `LyraMeshSocket` now tracks per-connection `{nextSendSn,
+recvUna}`, dedupes `sn < recvUna`, and sends KCP-ACK for each received PUSH.
+
+### Phys-conn sync DeviceInfo (corrected, from official pcap ground truth)
+
+- field 3 = const 1 (NOT device_type), field 5 = device_type (14=MacBook, 1=phone)
+- field 8 = OS version string ("26.5.2"), field 9 = conn_medium_types
+  (Mac 0x40082, phone 0x410a3 — we now send 0x40082)
+- field 10 = submsg {1: fixed32 0x1001} (present in both phone and official Mac)
+- field 11 = rom/app version ("5.1.174.10.6031221" mimics official)
+- Response: no field 5; NetworkInfo = {1:256, 5:""} only.
+
+### LogiConn establishment (works end-to-end)
+
+1. Phys sync req/resp (packType 1), then LogiConnSyncInfo (packType 2,
+   inner frame_type=5, field 6). Request: {1: session_id, 2: trust (48=EVERY_ONE),
+   4: "com.xiaomi.hyperconnect:miLyraShareTransfer", 5: uid_feature{8B id, 32B hash}}.
+   **Mirroring the request back** (same session/trust/uid_feature) is accepted.
+2. Auth handshake rides inner **frame_type=6, field 7** =
+   `MiConnectProto.AuthHandshakeFrame{f1: handshake_id, f2: HandshakeFrame}`.
+   `HandshakeFrame{f1: family, f2: message_class, oneof}`:
+   - families: 1=PasskeyPair, 2/6=AccountPair variants, 5=KeyAgree
+     (`XxxHandshake::GetType()`; `HandshakeBase::MakeHandshakeMessage` stores
+     GetType()→f1, MessageType→f2)
+   - message_class: 1=alert, 4=AccountPair msg, 6=KeyAgree msg
+   - oneof cases: 3=AlertFrame, 4=PasskeyEntryPair, 5=NumericComparisonPair,
+     6=AccountPairFrame, 7=AuthFrame, 8=KeyAgreeFrame
+   - PairFrame: {1: role (1=client/2=server), 2: client_notify, 3: server_notify,
+     4/5: finished}
+   - ClientNotify: {1: SupportedCipherSuites{1:1, 2: client_random(32B),
+     3/4: cipher ids, 5: GenericPublicKey{1: type, 2: 65B P-256 X963 pubkey}},
+     3: AuthExtParam{1:1}}
+   - ServerNotify: {1: SelectedCipherSuite{1:1, 2: server_random(32B),
+     3/4: selected ciphers, 5: server pubkey}, 3: SupportedCapacity{1:1},
+     4: AuthExtParam{1:1}}
+   - AlertFrame: {1: code, 2: message}; e.g. code 3 "bad message type"
+     (wrong family/class), code 5 "bad server notify message" (content rejected).
+3. Phone tries AccountPair family 2, then family 6 (fresh random+key each),
+   then **falls back to KeyAgree family 5** (ciphers change 16,8 → 32,2).
+   AccountPair server side requires an account long-term identity key
+   (GenericPublicKey type ≥ 2 + identity memcmp in
+   `HandshakeBase::ParseSelectedCipherSuite` Android 0xcf4708) — cred wall,
+   expected; KeyAgree path has no such requirement.
+
+### KeyAgree session key + channel encryption (fully solved)
+
+- `KeyAgreeHandshake::GenerateSessionKey` (Android 0xd034a4):
+  `CryptoUtil::Hkdf256` (0x859584, wraps mbedtls_hkdf SHA256):
+  `key = HKDF(ikm=ECDH P-256 shared secret (32B X963), salt=<32-byte protocol
+  constant 5ed5a3f836f6b54f7b1efad02714d5177b8a1f0f19e369cc0be8d98ba6297317>,
+  info=clientRandom ‖ serverRandom)` → 32-byte AES-256 key.
+- Encrypted LogiConn frames have `LogiConnFrame.flag (f4) = 1`; inner =
+  `[12-byte GCM nonce][ciphertext][16-byte GCM tag]`, no AAD
+  (`CryptoUtil::AesGcmEncrypt` 0x85a048: out = len+0x1c).
+- Full open sequence (all encrypted after KeyAgree server notify):
+  phone → LogiConnRequest (inner frame_type 1, field 2; service
+  `com.xiaomi.hyperconnect:miLyraShareTransfer`, options contain client package
+  `com.miui.mishare.connectivity`, 95-char colon-hex id, base64 token,
+  tcp_tunnel_profile) → we reply LogiConnResponse (frame_type 2, field 3,
+  **empty body works**) → phone → LogiConnResponseAck (frame_type 3, field 4,
+  empty). Phone Java: `OnChannelConfirm` → `ConfirmChannel(accept=0)` →
+  `LogiWorkflow: after=9(kConnected), res=0(success)`.
+- Phone re-establishes the whole flow (phys sync → sync_info → auth → request)
+  on a **channel-dedicated UDP source port**; each new endpoint needs fresh KCP
+  state (already handled).
+
+### Current blocker: post-connect silence (2026-07-21 end of session)
+
+After ResponseAck the phone sends only phys keepalives for ~10s, then
+LogiConnDisconnect (reason 29005) → UI 待接收 → 連接異常. The MiShare transfer
+protocol (from MiShare.apk jadx `x2/d.java`) is `FileSendProtocol{tag, body}`
+in channel Packets (type 1 = bytes, type 2 = file):
+tags 1=FileSendRequest, 2=FileSendRequestResponse, 3/4=Cancel(+Resp),
+5/6=Error(+Resp), 7/8=Complete(+Resp), 9=PreCheckMsgRequest, 10=PreCheckMsgResponse,
+11=SendVerifyRequest, 12=SendVerifyResponse, 13=BasicChannelRequest,
+14=BasicChannelResponse, 15=BackgroundWaitRequest.
+The sender never emits the first Packet.
+
+Hypotheses:
+- A. Receiver must send a transfer-level accept/ready first (which message is TBD).
+- B. (favored) Sender uses **DoubleConnection**: basic leg (service `miShareBasic`)
+  + advance leg (`miLyraShareTransfer`). Our Xposed injection only advertises
+  `miLyraShare`, and both observed LogiConns went to `miLyraShareTransfer`, so the
+  basic leg likely never completes → sender state machine stalls.
+  Evidence: receiver-side `a3/u.h0()` maps `miShareBasic` → DoubleConnection
+  (s2.t) with advance `miLyraShareTransfer`; sender has
+  `BasicChannelRequest{action:"create_advance_channel"}` (y2/e1.java Q0()).
+  Next: extend `MiShareTrustInjection.kt` to inject multiple services
+  (miLyraShare + miShareBasic), redeploy, then answer BasicChannelRequest with
+  BasicChannelResponse (tag 14).
+
+Ground-truth artifacts: `/tmp/official-lyra.pcap` (official phone→Mac success,
+but already-encrypted same-account path), phone pid for mi_connect_service
+logs 15069 (lyra-* tags).

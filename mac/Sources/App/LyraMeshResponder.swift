@@ -114,12 +114,55 @@ final class LyraMeshResponder {
                     "xiaomi.mishare.mesh_logi_enc_decrypted from=\(endpoint.debugDescription) " +
                         "variant=\(label) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
                 )
+                if let innerFrame = LogiConnInnerFrame(parsing: plaintext),
+                   case .request = innerFrame.payload {
+                    sendLogiConnResponse(
+                        frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+                    )
+                }
                 return
             } catch {
                 continue
             }
         }
         DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_enc_decrypt_failed bytes=\(inner.count)")
+    }
+
+    private func sendLogiConnResponse(
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        guard let channelKey else {
+            return
+        }
+        let responseInner = LogiConnInnerFrame(frameType: 2, payload: .response(Data()))
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(responseInner.serialized(), using: channelKey, nonce: nonce)
+            var encryptedInner = Data()
+            encryptedInner.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            encryptedInner.append(sealed.ciphertext)
+            encryptedInner.append(sealed.tag)
+
+            let responseLogiConn = LogiConnFrame(
+                logiConnId: logiConn.logiConnId,
+                localNetId: 1,
+                remoteNetId: logiConn.remoteNetId,
+                flag: true,
+                inner: encryptedInner
+            )
+            let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+            let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+            try reply(responseFrame)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_logi_response to=\(endpoint.debugDescription) " +
+                    "logiConnId=\(logiConn.logiConnId) encryptedBytes=\(encryptedInner.count)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_logi_response_failed", error)
+        }
     }
 
     private func handleLogiConn(
