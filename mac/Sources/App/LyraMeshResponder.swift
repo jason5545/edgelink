@@ -33,6 +33,9 @@ final class LyraMeshResponder {
     private var authServerRandom = Data()
     private var authSharedSecret = Data()
     private var channelKey: SymmetricKey?
+    private var expressHandshakeDone = false
+    private var expressListener: NWListener?
+    private let expressQueue = DispatchQueue(label: "edgelink.lyra.express")
 
     private static let hkdfSalt = Data([
         0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
@@ -127,11 +130,16 @@ final class LyraMeshResponder {
                     "xiaomi.mishare.mesh_logi_enc_decrypted from=\(endpoint.debugDescription) " +
                         "variant=\(label) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
                 )
-                if let innerFrame = LogiConnInnerFrame(parsing: plaintext),
-                   case .request = innerFrame.payload {
-                    sendLogiConnResponse(
-                        frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
-                    )
+                if let innerFrame = LogiConnInnerFrame(parsing: plaintext) {
+                    if case .request = innerFrame.payload {
+                        sendLogiConnResponse(
+                            frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+                        )
+                    } else if case .responseAck = innerFrame.payload {
+                        sendExpressHandshake(
+                            frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+                        )
+                    }
                 }
                 return
             } catch {
@@ -139,6 +147,114 @@ final class LyraMeshResponder {
             }
         }
         DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_enc_decrypt_failed bytes=\(inner.count)")
+    }
+
+    private func sendExpressHandshake(
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        guard !expressHandshakeDone, let channelKey else {
+            return
+        }
+        expressHandshakeDone = true
+
+        var key = Data(count: 16)
+        key.withUnsafeMutableBytes { buffer in
+            if let baseAddress = buffer.baseAddress {
+                arc4random_buf(baseAddress, 16)
+            }
+        }
+
+        let endpointDescription = endpoint.debugDescription
+        let packType = frame.packType
+        let logiConnId = logiConn.logiConnId
+        let remoteNetId = logiConn.remoteNetId
+
+        do {
+            let listener = try NWListener(using: .tcp, on: .any)
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.acceptExpressConnection(connection)
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                DiagnosticsLog.info("xiaomi.mishare.express_listener_state state=\(String(describing: state))")
+                guard case .ready = state, let port = listener.port?.rawValue, port != 0 else {
+                    return
+                }
+                let tlv = LyraExpressTLV.handshakeEventFrame(dataPort: UInt32(port), key: key)
+                do {
+                    try self.sendEncryptedChannelData(
+                        tlv,
+                        packType: packType,
+                        logiConnId: logiConnId,
+                        remoteNetId: remoteNetId,
+                        endpointDescription: endpointDescription,
+                        channelKey: channelKey
+                    )
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.express_handshake_sent to=\(endpointDescription) " +
+                            "dataPort=\(port) key=\(key.map { String(format: "%02x", $0) }.joined()) " +
+                            "tlvBytes=\(tlv.count)"
+                    )
+                } catch {
+                    DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
+                }
+            }
+            listener.start(queue: expressQueue)
+            expressListener = listener
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
+        }
+    }
+
+    private func sendEncryptedChannelData(
+        _ plaintext: Data,
+        packType: UInt8,
+        logiConnId: UInt32,
+        remoteNetId: UInt32,
+        endpointDescription: String,
+        channelKey: SymmetricKey
+    ) throws {
+        let nonce = AES.GCM.Nonce()
+        let sealed = try AES.GCM.seal(plaintext, using: channelKey, nonce: nonce)
+        var body = Data()
+        body.append(UInt8(logiConnId & 0xFF))
+        body.append(1)
+        body.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+        body.append(sealed.ciphertext)
+        body.append(sealed.tag)
+
+        let dataFrame = LyraMeshPack.Frame(packType: 5, payload: body)
+        try socket.sendInbound(frame: dataFrame, toEndpointDescription: endpointDescription)
+    }
+
+    private func acceptExpressConnection(_ connection: NWConnection) {
+        let endpoint = connection.endpoint
+        DiagnosticsLog.info("xiaomi.mishare.express_conn from=\(endpoint.debugDescription)")
+        connection.start(queue: expressQueue)
+        receiveExpressData(connection)
+    }
+
+    private func receiveExpressData(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
+            if let content, !content.isEmpty {
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.express_rx from=\(connection.endpoint.debugDescription) bytes=\(content.count) " +
+                        "hex=\(content.prefix(256).map { String(format: "%02x", $0) }.joined())"
+                )
+            }
+            if let error {
+                DiagnosticsLog.error("xiaomi.mishare.express_rx_failed", error)
+                return
+            }
+            if isComplete {
+                DiagnosticsLog.info("xiaomi.mishare.express_conn_closed from=\(connection.endpoint.debugDescription)")
+                return
+            }
+            self?.receiveExpressData(connection)
+        }
     }
 
     private func sendLogiConnResponse(
@@ -237,6 +353,10 @@ final class LyraMeshResponder {
                 "logiConnId=\(logiConn.logiConnId) remoteNetId=\(logiConn.remoteNetId) " +
                 "session=\(sessionId) trust=\(trustLevel) uidFeatureBytes=\(uidFeature.count)"
         )
+
+        expressHandshakeDone = false
+        expressListener?.cancel()
+        expressListener = nil
 
         var syncInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: sessionId, to: &syncInfo)

@@ -99,6 +99,26 @@ public final class LyraMeshSocket: @unchecked Sendable {
         connection.send(content: datagram, completion: .idempotent)
     }
 
+    public func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) throws {
+        try queue.sync {
+            guard let (id, connection) = inboundConnections.first(where: { _, connection in
+                (connection.currentPath?.remoteEndpoint ?? connection.endpoint).debugDescription == endpointDescription
+            }) else {
+                throw SocketError.invalidEndpoint
+            }
+            var state = sessionStates[id] ?? KcpSessionState()
+            let datagram = LyraMeshDatagram.encode(
+                tick: Self.tick(),
+                sn: state.nextSendSn,
+                una: state.recvUna,
+                payload: try LyraMeshPack.encode(frame)
+            )
+            state.nextSendSn &+= 1
+            sessionStates[id] = state
+            connection.send(content: datagram, completion: .idempotent)
+        }
+    }
+
     public static func tick() -> UInt32 {
         UInt32(DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
