@@ -156,6 +156,152 @@ final class LyraMeshResponder {
         }
     }
 
+    private struct AuthClientHello {
+        var handshakeId: UInt64
+        var family: UInt64
+        var messageClass: UInt64
+        var clientRandom: Data
+        var cipher1: UInt64
+        var cipher2: UInt64
+        var keyType: UInt64
+        var publicKey: Data
+    }
+
+    private func handleLogiUpgrade(
+        upgradeData: Data,
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        guard let hello = Self.parseAuthClientHello(upgradeData) else {
+            DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_upgrade_parse_failed bytes=\(upgradeData.count)")
+            return
+        }
+
+        let privateKey = P256.KeyAgreement.PrivateKey()
+        keyAgreementKey = privateKey
+        var sharedSecretPrefix = ""
+        do {
+            let peerPublicKey = try P256.KeyAgreement.PublicKey(x963Representation: hello.publicKey)
+            let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: peerPublicKey)
+            let secretData = sharedSecret.withUnsafeBytes { Data($0) }
+            sharedSecretPrefix = secretData.prefix(4).map { String(format: "%02x", $0) }.joined()
+        } catch {
+            DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_upgrade_ecdh_failed error=\(error.localizedDescription)")
+        }
+
+        DiagnosticsLog.info(
+            "xiaomi.mishare.mesh_logi_upgrade from=\(endpoint.debugDescription) " +
+                "logiConnId=\(logiConn.logiConnId) handshakeId=\(hello.handshakeId) " +
+                "family=\(hello.family) class=\(hello.messageClass) " +
+                "ciphers=\(hello.cipher1),\(hello.cipher2) secretPrefix=\(sharedSecretPrefix)"
+        )
+
+        var serverRandom = Data(count: 32)
+        _ = serverRandom.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+
+        var publicKeyMessage = Data()
+        LyraProtoWriter.appendVarintField(1, value: hello.keyType, to: &publicKeyMessage)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: privateKey.publicKey.x963Representation, to: &publicKeyMessage)
+
+        var cipherSuite = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &cipherSuite)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: serverRandom, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(3, value: hello.cipher1, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(4, value: hello.cipher2, to: &cipherSuite)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: publicKeyMessage, to: &cipherSuite)
+
+        var serverNotify = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: cipherSuite, to: &serverNotify)
+
+        var pairFrame = Data()
+        var handshakeFrame = Data()
+        if hello.family == 5 {
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &pairFrame)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &pairFrame)
+            LyraProtoWriter.appendVarintField(1, value: hello.family, to: &handshakeFrame)
+            LyraProtoWriter.appendVarintField(2, value: 6, to: &handshakeFrame)
+            LyraProtoWriter.appendLengthDelimitedField(8, value: pairFrame, to: &handshakeFrame)
+        } else {
+            var supportedCapacity = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &supportedCapacity)
+            var authExtParam = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &authExtParam)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: supportedCapacity, to: &serverNotify)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: authExtParam, to: &serverNotify)
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &pairFrame)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &pairFrame)
+            LyraProtoWriter.appendVarintField(1, value: hello.family, to: &handshakeFrame)
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &handshakeFrame)
+            LyraProtoWriter.appendLengthDelimitedField(6, value: pairFrame, to: &handshakeFrame)
+        }
+
+        var authFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: hello.handshakeId, to: &authFrame)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: handshakeFrame, to: &authFrame)
+
+        let responseInner = LogiConnInnerFrame(frameType: 6, payload: .upgrade(authFrame))
+        let responseLogiConn = LogiConnFrame(
+            logiConnId: logiConn.logiConnId,
+            localNetId: 1,
+            remoteNetId: logiConn.remoteNetId,
+            inner: responseInner.serialized()
+        )
+        let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+        let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+
+        do {
+            try reply(responseFrame)
+            let responsePayload = (try? LyraMeshPack.encode(responseFrame)) ?? Data()
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_logi_upgrade_response to=\(endpoint.debugDescription) " +
+                    "logiConnId=\(logiConn.logiConnId) hex=\(responsePayload.map { String(format: "%02x", $0) }.joined())"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_logi_upgrade_response_failed", error)
+        }
+    }
+
+    private static func parseAuthClientHello(_ data: Data) -> AuthClientHello? {
+        func lengthDelimited(_ fieldNumber: Int, in data: Data) -> Data? {
+            guard let fields = try? LyraProtoReader.readFields(from: data) else { return nil }
+            return fields.first { $0.number == fieldNumber && $0.wireType == 2 }?.lengthDelimitedValue
+        }
+        func varint(_ fieldNumber: Int, in data: Data) -> UInt64? {
+            guard let fields = try? LyraProtoReader.readFields(from: data) else { return nil }
+            return fields.first { $0.number == fieldNumber && $0.wireType == 0 }?.varintValue
+        }
+
+        guard let handshakeId = varint(1, in: data),
+              let handshakeFrame = lengthDelimited(2, in: data),
+              let family = varint(1, in: handshakeFrame),
+              let messageClass = varint(2, in: handshakeFrame),
+              let pairFrame = lengthDelimited(family == 5 ? 8 : 6, in: handshakeFrame),
+              let clientNotify = lengthDelimited(2, in: pairFrame),
+              let supportedCipherSuites = lengthDelimited(1, in: clientNotify),
+              let clientRandom = lengthDelimited(2, in: supportedCipherSuites),
+              let cipher1 = varint(3, in: supportedCipherSuites),
+              let cipher2 = varint(4, in: supportedCipherSuites),
+              let genericPublicKey = lengthDelimited(5, in: supportedCipherSuites),
+              let keyType = varint(1, in: genericPublicKey),
+              let publicKey = lengthDelimited(2, in: genericPublicKey),
+              publicKey.count == 65, publicKey.first == 0x04
+        else {
+            return nil
+        }
+        return AuthClientHello(
+            handshakeId: handshakeId,
+            family: family,
+            messageClass: messageClass,
+            clientRandom: clientRandom,
+            cipher1: cipher1,
+            cipher2: cipher2,
+            keyType: keyType,
+            publicKey: publicKey
+        )
+    }
+
     private func handleSyncRequest(
         frame: LyraMeshPack.Frame,
         physConn: PhysConnFrame,
