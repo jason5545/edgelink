@@ -6946,11 +6946,11 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             XposedHelpers.callMethod(serviceName, "getName") as? String
         }.getOrNull()
         log("mishare trust injection: addServiceListener filter=$filterName listener=$serviceListener")
-        if (filterName != MiShareTrustInjection.SERVICE_NAME) {
+        if (filterName == null || filterName !in MiShareTrustInjection.KNOWN_SERVICE_NAMES) {
             return false
         }
-        log("mishare trust injection: captured listener=$serviceListener")
-        MiShareTrustInjection.registerListener(classLoader, serviceListener) { message ->
+        log("mishare trust injection: captured listener=$serviceListener service=$filterName")
+        MiShareTrustInjection.registerListener(classLoader, filterName, serviceListener) { message ->
             log("mishare trust injection: $message")
         }
         return true

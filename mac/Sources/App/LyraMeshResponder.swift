@@ -61,11 +61,24 @@ final class LyraMeshResponder {
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
             return
         }
-        if let physConn = miFrame.physConnFrame,
-           case let .syncDeviceInfoRequest(requestData) = physConn.payload,
-           let request = PhysConnSyncDeviceInfoRequest(parsing: requestData) {
-            handleSyncRequest(frame: frame, physConn: physConn, request: request, endpoint: endpoint, reply: reply)
-            return
+        if let physConn = miFrame.physConnFrame {
+            if case let .syncDeviceInfoRequest(requestData) = physConn.payload,
+               let request = PhysConnSyncDeviceInfoRequest(parsing: requestData) {
+                handleSyncRequest(frame: frame, physConn: physConn, request: request, endpoint: endpoint, reply: reply)
+                return
+            }
+            if case let .keepAliveRequest(requestData) = physConn.payload {
+                handleKeepAliveRequest(
+                    frame: frame, physConn: physConn, request: requestData, endpoint: endpoint, reply: reply
+                )
+                return
+            }
+            if case let .disconnectRequest(requestData) = physConn.payload {
+                handleDisconnectRequest(
+                    frame: frame, physConn: physConn, request: requestData, endpoint: endpoint, reply: reply
+                )
+                return
+            }
         }
         for logiConn in miFrame.logiConnFrames {
             if logiConn.flag {
@@ -407,6 +420,65 @@ final class LyraMeshResponder {
             keyType: keyType,
             publicKey: publicKey
         )
+    }
+
+    private func handleKeepAliveRequest(
+        frame: LyraMeshPack.Frame,
+        physConn: PhysConnFrame,
+        request: Data,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        let tick = UInt64(LyraMeshSocket.tick())
+        var responsePayload = Data()
+        LyraProtoWriter.appendVarintField(1, value: tick, to: &responsePayload)
+        LyraProtoWriter.appendVarintField(2, value: 2, to: &responsePayload)
+        LyraProtoWriter.appendVarintField(3, value: tick, to: &responsePayload)
+        let responsePhysConn = PhysConnFrame(
+            field2: 5,
+            payload: .keepAliveResponse(responsePayload)
+        )
+        let miResponse = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: responsePhysConn)
+        let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+
+        do {
+            try reply(responseFrame)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_keepalive_response to=\(endpoint.debugDescription) " +
+                    "requestBytes=\(request.count)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_keepalive_response_failed", error)
+        }
+    }
+
+    private func handleDisconnectRequest(
+        frame: LyraMeshPack.Frame,
+        physConn: PhysConnFrame,
+        request: Data,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        var responsePayload = Data()
+        LyraProtoWriter.appendVarintField(
+            1, value: UInt64(Date().timeIntervalSince1970 * 1000), to: &responsePayload
+        )
+        let responsePhysConn = PhysConnFrame(
+            field2: 7,
+            payload: .disconnectResponse(responsePayload)
+        )
+        let miResponse = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: responsePhysConn)
+        let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+
+        do {
+            try reply(responseFrame)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_disconnect_response to=\(endpoint.debugDescription) " +
+                    "requestBytes=\(request.count)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_disconnect_response_failed", error)
+        }
     }
 
     private func handleSyncRequest(

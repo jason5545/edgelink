@@ -279,7 +279,6 @@ public enum PhysConnPayload: Equatable, Sendable {
     case syncDeviceInfoRequest(Data)
     case syncDeviceInfoResponse(Data)
     case updateDeviceInfo(Data)
-    case updateNetworkInfo(Data)
     case keepAliveRequest(Data)
     case keepAliveResponse(Data)
     case disconnectRequest(Data)
@@ -290,18 +289,17 @@ public enum PhysConnPayload: Equatable, Sendable {
         case .syncDeviceInfoRequest: return 3
         case .syncDeviceInfoResponse: return 4
         case .updateDeviceInfo: return 5
-        case .updateNetworkInfo: return 6
-        case .keepAliveRequest: return 7
-        case .keepAliveResponse: return 8
-        case .disconnectRequest: return 9
-        case .disconnectResponse: return 10
+        case .keepAliveRequest: return 6
+        case .keepAliveResponse: return 7
+        case .disconnectRequest: return 8
+        case .disconnectResponse: return 9
         }
     }
 
     var data: Data {
         switch self {
         case .syncDeviceInfoRequest(let data), .syncDeviceInfoResponse(let data),
-             .updateDeviceInfo(let data), .updateNetworkInfo(let data),
+             .updateDeviceInfo(let data),
              .keepAliveRequest(let data), .keepAliveResponse(let data),
              .disconnectRequest(let data), .disconnectResponse(let data):
             return data
@@ -313,11 +311,10 @@ public enum PhysConnPayload: Equatable, Sendable {
         case 3: self = .syncDeviceInfoRequest(data)
         case 4: self = .syncDeviceInfoResponse(data)
         case 5: self = .updateDeviceInfo(data)
-        case 6: self = .updateNetworkInfo(data)
-        case 7: self = .keepAliveRequest(data)
-        case 8: self = .keepAliveResponse(data)
-        case 9: self = .disconnectRequest(data)
-        case 10: self = .disconnectResponse(data)
+        case 6: self = .keepAliveRequest(data)
+        case 7: self = .keepAliveResponse(data)
+        case 8: self = .disconnectRequest(data)
+        case 9: self = .disconnectResponse(data)
         default: return nil
         }
     }
@@ -336,8 +333,12 @@ public struct PhysConnFrame: Equatable, Sendable {
 
     public func serialized() -> Data {
         var data = Data()
-        LyraProtoWriter.appendVarintField(1, value: UInt64(field1), to: &data)
-        LyraProtoWriter.appendVarintField(2, value: UInt64(field2), to: &data)
+        if field1 != 0 {
+            LyraProtoWriter.appendVarintField(1, value: UInt64(field1), to: &data)
+        }
+        if field2 != 0 {
+            LyraProtoWriter.appendVarintField(2, value: UInt64(field2), to: &data)
+        }
         if let payload {
             LyraProtoWriter.appendLengthDelimitedField(payload.fieldNumber, value: payload.data, to: &data)
         }

@@ -325,3 +325,103 @@ Hypotheses:
 Ground-truth artifacts: `/tmp/official-lyra.pcap` (official phone→Mac success,
 but already-encrypted same-account path), phone pid for mi_connect_service
 logs 15069 (lyra-* tags).
+
+### Live-session findings (2026-07-21, session 2)
+
+- **Phys keepalive root cause found & fixed (hypotheses A/B above were wrong)**.
+  Phone-side phys RX timer is 10s: `PhysConnHandler::OnTimerReceiveFunc keep
+  alive timeout and close, elapsed=10700, timeout=10s` → code 16032 →
+  LogiConnDisconnect. We never answered phys keepalives.
+- **PhysConnFrame wire mapping corrected** (old enum was shifted by one for
+  fields 6-10). Ground truth from official pcap + phone native logs
+  (`PhysConnHandler::DoSendProtocolFrame frame_type=N`):
+  - wire f3 = sync_device_info_request (frame_type 1), f4 = sync_device_info_response (2)
+  - wire f5 = update_device_info (3)
+  - wire f6 = keep_alive_request (4), wrapper field2=4, payload `{1: tick_varint, 2: 1}`
+    sent every ~2.7-10s by BOTH sides (official Mac sends every ~5s)
+  - wire f7 = keep_alive_response (5), wrapper field2=5, payload `{1: tick, 2: role, 3: tick2}`
+  - wire f8 = disconnect_request (6), wrapper field2=6, payload `{1: unix_ms}`
+  - wire f9 = disconnect_response (7), wrapper field2=7, payload `{1: unix_ms}`
+  - (no update_network_info on wire; old "updateNetworkInfo" field-6 frames were
+    actually keep_alive_requests)
+- LyraMeshSocket now sends periodic field-6 keepalive every 5s per active
+  inbound connection (started from `start()` — must NOT be started before
+  `start()` because `stop()` cancels the timer). LyraMeshResponder answers
+  field-6 with keepAliveResponse and field-8 with disconnectResponse.
+  PhysConnFrame.serialized() now omits zero field1/field2 (matches official).
+- Result: phys conn survives past 10s; phone now fails at **25s with 52008**
+  (`ContinuityService.ConnectionManager onChannelCreateFailed channelId N code
+  52008` → `MiShare miLyraShareTransfer:onConnectFailed 52008 nfcErr -3001`).
+- **Xposed multi-service injection done** (module versionCode 4):
+  `MiShareTrustInjection` supports `services` array in
+  `/data/local/tmp/edgelink-mishare-inject.json` (miLyraShare + miShareBasic),
+  keyed by the listener's registered service-filter name. Note: the MiShare
+  app only ever registers a `miLyraShare` filter listener; miShareBasic is
+  injected only if such a listener appears. Also: listener registration only
+  fires when the 互傳 page/switch is (re)opened — force-stopping the app
+  requires re-opening the page before injection works again.
+- **Real blocker after keepalive fix: miexpress (ExpressChannel) handshake**.
+  MiShare wraps the Lyra channel in miexpress (`com.xiaomi.miexpress`,
+  native libmiexpress on phone, `miexpress.framework` inside official Mac
+  app). Java flow: `createChannel(miLyraShareTransfer)` → Lyra kConnected →
+  `onChannelConfirmV2` → then waits for **ExpressChannel handshake (HSHK)**
+  → 25s → `ExpressChannelImpl::OnChannelCreateFailed [ECH N][MAIN][HSHK]`
+  52008. Only after HSHK does `onChannelCreateSuccess` → `SendAndReceiver:
+  onConnected` → PendingHandler gate opens → FileSendRequest. The phone never
+  speaks first after ResponseAck; the **server (receiver) sends the first
+  express frame**.
+- **Express architecture** (from miexpress.framework disasm, arm64):
+  - Lyra channel (cch1, service miLyraShareTransfer) = "event socket" carrying
+    `TlvExpressFrame`s; bulk data goes over a second channel (cch2, "data
+    socket") that the client opens to the server's advertised `data_port`
+    (likely TCP-tunneled; cf. `MiConnectProto.TcpTunnelProfile`,
+    `lyra.netbus.conn.tunnel.TunnelPortPairInfoFrame`,
+    `TunnelActionFrameConnect.destination_address`).
+  - Server flow: `ExpressServerChannel::ProtoHandshakeWithClient()` (0x318cc)
+    → enqueues lambda (0x31a60): builds 16-byte random key (`rand()` bytes),
+    name = `"ECH"+to_string(cch_id)`, calls
+    `ExpressDataSocket::NewServer(name, &port, 8, key, timeout)` (0x21f88),
+    then sends EVENT_HANDSHAKE frame via `ProtoSendChannelFrame` with filler
+    (0x32004):
+    `oneof.select(1)`, handshake child tag2 = `[server+0x1f0]` byte
+    (enable_multilinks), child tag3 = data_port, child tag4 = 16B key string,
+    child tag5 byte = 8.
+  - Client flow: `ExpressClientChannel::ProtoHandshakeWithServer(lock,
+    TlvHandshake)` (0x1d97c), logs `[HSHK]With server, ab=%d`, `Create cch2,
+    server_ch_id=%d, cch_usrdata_sz=%d`, `cch_=%s:%d`.
+- **TLV wire format** (miexpress::common::tlv):
+  - Node header 8B: `u16be type | u16be tag | u32be length`.
+  - Types: 1=byte(char), 3=int32, 4=int64, 5=string(raw bytes, no inner len),
+    0x100=TlvNodes(container), 0x101=TlvOneOfNodes.
+  - Ints big-endian; container payload = concatenated child nodes;
+    oneof payload = `i16be selectedTag` + selected child node serialization.
+  - `TlvExpressFrame` = TlvStructBase whose root is a TlvOneOfNodes
+    (tag=0xffff, type 0x101) over the frame's item list; children include
+    TlvHandshake(tag 1), TlvNodes(tag 2), plain node(tag 0), string node,
+    byte node(tag 2), TlvStreamSnd, ...
+  - **TlvHandshake = TlvNodes(tag=1, type 0x100), 6 children**:
+    tag0 int32 (default 0), tag1 int32 (default 1), tag2 int32 = multilinks
+    flag, tag3 int32 = data_port, tag4 string = 16-byte key, tag5 byte = 8.
+  - EVENT_HANDSHAKE frame bytes =
+    `01 01 ff ff <len32>` `00 01` `01 00 00 01 <len32>` + 6 child nodes.
+- **Channel data on the logi conn**: no LOGI_CONN_DATA frame type exists;
+  `LogiConnHandler` has separate entries `OnPhysReceiveLogiData` (control)
+  and `OnPhysReceiveUserData` (app data). Encrypted LogiConnFrame
+  (f4 flag=1, inner = [12B nonce][ct][16B tag]) carries either a
+  LogiConnInnerFrame protobuf (control) or raw channel bytes (user data).
+  Channel Packets (type 1 bytes / type 2 file) wrap
+  `FileSendProtocol{tag, body}` and, at the express layer, are further
+  wrapped inside TlvExpressFrames (`ProtoSendBytes`/`ProtoSendStream` fill
+  TlvExpressFrame lambdas).
+- Sender Java gate (why nothing was sent): `b3/e0` (LyraShareSender)
+  `onFileProcessSuccess` queues t0 into `j3/k0` PendingHandler gate A;
+  gate opens in `x2/m.N()` (onConnected) which fires only after
+  `onChannelCreateSuccess`. Never reached → FileSendRequest never sent.
+- Medium-type check: sender uses DoubleConnection proxy `s2.l` only if
+  `j3.i.Y(device)` = extras `key_discovery_medium_type` ⊆ 0x20002; our
+  injection uses medium_types=128 → simple proxy `s2.u` (so DoubleConnection
+  hypothesis B is doubly dead).
+- Next: after LogiConnResponseAck, send EVENT_HANDSHAKE TlvExpressFrame as
+  encrypted channel data + listen for the cch2 data connection (need to
+  determine whether cch2 is raw TCP or tunnel LogiConn), then the phone
+  should complete HSHK and emit FileSendRequest.

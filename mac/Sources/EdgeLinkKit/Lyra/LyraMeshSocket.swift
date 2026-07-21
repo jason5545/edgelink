@@ -25,6 +25,8 @@ public final class LyraMeshSocket: @unchecked Sendable {
     private var inboundConnections: [ObjectIdentifier: NWConnection] = [:]
     private var outboundConnections: [String: NWConnection] = [:]
     private var sessionStates: [ObjectIdentifier: KcpSessionState] = [:]
+    private var lastActivityByConnection: [ObjectIdentifier: Date] = [:]
+    private var physKeepaliveTimer: DispatchSourceTimer?
 
     public init() {}
 
@@ -51,9 +53,13 @@ public final class LyraMeshSocket: @unchecked Sendable {
             self?.accept(connection)
         }
         listener.start(queue: queue)
+        startPhysKeepalives()
     }
 
     public func stop() {
+        physKeepaliveTimer?.cancel()
+        physKeepaliveTimer = nil
+        lastActivityByConnection.removeAll()
         listener?.stateUpdateHandler = nil
         listener?.newConnectionHandler = nil
         listener?.cancel()
@@ -97,6 +103,47 @@ public final class LyraMeshSocket: @unchecked Sendable {
         UInt32(DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
+    public func startPhysKeepalives(interval: TimeInterval = 5, activityTimeout: TimeInterval = 15) {
+        physKeepaliveTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            self?.sendPhysKeepalives(activityTimeout: activityTimeout)
+        }
+        physKeepaliveTimer = timer
+        timer.resume()
+    }
+
+    private func sendPhysKeepalives(activityTimeout: TimeInterval) {
+        let now = Date()
+        for (id, connection) in inboundConnections {
+            guard let lastActivity = lastActivityByConnection[id],
+                  now.timeIntervalSince(lastActivity) <= activityTimeout
+            else {
+                continue
+            }
+            var payload = Data()
+            LyraProtoWriter.appendVarintField(1, value: UInt64(Self.tick()), to: &payload)
+            LyraProtoWriter.appendVarintField(2, value: 1, to: &payload)
+            let physConn = PhysConnFrame(field2: 4, payload: .keepAliveRequest(payload))
+            let miFrame = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: physConn)
+            let frame = LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized())
+            guard let encoded = try? LyraMeshPack.encode(frame) else {
+                continue
+            }
+            var state = sessionStates[id] ?? KcpSessionState()
+            let datagram = LyraMeshDatagram.encode(
+                tick: Self.tick(),
+                sn: state.nextSendSn,
+                una: state.recvUna,
+                payload: encoded
+            )
+            state.nextSendSn &+= 1
+            sessionStates[id] = state
+            connection.send(content: datagram, completion: .idempotent)
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
         inboundConnections[id] = connection
@@ -106,6 +153,7 @@ public final class LyraMeshSocket: @unchecked Sendable {
             case .cancelled, .failed:
                 self.inboundConnections[id] = nil
                 self.sessionStates[id] = nil
+                self.lastActivityByConnection[id] = nil
             default:
                 break
             }
@@ -123,6 +171,7 @@ public final class LyraMeshSocket: @unchecked Sendable {
                 if let segment = try? LyraMeshDatagram.decodeSegment(content),
                    segment.command == LyraMeshDatagram.commandPush
                 {
+                    lastActivityByConnection[id] = Date()
                     var state = self.sessionStates[id] ?? KcpSessionState()
                     let isDuplicate = segment.sn < state.recvUna
                     if !isDuplicate {

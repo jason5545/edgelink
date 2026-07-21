@@ -107,9 +107,24 @@ final class LyraNetbusFrameTests: XCTestCase {
 
     func testPhysConnFramePayloadFieldNumbers() {
         XCTAssertEqual(PhysConnPayload.syncDeviceInfoRequest(Data()).fieldNumber, 3)
-        XCTAssertEqual(PhysConnPayload.keepAliveRequest(Data()).fieldNumber, 7)
-        XCTAssertEqual(PhysConnPayload.disconnectResponse(Data()).fieldNumber, 10)
-        XCTAssertNil(PhysConnPayload(fieldNumber: 11, data: Data()))
+        XCTAssertEqual(PhysConnPayload.keepAliveRequest(Data()).fieldNumber, 6)
+        XCTAssertEqual(PhysConnPayload.keepAliveResponse(Data()).fieldNumber, 7)
+        XCTAssertEqual(PhysConnPayload.disconnectRequest(Data()).fieldNumber, 8)
+        XCTAssertEqual(PhysConnPayload.disconnectResponse(Data()).fieldNumber, 9)
+        XCTAssertNil(PhysConnPayload(fieldNumber: 10, data: Data()))
+    }
+
+    func testPhysConnFrameOmitsZeroScalarFields() {
+        var payload = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1_752_346_656_768, to: &payload)
+        let frame = PhysConnFrame(field2: 5, payload: .keepAliveResponse(payload))
+        let serialized = frame.serialized()
+        XCTAssertEqual(Array(serialized.prefix(2)), [0x10, 0x05])
+
+        let parsed = PhysConnFrame(parsing: serialized)
+        XCTAssertEqual(parsed?.field1, 0)
+        XCTAssertEqual(parsed?.field2, 5)
+        XCTAssertEqual(parsed?.payload, .keepAliveResponse(payload))
     }
 
     func testMeshPackCarryingMiConnectFrame() throws {

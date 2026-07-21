@@ -2,8 +2,6 @@ package com.edgelink.app
 
 import de.robv.android.xposed.XposedHelpers
 import java.io.File
-import java.util.Collections
-import java.util.WeakHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -11,6 +9,9 @@ import org.json.JSONObject
 
 object MiShareTrustInjection {
     const val SERVICE_NAME = "miLyraShare"
+    const val SERVICE_NAME_BASIC = "miShareBasic"
+    val KNOWN_SERVICE_NAMES = setOf(SERVICE_NAME, SERVICE_NAME_BASIC)
+
     private const val CONFIG_PATH = "/data/local/tmp/edgelink-mishare-inject.json"
     private const val KEY_ENABLED = "enabled"
     private const val KEY_DEVICE_ID = "device_id"
@@ -18,6 +19,7 @@ object MiShareTrustInjection {
     private const val KEY_DEVICE_TYPE = "device_type"
     private const val KEY_MEDIUM_TYPES = "medium_types"
     private const val KEY_TRUSTED_TYPES = "trusted_types"
+    private const val KEY_SERVICES = "services"
     private const val KEY_SERVICE_NAME = "service_name"
     private const val KEY_SERVICE_PACKAGE = "service_package"
     private const val KEY_SERVICE_DATA_B64 = "service_data_b64"
@@ -28,7 +30,8 @@ object MiShareTrustInjection {
     private const val DEFAULT_SERVICE_PACKAGE = "com.edgelink.mac"
     private const val INJECT_INTERVAL_SECONDS = 10L
 
-    private val listeners = Collections.newSetFromMap(WeakHashMap<Any, Boolean>())
+    private val lock = Any()
+    private val listenersByService = mutableMapOf<String, MutableSet<Any>>()
     private val injectorStarted = AtomicBoolean(false)
     private val scheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "edgelink-mishare-inject").apply { isDaemon = true }
@@ -37,8 +40,10 @@ object MiShareTrustInjection {
     @Volatile
     private var lastLoggedConfig: String? = null
 
-    fun registerListener(classLoader: ClassLoader, listener: Any, logger: (String) -> Unit) {
-        listeners += listener
+    fun registerListener(classLoader: ClassLoader, serviceName: String, listener: Any, logger: (String) -> Unit) {
+        synchronized(lock) {
+            listenersByService.getOrPut(serviceName) { mutableSetOf() } += listener
+        }
         if (injectorStarted.compareAndSet(false, true)) {
             scheduler.scheduleWithFixedDelay(
                 {
@@ -50,6 +55,39 @@ object MiShareTrustInjection {
                 TimeUnit.SECONDS
             )
         }
+    }
+
+    private data class ServiceSpec(val name: String, val packageName: String, val data: ByteArray?)
+
+    private fun decodeServiceData(encoded: String): ByteArray? = encoded.trim()
+        .takeIf { it.isNotEmpty() }
+        ?.let { runCatching { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }.getOrNull() }
+
+    private fun parseServiceSpecs(config: JSONObject): List<ServiceSpec> {
+        val specs = mutableListOf<ServiceSpec>()
+        val array = config.optJSONArray(KEY_SERVICES)
+        if (array != null) {
+            for (index in 0 until array.length()) {
+                val entry = array.optJSONObject(index) ?: continue
+                val name = entry.optString(KEY_SERVICE_NAME).trim()
+                if (name.isEmpty()) {
+                    continue
+                }
+                specs += ServiceSpec(
+                    name,
+                    entry.optString(KEY_SERVICE_PACKAGE).trim().ifEmpty { DEFAULT_SERVICE_PACKAGE },
+                    decodeServiceData(entry.optString(KEY_SERVICE_DATA_B64))
+                )
+            }
+        }
+        if (specs.isEmpty()) {
+            specs += ServiceSpec(
+                config.optString(KEY_SERVICE_NAME).trim().ifEmpty { SERVICE_NAME },
+                config.optString(KEY_SERVICE_PACKAGE).trim().ifEmpty { DEFAULT_SERVICE_PACKAGE },
+                decodeServiceData(config.optString(KEY_SERVICE_DATA_B64))
+            )
+        }
+        return specs
     }
 
     private fun injectOnce(classLoader: ClassLoader, logger: (String) -> Unit) {
@@ -77,32 +115,38 @@ object MiShareTrustInjection {
         val deviceType = config.optInt(KEY_DEVICE_TYPE, DEFAULT_DEVICE_TYPE)
         val mediumTypes = config.optInt(KEY_MEDIUM_TYPES, DEFAULT_MEDIUM_TYPES)
         val trustedTypes = config.optInt(KEY_TRUSTED_TYPES, DEFAULT_TRUSTED_TYPES)
-        val serviceName = config.optString(KEY_SERVICE_NAME).trim().ifEmpty { SERVICE_NAME }
-        val servicePackage = config.optString(KEY_SERVICE_PACKAGE).trim().ifEmpty { DEFAULT_SERVICE_PACKAGE }
-        val serviceData = config.optString(KEY_SERVICE_DATA_B64).trim()
-            .takeIf { it.isNotEmpty() }
-            ?.let { runCatching { android.util.Base64.decode(it, android.util.Base64.DEFAULT) }.getOrNull() }
+        val serviceSpecs = parseServiceSpecs(config)
 
-        val snapshot = listOf(deviceId, deviceName, deviceType, mediumTypes, trustedTypes, serviceName)
-            .joinToString()
+        val listenerSnapshot: Map<String, List<Any>> = synchronized(lock) {
+            listenersByService.mapValues { (_, value) -> value.toList() }
+        }
+
+        val servicesSummary = serviceSpecs.joinToString(",") { it.name }
+        val listenersSummary = listenerSnapshot.entries.joinToString(",") { "${it.key}:${it.value.size}" }
+        val snapshot = "$deviceId|$deviceName|$deviceType|$mediumTypes|$trustedTypes|$servicesSummary|$listenersSummary"
         logOnce(logger, "config-$snapshot") {
             "injecting deviceId=$deviceId name=$deviceName type=$deviceType " +
-                "medium=$mediumTypes trusted=$trustedTypes service=$serviceName " +
-                "listeners=${listeners.size}"
+                "medium=$mediumTypes trusted=$trustedTypes services=$servicesSummary " +
+                "listeners=$listenersSummary"
         }
 
         val trustedDeviceInfo = buildTrustedDeviceInfo(
             classLoader, deviceId, deviceName, deviceType, mediumTypes, trustedTypes
         ) ?: return
-        val businessServiceInfo = buildBusinessServiceInfo(
-            classLoader, serviceName, servicePackage, serviceData
-        ) ?: return
 
-        for (listener in listeners) {
-            runCatching {
-                XposedHelpers.callMethod(listener, "onServiceOnline", businessServiceInfo, trustedDeviceInfo)
-            }.onFailure {
-                logger("onServiceOnline call failed listener=$listener error=${it.message}")
+        val specsByName = serviceSpecs.associateBy { it.name }
+        for ((serviceName, serviceListeners) in listenerSnapshot) {
+            val spec = specsByName[serviceName]
+                ?: ServiceSpec(serviceName, DEFAULT_SERVICE_PACKAGE, null)
+            val businessServiceInfo = buildBusinessServiceInfo(
+                classLoader, spec.name, spec.packageName, spec.data
+            ) ?: return
+            for (listener in serviceListeners) {
+                runCatching {
+                    XposedHelpers.callMethod(listener, "onServiceOnline", businessServiceInfo, trustedDeviceInfo)
+                }.onFailure {
+                    logger("onServiceOnline call failed service=$serviceName listener=$listener error=${it.message}")
+                }
             }
         }
     }
