@@ -358,6 +358,8 @@ AEAD：
 {"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","iconPngBase64":"iVBORw0KGgo...","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
 {"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
 {"t":"status.ping","b":{}}
+{"t":"mac.sleep","b":{}}
+{"t":"mac.awake","b":{}}
 ```
 
 規則：
@@ -586,6 +588,32 @@ Hibernatable WebSockets API：`state.acceptWebSocket()`、`serializeAttachment()
 裝置到 Worker 的連線被閒置中斷；握手後的 secure channel 另外用
 `status.ping` / `status.pong` 做端到端 keepalive。任一端超過 15 秒沒有收到
 secure pong，應主動關閉目前 channel，交由 reconnect loop 建新連線與新 handshake。
+
+### Mac Sleep / Wake
+
+Mac 即將進入系統休眠前（`NSWorkspace.willSleepNotification`）會做兩件事：送 `mac.sleep`
+（b:`{}`）給 Android，並向 Worker 回報 power presence，然後完全拆除連線（取消 reconnect
+loop、關閉 channel），讓系統可以真正休眠。喚醒後重新連線，並在 handshake 成功後補送
+`mac.awake`（b:`{}`）與回報 `awake` presence。
+
+Power presence 是 Worker 上的小狀態（存在 RelayDO storage）：
+
+```
+POST /v1/presence   {"hostId":"...","deviceId":"...","state":"sleeping","ts":1751941000,"sig":"..."}
+GET  /v1/presence?hostId=...&deviceId=...&ts=...&sig=...
+```
+
+簽章方式與 `relay.auth` / TURN credentials 相同（Ed25519 對 `deviceId:ts` 簽名）。只有
+host 角色可以寫入 presence；配對的 client 可以讀取。回應為
+`{"state":"awake"|"sleeping","updatedAt":1751941000}`，從未回報過則是
+`{"state":"unknown","updatedAt":0}`。
+
+Android 收到 `mac.sleep` 後進入 suppressed 狀態：關閉目前 session、停止 WebSocket 重連，
+UI 顯示「Mac 睡眠中」。suppressed 期間不再嘗試建立 secure session，改為每 2 分鐘向 Worker
+GET 一次 presence（數百 bytes 的 HTTPS 請求）；看到 fresh 的 `awake` 才重新啟動連線。
+presence 查詢失敗或資料不明時，每累積 5 次（約 10 分鐘）仍會嘗試一次真正連線作為
+fallback。以下事件會立即喚醒 suppressed 狀態：收到 `mac.awake`、handshake 成功、app 回到
+前景、Android 網路變化、使用者手動 reconnect。手動 disconnect 會清除 suppressed 狀態。
 
 ### TURN Credentials
 

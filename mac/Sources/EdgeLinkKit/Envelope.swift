@@ -49,6 +49,8 @@ public enum EnvelopeType {
     public static let miLinkCommand = "milink.command"
     public static let miLinkCommandResult = "milink.command.result"
     public static let androidMicStatus = "android.mic.status"
+    public static let macSleep = "mac.sleep"
+    public static let macAwake = "mac.awake"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {

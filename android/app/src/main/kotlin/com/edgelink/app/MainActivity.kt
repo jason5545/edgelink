@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         controller.refreshNotificationAccess()
+        controller.notifyAppForegrounded()
     }
 
     private fun handleNotificationSyncChange(enabled: Boolean) {

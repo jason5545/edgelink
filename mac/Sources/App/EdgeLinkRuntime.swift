@@ -70,6 +70,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let macNotificationSource = MacNotificationDatabaseSource()
     private let screenSession = MacScreenSession()
     private let turnCredentialClient: TurnCredentialClient
+    private let presenceClient: PresenceClient
     private let callRelayCloudflareBridge = CallRelayCloudflareBridge()
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
@@ -86,6 +87,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
     private var lastSecurePongAt = Date.distantPast
+    private var pendingAwakeNotification = false
+    private var resumeConnectionAfterWake = false
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
@@ -155,6 +158,7 @@ final class EdgeLinkRuntime: ObservableObject {
         relayTransport = RelayTransport(endpoint: relayURL)
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
         turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
+        presenceClient = PresenceClient(baseURL: workerBaseURL)
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
@@ -2609,6 +2613,14 @@ final class EdgeLinkRuntime: ObservableObject {
                 connectionStatus = "Connected"
                 retryDelay = 1_000_000_000
                 resumeXiaomiMirrorAfterReconnectIfNeeded()
+                reportPresence(.awake, reason: "connected")
+                if pendingAwakeNotification {
+                    pendingAwakeNotification = false
+                    if let data = try? encoder.encode(Envelope(t: EnvelopeType.macAwake, b: EmptyBody())) {
+                        DiagnosticsLog.info("runtime.mac.awake_notify hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                        try? await session.sendPlaintext(data)
+                    }
+                }
 
                 let clipboardTask = Task { await clipboardLoop(session: session) }
                 let notificationTask = Task { await macNotificationLoop(identity: identity, session: session) }
@@ -2720,7 +2732,7 @@ final class EdgeLinkRuntime: ObservableObject {
         notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
             .sink { [weak self] _ in
                 Task { @MainActor in
-                    self?.handleSystemSleep()
+                    await self?.handleSystemSleep()
                 }
             }
             .store(in: &systemSleepWakeCancellables)
@@ -2734,14 +2746,61 @@ final class EdgeLinkRuntime: ObservableObject {
             .store(in: &systemSleepWakeCancellables)
     }
 
-    private func handleSystemSleep() {
+    private func handleSystemSleep() async {
         DiagnosticsLog.info("runtime.mac.system_sleep")
+        resumeConnectionAfterWake = currentConnectionGeneration != nil
+        if let session = currentSession,
+           let data = try? encoder.encode(Envelope(t: EnvelopeType.macSleep, b: EmptyBody())) {
+            try? await session.sendPlaintext(data)
+            pendingAwakeNotification = true
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        if let identity = localIdentity {
+            do {
+                try await presenceClient.report(hostId: identity.deviceId, identity: identity, state: .sleeping)
+                DiagnosticsLog.info("presence.mac.reported state=sleeping reason=system_sleep")
+            } catch {
+                DiagnosticsLog.warn("presence.mac.report_failed state=sleeping error=\(error.localizedDescription)")
+            }
+        }
+        currentConnectionGeneration = nil
+        connectionTask?.cancel()
+        connectionTask = nil
         currentChannel?.close()
+        currentChannel = nil
+        currentChannelGeneration = nil
+        currentSession = nil
+        screenSession.clearSender()
+        isConnected = false
+        connectionStatus = "Sleeping"
     }
 
     private func handleSystemWake() {
         DiagnosticsLog.info("runtime.mac.system_wake")
         currentChannel?.close()
+        guard resumeConnectionAfterWake else {
+            return
+        }
+        resumeConnectionAfterWake = false
+        reconnect()
+    }
+
+    private func reportPresence(_ state: MacPowerPresence, reason: String) {
+        guard let identity = localIdentity else {
+            return
+        }
+        Task {
+            for attempt in 1...3 {
+                do {
+                    try await presenceClient.report(hostId: identity.deviceId, identity: identity, state: state)
+                    DiagnosticsLog.info("presence.mac.reported state=\(state.rawValue) reason=\(reason)")
+                    return
+                } catch {
+                    DiagnosticsLog.warn("presence.mac.report_failed state=\(state.rawValue) attempt=\(attempt) error=\(error.localizedDescription)")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            }
+        }
     }
 
     private func clipboardLoop(session: SecureSessionHost) async {

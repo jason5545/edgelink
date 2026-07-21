@@ -4,6 +4,12 @@ import { isDeviceId, parseJson } from "./validation";
 const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
 const MAX_TURN_TTL_SECONDS = 48 * 60 * 60;
 const CLOUDFLARE_TURN_REALM = "turn.cloudflare.com";
+const PRESENCE_STORAGE_KEY = "presence";
+
+interface PresenceRecord {
+  state: "awake" | "sleeping";
+  updatedAt: number;
+}
 
 export class RelayDO implements DurableObject {
   constructor(
@@ -25,6 +31,14 @@ export class RelayDO implements DurableObject {
 
     if (url.pathname === "/v1/turn/credentials" && request.method === "POST") {
       return this.issueTurnCredentials(request);
+    }
+
+    if (url.pathname === "/v1/presence" && request.method === "POST") {
+      return this.reportPresence(request);
+    }
+
+    if (url.pathname === "/v1/presence" && request.method === "GET") {
+      return this.readPresence(request);
     }
 
     if (request.headers.get("upgrade") !== "websocket") {
@@ -179,6 +193,55 @@ export class RelayDO implements DurableObject {
       role,
       iceServers: payload.iceServers
     });
+  }
+
+  private async reportPresence(request: Request): Promise<Response> {
+    const body = await parseJson<{
+      hostId?: string;
+      deviceId?: string;
+      state?: string;
+      ts?: number;
+      sig?: string;
+    }>(request);
+
+    if (!body || !isDeviceId(body.hostId) || !isDeviceId(body.deviceId) || typeof body.ts !== "number" || !body.sig) {
+      return badRequest("invalid_presence_auth");
+    }
+    if (body.state !== "awake" && body.state !== "sleeping") {
+      return badRequest("invalid_presence_state");
+    }
+
+    const role = await this.authorize(body.hostId, body.deviceId, body.ts, body.sig);
+    if (role !== "host") {
+      return json({ error: "presence_auth_failed" }, { status: 401 });
+    }
+
+    const record: PresenceRecord = { state: body.state, updatedAt: Math.floor(Date.now() / 1000) };
+    await this.state.storage.put(PRESENCE_STORAGE_KEY, record);
+    return json({ ok: true });
+  }
+
+  private async readPresence(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const hostId = url.searchParams.get("hostId") ?? "";
+    const deviceId = url.searchParams.get("deviceId") ?? "";
+    const ts = Number(url.searchParams.get("ts") ?? "");
+    const sig = url.searchParams.get("sig") ?? "";
+
+    if (!isDeviceId(hostId) || !isDeviceId(deviceId) || !Number.isFinite(ts) || !sig) {
+      return badRequest("invalid_presence_auth");
+    }
+
+    const role = await this.authorize(hostId, deviceId, ts, sig);
+    if (!role) {
+      return json({ error: "presence_auth_failed" }, { status: 401 });
+    }
+
+    const record = await this.state.storage.get<PresenceRecord>(PRESENCE_STORAGE_KEY);
+    if (!record || (record.state !== "awake" && record.state !== "sleeping")) {
+      return json({ state: "unknown", updatedAt: 0 });
+    }
+    return json(record);
   }
 
   private closeReplacedRoleSockets(

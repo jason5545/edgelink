@@ -51,6 +51,7 @@ import com.edgelink.core.WorkerDeviceRegistrar
 import com.edgelink.transport.ByteChannel
 import com.edgelink.transport.LANTransport
 import com.edgelink.transport.PairingTransport
+import com.edgelink.transport.PresenceTransport
 import com.edgelink.transport.RelayTransport
 import com.edgelink.transport.SecureSessionClient
 import com.edgelink.transport.TurnCredentialTransport
@@ -87,6 +88,9 @@ private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
+private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
+private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
+private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
 private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
@@ -104,6 +108,12 @@ private enum class PendingShizukuAction {
     Screen,
     Sms,
     MiLinkProbe
+}
+
+private enum class MacPresenceState {
+    Awake,
+    Sleeping,
+    Unknown
 }
 
 internal enum class ShizukuAutoRepairTarget {
@@ -140,6 +150,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
     private val relayTransport = RelayTransport(crypto = crypto)
     private val turnCredentialTransport = TurnCredentialTransport(crypto = crypto)
+    private val presenceTransport = PresenceTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
@@ -226,6 +237,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onPhoneRelayMedia = { body ->
             AndroidCallRelayBridge.handleMedia(body)
+        },
+        onMacSleep = {
+            handleMacSleep()
+        },
+        onMacAwake = {
+            handleMacAwake()
         }
     )
 
@@ -257,6 +274,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var miLinkRootProbeAttempted = false
     @Volatile
     private var manuallyDisconnected = false
+    @Volatile
+    private var macSleepSuppressed = false
     private val connectionGeneration = AtomicInteger(0)
     private val autoReconnectWakeups = Channel<Unit>(Channel.CONFLATED)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -712,6 +731,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     override fun onDisconnect() {
         EdgeLinkLog.info("relay.android.disconnect_requested")
         manuallyDisconnected = true
+        macSleepSuppressed = false
         connectionGeneration.incrementAndGet()
         connectionJob?.cancel()
         connectionJob = null
@@ -1427,6 +1447,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun startConnection(identity: LocalIdentity, peer: PinnedPeer, reason: String) {
         currentPeer = peer
         manuallyDisconnected = false
+        macSleepSuppressed = false
         val generation = connectionGeneration.incrementAndGet()
         EdgeLinkLog.info(
             "relay.android.connection_start reason=$reason hostId=${peer.deviceId} clientId=${identity.deviceId} autoReconnect=${stateFlow.value.autoReconnectEnabled}"
@@ -1456,12 +1477,14 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             var channel: ByteChannel? = null
             try {
                 EdgeLinkLog.info("relay.android.connect_start hostId=${peer.deviceId} clientId=${identity.deviceId}")
-                stateFlow.update {
-                    it.copy(
-                        connectionStatus = "Connecting relay",
-                        connectionPhase = ConnectionPhase.Connecting,
-                        isConnected = false
-                    )
+                if (!macSleepSuppressed) {
+                    stateFlow.update {
+                        it.copy(
+                            connectionStatus = "Connecting relay",
+                            connectionPhase = ConnectionPhase.Connecting,
+                            isConnected = false
+                        )
+                    }
                 }
                 channel = withTimeoutOrNull(RELAY_CONNECT_TIMEOUT_MS) {
                     relayTransport.connect(
@@ -1486,11 +1509,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     crypto = crypto
                 )
 
-                stateFlow.update {
-                    it.copy(
-                        connectionStatus = "Handshaking",
-                        connectionPhase = ConnectionPhase.Handshaking
-                    )
+                if (!macSleepSuppressed) {
+                    stateFlow.update {
+                        it.copy(
+                            connectionStatus = "Handshaking",
+                            connectionPhase = ConnectionPhase.Handshaking
+                        )
+                    }
                 }
                 val handshakeEstablished = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
                     nextSession.connect()
@@ -1508,6 +1533,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 }
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
+                macSleepSuppressed = false
                 session = nextSession
                 refreshTurnCredentials("relay_connected")
                 sendLatestMiLinkStatus(nextSession, identity)
@@ -1558,10 +1584,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 AndroidMirrorScreenRemoteKeeper.stop("relay_disconnected")
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
+                val sleepSuppressed = macSleepSuppressed && autoReconnect
                 stateFlow.update {
                     it.copy(
-                        connectionStatus = if (autoReconnect) "Reconnecting" else "Disconnected",
-                        connectionPhase = if (autoReconnect) ConnectionPhase.Reconnecting else ConnectionPhase.Disconnected,
+                        connectionStatus = when {
+                            sleepSuppressed -> "Mac 睡眠中"
+                            autoReconnect -> "Reconnecting"
+                            else -> "Disconnected"
+                        },
+                        connectionPhase = if (autoReconnect && !sleepSuppressed) ConnectionPhase.Reconnecting else ConnectionPhase.Disconnected,
                         isConnected = false
                     )
                 }
@@ -1569,18 +1600,32 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     EdgeLinkLog.info("relay.android.auto_reconnect_disabled hostId=${peer.deviceId} clientId=${identity.deviceId}")
                     return
                 }
-                if (!waitForAutoReconnect(retryDelayMs)) {
-                    EdgeLinkLog.info("relay.android.auto_reconnect_stopped hostId=${peer.deviceId} clientId=${identity.deviceId}")
-                    stateFlow.update {
-                        it.copy(
-                            connectionStatus = "Disconnected",
-                            connectionPhase = ConnectionPhase.Disconnected,
-                            isConnected = false
-                        )
+                if (sleepSuppressed) {
+                    if (!waitForMacAwake(identity, peer, generation)) {
+                        EdgeLinkLog.info("relay.android.mac_sleep_wait_stopped hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                        stateFlow.update {
+                            it.copy(
+                                connectionStatus = "Disconnected",
+                                connectionPhase = ConnectionPhase.Disconnected,
+                                isConnected = false
+                            )
+                        }
+                        return
                     }
-                    return
+                } else {
+                    if (!waitForAutoReconnect(retryDelayMs)) {
+                        EdgeLinkLog.info("relay.android.auto_reconnect_stopped hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                        stateFlow.update {
+                            it.copy(
+                                connectionStatus = "Disconnected",
+                                connectionPhase = ConnectionPhase.Disconnected,
+                                isConnected = false
+                            )
+                        }
+                        return
+                    }
+                    retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_AUTO_RECONNECT_DELAY_MS)
                 }
-                retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_AUTO_RECONNECT_DELAY_MS)
             } finally {
                 channel?.close()
             }
@@ -1597,6 +1642,57 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         } == true
         EdgeLinkLog.info("relay.android.auto_reconnect_wait_done delayMs=$delayMs woke=$woke")
         return stateFlow.value.autoReconnectEnabled
+    }
+
+    private suspend fun waitForMacAwake(identity: LocalIdentity, peer: PinnedPeer, generation: Int): Boolean {
+        var unknownPolls = 0
+        while (coroutineContext.isActive && connectionGeneration.get() == generation && macSleepSuppressed) {
+            val woke = withTimeoutOrNull(MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS) {
+                autoReconnectWakeups.receive()
+                true
+            } == true
+            if (woke) {
+                EdgeLinkLog.info("relay.android.mac_sleep_wait_wakeup")
+                return stateFlow.value.autoReconnectEnabled
+            }
+            if (!stateFlow.value.autoReconnectEnabled || manuallyDisconnected) {
+                return false
+            }
+            when (fetchMacPresence(identity, peer)) {
+                MacPresenceState.Awake -> {
+                    EdgeLinkLog.info("relay.android.mac_sleep_presence_awake hostId=${peer.deviceId}")
+                    return true
+                }
+                MacPresenceState.Sleeping -> unknownPolls = 0
+                MacPresenceState.Unknown -> {
+                    unknownPolls += 1
+                    if (unknownPolls >= MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE) {
+                        EdgeLinkLog.info("relay.android.mac_sleep_presence_unknown_probe hostId=${peer.deviceId}")
+                        return true
+                    }
+                }
+            }
+        }
+        return stateFlow.value.autoReconnectEnabled
+    }
+
+    private suspend fun fetchMacPresence(identity: LocalIdentity, peer: PinnedPeer): MacPresenceState {
+        return runCatching {
+            presenceTransport.fetch(
+                workerBaseUrl = EdgeLinkConfig.workerBaseUrl,
+                hostId = peer.deviceId,
+                identity = identity
+            )
+        }.onFailure { error ->
+            EdgeLinkLog.warn("presence.android.fetch_failed error=${error.message}")
+        }.map { response ->
+            val ageSeconds = Instant.now().epochSecond - response.updatedAt
+            when {
+                response.state == "sleeping" -> MacPresenceState.Sleeping
+                response.state == "awake" && ageSeconds <= MAC_PRESENCE_FRESH_SECONDS -> MacPresenceState.Awake
+                else -> MacPresenceState.Unknown
+            }
+        }.getOrDefault(MacPresenceState.Unknown)
     }
 
     private fun currentScreenIceServerConfigs(): List<AndroidScreenIceServerConfig> {
@@ -1690,6 +1786,32 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun signalAutoReconnect(reason: String) {
         EdgeLinkLog.info("relay.android.auto_reconnect_wakeup reason=$reason")
         autoReconnectWakeups.trySend(Unit)
+    }
+
+    private fun handleMacSleep() {
+        EdgeLinkLog.info("relay.android.mac_sleep_received")
+        macSleepSuppressed = true
+        session?.close()
+        stateFlow.update {
+            it.copy(
+                connectionStatus = "Mac 睡眠中",
+                connectionPhase = ConnectionPhase.Disconnected,
+                isConnected = false
+            )
+        }
+    }
+
+    private fun handleMacAwake() {
+        EdgeLinkLog.info("relay.android.mac_awake_received")
+        macSleepSuppressed = false
+        signalAutoReconnect("mac_awake")
+    }
+
+    fun notifyAppForegrounded() {
+        if (macSleepSuppressed) {
+            EdgeLinkLog.info("relay.android.mac_sleep_foreground_probe")
+            signalAutoReconnect("app_foregrounded")
+        }
     }
 
     private suspend fun pingLoop(activeSession: SecureSessionClient) {
@@ -1932,13 +2054,23 @@ private class AndroidCommandDispatcher(
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
     private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit,
     private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit,
-    private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit
+    private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit,
+    private val onMacSleep: () -> Unit,
+    private val onMacAwake: () -> Unit
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
             EnvelopeTypes.STATUS_PING -> EnvelopeCodec.encode(EnvelopeTypes.STATUS_PONG, EmptyBody)
             EnvelopeTypes.STATUS_PONG -> {
                 onPong()
+                null
+            }
+            EnvelopeTypes.MAC_SLEEP -> {
+                onMacSleep()
+                null
+            }
+            EnvelopeTypes.MAC_AWAKE -> {
+                onMacAwake()
                 null
             }
             EnvelopeTypes.CLIPBOARD_SET -> {

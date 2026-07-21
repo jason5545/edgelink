@@ -48,6 +48,8 @@ object EnvelopeTypes {
     const val MILINK_COMMAND = "milink.command"
     const val MILINK_COMMAND_RESULT = "milink.command.result"
     const val ANDROID_MIC_STATUS = "android.mic.status"
+    const val MAC_SLEEP = "mac.sleep"
+    const val MAC_AWAKE = "mac.awake"
 }
 
 object EnvelopeCodec {
