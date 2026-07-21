@@ -40,6 +40,7 @@ final class XiaomiMiShareDiscovery: NSObject {
     private let browser = NetServiceBrowser()
     private let meshSocket = LyraMeshSocket()
     private var meshResponder: LyraMeshResponder?
+    private var meshAnnouncer: LyraMeshAnnouncer?
     private var lyraPublisher: XiaomiLyraMDNSPublisher?
     private var discoveredServices: [String: NetService] = [:]
     private var peersByServiceName: [String: XiaomiMiShareDiscoveredPeer] = [:]
@@ -115,10 +116,20 @@ final class XiaomiMiShareDiscovery: NSObject {
             }
         }
         do {
-            try meshSocket.start()
+            try meshSocket.start(preferredPort: Self.preferredMeshPort())
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.mesh_socket_start_failed", error)
         }
+    }
+
+    private static func preferredMeshPort() -> UInt16? {
+        let key = "xiaomiMiShareMeshPort"
+        if let saved = UserDefaults.standard.object(forKey: key) as? Int, saved > 0 {
+            return UInt16(saved)
+        }
+        let port = Int.random(in: 40000...60000)
+        UserDefaults.standard.set(port, forKey: key)
+        return UInt16(port)
     }
 
     private func publish(deviceIdHex: String, displayName: String) {
@@ -202,7 +213,41 @@ final class XiaomiMiShareDiscovery: NSObject {
                 "name=\(peer.displayName ?? "unknown") host=\(peer.hostName ?? "unknown") port=\(peer.port) " +
                 "medium=\(peer.mediumType ?? "unknown") ch=\(peer.channel ?? "unknown")"
         )
+        startAnnouncerIfPhonePeer(service: service, payload: payload, debugInfo: peer.debugInfo)
         emitSnapshot()
+    }
+
+    private func startAnnouncerIfPhonePeer(
+        service: NetService,
+        payload: XiaomiMiShareDiscoveryAppData?,
+        debugInfo: String?
+    ) {
+        guard payload?.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
+              let meshPort = payload?.meshPort, meshPort != 0,
+              let host = Self.parseDebugInfoIPv4(debugInfo)
+        else {
+            return
+        }
+        if meshAnnouncer == nil {
+            meshAnnouncer = LyraMeshAnnouncer(
+                deviceIdHexProvider: { [weak self] in self?.publishedDeviceIdHex },
+                displayNameProvider: { [weak self] in self?.publishedDisplayName ?? "EdgeLink Mac" }
+            )
+        }
+        DiagnosticsLog.info("xiaomi.mishare.announcer_start host=\(host) port=\(meshPort)")
+        meshAnnouncer?.start(host: host, port: meshPort)
+    }
+
+    private static func parseDebugInfoIPv4(_ debugInfo: String?) -> String? {
+        guard let debugInfo else { return nil }
+        for part in debugInfo.split(separator: ",") {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("v4:") {
+                let value = String(trimmed.dropFirst(3))
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
     }
 
     private static func txtString(_ key: String, in record: [String: Data]) -> String? {

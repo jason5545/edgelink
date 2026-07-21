@@ -76,16 +76,33 @@ public final class LyraChannelSocket: @unchecked Sendable {
 
     public func send(message: Data) throws {
         guard let socketKey else { return }
-        let channelFrame = LyraExpressTLV.oneOfNode(
+        let channelFrame = Self.wrapChannelFrame(message)
+        try sendEncrypted(channelFrame, key: socketKey, singleLayer: false)
+    }
+
+    public static func wrapChannelFrame(_ message: Data) -> Data {
+        LyraExpressTLV.oneOfNode(
             tag: 0xFFFF,
             selectedTag: 1,
             child: LyraExpressTLV.containerNode(tag: 1, children: [
                 LyraExpressTLV.stringNode(tag: 0, value: message)
             ])
         )
-        let fragments = try LyraChannelFragment.encode(message: channelFrame, key: socketKey)
+    }
+
+    public func sendVariant(channelFrame: Data, key: Data, singleLayer: Bool) throws {
+        try sendEncrypted(channelFrame, key: SymmetricKey(data: key), singleLayer: singleLayer)
+    }
+
+    private func sendEncrypted(_ channelFrame: Data, key: SymmetricKey, singleLayer: Bool) throws {
+        if singleLayer {
+            let packet = try LyraSocketPacket.encode(plaintext: channelFrame, key: key)
+            try sendDatagram(packet)
+            return
+        }
+        let fragments = try LyraChannelFragment.encode(message: channelFrame, key: key)
         for fragment in fragments {
-            let packet = try LyraSocketPacket.encode(plaintext: fragment, key: socketKey)
+            let packet = try LyraSocketPacket.encode(plaintext: fragment, key: key)
             try sendDatagram(packet)
         }
     }
@@ -165,8 +182,37 @@ public final class LyraChannelSocket: @unchecked Sendable {
         }
     }
 
+    public var candidateKeys: [Data] = []
+
+    private func decryptionKeys() -> [SymmetricKey] {
+        var keys: [SymmetricKey] = []
+        if let socketKey {
+            keys.append(socketKey)
+        }
+        for candidate in candidateKeys where candidate.count >= 16 {
+            keys.append(SymmetricKey(data: candidate))
+        }
+        return keys
+    }
+
+    private func openPacketAndFragment(_ frame: Data) -> (chunk: Data, offset: Int, total: Int, isLast: Bool)? {
+        for key in decryptionKeys() {
+            guard let (fragment, _) = try? LyraSocketPacket.decode(frame, key: key) else {
+                continue
+            }
+            if let decoded = try? LyraChannelFragment.decode(fragment: fragment, key: key) {
+                return decoded
+            }
+            if let oneOf = try? LyraExpressTLVParser.parseOneOf(fragment) {
+                _ = oneOf
+                return (fragment, 0, 1, true)
+            }
+        }
+        return nil
+    }
+
     private func drainPackets(id: ObjectIdentifier, state: inout SessionState, endpoint: NWEndpoint) {
-        guard let socketKey else { return }
+        guard socketKey != nil else { return }
         while !state.packetBuffer.isEmpty {
             let first = state.packetBuffer[state.packetBuffer.startIndex]
             let second = state.packetBuffer[state.packetBuffer.index(state.packetBuffer.startIndex, offsetBy: 1)]
@@ -185,12 +231,8 @@ public final class LyraChannelSocket: @unchecked Sendable {
                 guard state.packetBuffer.count >= frameLength else { return }
                 let frame = Data(state.packetBuffer.prefix(frameLength))
                 state.packetBuffer.removeFirst(frameLength)
-                guard let (fragment, _) = try? LyraSocketPacket.decode(frame, key: socketKey) else {
+                guard let (chunk, offset, total, isLast) = openPacketAndFragment(frame) else {
                     onDecryptFailure?("socket_packet bytes=\(frame.count)")
-                    continue
-                }
-                guard let (chunk, offset, total, isLast) = try? LyraChannelFragment.decode(fragment: fragment, key: socketKey) else {
-                    onDecryptFailure?("fragment bytes=\(fragment.count)")
                     continue
                 }
                 if total <= 1 || isLast && offset == 0 {

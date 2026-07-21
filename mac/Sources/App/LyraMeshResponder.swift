@@ -4,13 +4,13 @@ import Foundation
 import Network
 
 final class LyraMeshResponder {
-    private static let officialMacUidFeature = Data([
+    static let officialMacUidFeature = Data([
         0x0A, 0x08, 0x26, 0xFB, 0x1C, 0x8E, 0xAC, 0x7C, 0xFC, 0x1F, 0x12, 0x20,
         0x57, 0x65, 0xD7, 0xBF, 0xBD, 0xC3, 0xCA, 0x3C, 0x8B, 0x99, 0xF2, 0xA5,
         0x96, 0x08, 0xD3, 0x95, 0x8E, 0x2B, 0xC3, 0xEC, 0x1F, 0x64, 0x81, 0xEB,
         0x11, 0xB6, 0x56, 0x13, 0x08, 0x27, 0x21, 0xBF
     ])
-    private static let officialMacSyncInfoSignature = Data([
+    static let officialMacSyncInfoSignature = Data([
         0x33, 0x85, 0xFB, 0xAA, 0x02, 0xFD, 0x4E, 0x2C, 0xE1, 0x95, 0x74, 0x3A,
         0xA8, 0xDD, 0x50, 0xDB, 0xC6, 0xB7, 0xA4, 0xEC, 0x36, 0x6F, 0x0B, 0xAA,
         0x98, 0xA7, 0x6C, 0xDA, 0x11, 0x7F, 0x94, 0x25, 0x9B, 0xD8, 0x32, 0xCE,
@@ -39,8 +39,13 @@ final class LyraMeshResponder {
     private var channelSocket: LyraChannelSocket?
     private var channelServerKey = Data()
     private var phoneTransKey = Data()
+    private var phoneTransRandom = Data()
+    private var phoneColonHexKey = Data()
     private var peerChannelId: UInt32 = 0
     private var channelNegotiationStarted = false
+    private var lastEndpointDescription: String?
+    private var announceTimer: DispatchSourceTimer?
+    private let announceQueue = DispatchQueue(label: "edgelink.lyra.announce")
     private var expressDataKey = Data()
     private var eventBytesBuffer = Data()
     private var streamReceives: [UInt32: StreamReceive] = [:]
@@ -76,9 +81,23 @@ final class LyraMeshResponder {
         socket.onFrame = { [weak self] frame, endpoint, reply in
             self?.handle(frame: frame, endpoint: endpoint, reply: reply)
         }
+        startAnnounceTimer()
+    }
+
+    private func startAnnounceTimer() {
+        announceTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: announceQueue)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            guard let self, let endpoint = self.lastEndpointDescription else { return }
+            self.sendAnnounce(endpointDescription: endpoint)
+        }
+        announceTimer = timer
+        timer.resume()
     }
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
+        lastEndpointDescription = endpoint.debugDescription
         if frame.packType == 5 {
             handlePayloadV2(frame: frame, endpoint: endpoint)
             return
@@ -193,8 +212,8 @@ final class LyraMeshResponder {
         if let pdFields = try? LyraProtoReader.readFields(from: privateData) {
             for field in pdFields where field.wireType == 2 {
                 if field.number == 3, let value = field.lengthDelimitedValue {
-                    if transKey.isEmpty {
-                        transKey = Self.parseColonHexKey(value) ?? value
+                    if let colonKey = Self.parseColonHexKey(value) {
+                        phoneColonHexKey = colonKey
                     }
                 } else if field.number == 10, let value = field.lengthDelimitedValue,
                           let innerFields = try? LyraProtoReader.readFields(from: value)
@@ -206,6 +225,10 @@ final class LyraMeshResponder {
                         case (4, 2):
                             if let key = innerField.lengthDelimitedValue, key.count == 32 {
                                 transKey = key
+                            }
+                        case (5, 2):
+                            if let random = innerField.lengthDelimitedValue, random.count == 32 {
+                                phoneTransRandom = random
                             }
                         default:
                             continue
@@ -297,6 +320,7 @@ final class LyraMeshResponder {
             return
         }
         channelNegotiationStarted = true
+        sendAnnounce(endpointDescription: endpoint.debugDescription)
 
         var serverKey = Data(count: 32)
         serverKey.withUnsafeMutableBytes { buffer in
@@ -360,6 +384,7 @@ final class LyraMeshResponder {
         }
         do {
             let key = phoneTransKey.isEmpty ? Data(count: 32) : phoneTransKey
+            socket.candidateKeys = [phoneTransRandom, phoneColonHexKey].filter { $0.count == 32 }
             try socket.start(socketKey: key, serverChannelId: 5)
             channelSocket = socket
         } catch {
@@ -393,15 +418,35 @@ final class LyraMeshResponder {
                     return
                 }
                 let tlv = LyraExpressTLV.handshakeEventFrame(dataPort: UInt32(port), key: key)
-                do {
-                    try self.channelSocket?.send(message: tlv)
-                    DiagnosticsLog.info(
-                        "xiaomi.mishare.express_handshake_sent dataPort=\(port) " +
-                            "key=\(key.map { String(format: "%02x", $0) }.joined()) tlvBytes=\(tlv.count)"
-                    )
-                } catch {
-                    DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
+                let channelFrame = LyraChannelSocket.wrapChannelFrame(tlv)
+                var candidates: [(String, Data)] = [("f4", self.phoneTransKey)]
+                if !self.phoneTransRandom.isEmpty {
+                    var derived = Self.hkdfSalt
+                    derived.append(self.phoneTransRandom)
+                    derived.append(self.channelServerKey)
+                    candidates.append(("sha_f5_R", Data(SHA256.hash(data: derived))))
+                    var derivedAlt = Self.hkdfSalt
+                    derivedAlt.append(self.phoneTransKey)
+                    derivedAlt.append(self.channelServerKey)
+                    candidates.append(("sha_f4_R", Data(SHA256.hash(data: derivedAlt))))
+                    candidates.append(("f5", self.phoneTransRandom))
                 }
+                if !self.phoneColonHexKey.isEmpty {
+                    candidates.append(("f3hex", self.phoneColonHexKey))
+                }
+                for (name, candidate) in candidates where candidate.count == 32 {
+                    do {
+                        try self.channelSocket?.sendVariant(channelFrame: channelFrame, key: candidate, singleLayer: false)
+                        try self.channelSocket?.sendVariant(channelFrame: channelFrame, key: candidate, singleLayer: true)
+                        DiagnosticsLog.info("xiaomi.mishare.express_handshake_variant key=\(name)")
+                    } catch {
+                        DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
+                    }
+                }
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.express_handshake_sent dataPort=\(port) " +
+                        "key=\(key.map { String(format: "%02x", $0) }.joined()) tlvBytes=\(tlv.count) variants=\(candidates.count)"
+                )
             }
             listener.start(queue: expressQueue)
             expressListener = listener
@@ -429,6 +474,70 @@ final class LyraMeshResponder {
 
         let dataFrame = LyraMeshPack.Frame(packType: 5, payload: body)
         try socket.sendInbound(frame: dataFrame, toEndpointDescription: endpointDescription)
+    }
+
+    private func sendAnnounce(endpointDescription: String) {
+        guard let deviceIdHex = deviceIdHexProvider() else {
+            return
+        }
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
+            deviceName: displayNameProvider(),
+            deviceType: 14,
+            deviceId: deviceIdHex,
+            uidHash: "61F2",
+            hwModel: Self.hardwareModel(),
+            lyraVersion: "5.1.208.10.fullCnRelease.0512164",
+            services: [
+                LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
+            ],
+            ipAddress: Self.primaryIPv4Address(),
+            osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+        )
+        let payload = LyraTrustedDeviceInfo.plaintextAnnounce(deviceInfo: deviceInfo)
+        let frame = LyraMeshPack.Frame(packType: 5, payload: payload)
+        socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+        DiagnosticsLog.info(
+            "xiaomi.mishare.announce_sent to=\(endpointDescription) bytes=\(payload.count)"
+        )
+    }
+
+    private static func hardwareModel() -> String {
+        var size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        var model = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.model", &model, &size, nil, 0)
+        return String(cString: model)
+    }
+
+    private static func primaryIPv4Address() -> String? {
+        var address: String?
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0 else { return nil }
+        defer { freeifaddrs(interfaces) }
+        var current = interfaces
+        while let interface = current {
+            let flags = Int32(interface.pointee.ifa_flags)
+            let name = String(cString: interface.pointee.ifa_name)
+            if name == "en0", flags & IFF_UP != 0, interface.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(
+                    interface.pointee.ifa_addr,
+                    socklen_t(interface.pointee.ifa_addr.pointee.sa_len),
+                    &host,
+                    socklen_t(host.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                address = String(cString: host)
+                break
+            }
+            current = interface.pointee.ifa_next
+        }
+        return address
     }
 
     private func handleChannelMessage(_ message: Data, from endpoint: NWEndpoint) {
@@ -1097,6 +1206,7 @@ final class LyraMeshResponder {
                 "xiaomi.mishare.mesh_sync_response to=\(endpoint.debugDescription) " +
                     "physConnId=\(physConn.field1) hex=\(responsePayload.map { String(format: "%02x", $0) }.joined())"
             )
+            sendAnnounce(endpointDescription: endpoint.debugDescription)
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.mesh_sync_response_failed", error)
         }

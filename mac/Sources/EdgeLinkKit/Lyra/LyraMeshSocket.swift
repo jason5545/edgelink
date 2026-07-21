@@ -83,6 +83,7 @@ public final class LyraMeshSocket: @unchecked Sendable {
         }
         let key = "\(host):\(port)"
         let connection: NWConnection
+        let id: ObjectIdentifier
         if let existing = outboundConnections[key] {
             connection = existing
         } else {
@@ -93,30 +94,51 @@ public final class LyraMeshSocket: @unchecked Sendable {
             )
             outboundConnections[key] = newConnection
             newConnection.start(queue: queue)
+            let newId = ObjectIdentifier(newConnection)
+            receive(on: newConnection, id: newId)
             connection = newConnection
         }
-        let datagram = LyraMeshDatagram.encode(tick: Self.tick(), payload: try LyraMeshPack.encode(frame))
+        id = ObjectIdentifier(connection)
+        var state = sessionStates[id] ?? KcpSessionState()
+        let datagram = LyraMeshDatagram.encode(
+            tick: Self.tick(),
+            sn: state.nextSendSn,
+            una: state.recvUna,
+            payload: try LyraMeshPack.encode(frame)
+        )
+        state.nextSendSn &+= 1
+        sessionStates[id] = state
         connection.send(content: datagram, completion: .idempotent)
     }
 
     public func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) throws {
         try queue.sync {
-            guard let (id, connection) = inboundConnections.first(where: { _, connection in
-                (connection.currentPath?.remoteEndpoint ?? connection.endpoint).debugDescription == endpointDescription
-            }) else {
-                throw SocketError.invalidEndpoint
-            }
-            var state = sessionStates[id] ?? KcpSessionState()
-            let datagram = LyraMeshDatagram.encode(
-                tick: Self.tick(),
-                sn: state.nextSendSn,
-                una: state.recvUna,
-                payload: try LyraMeshPack.encode(frame)
-            )
-            state.nextSendSn &+= 1
-            sessionStates[id] = state
-            connection.send(content: datagram, completion: .idempotent)
+            try sendInboundOnQueue(frame: frame, toEndpointDescription: endpointDescription)
         }
+    }
+
+    public func sendInboundAsync(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) {
+        queue.async { [weak self] in
+            try? self?.sendInboundOnQueue(frame: frame, toEndpointDescription: endpointDescription)
+        }
+    }
+
+    private func sendInboundOnQueue(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) throws {
+        guard let (id, connection) = inboundConnections.first(where: { _, connection in
+            (connection.currentPath?.remoteEndpoint ?? connection.endpoint).debugDescription == endpointDescription
+        }) else {
+            throw SocketError.invalidEndpoint
+        }
+        var state = sessionStates[id] ?? KcpSessionState()
+        let datagram = LyraMeshDatagram.encode(
+            tick: Self.tick(),
+            sn: state.nextSendSn,
+            una: state.recvUna,
+            payload: try LyraMeshPack.encode(frame)
+        )
+        state.nextSendSn &+= 1
+        sessionStates[id] = state
+        connection.send(content: datagram, completion: .idempotent)
     }
 
     public static func tick() -> UInt32 {
