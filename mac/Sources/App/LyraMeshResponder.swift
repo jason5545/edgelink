@@ -36,6 +36,11 @@ final class LyraMeshResponder {
     private var expressHandshakeDone = false
     private var expressListener: NWListener?
     private let expressQueue = DispatchQueue(label: "edgelink.lyra.express")
+    private var channelSocket: LyraChannelSocket?
+    private var channelServerKey = Data()
+    private var phoneTransKey = Data()
+    private var peerChannelId: UInt32 = 0
+    private var channelNegotiationStarted = false
 
     private static let hkdfSalt = Data([
         0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
@@ -61,6 +66,10 @@ final class LyraMeshResponder {
     }
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
+        if frame.packType == 5 {
+            handlePayloadV2(frame: frame, endpoint: endpoint)
+            return
+        }
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
             return
         }
@@ -131,13 +140,14 @@ final class LyraMeshResponder {
                         "variant=\(label) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
                 )
                 if let innerFrame = LogiConnInnerFrame(parsing: plaintext) {
-                    if case .request = innerFrame.payload {
+                    if case let .request(requestData) = innerFrame.payload {
+                        parseLogiConnRequest(requestData)
                         sendLogiConnResponse(
                             frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
                         )
                     } else if case .responseAck = innerFrame.payload {
-                        sendExpressHandshake(
-                            frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+                        startChannelNegotiation(
+                            frame: frame, logiConn: logiConn, endpoint: endpoint
                         )
                     }
                 }
@@ -149,13 +159,179 @@ final class LyraMeshResponder {
         DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_enc_decrypt_failed bytes=\(inner.count)")
     }
 
-    private func sendExpressHandshake(
+    private func parseLogiConnRequest(_ data: Data) {
+        guard let fields = try? LyraProtoReader.readFields(from: data) else {
+            return
+        }
+        var serviceName = ""
+        var privateData = Data()
+        for field in fields {
+            switch (field.number, field.wireType) {
+            case (2, 2):
+                serviceName = field.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            case (3, 2):
+                privateData = field.lengthDelimitedValue ?? Data()
+            default:
+                continue
+            }
+        }
+        var transKey = Data()
+        if let pdFields = try? LyraProtoReader.readFields(from: privateData) {
+            for field in pdFields where field.number == 3 && field.wireType == 2 {
+                if let value = field.lengthDelimitedValue {
+                    transKey = Self.parseColonHexKey(value) ?? value
+                }
+            }
+        }
+        if !transKey.isEmpty {
+            phoneTransKey = transKey
+        }
+        DiagnosticsLog.info(
+            "xiaomi.mishare.mesh_logi_request service=\(serviceName) " +
+                "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count)"
+        )
+    }
+
+    private static func parseColonHexKey(_ data: Data) -> Data? {
+        guard let string = String(data: data, encoding: .utf8), string.contains(":") else {
+            return nil
+        }
+        let parts = string.split(separator: ":")
+        guard parts.count == 32 else {
+            return nil
+        }
+        var key = Data()
+        for part in parts {
+            guard let byte = UInt8(part, radix: 16) else {
+                return nil
+            }
+            key.append(byte)
+        }
+        return key
+    }
+
+    private func handlePayloadV2(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) {
+        let body = frame.payload
+        guard let channelKey, body.count > 30 else {
+            return
+        }
+        let flag = body[body.index(body.startIndex, offsetBy: 1)]
+        guard flag == 1 else {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.channel_payload_plain from=\(endpoint.debugDescription) bytes=\(body.count)"
+            )
+            return
+        }
+        let nonce = body[body.index(body.startIndex, offsetBy: 2)..<body.index(body.startIndex, offsetBy: 14)]
+        let ciphertext = body[body.index(body.startIndex, offsetBy: 14)..<body.index(body.endIndex, offsetBy: -16)]
+        let tag = body[body.index(body.endIndex, offsetBy: -16)..<body.endIndex]
+        guard let sealedBox = try? AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: Data(nonce)),
+            ciphertext: Data(ciphertext),
+            tag: Data(tag)
+        ), let plaintext = try? AES.GCM.open(sealedBox, using: channelKey) else {
+            DiagnosticsLog.warn("xiaomi.mishare.channel_payload_decrypt_failed bytes=\(body.count)")
+            return
+        }
+        DiagnosticsLog.info(
+            "xiaomi.mishare.channel_payload from=\(endpoint.debugDescription) bytes=\(plaintext.count) " +
+                "hex=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
+        )
+        guard let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext) else {
+            return
+        }
+        if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue,
+           let request = LyraChannelProtocol.PeerPortRequest(parsing: commandBody)
+        {
+            peerChannelId = request.channelId
+            if request.transKey.count == 32 {
+                phoneTransKey = request.transKey
+            }
+            DiagnosticsLog.info(
+                "xiaomi.mishare.channel_port_request channelId=\(request.channelId) " +
+                    "transKeyBytes=\(request.transKey.count)"
+            )
+        }
+    }
+
+    private func startChannelNegotiation(
         frame: LyraMeshPack.Frame,
         logiConn: LogiConnFrame,
-        endpoint: NWEndpoint,
-        reply: LyraMeshSocket.ReplyHandler
+        endpoint: NWEndpoint
     ) {
-        guard !expressHandshakeDone, let channelKey else {
+        guard !channelNegotiationStarted, channelKey != nil else {
+            return
+        }
+        channelNegotiationStarted = true
+
+        var serverKey = Data(count: 32)
+        serverKey.withUnsafeMutableBytes { buffer in
+            if let baseAddress = buffer.baseAddress {
+                arc4random_buf(baseAddress, 32)
+            }
+        }
+        channelServerKey = serverKey
+
+        let endpointDescription = endpoint.debugDescription
+        let logiConnId = logiConn.logiConnId
+        let remoteNetId = logiConn.remoteNetId
+
+        let socket = LyraChannelSocket()
+        socket.onRawDatagram = { datagram, from in
+            DiagnosticsLog.info(
+                "xiaomi.mishare.channel_socket_rx from=\(from.debugDescription) bytes=\(datagram.count)"
+            )
+        }
+        socket.onStateChanged = { [weak self] state in
+            guard let self else { return }
+            DiagnosticsLog.info("xiaomi.mishare.channel_socket_state state=\(String(describing: state))")
+            guard case .ready = state, let port = socket.boundPort, port != 0, let channelKey = self.channelKey else {
+                return
+            }
+            let response = LyraChannelProtocol.encodePeerPortResponse(
+                peerChannelId: self.peerChannelId,
+                serverChannelId: 5,
+                port: UInt32(port),
+                key: serverKey
+            )
+            do {
+                try self.sendEncryptedChannelData(
+                    response,
+                    packType: 5,
+                    logiConnId: logiConnId,
+                    remoteNetId: remoteNetId,
+                    endpointDescription: endpointDescription,
+                    channelKey: channelKey
+                )
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.channel_port_response to=\(endpointDescription) port=\(port) " +
+                        "peerChannelId=\(self.peerChannelId) bytes=\(response.count)"
+                )
+            } catch {
+                DiagnosticsLog.error("xiaomi.mishare.channel_port_response_failed", error)
+            }
+        }
+        socket.onPeerConnected = { [weak self] from in
+            DiagnosticsLog.info("xiaomi.mishare.channel_socket_peer from=\(from.debugDescription)")
+            self?.sendExpressHandshakeOverChannel()
+        }
+        socket.onMessage = { message, from in
+            DiagnosticsLog.info(
+                "xiaomi.mishare.channel_socket_message from=\(from.debugDescription) bytes=\(message.count) " +
+                    "hex=\(message.prefix(128).map { String(format: "%02x", $0) }.joined())"
+            )
+        }
+        do {
+            let peerKey = phoneTransKey.isEmpty ? Data(count: 32) : phoneTransKey
+            try socket.start(peerKey: peerKey, localKey: serverKey)
+            channelSocket = socket
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.channel_socket_start_failed", error)
+        }
+    }
+
+    private func sendExpressHandshakeOverChannel() {
+        guard !expressHandshakeDone, !channelServerKey.isEmpty else {
             return
         }
         expressHandshakeDone = true
@@ -166,11 +342,6 @@ final class LyraMeshResponder {
                 arc4random_buf(baseAddress, 16)
             }
         }
-
-        let endpointDescription = endpoint.debugDescription
-        let packType = frame.packType
-        let logiConnId = logiConn.logiConnId
-        let remoteNetId = logiConn.remoteNetId
 
         do {
             let listener = try NWListener(using: .tcp, on: .any)
@@ -185,18 +356,10 @@ final class LyraMeshResponder {
                 }
                 let tlv = LyraExpressTLV.handshakeEventFrame(dataPort: UInt32(port), key: key)
                 do {
-                    try self.sendEncryptedChannelData(
-                        tlv,
-                        packType: packType,
-                        logiConnId: logiConnId,
-                        remoteNetId: remoteNetId,
-                        endpointDescription: endpointDescription,
-                        channelKey: channelKey
-                    )
+                    try self.channelSocket?.send(message: tlv)
                     DiagnosticsLog.info(
-                        "xiaomi.mishare.express_handshake_sent to=\(endpointDescription) " +
-                            "dataPort=\(port) key=\(key.map { String(format: "%02x", $0) }.joined()) " +
-                            "tlvBytes=\(tlv.count)"
+                        "xiaomi.mishare.express_handshake_sent dataPort=\(port) " +
+                            "key=\(key.map { String(format: "%02x", $0) }.joined()) tlvBytes=\(tlv.count)"
                     )
                 } catch {
                     DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
@@ -357,6 +520,12 @@ final class LyraMeshResponder {
         expressHandshakeDone = false
         expressListener?.cancel()
         expressListener = nil
+        channelNegotiationStarted = false
+        channelSocket?.stop()
+        channelSocket = nil
+        channelServerKey = Data()
+        phoneTransKey = Data()
+        peerChannelId = 0
 
         var syncInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: sessionId, to: &syncInfo)
