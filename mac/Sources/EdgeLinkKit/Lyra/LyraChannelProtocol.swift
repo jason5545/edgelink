@@ -171,7 +171,8 @@ public enum LyraSocketPacket {
 }
 
 public enum LyraChannelFragment {
-    public static let flagsLast: UInt16 = 0xB882
+    public static let flagsEncrypted: UInt16 = 0x9882
+    public static let flagsLast: UInt16 = 0x9882
     public static let flagsMore: UInt16 = 0x9882
     public static let maxPayload = 1200
 

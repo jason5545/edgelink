@@ -41,6 +41,19 @@ final class LyraMeshResponder {
     private var phoneTransKey = Data()
     private var peerChannelId: UInt32 = 0
     private var channelNegotiationStarted = false
+    private var expressDataKey = Data()
+    private var eventBytesBuffer = Data()
+    private var streamReceives: [UInt32: StreamReceive] = [:]
+    private var expressBuffers: [ObjectIdentifier: Data] = [:]
+
+    private struct StreamReceive {
+        var streamId: UInt32
+        var contentLength: Int64
+        var filename: String
+        var fileURL: URL
+        var fileHandle: FileHandle?
+        var received: Int64
+    }
 
     private static let hkdfSalt = Data([
         0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
@@ -180,12 +193,23 @@ final class LyraMeshResponder {
         if let pdFields = try? LyraProtoReader.readFields(from: privateData) {
             for field in pdFields where field.wireType == 2 {
                 if field.number == 3, let value = field.lengthDelimitedValue {
-                    transKey = Self.parseColonHexKey(value) ?? value
+                    if transKey.isEmpty {
+                        transKey = Self.parseColonHexKey(value) ?? value
+                    }
                 } else if field.number == 10, let value = field.lengthDelimitedValue,
                           let innerFields = try? LyraProtoReader.readFields(from: value)
                 {
-                    for innerField in innerFields where innerField.number == 1 && innerField.wireType == 0 {
-                        channelId = UInt32(innerField.varintValue ?? 0)
+                    for innerField in innerFields {
+                        switch (innerField.number, innerField.wireType) {
+                        case (1, 0):
+                            channelId = UInt32(innerField.varintValue ?? 0)
+                        case (4, 2):
+                            if let key = innerField.lengthDelimitedValue, key.count == 32 {
+                                transKey = key
+                            }
+                        default:
+                            continue
+                        }
                     }
                 }
             }
@@ -321,19 +345,22 @@ final class LyraMeshResponder {
                 DiagnosticsLog.error("xiaomi.mishare.channel_port_response_failed", error)
             }
         }
-        socket.onPeerConnected = { [weak self] from in
+        socket.onPeerConnected = { from in
             DiagnosticsLog.info("xiaomi.mishare.channel_socket_peer from=\(from.debugDescription)")
+        }
+        socket.onNegotiated = { [weak self] peerChannelId, mtu in
+            DiagnosticsLog.info("xiaomi.mishare.channel_negotiated peerChannelId=\(peerChannelId) mtu=\(mtu)")
             self?.sendExpressHandshakeOverChannel()
         }
-        socket.onMessage = { message, from in
-            DiagnosticsLog.info(
-                "xiaomi.mishare.channel_socket_message from=\(from.debugDescription) bytes=\(message.count) " +
-                    "hex=\(message.prefix(128).map { String(format: "%02x", $0) }.joined())"
-            )
+        socket.onDecryptFailure = { reason in
+            DiagnosticsLog.warn("xiaomi.mishare.channel_socket_decrypt_failed reason=\(reason)")
+        }
+        socket.onMessage = { [weak self] message, from in
+            self?.handleChannelMessage(message, from: from)
         }
         do {
-            let peerKey = phoneTransKey.isEmpty ? Data(count: 32) : phoneTransKey
-            try socket.start(peerKey: peerKey, localKey: serverKey)
+            let key = phoneTransKey.isEmpty ? Data(count: 32) : phoneTransKey
+            try socket.start(socketKey: key, serverChannelId: 5)
             channelSocket = socket
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.channel_socket_start_failed", error)
@@ -352,6 +379,7 @@ final class LyraMeshResponder {
                 arc4random_buf(baseAddress, 16)
             }
         }
+        expressDataKey = key
 
         do {
             let listener = try NWListener(using: .tcp, on: .any)
@@ -403,31 +431,258 @@ final class LyraMeshResponder {
         try socket.sendInbound(frame: dataFrame, toEndpointDescription: endpointDescription)
     }
 
+    private func handleChannelMessage(_ message: Data, from endpoint: NWEndpoint) {
+        guard let (frameTag, frameChild) = try? LyraExpressTLVParser.parseOneOf(message), frameTag == 1 else {
+            DiagnosticsLog.warn("xiaomi.mishare.channel_frame_parse_failed bytes=\(message.count)")
+            return
+        }
+        let frameChildren = LyraExpressTLVParser.children(of: frameChild)
+        guard let payloadNode = LyraExpressTLVParser.firstChild(0, in: frameChildren) else {
+            return
+        }
+        let eventFrame = payloadNode.payload
+        guard let (eventTag, eventChild) = try? LyraExpressTLVParser.parseOneOf(eventFrame) else {
+            DiagnosticsLog.warn("xiaomi.mishare.express_event_parse_failed bytes=\(eventFrame.count)")
+            return
+        }
+        let children = LyraExpressTLVParser.children(of: eventChild)
+        switch eventTag {
+        case 1:
+            DiagnosticsLog.info("xiaomi.mishare.express_event_handshake_rx bytes=\(eventFrame.count)")
+        case 2:
+            let chunk = LyraExpressTLVParser.firstChild(0, in: children)?.payload ?? Data()
+            let more = LyraExpressTLVParser.firstChild(2, in: children)?.byteValue ?? 0
+            eventBytesBuffer.append(chunk)
+            if more == 0 {
+                let complete = eventBytesBuffer
+                eventBytesBuffer = Data()
+                handleFileSendProtocol(complete)
+            }
+        case 3:
+            handleStreamSendBegin(children)
+        default:
+            DiagnosticsLog.info("xiaomi.mishare.express_event tag=\(eventTag) bytes=\(eventFrame.count)")
+        }
+    }
+
+    private func sendEventFrame(oneOfTag: UInt16, child: Data) {
+        let frame = LyraExpressTLV.oneOfNode(tag: 0xFFFF, selectedTag: oneOfTag, child: child)
+        do {
+            try channelSocket?.send(message: frame)
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.express_event_send_failed", error)
+        }
+    }
+
+    private func handleFileSendProtocol(_ data: Data) {
+        guard let fields = try? LyraProtoReader.readFields(from: data) else {
+            return
+        }
+        var tag: UInt64 = 0
+        var body = Data()
+        for field in fields {
+            switch (field.number, field.wireType) {
+            case (1, 0): tag = field.varintValue ?? 0
+            case (2, 2): body = field.lengthDelimitedValue ?? Data()
+            default: continue
+            }
+        }
+        DiagnosticsLog.info("xiaomi.mishare.file_send_protocol tag=\(tag) bodyBytes=\(body.count)")
+        guard tag == 1 else {
+            return
+        }
+        var requestId: UInt64 = 0
+        var deviceName = ""
+        var fileNames: [String] = []
+        if let reqFields = try? LyraProtoReader.readFields(from: body) {
+            for field in reqFields {
+                switch (field.number, field.wireType) {
+                case (1, 0):
+                    requestId = field.varintValue ?? 0
+                case (2, 2):
+                    deviceName = field.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                case (5, 2):
+                    if let infoFields = try? LyraProtoReader.readFields(from: field.lengthDelimitedValue ?? Data()),
+                       let nameField = infoFields.first(where: { $0.number == 1 && $0.wireType == 2 }),
+                       let name = nameField.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) }
+                    {
+                        let size = infoFields.first(where: { $0.number == 2 && $0.wireType == 0 })?.varintValue ?? 0
+                        fileNames.append("\(name)(\(size))")
+                    }
+                default:
+                    continue
+                }
+            }
+        }
+        DiagnosticsLog.info(
+            "xiaomi.mishare.file_send_request requestId=\(requestId) from=\(deviceName) files=\(fileNames.joined(separator: ","))"
+        )
+
+        var response = Data()
+        LyraProtoWriter.appendVarintField(1, value: requestId, to: &response)
+        let taskId = UUID().uuidString
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(taskId.utf8), to: &response)
+        var protocolFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 2, to: &protocolFrame)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: response, to: &protocolFrame)
+        sendEventFrame(oneOfTag: 2, child: LyraExpressTLV.containerNode(tag: 2, children: [
+            LyraExpressTLV.stringNode(tag: 0, value: protocolFrame),
+            LyraExpressTLV.byteNode(tag: 2, value: 0)
+        ]))
+        DiagnosticsLog.info("xiaomi.mishare.file_send_response_sent requestId=\(requestId)")
+    }
+
+    private func handleStreamSendBegin(_ children: [LyraExpressTLVNode]) {
+        let streamId = LyraExpressTLVParser.firstChild(1, in: children)?.int32Value ?? 0
+        let contentLength = Int64(LyraExpressTLVParser.firstChild(2, in: children)?.int64Value ?? 0)
+        let filename = LyraExpressTLVParser.firstChild(3, in: children)
+            .flatMap { String(data: $0.payload, encoding: .utf8) } ?? "stream-\(streamId)"
+        DiagnosticsLog.info(
+            "xiaomi.mishare.stream_send_begin streamId=\(streamId) length=\(contentLength) name=\(filename)"
+        )
+
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads", isDirectory: true)
+            .appendingPathComponent("EdgeLink-MiShare", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let safeName = filename.components(separatedBy: "/").last ?? "stream-\(streamId)"
+        let fileURL = directory.appendingPathComponent(safeName)
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        let handle = try? FileHandle(forWritingTo: fileURL)
+        streamReceives[streamId] = StreamReceive(
+            streamId: streamId,
+            contentLength: contentLength,
+            filename: safeName,
+            fileURL: fileURL,
+            fileHandle: handle,
+            received: 0
+        )
+
+        sendEventFrame(oneOfTag: 4, child: LyraExpressTLV.containerNode(tag: 4, children: [
+            LyraExpressTLV.int32Node(tag: 0, value: streamId),
+            LyraExpressTLV.int32Node(tag: 1, value: 2),
+            LyraExpressTLV.int32Node(tag: 2, value: 1)
+        ]))
+        DiagnosticsLog.info("xiaomi.mishare.stream_rcv_begin_sent streamId=\(streamId)")
+    }
+
+    private func handleStreamlet(_ children: [LyraExpressTLVNode]) {
+        let data = LyraExpressTLVParser.firstChild(0, in: children)?.payload ?? Data()
+        let streamId = LyraExpressTLVParser.firstChild(1, in: children)?.int32Value ?? 0
+        let streamOffset = Int64(LyraExpressTLVParser.firstChild(2, in: children)?.int64Value ?? 0)
+        let streamletSize = Int32(bitPattern: LyraExpressTLVParser.firstChild(3, in: children)?.int32Value ?? 0)
+
+        guard var receive = streamReceives[streamId] else {
+            DiagnosticsLog.warn("xiaomi.mishare.streamlet_unknown_stream streamId=\(streamId)")
+            return
+        }
+        if streamletSize > 0 {
+            if let handle = receive.fileHandle {
+                do {
+                    try handle.seek(toOffset: UInt64(streamOffset))
+                    try handle.write(contentsOf: data)
+                } catch {
+                    DiagnosticsLog.error("xiaomi.mishare.stream_write_failed", error)
+                }
+            }
+            receive.received += Int64(data.count)
+            streamReceives[streamId] = receive
+            return
+        }
+        if streamletSize == 0 {
+            receive.fileHandle?.closeFile()
+            DiagnosticsLog.info(
+                "xiaomi.mishare.stream_complete streamId=\(streamId) name=\(receive.filename) " +
+                    "bytes=\(receive.received) path=\(receive.fileURL.path)"
+            )
+            streamReceives.removeValue(forKey: streamId)
+            sendEventFrame(oneOfTag: 5, child: LyraExpressTLV.containerNode(tag: 5, children: [
+                LyraExpressTLV.int32Node(tag: 0, value: streamId),
+                LyraExpressTLV.int32Node(tag: 1, value: 0),
+                LyraExpressTLV.int32Node(tag: 2, value: 1)
+            ]))
+            return
+        }
+        receive.fileHandle?.closeFile()
+        streamReceives.removeValue(forKey: streamId)
+        DiagnosticsLog.warn("xiaomi.mishare.stream_failed streamId=\(streamId) code=\(streamletSize)")
+        sendEventFrame(oneOfTag: 5, child: LyraExpressTLV.containerNode(tag: 5, children: [
+            LyraExpressTLV.int32Node(tag: 0, value: streamId),
+            LyraExpressTLV.int32Node(tag: 1, value: 3),
+            LyraExpressTLV.int32Node(tag: 2, value: 1)
+        ]))
+    }
+
     private func acceptExpressConnection(_ connection: NWConnection) {
         let endpoint = connection.endpoint
         DiagnosticsLog.info("xiaomi.mishare.express_conn from=\(endpoint.debugDescription)")
         connection.start(queue: expressQueue)
+        expressBuffers[ObjectIdentifier(connection)] = Data()
         receiveExpressData(connection)
     }
 
     private func receiveExpressData(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] content, _, isComplete, error in
+            guard let self else { return }
+            let id = ObjectIdentifier(connection)
             if let content, !content.isEmpty {
-                DiagnosticsLog.info(
-                    "xiaomi.mishare.express_rx from=\(connection.endpoint.debugDescription) bytes=\(content.count) " +
-                        "hex=\(content.prefix(256).map { String(format: "%02x", $0) }.joined())"
-                )
+                var buffer = self.expressBuffers[id] ?? Data()
+                buffer.append(content)
+                self.drainExpressFrames(&buffer, connection: connection)
+                self.expressBuffers[id] = buffer
             }
-            if let error {
-                DiagnosticsLog.error("xiaomi.mishare.express_rx_failed", error)
-                return
-            }
-            if isComplete {
+            if error != nil || isComplete {
+                self.expressBuffers.removeValue(forKey: id)
                 DiagnosticsLog.info("xiaomi.mishare.express_conn_closed from=\(connection.endpoint.debugDescription)")
                 return
             }
-            self?.receiveExpressData(connection)
+            self.receiveExpressData(connection)
         }
+    }
+
+    private func drainExpressFrames(_ buffer: inout Data, connection: NWConnection) {
+        while true {
+            guard buffer.count >= 10 else { return }
+            let header = Array(buffer.prefix(10))
+            guard header[0] == 0, header[1] == 0, header[2] == 0, header[3] == 0, header[4] == 0, header[5] == 0 else {
+                DiagnosticsLog.warn("xiaomi.mishare.express_bad_header hex=\(header.map { String(format: "%02x", $0) }.joined())")
+                buffer = Data()
+                return
+            }
+            let payloadLength = (Int(header[6]) << 24) | (Int(header[7]) << 16) | (Int(header[8]) << 8) | Int(header[9])
+            guard buffer.count >= 10 + payloadLength else { return }
+            let payload = Data(buffer[10..<(10 + payloadLength)])
+            buffer.removeFirst(10 + payloadLength)
+            decryptExpressFrame(payload, connection: connection)
+        }
+    }
+
+    private func decryptExpressFrame(_ payload: Data, connection: NWConnection) {
+        guard payload.count > 28, !expressDataKey.isEmpty else {
+            return
+        }
+        let key = SymmetricKey(data: expressDataKey)
+        let nonce = payload.prefix(12)
+        let tag = payload[payload.index(payload.startIndex, offsetBy: 12)..<payload.index(payload.startIndex, offsetBy: 28)]
+        let ciphertext = payload[payload.index(payload.startIndex, offsetBy: 28)...]
+        guard let sealedBox = try? AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: Data(nonce)),
+            ciphertext: Data(ciphertext),
+            tag: Data(tag)
+        ), let plaintext = try? AES.GCM.open(sealedBox, using: key) else {
+            DiagnosticsLog.warn("xiaomi.mishare.express_decrypt_failed bytes=\(payload.count)")
+            return
+        }
+        guard plaintext.count >= 2 else { return }
+        let trailerOffset = plaintext.count - 2
+        let tlvLength = (Int(plaintext[trailerOffset]) << 8) | Int(plaintext[trailerOffset + 1])
+        guard tlvLength <= trailerOffset else { return }
+        let tlv = Data(plaintext[(trailerOffset - tlvLength)..<trailerOffset])
+        guard let (tag100, child) = try? LyraExpressTLVParser.parseOneOf(tlv), tag100 == 0x100 else {
+            DiagnosticsLog.warn("xiaomi.mishare.express_tlv_unexpected bytes=\(tlv.count)")
+            return
+        }
+        handleStreamlet(LyraExpressTLVParser.children(of: child))
     }
 
     private func sendLogiConnResponse(
@@ -536,6 +791,13 @@ final class LyraMeshResponder {
         channelServerKey = Data()
         phoneTransKey = Data()
         peerChannelId = 0
+        expressDataKey = Data()
+        eventBytesBuffer = Data()
+        for (_, receive) in streamReceives {
+            receive.fileHandle?.closeFile()
+        }
+        streamReceives.removeAll()
+        expressBuffers.removeAll()
 
         var syncInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: sessionId, to: &syncInfo)

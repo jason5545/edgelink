@@ -426,6 +426,66 @@ logs 15069 (lyra-* tags).
   determine whether cch2 is raw TCP or tunnel LogiConn), then the phone
   should complete HSHK and emit FileSendRequest.
 
+### Live-session findings (2026-07-21, session 4)
+
+- **The missing "channel-init" is NOT the 2172B announce** — the 2172B
+  payload is just the periodic `TrustedDeviceInfoFrame` service announce on
+  the long-lived mesh conn (both directions, sent regularly). The real gate
+  is a **60-byte lyra-channel command on the channel's own LogiConn**:
+  `ChannelProtocol` 16B header (`10 00 <type> 10 <totalLen16be> ...`) +
+  `ChannelProto.ResponseOfPeerPort` (type 3): `{f1: peer_channel_id,
+  f2: server_channel_id, f3: socket_port, f5: 1, f7: 32B server key}` =
+  exactly 60B with a 32B key. On receive the phone does
+  `ChannelHandler::HandleChannelCreate` → opens a MiplayTransport KCP socket
+  to the given port (conv `0x12345678`, first datagram ≥25B, no app-level
+  accept handshake).
+- **The phone's channel_id + trans key ride inside the LogiConnRequest
+  private_data** (quick-conn style; no explicit request frame is sent):
+  private_data.f10 = embedded `RequestOfPeerPort` proto
+  `{f1: channel_id, f4: 32B trans key (raw), f5: 32B random}`.
+  private_data.f3 (95-char colon-hex 32B) is a DIFFERENT key — do not use it
+  for the socket channel. When the phone does send an explicit
+  `RequestOfPeerPort` (ChannelProtocol type 2, e.g. 99B with keys), it
+  carries f1=channel_id, f4=key, f5=random — handle both paths.
+- **Response f1 must equal the phone's channel_id** or the phone drops it:
+  `ChannelClientHandler::HandleReceivePayload:453 ... code=52013
+  "channel invalid id"`.
+- **LogiConnFrame semantics (corrects earlier mapping)**: f1 = sender's
+  local net id (u8, sequential per phys conn from 1), f2 = sender's remote
+  net id, f3 = logi_conn_id (random u32), f4 = flag, f5 = inner.
+  payload-v2 `[netId][flag]...`: netId = the RECEIVER's local net id
+  (peer's f1). On reused phys conns the phone demuxes strictly
+  (`LogiConnPhysReuse::OnPhysConnPayloadReceived:1093 ... local_id=0` drop);
+  on fresh conns it tolerates any netId.
+- **Socket channel data plane**: after the KCP connect, the phone sends a
+  54-byte PLAINTEXT TLV negotiation (oneof tag 0, TlvNodes tag 0:
+  `{i32 tag0 = server_channel_id, i32 tag1 = version 1, i32 tag2 = mtu
+  0xff00}`; 78B with KCP header). Server must reply PLAINTEXT oneof tag 4
+  (TlvNodes tag 4: `{i32 tag0 = server_channel_id, i32 tag1 = 0xff00}`,
+  42B). Only after the reply does the phone install the SocketPacket key and
+  fire OnChannelCreateSuccess.
+- **Encrypted data framing (post-negotiation)**: ChannelFrame TLV (oneof
+  tag 1 = data, TlvNodes tag 1 containing a string node with the raw payload,
+  e.g. the 99B EVENT_HANDSHAKE) → fragment layer
+  `[u16le flags=0x9882 (encrypted, bytes) / 0xB882 (plaintext body) / 0xD882
+  (file)][u16be bodyLen][u16be offset][u16be totalCount][nonce 12B]
+  [AES-256-GCM ct][tag 16B]` → SocketPacket
+  `[0x81 0x04 len16be][nonce 12B][AES-256-GCM ct][tag 16B]` → KCP PUSH.
+  GCM key = **the phone's 32B trans key** (request.f4 / private_data.f10.f4)
+  for both layers and both directions (SetSocketPacketSync(session,
+  impl+0x90) where impl+0x90 = ChannelInfo.key = client trans key).
+  The response.f7 server key is only used for GenUserSecretKey
+  (SHA256(salt ‖ f5-random ‖ server-key)) — not for socket data.
+- Errors seen: 52008 = 25s channel negotiate timeout (no response sent);
+  52013 = response.f1 wrong; 15056 = "logical conn medium type disable"
+  (phone has no link addr for us — mDNS/network issue, not protocol);
+  15011 = "logical conn no device link addr"; 16006 = phys conn timeout.
+- Testing note: after network switches the Mac app must be restarted so the
+  mDNS DebugInfo/A-record picks up the new en0 IP, or the phone never
+  resolves a link addr (15056).
+
+
+
 ### Live-session findings (2026-07-21, session 3)
 
 - **Channel-data wire format solved (payload-v2)**. TransDataType enum

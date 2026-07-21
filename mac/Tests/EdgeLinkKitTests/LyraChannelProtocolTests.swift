@@ -90,13 +90,14 @@ final class LyraChannelProtocolTests: XCTestCase {
         let fragments = try LyraChannelFragment.encode(message: message, key: key)
         XCTAssertEqual(fragments.count, 3)
         var reassembled = Data()
+        var lastTotal = 0
         for fragment in fragments {
-            let (chunk, _, _, isLast) = try LyraChannelFragment.decode(fragment: fragment, key: key)
+            let (chunk, _, total, _) = try LyraChannelFragment.decode(fragment: fragment, key: key)
+            lastTotal = total
             reassembled.append(chunk)
-            if isLast {
-                XCTAssertEqual(reassembled, message)
-            }
         }
+        XCTAssertEqual(lastTotal, 3)
+        XCTAssertEqual(reassembled, message)
     }
 
     func testLogiConnRequestTransKeyExtraction() {
@@ -124,6 +125,11 @@ final class LyraChannelProtocolTests: XCTestCase {
         let innerFields = try! LyraProtoReader.readFields(from: channelBlob!)
         let channelId = innerFields.first { $0.number == 1 && $0.wireType == 0 }?.varintValue
         XCTAssertEqual(channelId, 25)
+        let transKey = innerFields.first { $0.number == 4 && $0.wireType == 2 }?.lengthDelimitedValue
+        XCTAssertEqual(transKey?.count, 32)
+        XCTAssertEqual(transKey?.prefix(4), Data([0xF8, 0x73, 0x07, 0x33]))
+        let random = innerFields.first { $0.number == 5 && $0.wireType == 2 }?.lengthDelimitedValue
+        XCTAssertEqual(random?.count, 32)
     }
 }
 
