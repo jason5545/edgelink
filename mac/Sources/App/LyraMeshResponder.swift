@@ -29,6 +29,17 @@ final class LyraMeshResponder {
     private let deviceIdHexProvider: () -> String?
     private let displayNameProvider: () -> String
     private var keyAgreementKey: P256.KeyAgreement.PrivateKey?
+    private var authClientRandom = Data()
+    private var authServerRandom = Data()
+    private var authSharedSecret = Data()
+    private var channelKey: SymmetricKey?
+
+    private static let hkdfSalt = Data([
+        0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
+        0x7B, 0x1E, 0xFA, 0xD0, 0x27, 0x14, 0xD5, 0x17,
+        0x7B, 0x8A, 0x1F, 0x0F, 0x19, 0xE3, 0x69, 0xCC,
+        0x0B, 0xE8, 0xD9, 0x8B, 0xA6, 0x29, 0x73, 0x17
+    ])
 
     init(
         socket: LyraMeshSocket,
@@ -57,8 +68,58 @@ final class LyraMeshResponder {
             return
         }
         for logiConn in miFrame.logiConnFrames {
-            handleLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
+            if logiConn.flag {
+                handleEncryptedLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
+            } else {
+                handleLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
+            }
         }
+    }
+
+    private func handleEncryptedLogiConn(
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        let inner = logiConn.inner
+        guard !authSharedSecret.isEmpty, inner.count > 28 else {
+            DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_enc_nokey bytes=\(inner.count)")
+            return
+        }
+
+        let nonce = inner.prefix(12)
+        let ciphertext = inner.dropFirst(12).dropLast(16)
+        let tag = inner.suffix(16)
+        let infos: [(String, Data)] = [
+            ("cs", authClientRandom + authServerRandom),
+            ("sc", authServerRandom + authClientRandom)
+        ]
+        for (label, info) in infos {
+            let key = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: authSharedSecret),
+                salt: Self.hkdfSalt,
+                info: info,
+                outputByteCount: 32
+            )
+            do {
+                let sealedBox = try AES.GCM.SealedBox(
+                    nonce: AES.GCM.Nonce(data: nonce),
+                    ciphertext: ciphertext,
+                    tag: tag
+                )
+                let plaintext = try AES.GCM.open(sealedBox, using: key)
+                channelKey = key
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.mesh_logi_enc_decrypted from=\(endpoint.debugDescription) " +
+                        "variant=\(label) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
+                )
+                return
+            } catch {
+                continue
+            }
+        }
+        DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_enc_decrypt_failed bytes=\(inner.count)")
     }
 
     private func handleLogiConn(
@@ -181,11 +242,13 @@ final class LyraMeshResponder {
 
         let privateKey = P256.KeyAgreement.PrivateKey()
         keyAgreementKey = privateKey
+        authClientRandom = hello.clientRandom
         var sharedSecretPrefix = ""
         do {
             let peerPublicKey = try P256.KeyAgreement.PublicKey(x963Representation: hello.publicKey)
             let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: peerPublicKey)
             let secretData = sharedSecret.withUnsafeBytes { Data($0) }
+            authSharedSecret = secretData
             sharedSecretPrefix = secretData.prefix(4).map { String(format: "%02x", $0) }.joined()
         } catch {
             DiagnosticsLog.warn("xiaomi.mishare.mesh_logi_upgrade_ecdh_failed error=\(error.localizedDescription)")
@@ -200,6 +263,7 @@ final class LyraMeshResponder {
 
         var serverRandom = Data(count: 32)
         _ = serverRandom.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        authServerRandom = serverRandom
 
         var publicKeyMessage = Data()
         LyraProtoWriter.appendVarintField(1, value: hello.keyType, to: &publicKeyMessage)
