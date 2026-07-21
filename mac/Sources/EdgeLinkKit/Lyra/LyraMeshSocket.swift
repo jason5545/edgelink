@@ -15,10 +15,16 @@ public final class LyraMeshSocket: @unchecked Sendable {
 
     public private(set) var boundPort: UInt16?
 
+    private struct KcpSessionState {
+        var nextSendSn: UInt32 = 0
+        var recvUna: UInt32 = 0
+    }
+
     private let queue = DispatchQueue(label: "edgelink.lyra.mesh", qos: .userInitiated)
     private var listener: NWListener?
     private var inboundConnections: [ObjectIdentifier: NWConnection] = [:]
     private var outboundConnections: [String: NWConnection] = [:]
+    private var sessionStates: [ObjectIdentifier: KcpSessionState] = [:]
 
     public init() {}
 
@@ -99,35 +105,51 @@ public final class LyraMeshSocket: @unchecked Sendable {
             switch state {
             case .cancelled, .failed:
                 self.inboundConnections[id] = nil
+                self.sessionStates[id] = nil
             default:
                 break
             }
         }
         connection.start(queue: queue)
-        receive(on: connection)
+        receive(on: connection, id: id)
     }
 
-    private func receive(on connection: NWConnection) {
+    private func receive(on connection: NWConnection, id: ObjectIdentifier) {
         connection.receiveMessage { [weak self] content, _, _, error in
             guard let self else { return }
             if let content, !content.isEmpty {
                 let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
                 self.onRawDatagram?(content, endpoint)
-                if let payload = try? LyraMeshDatagram.decode(content),
-                   let decoded = try? LyraMeshPack.decode(payload)
+                if let segment = try? LyraMeshDatagram.decodeSegment(content),
+                   segment.command == LyraMeshDatagram.commandPush
                 {
-                    let reply: ReplyHandler = { responseFrame in
-                        let datagram = LyraMeshDatagram.encode(
-                            tick: Self.tick(),
-                            payload: try LyraMeshPack.encode(responseFrame)
-                        )
-                        connection.send(content: datagram, completion: .idempotent)
+                    var state = self.sessionStates[id] ?? KcpSessionState()
+                    let isDuplicate = segment.sn < state.recvUna
+                    if !isDuplicate {
+                        state.recvUna = segment.sn &+ 1
                     }
-                    self.onFrame?(decoded.frame, endpoint, reply)
+                    self.sessionStates[id] = state
+                    let ack = LyraMeshDatagram.encodeAck(tick: Self.tick(), sn: segment.sn, una: state.recvUna)
+                    connection.send(content: ack, completion: .idempotent)
+                    if !isDuplicate, let decoded = try? LyraMeshPack.decode(segment.payload) {
+                        let reply: ReplyHandler = { responseFrame in
+                            var replyState = self.sessionStates[id] ?? KcpSessionState()
+                            let datagram = LyraMeshDatagram.encode(
+                                tick: Self.tick(),
+                                sn: replyState.nextSendSn,
+                                una: replyState.recvUna,
+                                payload: try LyraMeshPack.encode(responseFrame)
+                            )
+                            replyState.nextSendSn &+= 1
+                            self.sessionStates[id] = replyState
+                            connection.send(content: datagram, completion: .idempotent)
+                        }
+                        self.onFrame?(decoded.frame, endpoint, reply)
+                    }
                 }
             }
             if error == nil {
-                self.receive(on: connection)
+                self.receive(on: connection, id: id)
             }
         }
     }

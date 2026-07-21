@@ -179,7 +179,9 @@ public struct MiConnectFrame: Equatable, Sendable {
             LyraProtoWriter.appendLengthDelimitedField(2, value: physConnFrame.serialized(), to: &v0)
         }
         var data = Data()
-        LyraProtoWriter.appendVarintField(1, value: UInt64(version), to: &data)
+        if version != 0 {
+            LyraProtoWriter.appendVarintField(1, value: UInt64(version), to: &data)
+        }
         LyraProtoWriter.appendLengthDelimitedField(2, value: v0, to: &data)
         return data
     }
@@ -456,7 +458,14 @@ public enum LyraMeshDatagram {
         case badMagic
     }
 
+    public static let commandPush: UInt8 = 0x51
+    public static let commandAck: UInt8 = 0x52
+
     public static func encode(tick: UInt32, payload: Data) -> Data {
+        encode(tick: tick, sn: 0, una: 0, payload: payload)
+    }
+
+    public static func encode(tick: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data {
         var data = Data(capacity: headerLength + payload.count)
         data.append(contentsOf: [0x78, 0x56, 0x34, 0x12])
         data.append(contentsOf: [0x51, 0x00, 0x00, 0x10])
@@ -466,7 +475,18 @@ public enum LyraMeshDatagram {
             UInt8((tick >> 16) & 0xFF),
             UInt8((tick >> 24) & 0xFF)
         ])
-        data.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+        data.append(contentsOf: [
+            UInt8(sn & 0xFF),
+            UInt8((sn >> 8) & 0xFF),
+            UInt8((sn >> 16) & 0xFF),
+            UInt8((sn >> 24) & 0xFF)
+        ])
+        data.append(contentsOf: [
+            UInt8(una & 0xFF),
+            UInt8((una >> 8) & 0xFF),
+            UInt8((una >> 16) & 0xFF),
+            UInt8((una >> 24) & 0xFF)
+        ])
         let length = UInt32(payload.count)
         data.append(contentsOf: [
             UInt8(length & 0xFF),
@@ -478,7 +498,37 @@ public enum LyraMeshDatagram {
         return data
     }
 
+    public static func encodeAck(tick: UInt32, sn: UInt32, una: UInt32) -> Data {
+        var data = Data(capacity: headerLength)
+        data.append(contentsOf: [0x78, 0x56, 0x34, 0x12])
+        data.append(contentsOf: [0x52, 0x00, 0x00, 0x10])
+        data.append(contentsOf: [
+            UInt8(tick & 0xFF),
+            UInt8((tick >> 8) & 0xFF),
+            UInt8((tick >> 16) & 0xFF),
+            UInt8((tick >> 24) & 0xFF)
+        ])
+        data.append(contentsOf: [
+            UInt8(sn & 0xFF),
+            UInt8((sn >> 8) & 0xFF),
+            UInt8((sn >> 16) & 0xFF),
+            UInt8((sn >> 24) & 0xFF)
+        ])
+        data.append(contentsOf: [
+            UInt8(una & 0xFF),
+            UInt8((una >> 8) & 0xFF),
+            UInt8((una >> 16) & 0xFF),
+            UInt8((una >> 24) & 0xFF)
+        ])
+        data.append(contentsOf: [0, 0, 0, 0])
+        return data
+    }
+
     public static func decode(_ data: Data) throws -> Data {
+        try decodeSegment(data).payload
+    }
+
+    public static func decodeSegment(_ data: Data) throws -> (command: UInt8, sn: UInt32, payload: Data) {
         let bytes = Array(data)
         guard bytes.count >= headerLength else {
             throw DatagramError.truncated
@@ -486,11 +536,13 @@ public enum LyraMeshDatagram {
         guard bytes[0] == 0x78, bytes[1] == 0x56, bytes[2] == 0x34, bytes[3] == 0x12 else {
             throw DatagramError.badMagic
         }
+        let command = bytes[4]
+        let sn = UInt32(bytes[12]) | (UInt32(bytes[13]) << 8) | (UInt32(bytes[14]) << 16) | (UInt32(bytes[15]) << 24)
         let length = Int(bytes[20]) | (Int(bytes[21]) << 8) | (Int(bytes[22]) << 16) | (Int(bytes[23]) << 24)
         guard bytes.count >= headerLength + length else {
             throw DatagramError.truncated
         }
-        return Data(bytes[headerLength..<(headerLength + length)])
+        return (command, sn, Data(bytes[headerLength..<(headerLength + length)]))
     }
 }
 
@@ -524,12 +576,14 @@ public struct LyraDeviceInfo: Equatable, Sendable {
     public func serialized() -> Data {
         var data = Data()
         LyraProtoWriter.appendLengthDelimitedField(2, value: Data(deviceId.utf8), to: &data)
-        LyraProtoWriter.appendVarintField(3, value: UInt64(deviceType), to: &data)
+        LyraProtoWriter.appendVarintField(3, value: 1, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(4, value: Data(uidHash.utf8), to: &data)
-        LyraProtoWriter.appendVarintField(5, value: 1, to: &data)
+        LyraProtoWriter.appendVarintField(5, value: UInt64(deviceType), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(6, value: Data(displayName.utf8), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(8, value: Data(osVersion.utf8), to: &data)
         LyraProtoWriter.appendVarintField(9, value: UInt64(connMediumTypes), to: &data)
+        let deviceStateInfo = Data([0x0D, 0x01, 0x10, 0x00, 0x00])
+        LyraProtoWriter.appendLengthDelimitedField(10, value: deviceStateInfo, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(11, value: Data(romVersion.utf8), to: &data)
         var wifiCapabilities = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &wifiCapabilities)
@@ -542,10 +596,10 @@ public struct PhysConnSyncDeviceInfoResponse: Equatable, Sendable {
     public var timestampMs: UInt64
     public var deviceInfo: LyraDeviceInfo
     public var field3: UInt32
-    public var field5: UInt32
+    public var field5: UInt32?
     public var networkInfo: Data?
 
-    public init(timestampMs: UInt64, deviceInfo: LyraDeviceInfo, field3: UInt32 = 256, field5: UInt32 = 128, networkInfo: Data? = nil) {
+    public init(timestampMs: UInt64, deviceInfo: LyraDeviceInfo, field3: UInt32 = 256, field5: UInt32? = nil, networkInfo: Data? = nil) {
         self.timestampMs = timestampMs
         self.deviceInfo = deviceInfo
         self.field3 = field3
@@ -558,7 +612,9 @@ public struct PhysConnSyncDeviceInfoResponse: Equatable, Sendable {
         LyraProtoWriter.appendVarintField(1, value: timestampMs, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(2, value: deviceInfo.serialized(), to: &data)
         LyraProtoWriter.appendVarintField(3, value: UInt64(field3), to: &data)
-        LyraProtoWriter.appendVarintField(5, value: UInt64(field5), to: &data)
+        if let field5 {
+            LyraProtoWriter.appendVarintField(5, value: UInt64(field5), to: &data)
+        }
         if let networkInfo {
             LyraProtoWriter.appendLengthDelimitedField(6, value: networkInfo, to: &data)
         }

@@ -36,6 +36,7 @@ final class XiaomiLyraMDNSPublisher {
         let name: String
         let index: UInt32
         let ipv4Address: [UInt8]
+        var ipv6LinkLocal: String?
 
         var ipv4Description: String {
             ipv4Address.map(String.init).joined(separator: ".")
@@ -117,12 +118,12 @@ final class XiaomiLyraMDNSPublisher {
     }
 
     private func registerService(on interfaces: [NetworkInterface]) throws {
-        let txt = try encodedRecord("TXT") {
-            try XiaomiLyraMDNSRecordEncoder.txtRecord(entries: [("AppData", appDataBase64)])
-        }
         let port = UInt16(5353).bigEndian
 
         for networkInterface in interfaces {
+            let txt = try encodedRecord("TXT") {
+                try XiaomiLyraMDNSRecordEncoder.txtRecord(entries: txtEntries(for: networkInterface))
+            }
             var serviceRef: DNSServiceRef?
             let result = txt.withUnsafeBytes { rawBuffer -> DNSServiceErrorType in
                 DNSServiceRegister(
@@ -153,6 +154,18 @@ final class XiaomiLyraMDNSPublisher {
             }
             serviceRefs.append(serviceRef)
         }
+    }
+
+    private func txtEntries(for networkInterface: NetworkInterface) -> [(String, String)] {
+        let debugInfo =
+            "{msg:hello, ifname:\(networkInterface.name), " +
+            "v4:\(networkInterface.ipv4Description), v6:\(networkInterface.ipv6LinkLocal ?? "")}"
+        return [
+            ("AppData", appDataBase64),
+            ("DebugInfo", debugInfo),
+            ("MediumType", "256"),
+            ("CH", "56")
+        ]
     }
 
     private func registerAddressRecords(on interfaces: [NetworkInterface]) throws {
@@ -276,6 +289,50 @@ final class XiaomiLyraMDNSPublisher {
             if !interfaces.contains(networkInterface) {
                 interfaces.append(networkInterface)
             }
+        }
+
+        var linkLocalV6: [String: String] = [:]
+        cursor = firstAddress
+        while let pointer = cursor {
+            defer { cursor = pointer.pointee.ifa_next }
+
+            let entry = pointer.pointee
+            guard let address = entry.ifa_addr,
+                  Int32(address.pointee.sa_family) == AF_INET6
+            else {
+                continue
+            }
+
+            let name = String(cString: entry.ifa_name)
+            guard interfaces.contains(where: { $0.name == name }),
+                  linkLocalV6[name] == nil
+            else {
+                continue
+            }
+
+            let sockaddr6 = address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                $0.pointee
+            }
+            var bytes = sockaddr6.sin6_addr
+            let isLinkLocal = withUnsafeBytes(of: &bytes) { raw in
+                raw[0] == 0xFE && (raw[1] & 0xC0) == 0x80
+            }
+            guard isLinkLocal else {
+                continue
+            }
+
+            var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            var address6 = sockaddr6.sin6_addr
+            guard inet_ntop(AF_INET6, &address6, &text, socklen_t(INET6_ADDRSTRLEN)) != nil else {
+                continue
+            }
+            linkLocalV6[name] = String(cString: text) + "%" + name
+        }
+
+        interfaces = interfaces.map { networkInterface in
+            var copy = networkInterface
+            copy.ipv6LinkLocal = linkLocalV6[networkInterface.name]
+            return copy
         }
 
         return interfaces.sorted { lhs, rhs in
