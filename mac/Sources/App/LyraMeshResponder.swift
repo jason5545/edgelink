@@ -220,7 +220,7 @@ final class LyraMeshResponder {
         let nonce = AES.GCM.Nonce()
         let sealed = try AES.GCM.seal(plaintext, using: channelKey, nonce: nonce)
         var body = Data()
-        body.append(UInt8(logiConnId & 0xFF))
+        body.append(UInt8(remoteNetId & 0xFF))
         body.append(1)
         body.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
         body.append(sealed.ciphertext)

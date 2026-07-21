@@ -425,3 +425,65 @@ logs 15069 (lyra-* tags).
   encrypted channel data + listen for the cch2 data connection (need to
   determine whether cch2 is raw TCP or tunnel LogiConn), then the phone
   should complete HSHK and emit FileSendRequest.
+
+### Live-session findings (2026-07-21, session 3)
+
+- **Channel-data wire format solved (payload-v2)**. TransDataType enum
+  (Mac micontinuity `ConnectionUtils::ToStr(TransDataType)`):
+  1=physical, 2=logical, 3=auth, 4=payload(encrypted), 5=payload-v2, 6=tunnel.
+  TransPackMesh packType maps 1:1 (0x09=phys, 0x11=logi, 0x29=payload-v2).
+  `DoLogiSendPayloadFrame` picks type 5 iff `GetSupportNoSecurity() != 0`
+  else type 4. Phone logs show it uses `options={type=5(...)}`.
+- **payload-v2 frame = `[netId&0xff][flag][nonce 12B][GCM ct][tag 16B]`**
+  for encrypted (flag=1), wrapped as TransPackMesh packType 5 (0x29),
+  `total = 4 + body` (multi-datagram reassembly supported — big frames are
+  split across KCP PUSHes, continuation datagrams have no 0x29 header).
+  Plaintext variant seen as `[netId][00][00][LogiConnFrame...]`
+  (phone→official-Mac service announce). Encryption key = the LogiConn
+  session key (same HKDF/AES-GCM as control frames, no AAD).
+  Sender writes netId = `LogiConnContextPhys::GetRemoteLogiConnNetId` low
+  byte — official pcap uses 0x01 in both directions.
+- **CONFIRMED WORKING**: our 99-byte EVENT_HANDSHAKE reached the phone as
+  `ConnectionManager::OnLogiConnClientPayloadReceived conn_id=.. data.len=99`
+  (12:51:35.947 session) — decrypt + delivery OK. But it never reached
+  `JChannelListenerAdapter::OnChannelReceive` → miexpress: the micont
+  channel was still in "creating" state (OnChannelCreateSuccess never
+  fired), so the packet was dropped/queued and HSHK timed out at 25s (52008).
+- **Official-transfer ground truth (phone logcat, 2026-07-21 13:11)**:
+  createChannel → OnChannelConfirm `[HSHK]Confirm INITIAL link` →
+  `OnLogiConnClientPayloadReceived data.len=60` (conn A) + `data.len=2172`
+  (main conn) → **OnChannelCreateSuccess** (48ms after confirm) →
+  `OnChannelReceive pkt_type=1 pkt_length=99` = the EVENT_HANDSHAKE
+  (miexpress-esevt logs `payload, tag=1`) → phone sends FileSendRequest
+  (`DoLogiSendPayloadFrame data_size=3571` → wire 3601 = +30 overhead
+  = [netId 1][flag 1][nonce 12][tag 16]) → Mac answers 53-byte packet
+  (tag=2 = FileSendRequestResponse) → 54-byte (tag=4) → file data
+  (`Send pkt_type=2`).
+- So the missing piece before EVENT_HANDSHAKE: the receiver must first send
+  a **~2KB "channel-init / service-announce" payload** (data.len=2172 on
+  the main conn; official Mac→phone 2205-byte type-5 frame in pcap =
+  2171B plaintext, encrypted). Only then does the phone's micont channel
+  become "created" and accept packets for miexpress. The 60-byte payload on
+  the second conn (72BAC981) is probably the other leg/service announce ack.
+- The phone's own service announce (plaintext type-5, old pcap):
+  `[01 00 00]` + LogiConnFrame{f1:1, f5: inner} where inner =
+  FileSendProtocol-ish `{f1:1, f2: <service-list proto>}` listing
+  miNfcShare / miShareBasic / WearGesture + device name + MAC + ids.
+- miexpress event socket logs each TLV with its oneof tag
+  (`miexpress-esevt: ExpressEventSocket::OnChannelReceive payload, tag=N`).
+- Express client needs no handshake response; after EVENT_HANDSHAKE it
+  immediately proceeds (FileSendRequest on the event channel as
+  TlvExpressFrame tag=? — the 3571B frame).
+- Next steps:
+  1. Reverse the 2172-byte channel-init payload: disassemble official Mac
+     micontinuity channel accept path (`ChannelServerHandler` /
+     `OnLogiConnServerConnected` in /tmp/micontinuity_arm64) or capture
+     official Mac→phone frames and diff against MiShare.apk proto classes
+     (HeteroChannel*Frame protos exist in MiConnectProto strings).
+  2. Send channel-init after LogiConnResponseAck, then EVENT_HANDSHAKE,
+     then answer FileSendRequest (tag 1) with FileSendRequestResponse
+     (tag 2) as encrypted payload-v2 packets.
+- Also note: `express_handshake_sent` dataPort TCP listener works, but the
+  phone never TCP-connects before HSHK completes — the data socket
+  (`ExpressDataSocket::NewServer` = raw TCP bind+getsockname) is used only
+  after the event-channel handshake.
