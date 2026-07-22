@@ -10,6 +10,17 @@ final class LyraMeshResponder {
         0x96, 0x08, 0xD3, 0x95, 0x8E, 0x2B, 0xC3, 0xEC, 0x1F, 0x64, 0x81, 0xEB,
         0x11, 0xB6, 0x56, 0x13, 0x08, 0x27, 0x21, 0xBF
     ])
+    static let officialMacSyncAuthCredential = Data([
+        0x18, 0x60, 0x81, 0x5E, 0xFC, 0xCB, 0x61, 0x00, 0xC2, 0x28, 0x52, 0x05,
+        0x26, 0x11, 0xE8, 0x1C, 0x68, 0x85, 0x53, 0x34, 0x49, 0xCC, 0x2D, 0x9D,
+        0x60, 0x8E, 0xE8, 0x1A, 0xA4, 0xCD, 0x42, 0xF0, 0x4D, 0xD5, 0xAA, 0x07,
+        0x2B, 0xA8, 0xB0, 0x67, 0x7A, 0xDA, 0x37, 0xF9, 0x3F, 0xC7, 0xAD, 0xDA,
+        0x6B, 0x5D, 0x9F, 0xB9, 0x18, 0xDF, 0x65, 0x10, 0xEB, 0xF6, 0xD3, 0xF8,
+        0xDC, 0xE9, 0x03, 0x12, 0xD6, 0xAE, 0xC1, 0xE5, 0xE8, 0xBD, 0xF5, 0x29,
+        0x66, 0x58, 0x61, 0x6E, 0x6E, 0xCB, 0xFF, 0xCF, 0x11, 0x37, 0xD0, 0xC3,
+        0x32, 0xD9, 0x34, 0x9A, 0xED, 0x05, 0x3C, 0x67, 0x61, 0x1B, 0x15, 0x2F,
+        0xFA, 0x8F, 0x17, 0x29, 0x18, 0x52, 0x9E, 0x68, 0xA0, 0xD9, 0x3
+    ])
     static let officialMacSyncInfoSignature = Data([
         0x33, 0x85, 0xFB, 0xAA, 0x02, 0xFD, 0x4E, 0x2C, 0xE1, 0x95, 0x74, 0x3A,
         0xA8, 0xDD, 0x50, 0xDB, 0xC6, 0xB7, 0xA4, 0xEC, 0x36, 0x6F, 0x0B, 0xAA,
@@ -46,6 +57,14 @@ final class LyraMeshResponder {
     private var lastEndpointDescription: String?
     private var announceTimer: DispatchSourceTimer?
     private let announceQueue = DispatchQueue(label: "edgelink.lyra.announce")
+    private var syncAuthPrivateKey: Curve25519.KeyAgreement.PrivateKey?
+    private var syncAuthPeerConnId = Data()
+    private var syncAuthOurConnId = Data()
+    private var syncSessionKey: SymmetricKey?
+    private var syncKeyCandidates: [SymmetricKey] = []
+    private var syncAuthSharedSecret = Data()
+    private var syncAnnounceEndpoint: String?
+    private var syncCookieByEndpoint: [String: UInt64] = [:]
     private var expressDataKey = Data()
     private var eventBytesBuffer = Data()
     private var streamReceives: [UInt32: StreamReceive] = [:]
@@ -112,8 +131,23 @@ final class LyraMeshResponder {
                 return
             }
             if case let .keepAliveRequest(requestData) = physConn.payload {
-                handleKeepAliveRequest(
-                    frame: frame, physConn: physConn, request: requestData, endpoint: endpoint, reply: reply
+                if physConn.field2 == 4 || physConn.field2 == 5 {
+                    handleSyncCookie(
+                        frame: frame, physConn: physConn, cookieData: requestData,
+                        wrapperField: 6, endpoint: endpoint, reply: reply
+                    )
+                } else {
+                    handleKeepAliveRequest(
+                        frame: frame, physConn: physConn, request: requestData, endpoint: endpoint, reply: reply
+                    )
+                }
+                return
+            }
+            if case let .keepAliveResponse(responseData) = physConn.payload,
+               physConn.field2 == 4 || physConn.field2 == 5 {
+                handleSyncCookie(
+                    frame: frame, physConn: physConn, cookieData: responseData,
+                    wrapperField: 7, endpoint: endpoint, reply: reply
                 )
                 return
             }
@@ -269,7 +303,7 @@ final class LyraMeshResponder {
 
     private func handlePayloadV2(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) {
         let body = frame.payload
-        guard let channelKey, body.count > 30 else {
+        guard body.count > 30 else {
             return
         }
         let flag = body[body.index(body.startIndex, offsetBy: 1)]
@@ -286,28 +320,57 @@ final class LyraMeshResponder {
             nonce: AES.GCM.Nonce(data: Data(nonce)),
             ciphertext: Data(ciphertext),
             tag: Data(tag)
-        ), let plaintext = try? AES.GCM.open(sealedBox, using: channelKey) else {
-            DiagnosticsLog.warn("xiaomi.mishare.channel_payload_decrypt_failed bytes=\(body.count)")
+        ) else {
             return
         }
-        DiagnosticsLog.info(
-            "xiaomi.mishare.channel_payload from=\(endpoint.debugDescription) bytes=\(plaintext.count) " +
-                "hex=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
-        )
-        guard let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext) else {
-            return
+        var keys: [(String, SymmetricKey)] = []
+        if let syncSessionKey {
+            keys.append(("sync", syncSessionKey))
         }
-        if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue,
-           let request = LyraChannelProtocol.PeerPortRequest(parsing: commandBody)
-        {
-            peerChannelId = request.channelId
-            if request.transKey.count == 32 {
-                phoneTransKey = request.transKey
+        for (index, candidate) in syncKeyCandidates.enumerated() {
+            keys.append(("syncCand\(index)", candidate))
+        }
+        if let channelKey {
+            keys.append(("channel", channelKey))
+        }
+        for (label, key) in keys {
+            guard let plaintext = try? AES.GCM.open(sealedBox, using: key) else {
+                continue
+            }
+            if label != "channel" {
+                syncSessionKey = key
+                syncKeyCandidates = []
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.sync_announce_decrypted from=\(endpoint.debugDescription) " +
+                        "label=\(label) bytes=\(plaintext.count) " +
+                        "hex=\(plaintext.prefix(400).map { String(format: "%02x", $0) }.joined())"
+                )
+                sendEncryptedSyncAnnounce(endpointDescription: endpoint.debugDescription, key: key)
+                return
             }
             DiagnosticsLog.info(
-                "xiaomi.mishare.channel_port_request channelId=\(request.channelId) " +
-                    "transKeyBytes=\(request.transKey.count)"
+                "xiaomi.mishare.channel_payload from=\(endpoint.debugDescription) bytes=\(plaintext.count) " +
+                    "hex=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
             )
+            guard let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext) else {
+                return
+            }
+            if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue,
+               let request = LyraChannelProtocol.PeerPortRequest(parsing: commandBody)
+            {
+                peerChannelId = request.channelId
+                if request.transKey.count == 32 {
+                    phoneTransKey = request.transKey
+                }
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.channel_port_request channelId=\(request.channelId) " +
+                        "transKeyBytes=\(request.transKey.count)"
+                )
+            }
+            return
+        }
+        if channelKey != nil || !syncKeyCandidates.isEmpty || syncSessionKey != nil {
+            DiagnosticsLog.warn("xiaomi.mishare.channel_payload_decrypt_failed bytes=\(body.count)")
         }
     }
 
@@ -434,6 +497,18 @@ final class LyraMeshResponder {
                 if !self.phoneColonHexKey.isEmpty {
                     candidates.append(("f3hex", self.phoneColonHexKey))
                 }
+                if !self.syncAuthSharedSecret.isEmpty {
+                    let secret = self.syncAuthSharedSecret
+                    candidates.append(("syncRaw", secret))
+                    candidates.append(("syncSha", Data(SHA256.hash(data: secret))))
+                    if !self.phoneTransKey.isEmpty {
+                        candidates.append(("syncTrans", Data(SHA256.hash(data: secret + self.phoneTransKey))))
+                        candidates.append(("transSync", Data(SHA256.hash(data: self.phoneTransKey + secret))))
+                    }
+                    for (index, candidate) in self.syncKeyCandidates.enumerated() {
+                        candidates.append(("syncHKDF\(index)", candidate.withUnsafeBytes { Data($0) }))
+                    }
+                }
                 for (name, candidate) in candidates where candidate.count == 32 {
                     do {
                         try self.channelSocket?.sendVariant(channelFrame: channelFrame, key: candidate, singleLayer: false)
@@ -477,6 +552,10 @@ final class LyraMeshResponder {
     }
 
     private func sendAnnounce(endpointDescription: String) {
+        if let syncSessionKey, let syncAnnounceEndpoint {
+            sendEncryptedSyncAnnounce(endpointDescription: syncAnnounceEndpoint, key: syncSessionKey)
+            return
+        }
         guard let deviceIdHex = deviceIdHexProvider() else {
             return
         }
@@ -851,6 +930,11 @@ final class LyraMeshResponder {
                 upgradeData: upgradeData, frame: frame, logiConn: logiConn,
                 endpoint: endpoint, reply: reply
             )
+        case let .disconnect(payload) where inner.frameType == 4:
+            handleSyncAuthContinuation(
+                payload: payload, frame: frame, logiConn: logiConn,
+                endpoint: endpoint, reply: reply
+            )
         default:
             DiagnosticsLog.info(
                 "xiaomi.mishare.mesh_logi_unhandled from=\(endpoint.debugDescription) " +
@@ -872,6 +956,7 @@ final class LyraMeshResponder {
         var sessionId: UInt64 = 0
         var trustLevel: UInt64 = 0
         var capability: UInt64?
+        var serviceName = ""
         var uidFeature = Data()
         var signature = Data()
         for field in fields {
@@ -879,6 +964,8 @@ final class LyraMeshResponder {
             case (1, 0): sessionId = field.varintValue ?? 0
             case (2, 0): trustLevel = field.varintValue ?? 0
             case (3, 0): capability = field.varintValue
+            case (4, 2):
+                serviceName = field.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             case (5, 2): uidFeature = field.lengthDelimitedValue ?? Data()
             case (6, 2): signature = field.lengthDelimitedValue ?? Data()
             default: continue
@@ -888,8 +975,16 @@ final class LyraMeshResponder {
         DiagnosticsLog.info(
             "xiaomi.mishare.mesh_logi_sync_info from=\(endpoint.debugDescription) " +
                 "logiConnId=\(logiConn.logiConnId) peerNetId=\(logiConn.localNetId) " +
-                "session=\(sessionId) trust=\(trustLevel) uidFeatureBytes=\(uidFeature.count)"
+                "session=\(sessionId) trust=\(trustLevel) service=\(serviceName) uidFeatureBytes=\(uidFeature.count)"
         )
+
+        if !serviceName.isEmpty {
+            handleSyncAuthRequest(
+                syncInfoData: syncInfoData, serviceName: serviceName,
+                frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+            )
+            return
+        }
 
         expressHandshakeDone = false
         expressListener?.cancel()
@@ -1091,6 +1186,249 @@ final class LyraMeshResponder {
             publicKey: publicKey
         )
     }
+
+    private func handleSyncCookie(
+        frame: LyraMeshPack.Frame,
+        physConn: PhysConnFrame,
+        cookieData: Data,
+        wrapperField: Int,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        let fields = (try? LyraProtoReader.readFields(from: cookieData)) ?? []
+        var cookie: UInt64 = 0
+        var phase: UInt64 = 0
+        var echo: UInt64 = 0
+        for field in fields {
+            switch (field.number, field.wireType) {
+            case (1, 0): cookie = field.varintValue ?? 0
+            case (2, 0): phase = field.varintValue ?? 0
+            case (3, 0): echo = field.varintValue ?? 0
+            default: continue
+            }
+        }
+        let ourCookie = UInt64.random(in: 1...UInt64(UInt32.max))
+        let endpointKey = endpoint.debugDescription
+        let lastCookie = syncCookieByEndpoint[endpointKey] ?? 0
+        if wrapperField == 7, phase >= 2, echo == lastCookie, lastCookie != 0 {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_sync_cookie_complete from=\(endpointKey) " +
+                    "cookie=\(cookie) phase=\(phase) echo=\(echo)"
+            )
+            return
+        }
+        let replyPhase: UInt64
+        if wrapperField == 7, phase < 2 {
+            replyPhase = phase + 1
+        } else {
+            replyPhase = phase
+        }
+        var inner = Data()
+        LyraProtoWriter.appendVarintField(1, value: ourCookie, to: &inner)
+        LyraProtoWriter.appendVarintField(2, value: replyPhase, to: &inner)
+        LyraProtoWriter.appendVarintField(3, value: cookie, to: &inner)
+        let responseNetId: UInt32 = physConn.field2 == 4 ? 5 : 4
+        let responsePayload: PhysConnPayload = wrapperField == 6
+            ? .keepAliveResponse(inner)
+            : .keepAliveRequest(inner)
+        let responsePhysConn = PhysConnFrame(field2: responseNetId, payload: responsePayload)
+        syncCookieByEndpoint[endpointKey] = ourCookie
+        let miResponse = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: responsePhysConn)
+        let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+        do {
+            try reply(responseFrame)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_sync_cookie from=\(endpoint.debugDescription) " +
+                    "netId=\(physConn.field2) wrapper=\(wrapperField) cookie=\(cookie) phase=\(phase) echo=\(echo) " +
+                    "ourCookie=\(ourCookie) replyPhase=\(replyPhase)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_sync_cookie_failed", error)
+        }
+    }
+
+    private func handleSyncAuthRequest(
+        syncInfoData: Data,
+        serviceName: String,
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        let fields = (try? LyraProtoReader.readFields(from: syncInfoData)) ?? []
+        var peerCred = Data()
+        for field in fields where field.number == 5 && field.wireType == 2 {
+            peerCred = field.lengthDelimitedValue ?? Data()
+        }
+        var peerConnId = Data()
+        var peerPubKey = Data()
+        for field in (try? LyraProtoReader.readFields(from: peerCred)) ?? [] {
+            switch (field.number, field.wireType) {
+            case (1, 2): peerConnId = field.lengthDelimitedValue ?? Data()
+            case (2, 2): peerPubKey = field.lengthDelimitedValue ?? Data()
+            default: continue
+            }
+        }
+
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        syncAuthPrivateKey = privateKey
+        syncAuthPeerConnId = peerConnId
+        var ourConnId = Data()
+        for _ in 0..<8 {
+            ourConnId.append(UInt8.random(in: 0...255))
+        }
+        syncAuthOurConnId = ourConnId
+        syncSessionKey = nil
+        syncKeyCandidates = deriveSyncKeyCandidates(peerPubKey: peerPubKey)
+        syncAnnounceEndpoint = endpoint.debugDescription
+
+        var cred = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: ourConnId, to: &cred)
+        LyraProtoWriter.appendLengthDelimitedField(
+            2, value: privateKey.publicKey.rawRepresentation, to: &cred
+        )
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 48, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(3, value: 7, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(
+            6, value: Self.officialMacSyncInfoSignature, to: &syncInfo
+        )
+        let responseInner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
+        let responseLogiConn = LogiConnFrame(
+            logiConnId: logiConn.logiConnId,
+            localNetId: logiConn.localNetId,
+            remoteNetId: logiConn.remoteNetId,
+            inner: responseInner.serialized()
+        )
+        let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+        let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+        do {
+            try reply(responseFrame)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_sync_auth_response to=\(endpoint.debugDescription) " +
+                    "service=\(serviceName) counter=\(logiConn.localNetId) " +
+                    "peerPubBytes=\(peerPubKey.count) keyCandidates=\(syncKeyCandidates.count)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.mesh_sync_auth_response_failed", error)
+        }
+    }
+
+    private func deriveSyncKeyCandidates(peerPubKey: Data) -> [SymmetricKey] {
+        guard let privateKey = syncAuthPrivateKey, peerPubKey.count == 32,
+              let peerKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPubKey),
+              let sharedSecret = try? privateKey.sharedSecretFromKeyAgreement(with: peerKey)
+        else {
+            return []
+        }
+        let secret = sharedSecret.withUnsafeBytes { Data($0) }
+        syncAuthSharedSecret = secret
+        let ours = syncAuthOurConnId
+        let theirs = syncAuthPeerConnId
+        let ourPub = privateKey.publicKey.rawRepresentation
+        let infos: [Data] = [
+            theirs + ours,
+            ours + theirs,
+            peerPubKey + ourPub,
+            ourPub + peerPubKey,
+            Data(),
+        ]
+        var keys: [SymmetricKey] = []
+        for info in infos {
+            keys.append(
+                HKDF<SHA256>.deriveKey(
+                    inputKeyMaterial: SymmetricKey(data: secret),
+                    salt: Self.hkdfSalt,
+                    info: info,
+                    outputByteCount: 32
+                )
+            )
+        }
+        return keys
+    }
+
+    private func handleSyncAuthContinuation(
+        payload: Data,
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler
+    ) {
+        if payload.count > 64 {
+            let blob = Self.officialMacSyncAuthCredential
+            let responseInner = LogiConnInnerFrame(frameType: 4, payload: .disconnect(blob))
+            let responseLogiConn = LogiConnFrame(
+                logiConnId: logiConn.logiConnId,
+                localNetId: logiConn.localNetId,
+                remoteNetId: logiConn.remoteNetId,
+                inner: responseInner.serialized()
+            )
+            let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+            let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+            do {
+                try reply(responseFrame)
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.mesh_sync_auth_cred_response to=\(endpoint.debugDescription) " +
+                        "credBytes=\(payload.count)"
+                )
+            } catch {
+                DiagnosticsLog.error("xiaomi.mishare.mesh_sync_auth_cred_failed", error)
+            }
+        } else if payload.count == 32 {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_sync_auth_confirm from=\(endpoint.debugDescription) " +
+                    "hex=\(payload.map { String(format: "%02x", $0) }.joined())"
+            )
+        } else {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.mesh_sync_auth_status from=\(endpoint.debugDescription) " +
+                    "hex=\(payload.map { String(format: "%02x", $0) }.joined())"
+            )
+        }
+    }
+
+    private func sendEncryptedSyncAnnounce(endpointDescription: String, key: SymmetricKey) {
+        guard let deviceIdHex = deviceIdHexProvider() else {
+            return
+        }
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
+            deviceName: displayNameProvider(),
+            deviceType: 14,
+            deviceId: deviceIdHex,
+            uidHash: "61F2",
+            hwModel: Self.hardwareModel(),
+            lyraVersion: "5.1.208.10.fullCnRelease.0512164",
+            services: [
+                LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
+            ],
+            ipAddress: Self.primaryIPv4Address(),
+            osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+        )
+        let inner = LyraTrustedDeviceInfo.plaintextAnnounce(deviceInfo: deviceInfo)
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(inner, using: key, nonce: nonce)
+            var payload = Data()
+            payload.append(1)
+            payload.append(1)
+            payload.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            payload.append(sealed.ciphertext)
+            payload.append(sealed.tag)
+            let frame = LyraMeshPack.Frame(packType: 5, payload: payload)
+            socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.sync_announce_sent to=\(endpointDescription) bytes=\(payload.count)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.sync_announce_failed", error)
+        }
+    }
+
 
     private func handleKeepAliveRequest(
         frame: LyraMeshPack.Frame,
