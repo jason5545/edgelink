@@ -25,6 +25,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
         var announced = false
         var fragments: [Int: Data] = [:]
         var fragmentExpectedTotal = 0
+        var pendingSegments: [UInt32: Data] = [:]
     }
 
     private let queue = DispatchQueue(label: "edgelink.lyra.channel", qos: .userInitiated)
@@ -166,7 +167,17 @@ public final class LyraChannelSocket: @unchecked Sendable {
                     var state = self.sessions[id] ?? SessionState()
                     let isDuplicate = segment.sn < state.recvUna
                     if !isDuplicate {
-                        state.recvUna = segment.sn &+ 1
+                        if segment.sn > state.recvUna {
+                            state.pendingSegments[segment.sn] = segment.payload
+                        } else {
+                            state.pendingSegments[segment.sn] = segment.payload
+                            var next = state.recvUna
+                            while let payload = state.pendingSegments.removeValue(forKey: next) {
+                                state.packetBuffer.append(payload)
+                                next &+= 1
+                            }
+                            state.recvUna = next
+                        }
                     }
                     self.sessions[id] = state
                     let ack = LyraMeshDatagram.encodeAck(
@@ -175,13 +186,12 @@ public final class LyraChannelSocket: @unchecked Sendable {
                         una: state.recvUna
                     )
                     connection.send(content: ack, completion: .idempotent)
-                    if !isDuplicate {
+                    if !isDuplicate, !state.packetBuffer.isEmpty {
                         if !state.announced {
                             state.announced = true
                             self.sessions[id] = state
                             self.onPeerConnected?(endpoint)
                         }
-                        state.packetBuffer.append(segment.payload)
                         self.drainPackets(id: id, state: &state, endpoint: endpoint)
                         if var latest = self.sessions[id] {
                             latest.recvUna = state.recvUna
@@ -190,8 +200,9 @@ public final class LyraChannelSocket: @unchecked Sendable {
                             latest.announced = state.announced
                             latest.fragments = state.fragments
                             latest.fragmentExpectedTotal = state.fragmentExpectedTotal
+                            latest.pendingSegments = state.pendingSegments
                             self.sessions[id] = latest
-            } else {
+                        } else {
                             self.sessions[id] = state
                         }
                     }
