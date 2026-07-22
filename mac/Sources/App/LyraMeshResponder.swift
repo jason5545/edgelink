@@ -898,7 +898,8 @@ final class LyraMeshResponder {
             }
             let payloadLength = (Int(header[6]) << 24) | (Int(header[7]) << 16) | (Int(header[8]) << 8) | Int(header[9])
             guard buffer.count >= 10 + payloadLength else { return }
-            let payload = Data(buffer[10..<(10 + payloadLength)])
+            let frame = buffer.prefix(10 + payloadLength)
+            let payload = Data(frame.suffix(payloadLength))
             buffer.removeFirst(10 + payloadLength)
             decryptExpressFrame(payload, connection: connection)
         }
