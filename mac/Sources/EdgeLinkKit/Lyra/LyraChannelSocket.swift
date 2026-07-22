@@ -94,6 +94,13 @@ public final class LyraChannelSocket: @unchecked Sendable {
         try sendEncrypted(channelFrame, key: SymmetricKey(data: key), singleLayer: singleLayer)
     }
 
+    public func sendVariantOfficial(channelFrame: Data, key: Data) throws {
+        let packet = try LyraSocketPacket.encodeOfficial(
+            plaintext: channelFrame, key: SymmetricKey(data: key)
+        )
+        try sendDatagram(packet)
+    }
+
     private func sendEncrypted(_ channelFrame: Data, key: SymmetricKey, singleLayer: Bool) throws {
         if singleLayer {
             let packet = try LyraSocketPacket.encode(plaintext: channelFrame, key: key)

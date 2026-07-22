@@ -140,6 +140,21 @@ public enum LyraSocketPacket {
         return data
     }
 
+    public static func encodeOfficial(plaintext: Data, key: SymmetricKey) throws -> Data {
+        let nonce = AES.GCM.Nonce()
+        let sealed = try AES.GCM.seal(plaintext, using: key, nonce: nonce)
+        let totalLength = 4 + 4 + 12 + plaintext.count + 16
+        var data = Data(capacity: totalLength)
+        data.append(contentsOf: [0x82, 0x58])
+        data.append(UInt8((totalLength >> 8) & 0xFF))
+        data.append(UInt8(totalLength & 0xFF))
+        data.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+        data.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+        data.append(sealed.ciphertext)
+        data.append(sealed.tag)
+        return data
+    }
+
     public static func frameLength(prefix: Data) -> Int? {
         let bytes = Array(prefix)
         guard bytes.count >= 4 else { return nil }

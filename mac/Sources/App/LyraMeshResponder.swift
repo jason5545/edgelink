@@ -482,46 +482,15 @@ final class LyraMeshResponder {
                 }
                 let tlv = LyraExpressTLV.handshakeEventFrame(dataPort: UInt32(port), key: key)
                 let channelFrame = LyraChannelSocket.wrapChannelFrame(tlv)
-                var candidates: [(String, Data)] = [("f4", self.phoneTransKey)]
-                if !self.phoneTransRandom.isEmpty {
-                    var derived = Self.hkdfSalt
-                    derived.append(self.phoneTransRandom)
-                    derived.append(self.channelServerKey)
-                    candidates.append(("sha_f5_R", Data(SHA256.hash(data: derived))))
-                    var derivedAlt = Self.hkdfSalt
-                    derivedAlt.append(self.phoneTransKey)
-                    derivedAlt.append(self.channelServerKey)
-                    candidates.append(("sha_f4_R", Data(SHA256.hash(data: derivedAlt))))
-                    candidates.append(("f5", self.phoneTransRandom))
+                do {
+                    try self.channelSocket?.sendVariantOfficial(channelFrame: channelFrame, key: self.phoneTransKey)
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.express_handshake_sent dataPort=\(port) " +
+                            "key=\(key.map { String(format: "%02x", $0) }.joined()) tlvBytes=\(tlv.count)"
+                    )
+                } catch {
+                    DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
                 }
-                if !self.phoneColonHexKey.isEmpty {
-                    candidates.append(("f3hex", self.phoneColonHexKey))
-                }
-                if !self.syncAuthSharedSecret.isEmpty {
-                    let secret = self.syncAuthSharedSecret
-                    candidates.append(("syncRaw", secret))
-                    candidates.append(("syncSha", Data(SHA256.hash(data: secret))))
-                    if !self.phoneTransKey.isEmpty {
-                        candidates.append(("syncTrans", Data(SHA256.hash(data: secret + self.phoneTransKey))))
-                        candidates.append(("transSync", Data(SHA256.hash(data: self.phoneTransKey + secret))))
-                    }
-                    for (index, candidate) in self.syncKeyCandidates.enumerated() {
-                        candidates.append(("syncHKDF\(index)", candidate.withUnsafeBytes { Data($0) }))
-                    }
-                }
-                for (name, candidate) in candidates where candidate.count == 32 {
-                    do {
-                        try self.channelSocket?.sendVariant(channelFrame: channelFrame, key: candidate, singleLayer: false)
-                        try self.channelSocket?.sendVariant(channelFrame: channelFrame, key: candidate, singleLayer: true)
-                        DiagnosticsLog.info("xiaomi.mishare.express_handshake_variant key=\(name)")
-                    } catch {
-                        DiagnosticsLog.error("xiaomi.mishare.express_handshake_failed", error)
-                    }
-                }
-                DiagnosticsLog.info(
-                    "xiaomi.mishare.express_handshake_sent dataPort=\(port) " +
-                        "key=\(key.map { String(format: "%02x", $0) }.joined()) tlvBytes=\(tlv.count) variants=\(candidates.count)"
-                )
             }
             listener.start(queue: expressQueue)
             expressListener = listener
@@ -979,6 +948,7 @@ final class LyraMeshResponder {
         )
 
         if !serviceName.isEmpty {
+            resetChannelState()
             handleSyncAuthRequest(
                 syncInfoData: syncInfoData, serviceName: serviceName,
                 frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
@@ -1245,6 +1215,25 @@ final class LyraMeshResponder {
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.mesh_sync_cookie_failed", error)
         }
+    }
+
+    private func resetChannelState() {
+        expressHandshakeDone = false
+        expressListener?.cancel()
+        expressListener = nil
+        channelNegotiationStarted = false
+        channelSocket?.stop()
+        channelSocket = nil
+        channelServerKey = Data()
+        phoneTransKey = Data()
+        peerChannelId = 0
+        expressDataKey = Data()
+        eventBytesBuffer = Data()
+        for (_, receive) in streamReceives {
+            receive.fileHandle?.closeFile()
+        }
+        streamReceives.removeAll()
+        expressBuffers.removeAll()
     }
 
     private func handleSyncAuthRequest(
