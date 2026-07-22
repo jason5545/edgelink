@@ -678,12 +678,15 @@ final class LyraMeshResponder {
               let fields = try? LyraProtoReader.readFields(from: envelope) else {
             return
         }
+        var requestId: UInt64 = 1
         var senderName = ""
         var taskId = ""
         var fileBytes = Data()
         var filename = ""
         for field in fields {
             switch (field.number, field.wireType) {
+            case (1, 0):
+                requestId = field.varintValue ?? 1
             case (2, 2):
                 senderName = field.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             case (3, 2):
@@ -704,6 +707,35 @@ final class LyraMeshResponder {
         guard !fileBytes.isEmpty else {
             DiagnosticsLog.warn("xiaomi.mishare.file_receive_empty sender=\(senderName)")
             return
+        }
+        var responseBody = Data()
+        LyraProtoWriter.appendVarintField(1, value: requestId, to: &responseBody)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(taskId.utf8), to: &responseBody)
+        LyraProtoWriter.appendVarintField(3, value: 0, to: &responseBody)
+        var protocolFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 2, to: &protocolFrame)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: responseBody, to: &protocolFrame)
+        let responseFrame = LyraExpressTLV.oneOfNode(
+            tag: 0xFFFF,
+            selectedTag: 1,
+            child: LyraExpressTLV.containerNode(tag: 1, children: [
+                LyraExpressTLV.stringNode(tag: 0, value: LyraExpressTLV.oneOfNode(
+                    tag: 0xFFFF,
+                    selectedTag: 2,
+                    child: LyraExpressTLV.containerNode(tag: 2, children: [
+                        LyraExpressTLV.int32Node(tag: 0, value: 0),
+                        LyraExpressTLV.stringNode(tag: 1, value: protocolFrame)
+                    ])
+                ))
+            ])
+        )
+        do {
+            try channelSocket?.sendVariant(channelFrame: responseFrame, key: phoneTransKey, singleLayer: true)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.file_send_response_sent requestId=\(requestId) taskId=\(taskId)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.file_send_response_failed", error)
         }
         if filename.isEmpty {
             filename = taskId.isEmpty ? "mishare-\(Int(Date().timeIntervalSince1970))" : taskId
