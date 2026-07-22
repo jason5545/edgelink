@@ -13,6 +13,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     public var onRawDatagram: ((Data, NWEndpoint) -> Void)?
     public var onStateChanged: ((NWListener.State) -> Void)?
     public var onDecryptFailure: ((String) -> Void)?
+    public var onOfficialPacket: ((Data, Int) -> Void)?
 
     public private(set) var boundPort: UInt16?
 
@@ -121,6 +122,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     private func sendDatagram(_ payload: Data) throws {
         for (id, connection) in connections {
             var state = sessions[id] ?? SessionState()
+            debugHandler?("channel_send sn=\(state.nextSendSn) una=\(state.recvUna) conns=\(connections.count) bytes=\(payload.count)")
             let datagram = LyraMeshDatagram.encode(
                 tick: LyraMeshSocket.tick(),
                 sn: state.nextSendSn,
@@ -132,6 +134,8 @@ public final class LyraChannelSocket: @unchecked Sendable {
             connection.send(content: datagram, completion: .idempotent)
         }
     }
+
+    public var debugHandler: ((String) -> Void)?
 
     private func accept(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
@@ -179,7 +183,17 @@ public final class LyraChannelSocket: @unchecked Sendable {
                         }
                         state.packetBuffer.append(segment.payload)
                         self.drainPackets(id: id, state: &state, endpoint: endpoint)
-                        self.sessions[id] = state
+                        if var latest = self.sessions[id] {
+                            latest.recvUna = state.recvUna
+                            latest.packetBuffer = state.packetBuffer
+                            latest.negotiated = state.negotiated
+                            latest.announced = state.announced
+                            latest.fragments = state.fragments
+                            latest.fragmentExpectedTotal = state.fragmentExpectedTotal
+                            self.sessions[id] = latest
+            } else {
+                            self.sessions[id] = state
+                        }
                     }
                 }
             }
@@ -249,6 +263,28 @@ public final class LyraChannelSocket: @unchecked Sendable {
                     state.fragmentExpectedTotal = total
                     deliver(chunk: chunk, offset: offset, total: total, state: &state, endpoint: endpoint)
                 }
+            } else if first == 0x82, second == 0x58 {
+                guard let frameLength = LyraSocketPacket.officialFrameLength(prefix: state.packetBuffer),
+                      frameLength > 0 else {
+                    state.packetBuffer = Data()
+                    return
+                }
+                guard state.packetBuffer.count >= frameLength else { return }
+                let frame = Data(state.packetBuffer.prefix(frameLength))
+                state.packetBuffer.removeFirst(frameLength)
+                var plaintext: Data?
+                for key in decryptionKeys() {
+                    if let opened = try? LyraSocketPacket.decodeOfficial(frame, key: key) {
+                        plaintext = opened
+                        break
+                    }
+                }
+                guard let plaintext else {
+                    onDecryptFailure?("official_packet bytes=\(frame.count)")
+                    continue
+                }
+                onOfficialPacket?(plaintext, frameLength)
+                deliver(chunk: plaintext, offset: 0, total: 1, state: &state, endpoint: endpoint)
             } else {
                 state.packetBuffer = Data()
                 return

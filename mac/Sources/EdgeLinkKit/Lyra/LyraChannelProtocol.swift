@@ -162,6 +162,36 @@ public enum LyraSocketPacket {
         return (Int(bytes[2]) << 8) | Int(bytes[3])
     }
 
+    public static func decodeOfficial(_ data: Data, key: SymmetricKey) throws -> Data {
+        let bytes = Array(data)
+        guard bytes.count >= 8, bytes[0] == 0x82, bytes[1] == 0x58 else {
+            throw PacketError.badMagic
+        }
+        let totalLength = (Int(bytes[2]) << 8) | Int(bytes[3])
+        guard bytes.count >= totalLength, totalLength >= 4 + 4 + 12 + 16 else {
+            throw PacketError.truncated
+        }
+        let nonce = Data(bytes[8..<20])
+        let ciphertext = Data(bytes[20..<(totalLength - 16)])
+        let tag = Data(bytes[(totalLength - 16)..<totalLength])
+        let sealedBox = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: nonce),
+            ciphertext: ciphertext,
+            tag: tag
+        )
+        guard let plaintext = try? AES.GCM.open(sealedBox, using: key) else {
+            throw PacketError.decryptionFailed
+        }
+        return plaintext
+    }
+
+    public static func officialFrameLength(prefix: Data) -> Int? {
+        let bytes = Array(prefix)
+        guard bytes.count >= 4 else { return nil }
+        guard bytes[0] == 0x82, bytes[1] == 0x58 else { return -1 }
+        return (Int(bytes[2]) << 8) | Int(bytes[3])
+    }
+
     public static func decode(_ data: Data, key: SymmetricKey) throws -> (plaintext: Data, consumed: Int) {
         let bytes = Array(data)
         guard let totalLength = frameLength(prefix: data), totalLength > 0 else {
