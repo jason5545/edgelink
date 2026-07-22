@@ -75,6 +75,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
+    private var lyraFileSendSession: LyraFileSendSession?
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
     private var localIdentity: LocalIdentity?
@@ -730,13 +731,6 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     func sendFilesWithXiaomiHyperConnect() {
-        xiaomiHyperConnectAvailable = XiaomiHyperConnectBridge.isInstalled
-        guard xiaomiHyperConnectAvailable else {
-            xiaomiMiLinkCommandStatus = "小米互聯服務未安裝"
-            DiagnosticsLog.warn("xiaomi.mac.transfer_ignored hyperconnect_missing")
-            return
-        }
-
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
@@ -748,14 +742,41 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
 
-        do {
-            try XiaomiHyperConnectBridge.openTransfer(fileURLs: panel.urls)
-            xiaomiMiLinkCommandStatus = "已交給小米快傳"
-            DiagnosticsLog.info("xiaomi.mac.transfer_opened files=\(panel.urls.count)")
-        } catch {
-            xiaomiMiLinkCommandStatus = "小米快傳開啟失敗"
-            DiagnosticsLog.error("xiaomi.mac.transfer_failed", error)
+        guard let endpoint = xiaomiMiShareDiscovery.currentPhoneMeshEndpoint(),
+              let deviceIdHex = xiaomiMiShareDiscovery.localDeviceIdHex
+        else {
+            xiaomiMiLinkCommandStatus = "看不到手機，請確認手機已開啟小米快傳"
+            DiagnosticsLog.warn("xiaomi.mishare.send_no_phone_endpoint")
+            if XiaomiHyperConnectBridge.isInstalled {
+                do {
+                    try XiaomiHyperConnectBridge.openTransfer(fileURLs: panel.urls)
+                    xiaomiMiLinkCommandStatus = "已交給小米快傳"
+                } catch {
+                    xiaomiMiLinkCommandStatus = "小米快傳開啟失敗"
+                }
+            }
+            return
         }
+
+        let files = LyraFileSendSession.makeFiles(from: panel.urls)
+        let session = LyraFileSendSession(
+            host: endpoint.host,
+            port: endpoint.port,
+            deviceIdHex: deviceIdHex,
+            displayName: xiaomiMiShareDiscovery.localDisplayName,
+            files: files
+        )
+        session.onStatus = { [weak self] status in
+            DispatchQueue.main.async {
+                self?.xiaomiMiLinkCommandStatus = "小米快傳：\(status)"
+            }
+        }
+        lyraFileSendSession = session
+        session.start()
+        xiaomiMiLinkCommandStatus = "小米快傳：連接手機…"
+        DiagnosticsLog.info(
+            "xiaomi.mishare.send_started to=\(endpoint.host):\(endpoint.port) files=\(files.count)"
+        )
     }
 
     @discardableResult

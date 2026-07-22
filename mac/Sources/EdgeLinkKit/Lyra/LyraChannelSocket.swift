@@ -82,6 +82,43 @@ public final class LyraChannelSocket: @unchecked Sendable {
         try sendEncrypted(channelFrame, key: socketKey, singleLayer: false)
     }
 
+    public func connect(host: String, port: UInt16, socketKey: Data) throws {
+        stop()
+        self.socketKey = SymmetricKey(data: socketKey)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw SocketError.listenerNotReady
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
+        let id = ObjectIdentifier(connection)
+        connections[id] = connection
+        sessions[id] = SessionState()
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .cancelled, .failed:
+                self.connections[id] = nil
+                self.sessions[id] = nil
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        receive(on: connection, id: id)
+    }
+
+    public func sendClientNegotiation(channelId: UInt32, version: UInt32, mtu: UInt32) throws {
+        let tlv = LyraExpressTLV.oneOfNode(
+            tag: 0xFFFF,
+            selectedTag: 0,
+            child: LyraExpressTLV.containerNode(tag: 0, children: [
+                LyraExpressTLV.int32Node(tag: 0, value: channelId),
+                LyraExpressTLV.int32Node(tag: 1, value: version),
+                LyraExpressTLV.int32Node(tag: 2, value: mtu)
+            ])
+        )
+        try sendRaw(tlv)
+    }
+
     public static func wrapChannelFrame(_ message: Data) -> Data {
         LyraExpressTLV.oneOfNode(
             tag: 0xFFFF,
@@ -349,6 +386,9 @@ public final class LyraChannelSocket: @unchecked Sendable {
                 onDecryptFailure?("negotiation_reply_send_failed")
             }
             _ = version
+        } else if selectedTag == 4, !children.isEmpty {
+            state.negotiated = true
+            onNegotiated?(children[0], children.count > 1 ? children[1] : 0)
         }
     }
 

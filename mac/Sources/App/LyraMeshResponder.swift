@@ -79,7 +79,7 @@ final class LyraMeshResponder {
         var received: Int64
     }
 
-    private static let hkdfSalt = Data([
+    static let hkdfSalt = Data([
         0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
         0x7B, 0x1E, 0xFA, 0xD0, 0x27, 0x14, 0xD5, 0x17,
         0x7B, 0x8A, 0x1F, 0x0F, 0x19, 0xE3, 0x69, 0xCC,
@@ -279,7 +279,8 @@ final class LyraMeshResponder {
         }
         DiagnosticsLog.info(
             "xiaomi.mishare.mesh_logi_request service=\(serviceName) " +
-                "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count) channelId=\(channelId)"
+                "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count) channelId=\(channelId) " +
+                "privateDataHex=\(privateData.map { String(format: "%02x", $0) }.joined())"
         )
     }
 
@@ -652,7 +653,7 @@ final class LyraMeshResponder {
         }
     }
 
-    private static func completedFileMessage(_ buffer: Data) -> Data? {
+    static func completedFileMessage(_ buffer: Data) -> Data? {
         let bytes = Array(buffer)
         guard bytes.count >= 6, bytes[0] == 0x08, bytes[2] == 0x12 else {
             return nil

@@ -27,6 +27,14 @@ public enum LyraExpressTLV {
         node(type: typeByte, tag: tag, payload: Data([value]))
     }
 
+    public static func int64Node(tag: UInt16, value: UInt64) -> Data {
+        var payload = Data(capacity: 8)
+        for shift in stride(from: 56, through: 0, by: -8) {
+            payload.append(UInt8((value >> shift) & 0xFF))
+        }
+        return node(type: typeInt64, tag: tag, payload: payload)
+    }
+
     public static func stringNode(tag: UInt16, value: Data) -> Data {
         node(type: typeString, tag: tag, payload: value)
     }

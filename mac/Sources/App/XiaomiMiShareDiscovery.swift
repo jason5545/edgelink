@@ -9,6 +9,7 @@ struct XiaomiMiShareDiscoveredPeer: Equatable, Identifiable {
     let deviceIdHex: String?
     let displayName: String?
     let hostName: String?
+    let resolvedIPv4: String?
     let port: Int
     let mediumType: String?
     let channel: String?
@@ -200,6 +201,7 @@ final class XiaomiMiShareDiscovery: NSObject {
             deviceIdHex: payload?.deviceIdHex,
             displayName: payload?.displayName,
             hostName: service.hostName,
+            resolvedIPv4: Self.firstIPv4Address(from: service.addresses),
             port: service.port,
             mediumType: Self.txtString("MediumType", in: txt),
             channel: Self.txtString("CH", in: txt),
@@ -213,18 +215,61 @@ final class XiaomiMiShareDiscovery: NSObject {
                 "name=\(peer.displayName ?? "unknown") host=\(peer.hostName ?? "unknown") port=\(peer.port) " +
                 "medium=\(peer.mediumType ?? "unknown") ch=\(peer.channel ?? "unknown")"
         )
-        startAnnouncerIfPhonePeer(service: service, payload: payload, debugInfo: peer.debugInfo)
+        startAnnouncerIfPhonePeer(service: service, payload: payload, debugInfo: peer.debugInfo, resolvedIPv4: peer.resolvedIPv4)
         emitSnapshot()
     }
+
+    func currentPhoneMeshEndpoint() -> (host: String, port: UInt16)? {
+        for peer in peersByServiceName.values {
+            guard let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:)),
+                  appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
+                  let meshPort = appData.meshPort, meshPort != 0,
+                  let host = peer.resolvedIPv4 ?? Self.parseDebugInfoIPv4(peer.debugInfo)
+            else {
+                continue
+            }
+            return (host, meshPort)
+        }
+        return nil
+    }
+
+    private static func firstIPv4Address(from addresses: [Data]?) -> String? {
+        guard let addresses else { return nil }
+        for data in addresses {
+            let family = data.withUnsafeBytes { $0.load(as: sockaddr.self).sa_family }
+            guard family == sa_family_t(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = data.withUnsafeBytes { ptr -> Int32 in
+                guard let baseAddress = ptr.baseAddress else { return -1 }
+                return getnameinfo(
+                    baseAddress.assumingMemoryBound(to: sockaddr.self),
+                    socklen_t(data.count),
+                    &host,
+                    socklen_t(host.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+            }
+            if result == 0 {
+                return String(cString: host)
+            }
+        }
+        return nil
+    }
+
+    var localDeviceIdHex: String? { publishedDeviceIdHex }
+    var localDisplayName: String { publishedDisplayName ?? "EdgeLink Mac" }
 
     private func startAnnouncerIfPhonePeer(
         service: NetService,
         payload: XiaomiMiShareDiscoveryAppData?,
-        debugInfo: String?
+        debugInfo: String?,
+        resolvedIPv4: String?
     ) {
         guard payload?.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
               let meshPort = payload?.meshPort, meshPort != 0,
-              let host = Self.parseDebugInfoIPv4(debugInfo)
+              let host = resolvedIPv4 ?? Self.parseDebugInfoIPv4(debugInfo)
         else {
             return
         }

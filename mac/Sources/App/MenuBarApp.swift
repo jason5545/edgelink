@@ -122,11 +122,10 @@ private struct MenuBarPopover: View {
                 XiaomiMiShareDiscoveryPanel(runtime: runtime)
 
                 Button {
-                    runtime.openPhoneMiShare()
+                    runtime.sendFilesWithXiaomiHyperConnect()
                 } label: {
-                    Label("手機快傳入口", systemImage: "square.and.arrow.up")
+                    Label("小米快傳傳檔給手機", systemImage: "paperplane")
                 }
-                .disabled(!runtime.isConnected)
 
                 if !runtime.xiaomiMiLinkCommandStatus.isEmpty {
                     Text(runtime.xiaomiMiLinkCommandStatus)
@@ -187,13 +186,6 @@ private struct XiaomiMiShareDiscoveryPanel: View {
             } label: {
                 Label("重新掃描小米快傳", systemImage: "dot.radiowaves.left.and.right")
             }
-
-            Button {
-                runtime.probePhoneMiShareDiscovery()
-            } label: {
-                Label("手機 SDK 掃描 Mac", systemImage: "iphone.radiowaves.left.and.right")
-            }
-            .disabled(!runtime.isConnected)
         }
     }
 
