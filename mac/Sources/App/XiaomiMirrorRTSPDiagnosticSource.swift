@@ -4429,6 +4429,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private var firstRenderedReported = false
     private var unsupportedFormatLogged = false
     private var privateAudioFormatPrimed = false
+    private var ff02SelfPrimeStreak = 0
     private var parseFailureCount: UInt64 = 0
     private var scheduleFailureCount: UInt64 = 0
     private var suspiciousPCMDropCount: UInt64 = 0
@@ -4466,7 +4467,11 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
 
         let pcmPayload = parsed.pcmPayload
         let stats = pcmS16LEStats(pcmPayload)
-        guard isPrivateAudioPayloadSafe(parsed, stats: stats) else {
+        let needsSelfPrime = parsed.kind == "ff02" && !privateAudioFormatPrimed
+        guard isPrivateAudioPayloadSafe(parsed, stats: stats, allowUnprimedFF02: needsSelfPrime) else {
+            if needsSelfPrime {
+                ff02SelfPrimeStreak = 0
+            }
             suspiciousPCMDropCount += 1
             if suspiciousPCMDropCount <= 5 || suspiciousPCMDropCount % 50 == 0 {
                 DiagnosticsLog.warn(
@@ -4483,6 +4488,18 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
         }
         if parsed.kind == "ff03" {
             privateAudioFormatPrimed = true
+        }
+        if needsSelfPrime {
+            ff02SelfPrimeStreak += 1
+            guard ff02SelfPrimeStreak >= Self.ff02SelfPrimePacketCount else {
+                return
+            }
+            privateAudioFormatPrimed = true
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.audio_private_self_primed session=\(sessionID.uuidString) " +
+                    "pes=\(pesReceived) streak=\(ff02SelfPrimeStreak) pcmBytes=\(pcmPayload.count) " +
+                    "sampleRate=\(Int(parsed.format.sampleRate)) channels=\(parsed.format.channels)"
+            )
         }
         activeFormat = parsed.format
         writePCMCapture(pcmPayload)
@@ -4512,7 +4529,8 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
 
     private func isPrivateAudioPayloadSafe(
         _ parsed: XiaomiMirrorMPTPrivateAudioPayload,
-        stats: (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int)
+        stats: (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int),
+        allowUnprimedFF02: Bool = false
     ) -> Bool {
         guard parsed.format.sampleRate >= 8_000,
               parsed.format.sampleRate <= 192_000,
@@ -4531,7 +4549,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
            (parsed.declaredPayloadBytes < 0 || parsed.declaredPayloadBytes > Self.maxPrivateAudioPayloadBytes) {
             return false
         }
-        if parsed.kind == "ff02", !privateAudioFormatPrimed {
+        if parsed.kind == "ff02", !privateAudioFormatPrimed, !allowUnprimedFF02 {
             return false
         }
         if let declaredFrames = parsed.declaredFrames, declaredFrames > 0 {
@@ -4606,8 +4624,16 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
             )
 
         case 0x02:
-            guard let declaredPayloadBytes = payload.readUInt32BE(at: 8) else {
+            guard let rawDeclaredBytes = payload.readUInt32BE(at: 8) else {
                 return nil
+            }
+            let declaredPayloadBytes: UInt32
+            if rawDeclaredBytes > UInt32(Self.maxPrivateAudioPayloadBytes),
+               let narrow = payload.readUInt16BE(at: 8),
+               narrow > 0 {
+                declaredPayloadBytes = UInt32(narrow)
+            } else {
+                declaredPayloadBytes = rawDeclaredBytes
             }
             let format = activeFormat
             let pcmPayload = trimmedAudioPayload(payload, headerLength: 18, declaredPayloadBytes: Int(declaredPayloadBytes))
@@ -4819,6 +4845,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private static let pcmCapturePath = "/private/tmp/edgelink-xiaomi-mirror-audio.pcm"
     private static let captureLimitBytes = 4 * 1024 * 1024
     private static let maxPrivateAudioPayloadBytes = 64 * 1024
+    private static let ff02SelfPrimePacketCount = 5
     private static let suspiciousPCMMaxAbsThreshold = 30_000
     private static let suspiciousPCMAverageAbsThreshold = 12_000
     private static let suspiciousPCMNonzeroRatioThreshold = 0.95
