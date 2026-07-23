@@ -87,6 +87,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var currentConnectionGeneration: UUID?
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
+    private var currentChannelTransport: String?
     private var lanSessionListener: LANSessionListener?
     private var lanSessionTask: Task<Void, Never>?
     private var hostSessionDidConnect = false
@@ -587,6 +588,8 @@ final class EdgeLinkRuntime: ObservableObject {
         canDisconnect = false
         connectionTask?.cancel()
         connectionTask = nil
+        lanSessionTask?.cancel()
+        lanSessionTask = nil
         turnCredentialTask?.cancel()
         turnCredentialTask = nil
         latestTurnCredential = nil
@@ -608,6 +611,7 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannel?.close()
         currentChannel = nil
         currentChannelGeneration = nil
+        currentChannelTransport = nil
         currentSession = nil
         screenSession.clearSender()
         screenSession.setIceServerConfigs([])
@@ -2478,6 +2482,7 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannel?.close()
         currentChannel = nil
         currentChannelGeneration = nil
+        currentChannelTransport = nil
         currentSession = nil
         screenSession.clearSender()
         stopPhoneRelayProbe(reason: "start_connection")
@@ -2512,14 +2517,17 @@ final class EdgeLinkRuntime: ObservableObject {
                     if currentChannelGeneration == channelGeneration {
                         currentChannel = nil
                         currentChannelGeneration = nil
+                        currentChannelTransport = nil
                     }
                 }
 
                 DiagnosticsLog.info("relay.mac.connect_start hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 hostSessionDidConnect = false
-                isConnected = false
-                canDisconnect = true
-                connectionStatus = "Connecting relay"
+                if currentChannelGeneration == nil {
+                    isConnected = false
+                    canDisconnect = true
+                    connectionStatus = "Connecting relay"
+                }
                 let connectedChannel = try await relayTransport.connect(hostId: identity.deviceId, identity: identity)
                 guard currentConnectionGeneration == connectionGeneration else {
                     connectedChannel.close()
@@ -2540,14 +2548,16 @@ final class EdgeLinkRuntime: ObservableObject {
                     return
                 }
                 DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
-                isConnected = false
-                currentSession = nil
-                screenSession.clearSender()
-                screenSession.handleTransportInterrupted()
-                stopPhoneCallRelayAudio(reason: "transport_interrupted")
-                androidMicRelayArmed = false
-                isPhoneCallActive = false
-                connectionStatus = "Disconnected"
+                if currentChannelGeneration == nil {
+                    isConnected = false
+                    currentSession = nil
+                    screenSession.clearSender()
+                    screenSession.handleTransportInterrupted()
+                    stopPhoneCallRelayAudio(reason: "transport_interrupted")
+                    androidMicRelayArmed = false
+                    isPhoneCallActive = false
+                    connectionStatus = "Disconnected"
+                }
                 if hostSessionDidConnect {
                     retryDelay = 1_000_000_000
                 }
@@ -2565,8 +2575,11 @@ final class EdgeLinkRuntime: ObservableObject {
         channelGeneration: UUID,
         transport: String
     ) async throws {
-        currentChannel = channel
-        currentChannelGeneration = channelGeneration
+        if currentChannelGeneration == nil {
+            currentChannel = channel
+            currentChannelGeneration = channelGeneration
+            currentChannelTransport = transport
+        }
 
         let callRelayCloudflareBridge = callRelayCloudflareBridge
         let xiaomiMirrorRTSPDiagnosticSource = xiaomiMirrorRTSPDiagnosticSource
@@ -2656,11 +2669,28 @@ final class EdgeLinkRuntime: ObservableObject {
                     dispatcher: dispatcher
                 )
 
-                connectionStatus = "Handshaking"
+                if currentChannelGeneration == channelGeneration {
+                    connectionStatus = "Handshaking"
+                }
                 try await session.connect()
                 guard currentConnectionGeneration == connectionGeneration else {
                     channel.close()
                     return
+                }
+                if currentChannelGeneration != channelGeneration {
+                    if currentChannelGeneration == nil || transport == "lan" {
+                        if currentChannelGeneration != nil {
+                            DiagnosticsLog.info("\(transport).mac.preempt_active_session hostId=\(identity.deviceId) clientId=\(peer.deviceId) replacedTransport=\(currentChannelTransport ?? "unknown")")
+                            currentChannel?.close()
+                        }
+                        currentChannel = channel
+                        currentChannelGeneration = channelGeneration
+                        currentChannelTransport = transport
+                    } else {
+                        DiagnosticsLog.info("relay.mac.redundant_session_closed hostId=\(identity.deviceId) clientId=\(peer.deviceId) activeTransport=\(currentChannelTransport ?? "unknown")")
+                        channel.close()
+                        throw SecureKeepaliveError.redundantSession
+                    }
                 }
                 DiagnosticsLog.info("\(transport).mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
@@ -2759,6 +2789,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     if self.currentChannelGeneration == channelGeneration {
                         self.currentChannel = nil
                         self.currentChannelGeneration = nil
+                        self.currentChannelTransport = nil
                     }
                 }
             }
@@ -2773,6 +2804,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
             } catch {
                 DiagnosticsLog.error("lan.mac.session_ended hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
+                if self.currentChannelGeneration == channelGeneration {
+                    self.isConnected = false
+                    self.connectionStatus = "Disconnected"
+                }
             }
         }
     }
@@ -2872,9 +2907,12 @@ final class EdgeLinkRuntime: ObservableObject {
         currentConnectionGeneration = nil
         connectionTask?.cancel()
         connectionTask = nil
+        lanSessionTask?.cancel()
+        lanSessionTask = nil
         currentChannel?.close()
         currentChannel = nil
         currentChannelGeneration = nil
+        currentChannelTransport = nil
         currentSession = nil
         screenSession.clearSender()
         isConnected = false
@@ -3688,4 +3726,5 @@ private enum PairingRuntimeError: Error {
 private enum SecureKeepaliveError: Error {
     case receiveLoopEnded
     case pongTimedOut
+    case redundantSession
 }
