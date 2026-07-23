@@ -2246,7 +2246,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             return emptyList()
         }
         xiaomiMirrorPointerButtonMask = 0x00
-        val distance = min(720f, max(96f, abs(wheelDy).toFloat() * 2.6f))
+        val distance = min(160f, max(8f, abs(wheelDy).toFloat() * 0.3f))
         val direction = if (wheelDy > 0) 1f else -1f
         val startX = x.coerceIn(0, screenWidth - 1)
         val startY = y.coerceIn(0, screenHeight - 1)
