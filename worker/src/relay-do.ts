@@ -54,6 +54,7 @@ export class RelayDO implements DurableObject {
     const [client, server] = Object.values(pair);
     server.serializeAttachment({ authenticated: false } satisfies RelaySocketAttachment);
     this.state.acceptWebSocket(server);
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -72,7 +73,15 @@ export class RelayDO implements DurableObject {
     for (const socket of this.state.getWebSockets()) {
       const targetAttachment = readAttachment(socket);
       if (socket !== sender && targetAttachment.authenticated && shouldForward(senderAttachment, targetAttachment)) {
-        socket.send(message);
+        try {
+          socket.send(message);
+        } catch {
+          // A stalled peer socket must not tear down the healthy sender.
+          // Reap the dead target so later frames skip it.
+          try {
+            socket.close(1011, "relay_send_failed");
+          } catch {}
+        }
       }
     }
   }
@@ -87,6 +96,12 @@ export class RelayDO implements DurableObject {
         sig?: string;
       };
     }>(message);
+
+    if (body?.t === "ping") {
+      // DO is awake, so the hibernation auto-response did not fire.
+      sender.send('{"t":"pong"}');
+      return;
+    }
 
     if (body?.t !== "relay.auth" || !body.b || !isDeviceId(body.b.hostId) || !isDeviceId(body.b.deviceId) || typeof body.b.ts !== "number" || !body.b.sig) {
       sender.close(1008, "invalid_relay_auth");

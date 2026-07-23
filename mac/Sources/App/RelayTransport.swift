@@ -89,7 +89,11 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
                 }
                 return data
             case .string(let text):
-                DiagnosticsLog.warn("relay.transport.mac.text_ignored hostId=\(hostId) deviceId=\(deviceId) text=\(text)")
+                if text == #"{"t":"pong"}"# {
+                    DiagnosticsLog.info("relay.transport.mac.app_pong hostId=\(hostId) deviceId=\(deviceId)")
+                } else {
+                    DiagnosticsLog.warn("relay.transport.mac.text_ignored hostId=\(hostId) deviceId=\(deviceId) text=\(text)")
+                }
                 continue
             @unknown default:
                 DiagnosticsLog.warn("relay.transport.mac.unknown_message hostId=\(hostId) deviceId=\(deviceId)")
@@ -177,6 +181,7 @@ private final class RelayWebSocketChannel: ByteChannel, @unchecked Sendable {
                 try await Task.sleep(nanoseconds: Self.keepaliveIntervalNanoseconds)
                 try Task.checkCancellation()
                 try await sendPingWithTimeout()
+                try await task.send(.string(#"{"t":"ping"}"#))
             } catch is CancellationError {
                 return
             } catch {

@@ -19,10 +19,14 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.time.Instant
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
 
 private const val RELAY_WEBSOCKET_PING_INTERVAL_SECONDS = 15L
+private const val RELAY_APP_PING_TEXT = "{\"t\":\"ping\"}"
+private const val RELAY_APP_PONG_TEXT = "{\"t\":\"pong\"}"
 
 class RelayTransport(
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -85,6 +89,7 @@ private class OkHttpRelayByteChannel(
     private val binaryFramesReceived = AtomicLong(0)
     private val binaryFramesSent = AtomicLong(0)
     private var webSocket: WebSocket? = null
+    private var appPingScheduler: ScheduledExecutorService? = null
 
     fun attach(socket: WebSocket) {
         webSocket = socket
@@ -108,6 +113,9 @@ private class OkHttpRelayByteChannel(
         if (envelope?.t == "relay.ready") {
             EdgeLinkLog.info("relay.transport.ready hostId=$hostId deviceId=$deviceId role=${envelope.b.role}")
             ready.complete(Unit)
+            startAppPing()
+        } else if (text == RELAY_APP_PONG_TEXT) {
+            EdgeLinkLog.info("relay.transport.app_pong hostId=$hostId deviceId=$deviceId")
         } else {
             EdgeLinkLog.warn("relay.transport.text_unexpected hostId=$hostId deviceId=$deviceId text=$text")
         }
@@ -126,16 +134,37 @@ private class OkHttpRelayByteChannel(
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         EdgeLinkLog.error("relay.transport.failure hostId=$hostId deviceId=$deviceId status=${response?.code}", t)
+        stopAppPing()
         ready.completeExceptionally(t)
         incoming.close(t)
     }
 
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
         EdgeLinkLog.info("relay.transport.closed hostId=$hostId deviceId=$deviceId code=$code reason=$reason")
+        stopAppPing()
         if (!ready.isCompleted) {
             ready.completeExceptionally(IllegalStateException("Relay WebSocket closed before ready: $code $reason"))
         }
         incoming.close()
+    }
+
+    private fun startAppPing() {
+        stopAppPing()
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        scheduler.scheduleWithFixedDelay({
+            val socket = webSocket ?: return@scheduleWithFixedDelay
+            try {
+                socket.send(RELAY_APP_PING_TEXT)
+            } catch (error: Throwable) {
+                EdgeLinkLog.warn("relay.transport.app_ping_failed hostId=$hostId deviceId=$deviceId error=$error")
+            }
+        }, RELAY_WEBSOCKET_PING_INTERVAL_SECONDS, RELAY_WEBSOCKET_PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
+        appPingScheduler = scheduler
+    }
+
+    private fun stopAppPing() {
+        appPingScheduler?.shutdownNow()
+        appPingScheduler = null
     }
 
     override suspend fun send(bytes: ByteArray) {
@@ -158,6 +187,7 @@ private class OkHttpRelayByteChannel(
 
     override fun close() {
         EdgeLinkLog.info("relay.transport.close hostId=$hostId deviceId=$deviceId")
+        stopAppPing()
         incoming.close()
         webSocket?.close(1000, "Client closing")
     }
