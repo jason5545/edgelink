@@ -658,3 +658,62 @@ The Xposed module only relaxes `PermissionChecker.checkPermissions(...)` inside
 `com.xiaomi.mi_connect_service`, and only when the Binder caller resolves to `com.edgelink.app`.
 This keeps the probe bounded: it verifies whether EdgeLink can talk to MiConnectService's metadata
 layer without making the official Xiaomi Mac app part of the main flow.
+
+## Caller Gate Inventory (2026-07-23 audit)
+
+Static audit of every caller-identity check in the MiLink APK, with the exact API each gate uses
+and whether root-level tricks can pass it without runtime hooks.
+
+### Gate 1: `PrivilegedPackageManager.checkPackagePermission`
+
+`com.xiaomi.dist.utils.PrivilegedPackageManager` (used by handoff, media, and base utils). The
+accept cascade is:
+
+1. MiLink itself debuggable (`flags & 2`) — not usable.
+2. **Caller is a system app (`ApplicationInfo.flags & 129` = `FLAG_SYSTEM | FLAG_UPDATED_SYSTEM_APP`)
+   — passes unconditionally, no signature comparison at all.**
+3. Same signature as MiLink itself.
+4. Four hardcoded SHA-1 hashes (`INTERNAL_SIGNATURES`), read via modern
+   `GET_SIGNING_CERTIFICATES` (flag `134217728`) + `getApkContentsSigners()` in
+   `com.xiaomi.dist.utils.SignatureUtils`.
+5. Runtime whitelist (`addWhiteList(pkg, sigSha1)`) — currently the Xposed injection target.
+
+Implication: a Magisk-module install of EdgeLink into `/system` (priv-app) passes gate 1 with zero
+signature spoofing.
+
+### Gate 2: `BaseClientService.b()` (MiLinkCast)
+
+`ClientV2PublicService` Binder calls are gated by `BaseClientService.b()`, which checks:
+
+- caller package name must be one of 7 hardcoded entries in `l5.b.f31363a`
+  (`cn.wps.*` xiaomi variants, wearable, `com.mi.health`, `com.xiaomi.milink.autotest[.test]`)
+- `MD5(signature)` must match the hardcoded hash for that package
+- signature is read via **legacy `GET_SIGNATURES` (flag 64)** in `com.milink.util.i.s()`
+
+This is the easiest signature scheme to spoof (v1/JAR cert). With CorePatch-style signature
+verification bypass, EdgeLink could be installed with package name `com.mi.health` and the public
+cert extracted from the real Mi Health APK. This is the only caller gate that actually needs
+signature spoofing.
+
+### Gate 3: Manifest permission levels
+
+From `decoded/AndroidManifest.xml`:
+
+- Most interop permissions are `signature|privileged` or `signatureOrSystem`
+  (`miui.permission.ACCESS_CAST_PROVIDER`, `com.xiaomi.dist.permission.DIST_HARDWARE_SERVICE`,
+  `ACCESS_HANDOFF_CONTROL`, etc.) — grantable to a whitelisted priv-app via
+  `privapp-permissions-edgelink.xml`, no signature needed.
+- Pure `signature` (need spoof or hook): `com.miui.onehop.permission.MIRROR`,
+  `miui.permission.USE_INTERNAL_GENERAL_API`,
+  `com.milink.service.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`.
+
+### Strategy
+
+| Layer | Covers | Maintenance |
+|---|---|---|
+| Magisk module: EdgeLink as system/priv-app | Gate 1 fully, gate 3 mostly | Near zero (generic tooling) |
+| CorePatch v1 signature spoof as `com.mi.health` | Gate 2, gate 3's three pure-signature permissions | Low (community-maintained) |
+| Remaining behavior hooks | `onServiceOnline` synthesis, fake-remote, etc. | EdgeLink-owned surface |
+
+The earlier assumption that the signature whitelist is impassable only holds without system-app
+identity. Try the pure Magisk priv-app route first; it likely deletes half the runtime hooks.
