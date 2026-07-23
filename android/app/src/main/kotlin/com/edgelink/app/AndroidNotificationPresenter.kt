@@ -59,12 +59,12 @@ class AndroidNotificationPresenter(private val context: Context) {
             val manager = context.getSystemService(NotificationManager::class.java)
             val remote = NotificationChannel(
                 REMOTE_NOTIFICATION_CHANNEL_ID,
-                "遠端通知",
+                context.getString(R.string.notification_channel_remote),
                 NotificationManager.IMPORTANCE_DEFAULT
             )
             val service = NotificationChannel(
                 SERVICE_NOTIFICATION_CHANNEL_ID,
-                "EdgeLink 同步",
+                context.getString(R.string.notification_channel_sync),
                 NotificationManager.IMPORTANCE_LOW
             )
             manager.createNotificationChannel(remote)

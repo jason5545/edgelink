@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="remote_input_service_label">EdgeLink Remote Input</string>
+  <string name="remote_input_service_description">Allow EdgeLink to control this phone from a paired Mac.</string>
+  <string name="xposed_description">Lets EdgeLink integrate with the Xiaomi MiLink runtime in an authorized root hook environment.</string>
+
+  <string name="status_starting">Starting</string>
+  <string name="status_registering">Registering device</string>
+  <string name="status_no_paired_mac">No Mac paired yet</string>
+  <string name="status_invalid_mac_id">Invalid Mac ID</string>
+  <string name="status_opening_pairing">Opening pairing</string>
+  <string name="status_pairing_failed">Pairing failed</string>
+  <string name="status_waiting_for_mac">Waiting for Mac</string>
+  <string name="status_compare_code">Compare the code</string>
+  <string name="status_paired">Paired</string>
+  <string name="status_setup_failed">Setup failed</string>
+  <string name="status_reconnecting">Reconnecting</string>
+  <string name="status_connecting_relay">Connecting to relay</string>
+  <string name="status_handshaking">Handshaking</string>
+  <string name="status_connected">Connected</string>
+  <string name="status_disconnected">Disconnected</string>
+  <string name="status_mac_sleeping">Mac is asleep</string>
+  <string name="service_connected_to">Connected to %1$s</string>
+
+  <string name="notification_channel_remote">Remote notifications</string>
+  <string name="notification_channel_sync">EdgeLink sync</string>
+
+  <string name="action_reconnect">Reconnect</string>
+  <string name="action_disconnect">Disconnect</string>
+  <string name="action_quit">Quit EdgeLink</string>
+  <string name="action_open_settings">Open settings</string>
+  <string name="action_fix">Fix</string>
+  <string name="action_authorize">Authorize</string>
+  <string name="action_test_milink">Test MiLink</string>
+  <string name="action_send">Send</string>
+  <string name="action_confirm">Confirm</string>
+  <string name="action_start_pairing">Start pairing</string>
+  <string name="pairing_in_progress">Pairing</string>
+
+  <string name="permissions_ready">All permissions granted</string>
+  <string name="permissions_missing_title">Permissions needed</string>
+  <string name="remote_control_title">Remote control</string>
+  <string name="remote_not_connected">Not connected</string>
+  <string name="keyboard_expand">Show keyboard</string>
+  <string name="keyboard_collapse">Hide keyboard</string>
+  <string name="input_text_label">Enter text</string>
+
+  <string name="settings_title">Settings</string>
+  <string name="section_device_info">Device info</string>
+  <string name="label_local_id">Local ID</string>
+  <string name="value_not_registered">Not registered</string>
+  <string name="value_not_paired">Not paired</string>
+  <string name="section_sync">Sync</string>
+  <string name="toggle_auto_reconnect">Auto reconnect</string>
+  <string name="toggle_mac_notification_sync">Mac notification sync</string>
+  <string name="section_screen_share">Screen casting</string>
+  <string name="toggle_screen_share_privacy">Casting privacy protection</string>
+  <string name="screen_share_privacy_on">Notifications and private content are hidden while casting</string>
+  <string name="screen_share_privacy_off">Notifications and private content are shown while casting</string>
+  <string name="screen_share_privacy_requirement">Requires WRITE_SECURE_SETTINGS or Shizuku authorization</string>
+  <string name="section_permissions_detail">Permission details</string>
+  <string name="permission_ready">Ready</string>
+  <string name="permission_remote_input">Remote input</string>
+  <string name="permission_remote_input_missing">Accessibility service must be enabled</string>
+  <string name="permission_keep_screen_on">Keep screen awake</string>
+  <string name="permission_keep_screen_on_missing">Requires modifying system settings or drawing over other apps</string>
+  <string name="permission_sms_missing">SMS permission required</string>
+  <string name="permission_notification_sync_title">Notification sync</string>
+  <string name="notification_access_missing">Notification access required</string>
+  <string name="notification_post_missing">Notification alerts must be allowed</string>
+  <string name="notification_post_blocked">Notification alerts are blocked by the system</string>
+
+  <string name="shizuku_status_label">Status</string>
+  <string name="shizuku_status_disconnected">Not connected</string>
+  <string name="shizuku_status_unsupported">Unsupported version</string>
+  <string name="shizuku_status_authorized_root">Authorized: root</string>
+  <string name="shizuku_status_authorized_shell">Authorized: shell</string>
+  <string name="shizuku_status_authorized">Authorized</string>
+  <string name="shizuku_status_authorized_uid">Authorized: uid %1$d</string>
+  <string name="shizuku_status_denied">Denied</string>
+  <string name="shizuku_status_can_authorize">Ready to authorize</string>
+  <string name="milink_status_format">MiLink: %1$s</string>
+  <string name="milink_probe_not_tested">Not tested yet</string>
+  <string name="milink_probe_requires_shizuku_root">Requires Shizuku root</string>
+
+  <string name="pairing_prompt_enter_id">Enter the 9-digit ID shown on your Mac</string>
+  <string name="pairing_prompt_confirm">Make sure both numbers match, then tap Confirm</string>
+</resources>

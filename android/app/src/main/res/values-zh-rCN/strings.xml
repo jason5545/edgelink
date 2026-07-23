@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="remote_input_service_label">EdgeLink 远程输入</string>
+  <string name="remote_input_service_description">允许 EdgeLink 从已配对的 Mac 控制这部手机。</string>
+  <string name="xposed_description">让 EdgeLink 在已授权的 root hook 环境中对接 Xiaomi MiLink runtime。</string>
+
+  <string name="status_starting">启动中</string>
+  <string name="status_registering">正在注册设备</string>
+  <string name="status_no_paired_mac">尚未配对 Mac</string>
+  <string name="status_invalid_mac_id">Mac ID 不正确</string>
+  <string name="status_opening_pairing">正在打开配对</string>
+  <string name="status_pairing_failed">配对失败</string>
+  <string name="status_waiting_for_mac">等待 Mac 确认</string>
+  <string name="status_compare_code">比对确认码</string>
+  <string name="status_paired">已配对</string>
+  <string name="status_setup_failed">初始化失败</string>
+  <string name="status_reconnecting">正在重新连接</string>
+  <string name="status_connecting_relay">正在连接 relay</string>
+  <string name="status_handshaking">握手中</string>
+  <string name="status_connected">已连接</string>
+  <string name="status_disconnected">已断开</string>
+  <string name="status_mac_sleeping">Mac 睡眠中</string>
+  <string name="service_connected_to">已连接到 %1$s</string>
+
+  <string name="notification_channel_remote">远程通知</string>
+  <string name="notification_channel_sync">EdgeLink 同步</string>
+
+  <string name="action_reconnect">重新连接</string>
+  <string name="action_disconnect">断开连接</string>
+  <string name="action_quit">退出 EdgeLink</string>
+  <string name="action_open_settings">打开设置</string>
+  <string name="action_fix">修复</string>
+  <string name="action_authorize">授权</string>
+  <string name="action_test_milink">测试 MiLink</string>
+  <string name="action_send">发送</string>
+  <string name="action_confirm">Confirm</string>
+  <string name="action_start_pairing">开始配对</string>
+  <string name="pairing_in_progress">配对中</string>
+
+  <string name="permissions_ready">权限已就绪</string>
+  <string name="permissions_missing_title">需要补齐权限</string>
+  <string name="remote_control_title">远程控制</string>
+  <string name="remote_not_connected">当前未连接</string>
+  <string name="keyboard_expand">打开键盘</string>
+  <string name="keyboard_collapse">收起键盘</string>
+  <string name="input_text_label">输入文字</string>
+
+  <string name="settings_title">设置</string>
+  <string name="section_device_info">设备信息</string>
+  <string name="label_local_id">本机 ID</string>
+  <string name="value_not_registered">尚未注册</string>
+  <string name="value_not_paired">尚未配对</string>
+  <string name="section_sync">同步</string>
+  <string name="toggle_auto_reconnect">自动重新连接</string>
+  <string name="toggle_mac_notification_sync">Mac 通知同步</string>
+  <string name="section_screen_share">屏幕投放</string>
+  <string name="toggle_screen_share_privacy">投放隐私保护</string>
+  <string name="screen_share_privacy_on">投放时隐藏通知与私密内容</string>
+  <string name="screen_share_privacy_off">投放时显示通知与私密内容</string>
+  <string name="screen_share_privacy_requirement">需要 WRITE_SECURE_SETTINGS 或 Shizuku 授权</string>
+  <string name="section_permissions_detail">权限明细</string>
+  <string name="permission_ready">就绪</string>
+  <string name="permission_remote_input">远程输入</string>
+  <string name="permission_remote_input_missing">需要启用无障碍服务</string>
+  <string name="permission_keep_screen_on">屏幕保持唤醒</string>
+  <string name="permission_keep_screen_on_missing">需要修改系统设置或显示在其他应用上层</string>
+  <string name="permission_sms_missing">需要短信权限</string>
+  <string name="permission_notification_sync_title">通知同步</string>
+  <string name="notification_access_missing">需要通知读取权限</string>
+  <string name="notification_post_missing">需要允许通知提醒</string>
+  <string name="notification_post_blocked">通知提醒被系统拦截</string>
+
+  <string name="shizuku_status_label">状态</string>
+  <string name="shizuku_status_disconnected">未连接</string>
+  <string name="shizuku_status_unsupported">版本不支持</string>
+  <string name="shizuku_status_authorized_root">已授权：root</string>
+  <string name="shizuku_status_authorized_shell">已授权：shell</string>
+  <string name="shizuku_status_authorized">已授权</string>
+  <string name="shizuku_status_authorized_uid">已授权：uid %1$d</string>
+  <string name="shizuku_status_denied">已拒绝</string>
+  <string name="shizuku_status_can_authorize">可授权</string>
+  <string name="milink_status_format">MiLink：%1$s</string>
+  <string name="milink_probe_not_tested">尚未测试</string>
+  <string name="milink_probe_requires_shizuku_root">需要 Shizuku root</string>
+
+  <string name="pairing_prompt_enter_id">输入 Mac 上显示的 9 位 ID</string>
+  <string name="pairing_prompt_confirm">确认两边数字相同后按 Confirm</string>
+</resources>

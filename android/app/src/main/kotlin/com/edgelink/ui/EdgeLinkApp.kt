@@ -68,11 +68,13 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.edgelink.app.R
 import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
@@ -182,7 +184,7 @@ enum class ConnectionPhase {
 
 data class EdgeLinkUiState(
     val localDeviceId: String = "",
-    val peerName: String = "尚未配對 Mac",
+    val peerName: String = "",
     val peerDeviceId: String = "",
     val connectionStatus: String = "Starting",
     val connectionPhase: ConnectionPhase = ConnectionPhase.Idle,
@@ -373,7 +375,7 @@ private fun ConnectionStatusCard(state: EdgeLinkUiState, actions: EdgeLinkAction
 
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    text = state.peerName,
+                    text = state.peerName.ifEmpty { stringResource(R.string.status_no_paired_mac) },
                     style = MaterialTheme.typography.headlineSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -391,14 +393,14 @@ private fun ConnectionStatusCard(state: EdgeLinkUiState, actions: EdgeLinkAction
                     onClick = actions::onReconnect,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("重新連線")
+                    Text(stringResource(R.string.action_reconnect))
                 }
             } else {
                 Button(
                     onClick = actions::onReconnect,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("重新連線")
+                    Text(stringResource(R.string.action_reconnect))
                 }
             }
         }
@@ -425,7 +427,7 @@ private fun PermissionHealthCard(state: EdgeLinkUiState, actions: EdgeLinkAction
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
-                    text = "權限已就緒",
+                    text = stringResource(R.string.permissions_ready),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -445,7 +447,7 @@ private fun PermissionHealthCard(state: EdgeLinkUiState, actions: EdgeLinkAction
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("需要補齊權限", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.permissions_missing_title), style = MaterialTheme.typography.titleMedium)
             missing.forEach { permission ->
                 MissingPermissionRow(permission = permission)
             }
@@ -478,7 +480,7 @@ private fun RemoteControlEntry(onOpenRemoteControl: () -> Unit) {
             .fillMaxWidth()
             .height(64.dp)
     ) {
-        Text("遠端控制")
+        Text(stringResource(R.string.remote_control_title))
     }
 }
 
@@ -513,7 +515,7 @@ private fun RemoteControlScreen(
                     onClick = { keyboardExpanded = !keyboardExpanded },
                     modifier = Modifier.padding(16.dp)
                 ) {
-                    Text(if (keyboardExpanded) "收合鍵盤" else "開啟鍵盤")
+                    Text(stringResource(if (keyboardExpanded) R.string.keyboard_collapse else R.string.keyboard_expand))
                 }
 
                 AnimatedVisibility(
@@ -551,14 +553,14 @@ private fun RemoteControlScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                Text("目前未連線", style = MaterialTheme.typography.headlineSmall)
+                Text(stringResource(R.string.remote_not_connected), style = MaterialTheme.typography.headlineSmall)
                 Text(
                     text = localizedStatus(state.connectionStatus),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Button(onClick = actions::onReconnect) {
-                    Text("重新連線")
+                    Text(stringResource(R.string.action_reconnect))
                 }
             }
         }
@@ -591,7 +593,7 @@ private fun SettingsScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("設定") },
+                title = { Text(stringResource(R.string.settings_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Text("‹", fontSize = 30.sp)
@@ -608,9 +610,9 @@ private fun SettingsScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                SettingsSection(title = "裝置資訊") {
-                    MonoTextRow(label = "本機 ID", value = state.localDeviceId.ifEmpty { "尚未註冊" })
-                    MonoTextRow(label = "Peer ID", value = state.peerDeviceId.ifEmpty { "尚未配對" })
+                SettingsSection(title = stringResource(R.string.section_device_info)) {
+                    MonoTextRow(label = stringResource(R.string.label_local_id), value = state.localDeviceId.ifEmpty { stringResource(R.string.value_not_registered) })
+                    MonoTextRow(label = "Peer ID", value = state.peerDeviceId.ifEmpty { stringResource(R.string.value_not_paired) })
                 }
             }
 
@@ -621,9 +623,9 @@ private fun SettingsScreen(
             }
 
             item {
-                SettingsSection(title = "同步") {
+                SettingsSection(title = stringResource(R.string.section_sync)) {
                     SettingsToggleRow(
-                        label = "自動重新連線",
+                        label = stringResource(R.string.toggle_auto_reconnect),
                         checked = state.autoReconnectEnabled,
                         onCheckedChange = actions::onAutoReconnectChange
                     )
@@ -640,13 +642,13 @@ private fun SettingsScreen(
             }
 
             item {
-                SettingsSection(title = "螢幕投放") {
+                SettingsSection(title = stringResource(R.string.section_screen_share)) {
                     SettingsToggleRow(
-                        label = "投放隱私保護",
+                        label = stringResource(R.string.toggle_screen_share_privacy),
                         supportingText = if (state.screenSharePrivacyEnabled) {
-                            "隱藏投放中的通知與私密內容"
+                            stringResource(R.string.screen_share_privacy_on)
                         } else {
-                            "投放時顯示通知與私密內容"
+                            stringResource(R.string.screen_share_privacy_off)
                         },
                         checked = state.screenSharePrivacyEnabled,
                         enabled = state.screenSharePrivacyControlAvailable,
@@ -654,7 +656,7 @@ private fun SettingsScreen(
                     )
                     if (!state.screenSharePrivacyControlAvailable) {
                         Text(
-                            text = "需要 WRITE_SECURE_SETTINGS 或 Shizuku 授權",
+                            text = stringResource(R.string.screen_share_privacy_requirement),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
@@ -664,25 +666,25 @@ private fun SettingsScreen(
             }
 
             item {
-                SettingsSection(title = "權限明細") {
+                SettingsSection(title = stringResource(R.string.section_permissions_detail)) {
                     PermissionStatusRow(
-                        label = "遠端輸入",
+                        label = stringResource(R.string.permission_remote_input),
                         granted = state.remoteInputAccessGranted,
-                        missingText = "需要啟用輔助使用服務",
+                        missingText = stringResource(R.string.permission_remote_input_missing),
                         actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenRemoteInputSettings
                     )
                     PermissionStatusRow(
-                        label = "螢幕保持喚醒",
+                        label = stringResource(R.string.permission_keep_screen_on),
                         granted = state.screenDimmingAccessGranted,
-                        missingText = "需要修改系統設定或顯示在其他應用程式上層",
+                        missingText = stringResource(R.string.permission_keep_screen_on_missing),
                         actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenScreenDimmingSettings
                     )
                     PermissionStatusRow(
                         label = "SMS",
                         granted = state.smsAccessGranted,
-                        missingText = "需要簡訊權限",
+                        missingText = stringResource(R.string.permission_sms_missing),
                         actionLabel = permissionActionLabel(state),
                         onOpenSettings = actions::onOpenSmsSettings
                     )
@@ -695,7 +697,7 @@ private fun SettingsScreen(
                     enabled = state.canDisconnect,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("中斷連線")
+                    Text(stringResource(R.string.action_disconnect))
                 }
             }
 
@@ -708,7 +710,7 @@ private fun SettingsScreen(
                     ),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("結束 EdgeLink")
+                    Text(stringResource(R.string.action_quit))
                 }
             }
         }
@@ -756,13 +758,13 @@ private fun MonoTextRow(label: String, value: String) {
 @Composable
 private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
     ListItem(
-        headlineContent = { Text("狀態") },
+        headlineContent = { Text(stringResource(R.string.shizuku_status_label)) },
         supportingContent = {
             Column {
                 Text(shizukuStatusText(state))
                 state.xiaomiMiLinkProbeStatus?.let { status ->
                     Text(
-                        text = "MiLink：$status",
+                        text = stringResource(R.string.milink_status_format, status),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 2,
@@ -774,11 +776,11 @@ private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
         trailingContent = {
             if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionGranted && !state.shizukuPermissionRequestBlocked) {
                 FilledTonalButton(onClick = actions::onRequestShizukuPermission) {
-                    Text("授權")
+                    Text(stringResource(R.string.action_authorize))
                 }
             } else if (state.shizukuUid == 0) {
                 FilledTonalButton(onClick = actions::onProbeMiLink) {
-                    Text("測 MiLink")
+                    Text(stringResource(R.string.action_test_milink))
                 }
             }
         },
@@ -821,7 +823,7 @@ private fun NotificationToggleRow(
 ) {
     Column {
         SettingsToggleRow(
-            label = "Mac 通知同步",
+            label = stringResource(R.string.toggle_mac_notification_sync),
             checked = enabled,
             onCheckedChange = onCheckedChange
         )
@@ -832,7 +834,7 @@ private fun NotificationToggleRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (!accessGranted) "需要通知存取權" else "通知提醒被系統擋住",
+                    text = if (!accessGranted) stringResource(R.string.notification_access_missing) else stringResource(R.string.notification_post_blocked),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.weight(1f)
@@ -850,13 +852,13 @@ private fun PermissionStatusRow(
     label: String,
     granted: Boolean,
     missingText: String,
-    actionLabel: String = "開啟設定",
+    actionLabel: String,
     onOpenSettings: () -> Unit
 ) {
     ListItem(
         headlineContent = { Text(label) },
         supportingContent = {
-            Text(if (granted) "就緒" else missingText)
+            Text(if (granted) stringResource(R.string.permission_ready) else missingText)
         },
         trailingContent = {
             if (!granted) {
@@ -971,7 +973,7 @@ private fun KeyboardPanel(
         OutlinedTextField(
             value = text,
             onValueChange = onTextChange,
-            label = { Text("輸入文字") },
+            label = { Text(stringResource(R.string.input_text_label)) },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -981,7 +983,7 @@ private fun KeyboardPanel(
             onClick = onSendText,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("送出")
+            Text(stringResource(R.string.action_send))
         }
     }
 }
@@ -1001,9 +1003,9 @@ private fun PairingScreen(
             Text("EdgeLink", style = MaterialTheme.typography.headlineMedium)
             Text(
                 text = if (state.pairingSas.isEmpty()) {
-                    "輸入 Mac 顯示的 9 碼 ID"
+                    stringResource(R.string.pairing_prompt_enter_id)
                 } else {
-                    "確認兩邊數字相同後按 Confirm"
+                    stringResource(R.string.pairing_prompt_confirm)
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1058,7 +1060,7 @@ private fun PairingScreen(
                     .fillMaxWidth()
                     .height(64.dp)
             ) {
-                Text("Confirm", fontSize = 20.sp)
+                Text(stringResource(R.string.action_confirm), fontSize = 20.sp)
             }
         } else {
             Button(
@@ -1068,7 +1070,7 @@ private fun PairingScreen(
                     .fillMaxWidth()
                     .height(64.dp)
             ) {
-                Text(if (state.isPairing) "配對中" else "開始配對", fontSize = 20.sp)
+                Text(stringResource(if (state.isPairing) R.string.pairing_in_progress else R.string.action_start_pairing), fontSize = 20.sp)
             }
         }
 
@@ -1139,13 +1141,14 @@ private data class MissingPermission(
     val onOpen: () -> Unit
 )
 
+@Composable
 private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions): List<MissingPermission> =
     buildList {
         if (state.notificationSyncEnabled && (!state.notificationAccessGranted || !state.notificationPostGranted)) {
             add(
                 MissingPermission(
-                    title = "通知同步",
-                    detail = if (!state.notificationAccessGranted) "需要通知存取權" else "需要允許通知提醒",
+                    title = stringResource(R.string.permission_notification_sync_title),
+                    detail = stringResource(if (!state.notificationAccessGranted) R.string.notification_access_missing else R.string.notification_post_missing),
                     actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenNotificationSettings
                 )
@@ -1154,8 +1157,8 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
         if (!state.remoteInputAccessGranted) {
             add(
                 MissingPermission(
-                    title = "遠端輸入",
-                    detail = "需要啟用輔助使用服務",
+                    title = stringResource(R.string.permission_remote_input),
+                    detail = stringResource(R.string.permission_remote_input_missing),
                     actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenRemoteInputSettings
                 )
@@ -1164,8 +1167,8 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
         if (!state.screenDimmingAccessGranted) {
             add(
                 MissingPermission(
-                    title = "螢幕保持喚醒",
-                    detail = "需要修改系統設定或顯示在其他應用程式上層",
+                    title = stringResource(R.string.permission_keep_screen_on),
+                    detail = stringResource(R.string.permission_keep_screen_on_missing),
                     actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenScreenDimmingSettings
                 )
@@ -1175,7 +1178,7 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
             add(
                 MissingPermission(
                     title = "SMS",
-                    detail = "需要簡訊權限",
+                    detail = stringResource(R.string.permission_sms_missing),
                     actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenSmsSettings
                 )
@@ -1183,25 +1186,27 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
         }
     }
 
+@Composable
 private fun permissionActionLabel(state: EdgeLinkUiState): String =
     if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionRequestBlocked) {
-        "修復"
+        stringResource(R.string.action_fix)
     } else {
-        "開啟設定"
+        stringResource(R.string.action_open_settings)
     }
 
+@Composable
 private fun shizukuStatusText(state: EdgeLinkUiState): String =
     when {
-        !state.shizukuAvailable -> "未連線"
-        !state.shizukuSupported -> "版本不支援"
+        !state.shizukuAvailable -> stringResource(R.string.shizuku_status_disconnected)
+        !state.shizukuSupported -> stringResource(R.string.shizuku_status_unsupported)
         state.shizukuPermissionGranted -> when (state.shizukuUid) {
-            0 -> "已授權：root"
-            2000 -> "已授權：shell"
-            null -> "已授權"
-            else -> "已授權：uid ${state.shizukuUid}"
+            0 -> stringResource(R.string.shizuku_status_authorized_root)
+            2000 -> stringResource(R.string.shizuku_status_authorized_shell)
+            null -> stringResource(R.string.shizuku_status_authorized)
+            else -> stringResource(R.string.shizuku_status_authorized_uid, state.shizukuUid)
         }
-        state.shizukuPermissionRequestBlocked -> "已拒絕"
-        else -> "可授權"
+        state.shizukuPermissionRequestBlocked -> stringResource(R.string.shizuku_status_denied)
+        else -> stringResource(R.string.shizuku_status_can_authorize)
     }
 
 private val EdgeLinkUiState.canDisconnect: Boolean
@@ -1210,23 +1215,25 @@ private val EdgeLinkUiState.canDisconnect: Boolean
         connectionPhase == ConnectionPhase.Handshaking ||
         connectionPhase == ConnectionPhase.Reconnecting
 
+@Composable
 private fun localizedStatus(status: String): String =
     when (status) {
-        "Starting" -> "啟動中"
-        "Registering" -> "註冊裝置中"
-        "No paired Mac" -> "尚未配對 Mac"
-        "Invalid Mac ID" -> "Mac ID 不正確"
-        "Opening pairing" -> "正在開啟配對"
-        "Pairing failed" -> "配對失敗"
-        "Waiting for Mac" -> "等待 Mac 確認"
-        "Compare code" -> "比對確認碼"
-        "Paired" -> "已配對"
-        "Setup failed" -> "初始化失敗"
-        "Reconnecting" -> "重新連線中"
-        "Connecting relay" -> "連線到 relay"
-        "Handshaking" -> "握手中"
-        "Connected" -> "已連線"
-        "Disconnected" -> "已中斷"
+        "Starting" -> stringResource(R.string.status_starting)
+        "Registering" -> stringResource(R.string.status_registering)
+        "No paired Mac" -> stringResource(R.string.status_no_paired_mac)
+        "Invalid Mac ID" -> stringResource(R.string.status_invalid_mac_id)
+        "Opening pairing" -> stringResource(R.string.status_opening_pairing)
+        "Pairing failed" -> stringResource(R.string.status_pairing_failed)
+        "Waiting for Mac" -> stringResource(R.string.status_waiting_for_mac)
+        "Compare code" -> stringResource(R.string.status_compare_code)
+        "Paired" -> stringResource(R.string.status_paired)
+        "Setup failed" -> stringResource(R.string.status_setup_failed)
+        "Reconnecting" -> stringResource(R.string.status_reconnecting)
+        "Connecting relay" -> stringResource(R.string.status_connecting_relay)
+        "Handshaking" -> stringResource(R.string.status_handshaking)
+        "Connected" -> stringResource(R.string.status_connected)
+        "Disconnected" -> stringResource(R.string.status_disconnected)
+        "Mac sleeping" -> stringResource(R.string.status_mac_sleeping)
         else -> status
     }
 

@@ -30,9 +30,9 @@ class EdgeLinkForegroundService : Service() {
         notificationJob = scope.launch {
             controller.state.collectLatest { state ->
                 val status = if (state.isConnected) {
-                    "已連線到 ${state.peerName}"
+                    applicationContext.getString(R.string.service_connected_to, state.peerName)
                 } else {
-                    localizedStatus(state.connectionStatus)
+                    localizedStatus(applicationContext, state.connectionStatus)
                 }
                 updateForegroundNotification(status)
             }
@@ -80,23 +80,24 @@ class EdgeLinkForegroundService : Service() {
             }
         }
 
-        private fun localizedStatus(status: String): String =
+        private fun localizedStatus(context: Context, status: String): String =
             when (status) {
-                "Starting" -> "啟動中"
-                "Registering" -> "註冊裝置中"
-                "No paired Mac" -> "尚未配對 Mac"
-                "Invalid Mac ID" -> "Mac ID 不正確"
-                "Opening pairing" -> "正在開啟配對"
-                "Pairing failed" -> "配對失敗"
-                "Waiting for Mac" -> "等待 Mac 確認"
-                "Compare code" -> "比對確認碼"
-                "Paired" -> "已配對"
-                "Setup failed" -> "初始化失敗"
-                "Reconnecting" -> "重新連線中"
-                "Connecting relay" -> "連線到 relay"
-                "Handshaking" -> "握手中"
-                "Connected" -> "已連線"
-                "Disconnected" -> "已中斷"
+                "Starting" -> context.getString(R.string.status_starting)
+                "Registering" -> context.getString(R.string.status_registering)
+                "No paired Mac" -> context.getString(R.string.status_no_paired_mac)
+                "Invalid Mac ID" -> context.getString(R.string.status_invalid_mac_id)
+                "Opening pairing" -> context.getString(R.string.status_opening_pairing)
+                "Pairing failed" -> context.getString(R.string.status_pairing_failed)
+                "Waiting for Mac" -> context.getString(R.string.status_waiting_for_mac)
+                "Compare code" -> context.getString(R.string.status_compare_code)
+                "Paired" -> context.getString(R.string.status_paired)
+                "Setup failed" -> context.getString(R.string.status_setup_failed)
+                "Reconnecting" -> context.getString(R.string.status_reconnecting)
+                "Connecting relay" -> context.getString(R.string.status_connecting_relay)
+                "Handshaking" -> context.getString(R.string.status_handshaking)
+                "Connected" -> context.getString(R.string.status_connected)
+                "Disconnected" -> context.getString(R.string.status_disconnected)
+                "Mac sleeping" -> context.getString(R.string.status_mac_sleeping)
                 else -> status
             }
     }

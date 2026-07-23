@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="remote_input_service_label">EdgeLink リモート入力</string>
+  <string name="remote_input_service_description">ペアリング済みの Mac から EdgeLink がこのスマートフォンを操作できるようにします。</string>
+  <string name="xposed_description">許可された root hook 環境で EdgeLink を Xiaomi MiLink ランタイムに接続します。</string>
+
+  <string name="status_starting">起動中</string>
+  <string name="status_registering">デバイスを登録中</string>
+  <string name="status_no_paired_mac">Mac が未ペアリング</string>
+  <string name="status_invalid_mac_id">Mac ID が正しくありません</string>
+  <string name="status_opening_pairing">ペアリングを開始しています</string>
+  <string name="status_pairing_failed">ペアリングに失敗しました</string>
+  <string name="status_waiting_for_mac">Mac の確認待ち</string>
+  <string name="status_compare_code">確認コードを照合</string>
+  <string name="status_paired">ペアリング済み</string>
+  <string name="status_setup_failed">初期化に失敗しました</string>
+  <string name="status_reconnecting">再接続中</string>
+  <string name="status_connecting_relay">リレーに接続中</string>
+  <string name="status_handshaking">ハンドシェイク中</string>
+  <string name="status_connected">接続済み</string>
+  <string name="status_disconnected">切断されました</string>
+  <string name="status_mac_sleeping">Mac はスリープ中</string>
+  <string name="service_connected_to">%1$s に接続中</string>
+
+  <string name="notification_channel_remote">リモート通知</string>
+  <string name="notification_channel_sync">EdgeLink 同期</string>
+
+  <string name="action_reconnect">再接続</string>
+  <string name="action_disconnect">切断</string>
+  <string name="action_quit">EdgeLink を終了</string>
+  <string name="action_open_settings">設定を開く</string>
+  <string name="action_fix">修復</string>
+  <string name="action_authorize">許可</string>
+  <string name="action_test_milink">MiLink をテスト</string>
+  <string name="action_send">送信</string>
+  <string name="action_confirm">Confirm</string>
+  <string name="action_start_pairing">ペアリングを開始</string>
+  <string name="pairing_in_progress">ペアリング中</string>
+
+  <string name="permissions_ready">権限はすべて許可されています</string>
+  <string name="permissions_missing_title">権限が必要です</string>
+  <string name="remote_control_title">リモートコントロール</string>
+  <string name="remote_not_connected">現在接続されていません</string>
+  <string name="keyboard_expand">キーボードを開く</string>
+  <string name="keyboard_collapse">キーボードを閉じる</string>
+  <string name="input_text_label">テキストを入力</string>
+
+  <string name="settings_title">設定</string>
+  <string name="section_device_info">デバイス情報</string>
+  <string name="label_local_id">ローカル ID</string>
+  <string name="value_not_registered">未登録</string>
+  <string name="value_not_paired">未ペアリング</string>
+  <string name="section_sync">同期</string>
+  <string name="toggle_auto_reconnect">自動再接続</string>
+  <string name="toggle_mac_notification_sync">Mac 通知の同期</string>
+  <string name="section_screen_share">画面キャスト</string>
+  <string name="toggle_screen_share_privacy">キャスト中のプライバシー保護</string>
+  <string name="screen_share_privacy_on">キャスト中は通知とプライベートな内容を非表示にします</string>
+  <string name="screen_share_privacy_off">キャスト中は通知とプライベートな内容を表示します</string>
+  <string name="screen_share_privacy_requirement">WRITE_SECURE_SETTINGS または Shizuku の許可が必要です</string>
+  <string name="section_permissions_detail">権限の詳細</string>
+  <string name="permission_ready">準備完了</string>
+  <string name="permission_remote_input">リモート入力</string>
+  <string name="permission_remote_input_missing">ユーザー補助サービスを有効にする必要があります</string>
+  <string name="permission_keep_screen_on">画面をスリープしない</string>
+  <string name="permission_keep_screen_on_missing">システム設定の変更または他のアプリの上に表示する権限が必要です</string>
+  <string name="permission_sms_missing">SMS の権限が必要です</string>
+  <string name="permission_notification_sync_title">通知の同期</string>
+  <string name="notification_access_missing">通知へのアクセス権が必要です</string>
+  <string name="notification_post_missing">通知の許可が必要です</string>
+  <string name="notification_post_blocked">通知がシステムによってブロックされています</string>
+
+  <string name="shizuku_status_label">ステータス</string>
+  <string name="shizuku_status_disconnected">未接続</string>
+  <string name="shizuku_status_unsupported">サポートされていないバージョン</string>
+  <string name="shizuku_status_authorized_root">許可済み：root</string>
+  <string name="shizuku_status_authorized_shell">許可済み：shell</string>
+  <string name="shizuku_status_authorized">許可済み</string>
+  <string name="shizuku_status_authorized_uid">許可済み：uid %1$d</string>
+  <string name="shizuku_status_denied">拒否されました</string>
+  <string name="shizuku_status_can_authorize">許可可能</string>
+  <string name="milink_status_format">MiLink：%1$s</string>
+  <string name="milink_probe_not_tested">未テスト</string>
+  <string name="milink_probe_requires_shizuku_root">Shizuku root が必要です</string>
+
+  <string name="pairing_prompt_enter_id">Mac に表示されている 9 桁の ID を入力してください</string>
+  <string name="pairing_prompt_confirm">両方の数字が同じことを確認して Confirm を押してください</string>
+</resources>

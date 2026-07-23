@@ -198,7 +198,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             shizukuPermissionGranted = initialShizukuState.permissionGranted,
             shizukuPermissionRequestBlocked = initialShizukuState.permissionRequestBlocked,
             shizukuUid = initialShizukuState.uid,
-            xiaomiMiLinkProbeStatus = if (initialShizukuState.canUse) "尚未測試" else null
+            xiaomiMiLinkProbeStatus = if (initialShizukuState.canUse) appContext.getString(R.string.milink_probe_not_tested) else null
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
@@ -889,7 +889,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         miLinkRootProbeAttempted = false
         if (!tryRunOrRequestShizuku(PendingShizukuAction.MiLinkProbe)) {
             stateFlow.update {
-                it.copy(xiaomiMiLinkProbeStatus = "需要 Shizuku root")
+                it.copy(xiaomiMiLinkProbeStatus = appContext.getString(R.string.milink_probe_requires_shizuku_root))
             }
         }
     }
@@ -1132,7 +1132,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 shizukuPermissionRequestBlocked = shizukuState.permissionRequestBlocked,
                 shizukuUid = shizukuState.uid,
                 xiaomiMiLinkProbeStatus = if (shizukuState.canUse) {
-                    it.xiaomiMiLinkProbeStatus ?: "尚未測試"
+                    it.xiaomiMiLinkProbeStatus ?: appContext.getString(R.string.milink_probe_not_tested)
                 } else {
                     null
                 }
@@ -1647,7 +1647,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 stateFlow.update {
                     it.copy(
                         connectionStatus = when {
-                            sleepSuppressed -> "Mac 睡眠中"
+                            sleepSuppressed -> "Mac sleeping"
                             autoReconnect -> "Reconnecting"
                             else -> "Disconnected"
                         },
@@ -1854,7 +1854,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         session?.close()
         stateFlow.update {
             it.copy(
-                connectionStatus = "Mac 睡眠中",
+                connectionStatus = "Mac sleeping",
                 connectionPhase = ConnectionPhase.Disconnected,
                 isConnected = false
             )
