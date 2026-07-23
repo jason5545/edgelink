@@ -49,6 +49,7 @@ import com.edgelink.core.SmsSendBody
 import com.edgelink.core.SmsSendResultBody
 import com.edgelink.core.WorkerDeviceRegistrar
 import com.edgelink.transport.ByteChannel
+import com.edgelink.transport.LANSessionTransport
 import com.edgelink.transport.LANTransport
 import com.edgelink.transport.PairingTransport
 import com.edgelink.transport.PresenceTransport
@@ -85,6 +86,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 private const val HANDSHAKE_TIMEOUT_MS = 4_000L
 private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
+private const val LAN_CONNECT_TIMEOUT_MS = 4_000L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
@@ -149,6 +151,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val settingsStore = SharedPreferencesSettingsStore(appContext)
     private val registrar = WorkerDeviceRegistrar(EdgeLinkConfig.workerBaseUrl)
     private val relayTransport = RelayTransport(crypto = crypto)
+    private val lanSessionTransport = LANSessionTransport(appContext).also { it.startDiscovery() }
     private val turnCredentialTransport = TurnCredentialTransport(crypto = crypto)
     private val presenceTransport = PresenceTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
@@ -1486,17 +1489,35 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         )
                     }
                 }
-                channel = withTimeoutOrNull(RELAY_CONNECT_TIMEOUT_MS) {
-                    relayTransport.connect(
-                        relayUrl = EdgeLinkConfig.relayUrl,
-                        hostId = peer.deviceId,
-                        identity = identity
-                    )
-                } ?: run {
-                    EdgeLinkLog.warn(
-                        "relay.android.connect_timeout hostId=${peer.deviceId} clientId=${identity.deviceId} timeoutMs=$RELAY_CONNECT_TIMEOUT_MS"
-                    )
-                    error("Relay connect timed out after ${RELAY_CONNECT_TIMEOUT_MS}ms.")
+                channel = withTimeoutOrNull(LAN_CONNECT_TIMEOUT_MS) {
+                    lanSessionTransport.currentEndpoint()?.let { endpoint ->
+                        EdgeLinkLog.info("lan.android.connect_start host=${endpoint.host} port=${endpoint.port}")
+                        runCatching {
+                            lanSessionTransport.connect(endpoint.host, endpoint.port)
+                        }.onFailure { error ->
+                            EdgeLinkLog.warn(
+                                "lan.android.connect_failed host=${endpoint.host} port=${endpoint.port} " +
+                                    "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                            )
+                        }.getOrNull()
+                    }
+                }
+                if (channel == null) {
+                    EdgeLinkLog.info("lan.android.unavailable_fallback_relay hostId=${peer.deviceId}")
+                }
+                if (channel == null) {
+                    channel = withTimeoutOrNull(RELAY_CONNECT_TIMEOUT_MS) {
+                        relayTransport.connect(
+                            relayUrl = EdgeLinkConfig.relayUrl,
+                            hostId = peer.deviceId,
+                            identity = identity
+                        )
+                    } ?: run {
+                        EdgeLinkLog.warn(
+                            "relay.android.connect_timeout hostId=${peer.deviceId} clientId=${identity.deviceId} timeoutMs=$RELAY_CONNECT_TIMEOUT_MS"
+                        )
+                        error("Relay connect timed out after ${RELAY_CONNECT_TIMEOUT_MS}ms.")
+                    }
                 }
                 if (connectionGeneration.get() != generation) {
                     channel.close()

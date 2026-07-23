@@ -87,6 +87,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var currentConnectionGeneration: UUID?
     private var currentChannel: ByteChannel?
     private var currentChannelGeneration: UUID?
+    private var lanSessionListener: LANSessionListener?
+    private var lanSessionTask: Task<Void, Never>?
+    private var hostSessionDidConnect = false
     private var lastSecurePongAt = Date.distantPast
     private var pendingAwakeNotification = false
     private var resumeConnectionAfterWake = false
@@ -2467,6 +2470,10 @@ final class EdgeLinkRuntime: ObservableObject {
         currentConnectionGeneration = connectionGeneration
         canDisconnect = true
 
+        startLANSessionListenerIfNeeded(identity: identity)
+        lanSessionTask?.cancel()
+        lanSessionTask = nil
+
         connectionTask?.cancel()
         currentChannel?.close()
         currentChannel = nil
@@ -2509,6 +2516,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
 
                 DiagnosticsLog.info("relay.mac.connect_start hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                hostSessionDidConnect = false
                 isConnected = false
                 canDisconnect = true
                 connectionStatus = "Connecting relay"
@@ -2518,11 +2526,50 @@ final class EdgeLinkRuntime: ObservableObject {
                     return
                 }
                 channel = connectedChannel
-                currentChannel = connectedChannel
-                currentChannelGeneration = channelGeneration
+                try await runHostSession(
+                    channel: connectedChannel,
+                    identity: identity,
+                    peer: peer,
+                    connectionGeneration: connectionGeneration,
+                    channelGeneration: channelGeneration,
+                    transport: "relay"
+                )
+            } catch {
+                if Task.isCancelled || currentConnectionGeneration != connectionGeneration {
+                    DiagnosticsLog.info("relay.mac.connect_cancelled hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                    return
+                }
+                DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
+                isConnected = false
+                currentSession = nil
+                screenSession.clearSender()
+                screenSession.handleTransportInterrupted()
+                stopPhoneCallRelayAudio(reason: "transport_interrupted")
+                androidMicRelayArmed = false
+                isPhoneCallActive = false
+                connectionStatus = "Disconnected"
+                if hostSessionDidConnect {
+                    retryDelay = 1_000_000_000
+                }
+                try? await Task.sleep(nanoseconds: retryDelay)
+                retryDelay = min(retryDelay * 2, 30_000_000_000)
+            }
+        }
+    }
 
-                let callRelayCloudflareBridge = callRelayCloudflareBridge
-                let xiaomiMirrorRTSPDiagnosticSource = xiaomiMirrorRTSPDiagnosticSource
+    private func runHostSession(
+        channel: ByteChannel,
+        identity: LocalIdentity,
+        peer: PinnedPeer,
+        connectionGeneration: UUID,
+        channelGeneration: UUID,
+        transport: String
+    ) async throws {
+        currentChannel = channel
+        currentChannelGeneration = channelGeneration
+
+        let callRelayCloudflareBridge = callRelayCloudflareBridge
+        let xiaomiMirrorRTSPDiagnosticSource = xiaomiMirrorRTSPDiagnosticSource
                 let dispatcher = CommandDispatcher(
                     clipboardSync: clipboardSync,
                     notificationPresenter: notificationPresenter,
@@ -2603,7 +2650,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     }
                 )
                 let session = SecureSessionHost(
-                    channel: connectedChannel,
+                    channel: channel,
                     identity: identity,
                     peer: peer,
                     dispatcher: dispatcher
@@ -2612,10 +2659,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 connectionStatus = "Handshaking"
                 try await session.connect()
                 guard currentConnectionGeneration == connectionGeneration else {
-                    connectedChannel.close()
+                    channel.close()
                     return
                 }
-                DiagnosticsLog.info("relay.mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                DiagnosticsLog.info("\(transport).mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
                 lastSecurePongAt = Date()
                 Task { [weak self] in
@@ -2632,7 +2679,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
                 isConnected = true
                 connectionStatus = "Connected"
-                retryDelay = 1_000_000_000
+                hostSessionDidConnect = true
                 resumeXiaomiMirrorAfterReconnectIfNeeded()
                 reportPresence(.awake, reason: "connected")
                 if pendingAwakeNotification {
@@ -2672,22 +2719,60 @@ final class EdgeLinkRuntime: ObservableObject {
                     group.cancelAll()
                 }
                 throw SecureKeepaliveError.receiveLoopEnded
-            } catch {
-                if Task.isCancelled || currentConnectionGeneration != connectionGeneration {
-                    DiagnosticsLog.info("relay.mac.connect_cancelled hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
-                    return
+    }
+
+    private func startLANSessionListenerIfNeeded(identity: LocalIdentity) {
+        guard lanSessionListener == nil else {
+            return
+        }
+        let listener = LANSessionListener { [weak self] channel in
+            if let channel = channel as? LANTCPByteChannel {
+                channel.start()
+            }
+            Task { @MainActor in
+                self?.handleLANAcceptedChannel(channel)
+            }
+        }
+        lanSessionListener = listener
+        listener.start(serviceName: identity.name)
+    }
+
+    private func handleLANAcceptedChannel(_ channel: ByteChannel) {
+        guard let identity = localIdentity,
+              let peer = currentPeer,
+              let generation = currentConnectionGeneration else {
+            DiagnosticsLog.warn("lan.mac.session_rejected reason=no_pairing_context")
+            channel.close()
+            return
+        }
+        let channelGeneration = UUID()
+        DiagnosticsLog.info("lan.mac.session_start hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+        lanSessionTask?.cancel()
+        lanSessionTask = Task { [weak self] in
+            guard let self else {
+                channel.close()
+                return
+            }
+            defer {
+                channel.close()
+                Task { @MainActor in
+                    if self.currentChannelGeneration == channelGeneration {
+                        self.currentChannel = nil
+                        self.currentChannelGeneration = nil
+                    }
                 }
-                DiagnosticsLog.error("relay.mac.disconnected hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
-                isConnected = false
-                currentSession = nil
-                screenSession.clearSender()
-                screenSession.handleTransportInterrupted()
-                stopPhoneCallRelayAudio(reason: "transport_interrupted")
-                androidMicRelayArmed = false
-                isPhoneCallActive = false
-                connectionStatus = "Disconnected"
-                try? await Task.sleep(nanoseconds: retryDelay)
-                retryDelay = min(retryDelay * 2, 30_000_000_000)
+            }
+            do {
+                try await self.runHostSession(
+                    channel: channel,
+                    identity: identity,
+                    peer: peer,
+                    connectionGeneration: generation,
+                    channelGeneration: channelGeneration,
+                    transport: "lan"
+                )
+            } catch {
+                DiagnosticsLog.error("lan.mac.session_ended hostId=\(identity.deviceId) clientId=\(peer.deviceId)", error)
             }
         }
     }
