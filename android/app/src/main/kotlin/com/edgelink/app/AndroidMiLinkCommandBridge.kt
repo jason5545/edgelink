@@ -1121,16 +1121,18 @@ class AndroidMiLinkCommandBridge(
             ?.trim()
             ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
             ?: return null
+        // The Mac commits to the cloud session it creates (its renderer binds
+        // to that sessionId), so the phone must not veto it in favor of LAN —
+        // doing so strands the Mac with an empty session while the phone
+        // keeps streaming a stale one.
         val peerHost = body.args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() }
         val peerPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
         val probePort = body.args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
-        val useLAN = peerPort != null && LANTransport.isReachable(peerHost, probePort)
         EdgeLinkLog.info(
             "xiaomi.mirror.android.media_route reason=$reason " +
-                "transport=${if (useLAN) "lan" else "cloudflare"} " +
-                "peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+                "transport=cloudflare peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
         )
-        return cloudSessionId.takeUnless { useLAN }
+        return cloudSessionId
     }
 
     private fun callMirrorDeviceProviderWithDeadline(
