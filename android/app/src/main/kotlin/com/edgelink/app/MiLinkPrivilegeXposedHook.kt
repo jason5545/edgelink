@@ -384,6 +384,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var xiaomiMirrorKeyboardShareSocket: Any? = null
     private var xiaomiMirrorKeyboardLastHidCreateAttemptMs: Long = 0L
     private var xiaomiMirrorAcceptInputCallback: Any? = null
+    private var xiaomiMirrorKeyboardEdgeLinkHidDevice: Any? = null
+    private var xiaomiMirrorKeyboardSessionArmed: Boolean = false
+    private var xiaomiMirrorSavedShowImeWithHardKeyboard: Int? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (!MiLinkPrivilegeHookPolicy.shouldHook(lpparam.packageName, lpparam.processName)) {
@@ -1975,6 +1978,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun handleMirrorKeyboardProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
+        if (extras.booleanCompat("releaseOnly")) {
+            return handleMirrorKeyboardReleaseProvider(classLoader, extras)
+        }
         if (extras.booleanCompat("prepareOnly")) {
             return handleMirrorKeyboardReadyProvider(classLoader, extras)
         }
@@ -2110,6 +2116,166 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             putBoolean("prepareOnly", true)
         }
     }
+
+    private fun handleMirrorKeyboardReleaseProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
+        val requestId = extras.getString("requestId").orEmpty()
+        val source = extras.getString("source").orEmpty()
+        val release = releaseXiaomiMirrorKeyboard(classLoader, source.ifBlank { "provider" })
+        log(
+            "mirror keyboard release provider requestId=$requestId source=$source " +
+                "accepted=${release.accepted} route=${release.route} message=${release.message}"
+        )
+        return Bundle().apply {
+            putBoolean("edgelinkKeyboardAccepted", release.accepted)
+            putBoolean("edgelinkKeyboardReleased", release.accepted)
+            putBoolean("enable", release.accepted)
+            putInt("value", if (release.accepted) 0 else -1)
+            putString("route", release.route)
+            putString("message", release.message)
+            putString("requestId", requestId)
+            putString("source", source)
+            putBoolean("releaseOnly", true)
+        }
+    }
+
+    private fun releaseXiaomiMirrorKeyboard(
+        classLoader: ClassLoader,
+        source: String
+    ): XiaomiMirrorKeyboardInjectionResult {
+        return runCatching {
+            val steps = mutableListOf<String>()
+            val createdDevice = xiaomiMirrorKeyboardEdgeLinkHidDevice
+            if (createdDevice != null) {
+                val closed = runCatching {
+                    createdDevice.javaClass.getMethod("close").invoke(createdDevice)
+                    true
+                }.getOrElse { error ->
+                    val cause = error.cause ?: error
+                    log(
+                        "mirror keyboard release close failed source=$source: " +
+                            "${cause.javaClass.simpleName}: ${cause.message}"
+                    )
+                    false
+                }
+                if (closed) {
+                    unregisterXiaomiMirrorHidDevice(classLoader, createdDevice)
+                    xiaomiMirrorKeyboardEdgeLinkHidDevice = null
+                }
+                steps += "hidClose=$closed"
+            } else {
+                steps += "hidClose=skipped:not_edgelink_device"
+            }
+            val context = xiaomiMirrorApplicationContext(classLoader)
+            if (context != null && xiaomiMirrorKeyboardSessionArmed) {
+                restoreXiaomiMirrorKeyboardSettings(classLoader, context, source)
+                steps += "settings=restored"
+            } else {
+                steps += "settings=skipped:armed=$xiaomiMirrorKeyboardSessionArmed context=${context != null}"
+            }
+            synchronized(xiaomiMirrorKeyboardPressedUsages) {
+                xiaomiMirrorKeyboardPressedUsages.clear()
+                xiaomiMirrorKeyboardModifierMask = 0
+            }
+            synchronized(xiaomiMirrorKeyboardShareLock) {
+                xiaomiMirrorPointerButtonMask = 0
+            }
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = true,
+                route = "xiaomi.mirror.hid.release",
+                message = "keyboard released source=$source ${steps.joinToString(" ")}"
+            )
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "xiaomi.mirror.hid.release",
+                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
+            )
+        }
+    }
+
+    private fun restoreXiaomiMirrorKeyboardSettings(
+        classLoader: ClassLoader,
+        context: Context,
+        source: String
+    ) {
+        closeXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
+        val inputState = setXiaomiMirrorInputMethodState(classLoader, context, 0, source)
+        val resolver = context.contentResolver
+        val openedCleared = runCatching {
+            Settings.Secure.putInt(resolver, "mirror_hid_device_opened", 0)
+        }.getOrElse { error ->
+            log("mirror keyboard release setting mirror_hid_device_opened failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+            false
+        }
+        val synergyCleared = runCatching {
+            Settings.Secure.putInt(resolver, "synergy_mode", 0)
+        }.getOrDefault(false)
+        val savedShowIme = xiaomiMirrorSavedShowImeWithHardKeyboard
+        val showImeRestored = if (savedShowIme != null) {
+            runCatching {
+                Settings.Secure.putInt(resolver, "show_ime_with_hard_keyboard", savedShowIme)
+            }.getOrElse { error ->
+                log("mirror keyboard release setting show_ime_with_hard_keyboard failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+                false
+            }
+        } else {
+            false
+        }
+        xiaomiMirrorSavedShowImeWithHardKeyboard = null
+        val mouseShare = notifyXiaomiMirrorMouseShareMode(classLoader, enabled = false)
+        xiaomiMirrorKeyboardSessionArmed = false
+        log(
+            "mirror keyboard hardware state released source=$source openedCleared=$openedCleared " +
+                "synergyCleared=$synergyCleared showImeRestored=$showImeRestored " +
+                "savedShowIme=${savedShowIme?.toString() ?: "none"} mouseShare=$mouseShare $inputState"
+        )
+    }
+
+    private fun unregisterXiaomiMirrorHidDevice(classLoader: ClassLoader, device: Any) {
+        runCatching {
+            val holderClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER,
+                XIAOMI_MIRROR_SHARE_HID_DEVICE_HOLDER_JADX_NAME
+            )
+            val holder = holderClass.getMethod("c").invoke(null)
+            val current = holderClass.getMethod("a").invoke(holder)
+            if (current === device) {
+                holderClass.getMethod("d", device.javaClass).invoke(holder, *arrayOf<Any?>(null))
+            }
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to unregister share pc hid holder: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+        runCatching {
+            val managerClass = findTargetClass(classLoader, XIAOMI_MIRROR_HID_MANAGER)
+            val manager = managerClass.getMethod("getInstance").invoke(null)
+            val current = managerClass.getMethod("getDevice").invoke(manager)
+            if (current === device) {
+                managerClass.getMethod("setDevice", device.javaClass).invoke(manager, *arrayOf<Any?>(null))
+            }
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log("failed to unregister hid manager device: ${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    }
+
+    private fun notifyXiaomiMirrorMouseShareMode(classLoader: ClassLoader, enabled: Boolean): Boolean =
+        runCatching {
+            val managerClass = findFirstTargetClass(
+                classLoader,
+                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER,
+                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER_JADX_NAME
+            )
+            val manager = managerClass.getMethod("m").invoke(null)
+            managerClass.getMethod("t", java.lang.Boolean.TYPE).invoke(manager, enabled)
+            true
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log("mirror keyboard release notifyMouseShareModeState failed: ${cause.javaClass.simpleName}: ${cause.message}")
+            false
+        }
 
     private fun buildXiaomiMirrorKeyboardReport(
         keyCode: Int,
@@ -2542,6 +2708,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             )
             xiaomiMirrorKeyboardLastHidCreateAttemptMs = SystemClock.uptimeMillis()
             registerXiaomiMirrorHidDevice(classLoader, device, deviceClass)
+            xiaomiMirrorKeyboardEdgeLinkHidDevice = device
             log(
                 "mirror keyboard virtual hid device created descriptorBytes=${descriptor.size} " +
                     "ptr=${xiaomiMirrorHidDevicePtr(device)} ${xiaomiMirrorUhidAccessSummary()}"
@@ -3080,6 +3247,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         val context = xiaomiMirrorApplicationContext(classLoader)
             ?: return "settings=skipped:no_context"
         val resolver = context.contentResolver
+        xiaomiMirrorKeyboardSessionArmed = true
+        if (xiaomiMirrorSavedShowImeWithHardKeyboard == null) {
+            xiaomiMirrorSavedShowImeWithHardKeyboard = runCatching {
+                Settings.Secure.getInt(resolver, "show_ime_with_hard_keyboard")
+            }.getOrNull()
+        }
         val officialIme = prepareXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
         val inputState = setXiaomiMirrorInputMethodState(
             classLoader,
@@ -3130,13 +3303,19 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     }
 
     private fun markXiaomiMirrorHardwareKeyboardClosed(classLoader: ClassLoader, source: String) {
-        val context = xiaomiMirrorApplicationContext(classLoader) ?: return
-        closeXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
-        runCatching {
-            Settings.Secure.putInt(context.contentResolver, "mirror_hid_device_opened", 0)
-        }.onFailure { error ->
-            log("mirror keyboard setting mirror_hid_device_opened close failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+        if (xiaomiMirrorKeyboardEdgeLinkHidDevice != null) {
+            xiaomiMirrorKeyboardEdgeLinkHidDevice = null
         }
+        val context = xiaomiMirrorApplicationContext(classLoader) ?: return
+        if (!xiaomiMirrorKeyboardSessionArmed) {
+            runCatching {
+                Settings.Secure.putInt(context.contentResolver, "mirror_hid_device_opened", 0)
+            }.onFailure { error ->
+                log("mirror keyboard setting mirror_hid_device_opened close failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+            }
+            return
+        }
+        restoreXiaomiMirrorKeyboardSettings(classLoader, context, source)
     }
 
     private fun prepareXiaomiMirrorOfficialInputMethodSession(

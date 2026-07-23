@@ -52,6 +52,7 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
                     COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY -> requestMirrorSourceRecovery(body)
                     COMMAND_MIRROR_KEYBOARD_READY -> prepareMirrorKeyboard(body)
+                    COMMAND_MIRROR_KEYBOARD_RELEASE -> releaseMirrorKeyboard(body)
                     COMMAND_MIRROR_KEYBOARD -> sendMirrorKeyboard(body)
                     COMMAND_MIRROR_POINTER -> sendMirrorPointer(body)
                     COMMAND_MIRROR_GLOBAL -> sendMirrorGlobal(body)
@@ -765,6 +766,51 @@ class AndroidMiLinkCommandBridge(
                 success = false,
                 route = "xiaomi.mirror.hid.pending",
                 message = "keyboardReady pending>${result.deadlineMs}ms",
+                data = mapOf(
+                    "pendingMethod" to "edgeLinkKeyboard",
+                    "pendingDeadlineMs" to result.deadlineMs.toString(),
+                    "source" to body.args["source"].orEmpty()
+                )
+            )
+        }
+    }
+
+    private fun releaseMirrorKeyboard(body: MiLinkCommandBody): CommandResult {
+        val result = callMirrorProviderWithDeadline(
+            method = "edgeLinkKeyboard",
+            deadlineMs = mirrorKeyboardProviderDeadlineMs
+        ) {
+            val providerResult = appContext.contentResolver.callMirrorProvider(
+                "edgeLinkKeyboard",
+                Bundle().apply {
+                    putBoolean("releaseOnly", true)
+                    putString("source", body.args["source"].orEmpty())
+                    putString("requestId", body.requestId)
+                    putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
+                }
+            )
+            val released = providerResult?.getBoolean("edgelinkKeyboardReleased", false) == true
+            CommandResult(
+                success = released,
+                route = "xiaomi.mirror.hid.release",
+                message = "keyboardRelease released=$released keys=${providerResult?.keySummary().orEmpty()}",
+                data = mapOf(
+                    "released" to released.toString(),
+                    "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
+                    "providerRoute" to providerResult?.getString("route").orEmpty(),
+                    "providerMessage" to providerResult?.getString("message").orEmpty(),
+                    "source" to body.args["source"].orEmpty()
+                )
+            )
+        }
+        return when (result) {
+            is MirrorProviderDeadlineResult.Completed -> result.result
+            is MirrorProviderDeadlineResult.Pending -> CommandResult(
+                success = false,
+                route = "xiaomi.mirror.hid.release.pending",
+                message = "keyboardRelease pending>${result.deadlineMs}ms",
                 data = mapOf(
                     "pendingMethod" to "edgeLinkKeyboard",
                     "pendingDeadlineMs" to result.deadlineMs.toString(),
@@ -1737,6 +1783,7 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
         const val COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_KEYBOARD_READY = "xiaomi.mirror.keyboardReady"
+        const val COMMAND_MIRROR_KEYBOARD_RELEASE = "xiaomi.mirror.keyboardRelease"
         const val COMMAND_MIRROR_KEYBOARD = "xiaomi.mirror.keyboard"
         const val COMMAND_MIRROR_POINTER = "xiaomi.mirror.pointer"
         const val COMMAND_MIRROR_GLOBAL = "xiaomi.mirror.global"
