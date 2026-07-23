@@ -682,6 +682,16 @@ final class MacScreenSession: NSObject, ObservableObject {
         showWindow()
     }
 
+    func showConnectingWindow() {
+        if !isScreenSessionActive {
+            isScreenSessionActive = true
+            onSessionActivityChanged?(true)
+        }
+        status = "連線中"
+        showWindow()
+        DiagnosticsLog.info("screen.mac.connecting_window_shown")
+    }
+
     func sendGlobal(_ action: String) {
         if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
             markControlSent(kind: "xiaomi:global:\(action)", shouldLog: false)
@@ -747,7 +757,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             backing: .buffered,
             defer: false
         )
-        window.title = "Phone"
+        window.title = "手機"
         window.minSize = NSSize(width: 260, height: 360)
         window.contentView = NSHostingView(rootView: content)
         window.center()
@@ -1774,6 +1784,26 @@ struct PhoneScreenView: View {
         return CGFloat(meta.w) / CGFloat(meta.h)
     }
 
+    @ViewBuilder
+    private var connectingOverlay: some View {
+        let content = VStack(spacing: 14) {
+            ConnectingSpinnerView()
+            Text(session.status)
+                .foregroundStyle(.secondary)
+                .font(.callout)
+        }
+        if #available(macOS 26.0, *) {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .glassEffect(.regular, in: .rect)
+        } else {
+            ZStack {
+                VisualEffectBlurView(material: .hudWindow, blendingMode: .withinWindow)
+                content
+            }
+        }
+    }
+
     private var videoStage: some View {
         GeometryReader { geometry in
             let videoFrame = fittedVideoFrame(in: geometry.size)
@@ -1785,9 +1815,7 @@ struct PhoneScreenView: View {
                     .position(x: videoFrame.midX, y: videoFrame.midY)
 
                 if !session.hasRemoteVideo {
-                    Text(session.status)
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
+                    connectingOverlay
                 }
             }
         }
@@ -1884,6 +1912,68 @@ struct PhoneVideoView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: PhoneVideoRendererView, context: Context) {}
+}
+
+private struct ConnectingSpinnerView: View {
+    @State private var rotation: Double = 0
+    @State private var pulse = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.12), lineWidth: 3.5)
+
+            Circle()
+                .trim(from: 0, to: 0.72)
+                .stroke(
+                    AngularGradient(
+                        colors: [
+                            Color.accentColor.opacity(0),
+                            Color.accentColor.opacity(0.45),
+                            Color.accentColor
+                        ],
+                        center: .center,
+                        startAngle: .degrees(0),
+                        endAngle: .degrees(360 * 0.72)
+                    ),
+                    style: StrokeStyle(lineWidth: 3.5, lineCap: .round)
+                )
+                .rotationEffect(.degrees(rotation))
+                .shadow(color: Color.accentColor.opacity(0.45), radius: 6)
+
+            Circle()
+                .fill(Color.accentColor.opacity(pulse ? 0.28 : 0.10))
+                .frame(width: 10, height: 10)
+                .scaleEffect(pulse ? 1.25 : 0.85)
+        }
+        .frame(width: 40, height: 40)
+        .onAppear {
+            withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+                rotation = 360
+            }
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+}
+
+struct VisualEffectBlurView: NSViewRepresentable {    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        view.isEmphasized = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+    }
 }
 
 private final class MainThreadWatchdog {

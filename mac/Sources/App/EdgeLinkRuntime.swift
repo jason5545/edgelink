@@ -412,6 +412,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 isPhoneScreenViewerVisible = false
             }
             screenSession.setXiaomiMirrorRouteActive(true)
+            screenSession.showConnectingWindow()
             let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
@@ -475,6 +476,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         xiaomiMiLinkCommandStatus = "等待小米鏡像路由…"
+        screenSession.showConnectingWindow()
         DiagnosticsLog.info("xiaomi.mac.screen_route_deferred reason=awaiting_milink_status")
         deferredViewPhoneScreenTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
