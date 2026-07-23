@@ -35,128 +35,204 @@ struct EdgeLinkMacApp: App {
     }
 }
 
+private enum MenuBarSection: String, CaseIterable, Identifiable {
+    case status
+    case phone
+    case miShare
+    case settings
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .status:
+            return "狀態"
+        case .phone:
+            return "手機"
+        case .miShare:
+            return "快傳"
+        case .settings:
+            return "設定"
+        }
+    }
+}
+
 private struct MenuBarPopover: View {
     @ObservedObject var runtime: EdgeLinkRuntime
     @Environment(\.openWindow) private var openWindow
+    @State private var selectedSection: MenuBarSection = .status
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if runtime.isPairing {
                 PairingPanel(runtime: runtime)
             } else {
-                StatusSummary(runtime: runtime)
+                Picker("分類", selection: $selectedSection) {
+                    ForEach(MenuBarSection.allCases) { section in
+                        Text(section.title).tag(section)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
 
-                if !runtime.peerDeviceId.isEmpty {
-                    Divider()
-                    ConnectionActions(runtime: runtime)
+                switch selectedSection {
+                case .status:
+                    StatusSection(runtime: runtime)
+                case .phone:
+                    PhoneSection(runtime: runtime, openWindow: openWindow)
+                case .miShare:
+                    MiShareSection(runtime: runtime)
+                case .settings:
+                    SettingsSection(runtime: runtime)
                 }
 
                 Divider()
 
-                Toggle(
-                    "Mac 通知",
-                    isOn: Binding(
-                        get: { runtime.macNotificationSyncEnabled },
-                        set: { runtime.setMacNotificationSyncEnabled($0) }
-                    )
-                )
-                .toggleStyle(.switch)
-
-                Toggle(
-                    "系統驗證碼",
-                    isOn: Binding(
-                        get: { runtime.verificationCodeSystemBridgeEnabled },
-                        set: { runtime.setVerificationCodeSystemBridgeEnabled($0) }
-                    )
-                )
-                .toggleStyle(.switch)
-
-                Toggle(
-                    "自動複製驗證碼",
-                    isOn: Binding(
-                        get: { runtime.verificationCodeAutoCopyEnabled },
-                        set: { runtime.setVerificationCodeAutoCopyEnabled($0) }
-                    )
-                )
-                .toggleStyle(.switch)
-
-                if runtime.latestVerificationCode != nil {
-                    Divider()
-                    LatestVerificationCodePanel(runtime: runtime)
-                }
-
-                if !runtime.peerDeviceId.isEmpty {
-                    Divider()
-                    PhoneControlPanel(runtime: runtime)
-                }
-
-                if runtime.isPhoneScreenSessionActive {
+                HStack {
                     Button {
-                        runtime.showPhoneScreen()
+                        runtime.startPairing()
                     } label: {
-                        Label(
-                            runtime.isPhoneScreenViewerVisible ? "重新檢視" : "重新檢視手機畫面",
-                            systemImage: "rectangle.on.rectangle"
-                        )
+                        Label("配對新裝置", systemImage: "plus.circle")
                     }
 
-                    Button {
-                        runtime.stopPhoneScreen()
+                    Spacer()
+
+                    Button(role: .destructive) {
+                        runtime.quit()
                     } label: {
-                        Label("停止手機投放", systemImage: "stop.circle")
+                        Label("結束 EdgeLink", systemImage: "power")
                     }
-                } else {
-                    Button {
-                        runtime.viewPhoneScreen()
-                    } label: {
-                        Label(
-                            runtime.hasViewedPhoneScreen ? "重新檢視" : "檢視手機畫面",
-                            systemImage: "iphone"
-                        )
-                    }
-                    .disabled(!runtime.isConnected)
-                }
-
-                Divider()
-
-                XiaomiMiShareDiscoveryPanel(runtime: runtime)
-
-                Button {
-                    runtime.sendFilesWithXiaomiHyperConnect()
-                } label: {
-                    Label("小米快傳傳檔給手機", systemImage: "paperplane")
-                }
-
-                if !runtime.xiaomiMiLinkCommandStatus.isEmpty {
-                    Text(runtime.xiaomiMiLinkCommandStatus)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-
-                Button {
-                    openWindow(id: "sms")
-                } label: {
-                    Label("訊息…", systemImage: "message")
-                }
-
-                Divider()
-
-                Button {
-                    runtime.startPairing()
-                } label: {
-                    Label("配對新裝置", systemImage: "plus.circle")
-                }
-
-                Button(role: .destructive) {
-                    runtime.quit()
-                } label: {
-                    Label("結束 EdgeLink", systemImage: "power")
                 }
             }
         }
         .padding()
-        .frame(width: 280)
+        .frame(width: 300)
+    }
+}
+
+private struct StatusSection: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            StatusSummary(runtime: runtime)
+
+            if !runtime.peerDeviceId.isEmpty {
+                Divider()
+                ConnectionActions(runtime: runtime)
+            }
+
+            if runtime.latestVerificationCode != nil {
+                Divider()
+                LatestVerificationCodePanel(runtime: runtime)
+            }
+        }
+    }
+}
+
+private struct PhoneSection: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+    let openWindow: OpenWindowAction
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !runtime.peerDeviceId.isEmpty {
+                PhoneControlPanel(runtime: runtime)
+                Divider()
+            }
+
+            if runtime.isPhoneScreenSessionActive {
+                Button {
+                    runtime.showPhoneScreen()
+                } label: {
+                    Label(
+                        runtime.isPhoneScreenViewerVisible ? "重新檢視" : "重新檢視手機畫面",
+                        systemImage: "rectangle.on.rectangle"
+                    )
+                }
+
+                Button {
+                    runtime.stopPhoneScreen()
+                } label: {
+                    Label("停止手機投放", systemImage: "stop.circle")
+                }
+            } else {
+                Button {
+                    runtime.viewPhoneScreen()
+                } label: {
+                    Label(
+                        runtime.hasViewedPhoneScreen ? "重新檢視" : "檢視手機畫面",
+                        systemImage: "iphone"
+                    )
+                }
+                .disabled(!runtime.isConnected)
+            }
+
+            Button {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "sms")
+            } label: {
+                Label("訊息…", systemImage: "message")
+            }
+        }
+    }
+}
+
+private struct MiShareSection: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            XiaomiMiShareDiscoveryPanel(runtime: runtime)
+
+            Button {
+                runtime.sendFilesWithXiaomiHyperConnect()
+            } label: {
+                Label("小米快傳傳檔給手機", systemImage: "paperplane")
+            }
+
+            if !runtime.xiaomiMiLinkCommandStatus.isEmpty {
+                Text(runtime.xiaomiMiLinkCommandStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+    }
+}
+
+private struct SettingsSection: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(
+                "Mac 通知",
+                isOn: Binding(
+                    get: { runtime.macNotificationSyncEnabled },
+                    set: { runtime.setMacNotificationSyncEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+
+            Toggle(
+                "系統驗證碼",
+                isOn: Binding(
+                    get: { runtime.verificationCodeSystemBridgeEnabled },
+                    set: { runtime.setVerificationCodeSystemBridgeEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+
+            Toggle(
+                "自動複製驗證碼",
+                isOn: Binding(
+                    get: { runtime.verificationCodeAutoCopyEnabled },
+                    set: { runtime.setVerificationCodeAutoCopyEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+        }
     }
 }
 
