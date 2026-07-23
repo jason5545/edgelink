@@ -2832,6 +2832,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkDecodedFrames: UInt64 = 0
     private var mptSinkDecodeFailedFrames: UInt64 = 0
     private var lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTDecodedFrameUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTFrameStallDecoderResetUptimeNanoseconds: UInt64 = 0
     private var mptSinkFrameStallDecoderResetCount: UInt64 = 0
@@ -3120,6 +3121,7 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
@@ -3138,7 +3140,11 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         let now = DispatchTime.now().uptimeNanoseconds
-        let elapsedMediaSeconds = Double(now - lastMPTMediaPacketUptimeNanoseconds) / 1_000_000_000
+        // Judge source liveness by any arriving push, not only in-order
+        // delivered ones: a lost KCP segment blocks delivery while the
+        // source keeps sending, and must go through resync instead of
+        // source recovery.
+        let elapsedMediaSeconds = Double(now - lastMPTAnyPushUptimeNanoseconds) / 1_000_000_000
         let elapsedFrameSeconds = mptSinkDecodedFrames > 0 || mptSinkRTPPacketsReceived > 20
             ? Double(now - lastMPTDecodedFrameUptimeNanoseconds) / 1_000_000_000
             : nil
@@ -3567,6 +3573,10 @@ private final class XiaomiMirrorRTPMediaSender {
     }
 
     private func handleKCPPush(_ segment: KCPIncomingSegment) {
+        // Any arriving push — even out-of-order or buffered — proves the
+        // source is still sending. Head-of-line blocking behind a lost
+        // segment must not read as "no packets from source".
+        lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         if mptSinkOnly,
            mptSinkRTPPacketsReceived == 0,
            kcpReceiveBuffer.isEmpty,
@@ -3660,6 +3670,13 @@ private final class XiaomiMirrorRTPMediaSender {
         let now = DispatchTime.now().uptimeNanoseconds
         guard now - kcpOutOfOrderStartedUptimeNanoseconds >= Self.kcpReceiveStallResyncDelayNanoseconds else {
             return false
+        }
+        // At low packet rates (static screen) the count/gap thresholds below
+        // can take longer than the 6s stall watchdog, so bound any
+        // head-of-line stall by time as well.
+        if !kcpReceiveBuffer.isEmpty,
+           now - kcpOutOfOrderStartedUptimeNanoseconds >= Self.kcpReceiveStallResyncMaxStallNanoseconds {
+            return true
         }
         return delta >= Self.kcpReceiveStallResyncMinGap ||
             kcpReceiveBuffer.count >= Self.kcpReceiveStallResyncMinBuffered
@@ -4163,6 +4180,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let kcpReceiveBufferLimit = 600
     private static let kcpReceiveMaxGap: UInt32 = 1_200
     private static let kcpReceiveStallResyncDelayNanoseconds: UInt64 = 250_000_000
+    private static let kcpReceiveStallResyncMaxStallNanoseconds: UInt64 = 1_500_000_000
     private static let kcpReceiveStallResyncMinGap: Int64 = 128
     private static let kcpReceiveStallResyncMinBuffered = 48
     private static let officialMPTSocketBufferBytes: Int32 = 6_291_456
