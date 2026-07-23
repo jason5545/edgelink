@@ -19,15 +19,12 @@ object AndroidMirrorScreenRemoteKeeper {
     private val lifecycleMutex = Mutex()
     private var refreshJob: Job? = null
     private var activeKey: String? = null
-    private var pendingStopJob: Job? = null
 
     fun noteSessionArmed(context: Context, peerHost: String?, peerPort: Int?) {
         val appContext = context.applicationContext
         val key = "${peerHost.orEmpty()}:${peerPort?.toString().orEmpty()}"
         scope.launch {
             lifecycleMutex.withLock {
-                pendingStopJob?.cancel()
-                pendingStopJob = null
                 if (refreshJob?.isActive == true && activeKey == key) {
                     return@withLock
                 }
@@ -65,8 +62,6 @@ object AndroidMirrorScreenRemoteKeeper {
     fun stop(reason: String) {
         scope.launch {
             lifecycleMutex.withLock {
-                pendingStopJob?.cancel()
-                pendingStopJob = null
                 val key = activeKey
                 activeKey = null
                 refreshJob?.cancelAndJoin()
@@ -75,23 +70,6 @@ object AndroidMirrorScreenRemoteKeeper {
                     EdgeLinkLog.info(
                         "xiaomi.mirror.android.screen_remote_keeper_stop peer=$key reason=$reason"
                     )
-                }
-            }
-        }
-    }
-
-    fun stopAfterGrace(reason: String, graceMs: Long) {
-        scope.launch {
-            lifecycleMutex.withLock {
-                val key = activeKey ?: return@withLock
-                pendingStopJob?.cancel()
-                EdgeLinkLog.info(
-                    "xiaomi.mirror.android.screen_remote_keeper_stop_scheduled " +
-                        "peer=$key reason=$reason graceMs=$graceMs"
-                )
-                pendingStopJob = scope.launch {
-                    delay(graceMs)
-                    stop("$reason:grace_expired")
                 }
             }
         }

@@ -42,7 +42,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val OFFICIAL_RTSP_AUTH_KEY_TYPE = "3"
     private const val OFFICIAL_RTSP_AUTH_ALGORITHM_TYPES = "7"
     private const val OFFICIAL_RTSP_PREFERRED_AUTH_ALGORITHM_VAL = "4"
-    private const val SCREEN_STOP_GRACE_MS = 120_000L
+    private const val SOURCE_TEARDOWN_TIMEOUT_MS = 1_500L
     private val OFFICIAL_SCREEN_AUTH_KEY = "EdgeLinkMirrorK!".toByteArray(Charsets.UTF_8)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -50,7 +50,6 @@ object AndroidMiLinkMirrorMediaBridge {
     private var activeJob: Job? = null
     private var activeSessionId: String? = null
     private var activeSession: MirrorMediaBridgeSession? = null
-    private var pendingStopJob: Job? = null
 
     fun start(
         request: AndroidMiLinkMirrorCloudBridgeRequest,
@@ -62,8 +61,6 @@ object AndroidMiLinkMirrorMediaBridge {
             .distinct()
         scope.launch {
             lifecycleMutex.withLock {
-                pendingStopJob?.cancel()
-                pendingStopJob = null
                 val existing = activeSession
                 if (existing != null && activeJob?.isActive == true) {
                     if (activeSessionId == sessionId) {
@@ -96,37 +93,21 @@ object AndroidMiLinkMirrorMediaBridge {
     fun stop(reason: String) {
         scope.launch {
             lifecycleMutex.withLock {
-                pendingStopJob?.cancel()
-                pendingStopJob = null
                 val sessionId = activeSessionId
+                val session = activeSession
                 activeSessionId = null
                 activeSession = null
+                if (session != null) {
+                    kotlinx.coroutines.withTimeoutOrNull(SOURCE_TEARDOWN_TIMEOUT_MS) {
+                        session.sendSourceTeardown(reason)
+                    }
+                }
                 activeJob?.cancelAndJoin()
                 activeJob = null
                 if (sessionId != null) {
                     EdgeLinkLog.info(
                         "xiaomi.mirror.android.cloudflare_bridge_stop sessionId=$sessionId reason=$reason"
                     )
-                }
-            }
-        }
-    }
-
-    fun stopAfterGrace(reason: String, graceMs: Long = SCREEN_STOP_GRACE_MS) {
-        scope.launch {
-            lifecycleMutex.withLock {
-                val sessionId = activeSessionId ?: return@withLock
-                if (activeJob?.isActive != true) {
-                    return@withLock
-                }
-                pendingStopJob?.cancel()
-                EdgeLinkLog.info(
-                    "xiaomi.mirror.android.cloudflare_bridge_stop_scheduled " +
-                        "sessionId=$sessionId reason=$reason graceMs=$graceMs"
-                )
-                pendingStopJob = scope.launch {
-                    delay(graceMs)
-                    stop("$reason:grace_expired")
                 }
             }
         }
@@ -170,7 +151,41 @@ object AndroidMiLinkMirrorMediaBridge {
             sessionId = newSessionId
             sendMedia = newSendMedia
         }
+
+        suspend fun sendSourceTeardown(reason: String) {
+            val uri = presentationURL ?: return
+            if (!sentPLAY || socket == null || writer == null) {
+                return
+            }
+            runCatching {
+                sendRTSPRequest(
+                    method = "SET_PARAMETER",
+                    uri = uri,
+                    headers = listOfNotNull(
+                        sessionHeader?.let { "Session" to it },
+                        "Content-Type" to "text/parameters"
+                    ),
+                    body = "wfd_trigger_method: TEARDOWN\r\n",
+                    label = "teardown_trigger"
+                )
+                sendRTSPRequest(
+                    method = "TEARDOWN",
+                    uri = uri,
+                    headers = listOfNotNull(sessionHeader?.let { "Session" to it }),
+                    label = "TEARDOWN"
+                )
+                EdgeLinkLog.info(
+                    "xiaomi.mirror.android.cloudflare_rtsp_teardown_sent sessionId=$sessionId reason=$reason"
+                )
+            }.onFailure { error ->
+                EdgeLinkLog.info(
+                    "xiaomi.mirror.android.cloudflare_rtsp_teardown_failed sessionId=$sessionId " +
+                        "reason=$reason error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
+        }
         private val pendingRequests = mutableMapOf<String, String>()
+        private val rtspWriteMutex = Mutex()
         private val rtspCharset: Charset = Charsets.ISO_8859_1
         private var socket: Socket? = null
         private var writer: BufferedWriter? = null
@@ -751,10 +766,12 @@ object AndroidMiLinkMirrorMediaBridge {
                 "xiaomi.mirror.android.cloudflare_rtsp_message sessionId=$sessionId dir=out " +
                     "firstLine=${firstLine.forRTSPLog()} label=$label bytes=${message.toByteArray(rtspCharset).size}"
             )
-            withContext(Dispatchers.IO) {
-                val activeWriter = checkNotNull(writer)
-                activeWriter.write(message)
-                activeWriter.flush()
+            rtspWriteMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    val activeWriter = checkNotNull(writer)
+                    activeWriter.write(message)
+                    activeWriter.flush()
+                }
             }
         }
 
