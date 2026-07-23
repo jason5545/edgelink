@@ -24,6 +24,7 @@ import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
 import com.edgelink.core.LocalIdentity
 import com.edgelink.core.MiLinkCommandBody
+import com.edgelink.core.MiLinkCommandResultBody
 import com.edgelink.core.MiLinkFrameBody
 import com.edgelink.core.MiLinkMirrorMediaBody
 import com.edgelink.core.MiLinkStatusBody
@@ -93,6 +94,8 @@ private const val PONG_TIMEOUT_MS = 15_000L
 private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
 private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
+private const val MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
+private const val MILINK_COMMAND_MIRROR_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
 private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
@@ -162,6 +165,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val miLinkCommandBridge = AndroidMiLinkCommandBridge(appContext) { request ->
         startMiLinkMirrorCloudBridge(request)
     }
+    private val miLinkScreenPowerGuard = AndroidScreenPowerGuard(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
     }
@@ -218,6 +222,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onScreenStartReceived = {
             ensureTurnCredentials("screen_start")
+        },
+        onScreenStopReceived = {
+            stopMiLinkScreenPowerGuard()
+        },
+        onMiLinkCommandResult = { body, result ->
+            handleMiLinkCommandResult(body, result)
         },
         onPhoneActionReceived = { body ->
             if (body.action == "dial" || body.action == "answer") {
@@ -632,6 +642,24 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    private fun handleMiLinkCommandResult(body: MiLinkCommandBody, result: MiLinkCommandResultBody) {
+        if (!result.success) {
+            return
+        }
+        when (body.command) {
+            MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY,
+            MILINK_COMMAND_MIRROR_SOURCE_RECOVERY -> scope.launch {
+                miLinkScreenPowerGuard.onSharingStarted()
+            }
+        }
+    }
+
+    private fun stopMiLinkScreenPowerGuard() {
+        scope.launch {
+            miLinkScreenPowerGuard.onSharingStopped()
+        }
+    }
+
     override fun onPointer(body: InputPointerBody) {
         sendEnvelope(EnvelopeTypes.INPUT_POINTER, body)
     }
@@ -745,6 +773,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         session = null
         AndroidMiLinkMirrorMediaBridge.stop("disconnect")
         AndroidMirrorScreenRemoteKeeper.stop("disconnect")
+        stopMiLinkScreenPowerGuard()
         screenSession.stop()
         stateFlow.update {
             it.copy(
@@ -1458,6 +1487,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         connectionJob?.cancel()
         AndroidMiLinkMirrorMediaBridge.stop("connection_restart")
         AndroidMirrorScreenRemoteKeeper.stop("connection_restart")
+        stopMiLinkScreenPowerGuard()
         screenSession.stop()
         session?.close()
         session = null
@@ -1610,6 +1640,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 // (stock startShare cannot revive the fake remote). The bridge
                 // send closure no-ops while session is null and re-binds on
                 // the next startMainDisplay.
+                stopMiLinkScreenPowerGuard()
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
                 val sleepSuppressed = macSleepSuppressed && autoReconnect
@@ -1819,6 +1850,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun handleMacSleep() {
         EdgeLinkLog.info("relay.android.mac_sleep_received")
         macSleepSuppressed = true
+        stopMiLinkScreenPowerGuard()
         session?.close()
         stateFlow.update {
             it.copy(
@@ -2110,6 +2142,8 @@ private class AndroidCommandDispatcher(
     private val onPong: () -> Unit,
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
+    private val onScreenStopReceived: () -> Unit,
+    private val onMiLinkCommandResult: (MiLinkCommandBody, MiLinkCommandResultBody) -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
     private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit,
     private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit,
@@ -2178,6 +2212,7 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.MILINK_COMMAND -> {
                 val envelope = EnvelopeCodec.decode<MiLinkCommandBody>(plaintext)
                 val result = miLinkCommandBridge.handle(envelope.b)
+                onMiLinkCommandResult(envelope.b, result)
                 EnvelopeCodec.encode(EnvelopeTypes.MILINK_COMMAND_RESULT, result)
             }
             EnvelopeTypes.SCREEN_START -> {
@@ -2188,6 +2223,7 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.SCREEN_STOP -> {
                 AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
                 AndroidMirrorScreenRemoteKeeper.stop("screen_stop")
+                onScreenStopReceived()
                 screenSession.stop()
                 null
             }
