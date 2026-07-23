@@ -43,6 +43,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 internal object MiLinkPrivilegeHookPolicy {
     const val EDGE_LINK_PACKAGE = "com.edgelink.app"
@@ -2215,9 +2219,58 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             } else {
                 emptyList()
             }
-            "rightUp", "wheel" -> emptyList()
+            "rightUp" -> emptyList()
+            "wheel" -> buildXiaomiMirrorWheelReports(
+                wheelDy = wheelDy,
+                x = x,
+                y = y,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                pointerX = pointerX,
+                pointerY = pointerY
+            )
             else -> emptyList()
         }
+    }
+
+    private fun buildXiaomiMirrorWheelReports(
+        wheelDy: Int,
+        x: Int,
+        y: Int,
+        screenWidth: Int,
+        screenHeight: Int,
+        pointerX: Int,
+        pointerY: Int
+    ): List<ByteArray> {
+        if (wheelDy == 0 || screenWidth <= 1 || screenHeight <= 1) {
+            return emptyList()
+        }
+        xiaomiMirrorPointerButtonMask = 0x00
+        val distance = min(720f, max(96f, abs(wheelDy).toFloat() * 2.6f))
+        val direction = if (wheelDy > 0) 1f else -1f
+        val startX = x.coerceIn(0, screenWidth - 1)
+        val startY = y.coerceIn(0, screenHeight - 1)
+        val endY = (startY + distance * direction).coerceIn(0f, (screenHeight - 1).toFloat())
+        val reports = ArrayList<ByteArray>(XIAOMI_MIRROR_WHEEL_STEPS + 2)
+        reports.add(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
+        for (step in 1..XIAOMI_MIRROR_WHEEL_STEPS) {
+            val stepY = (startY + (endY - startY) * step / XIAOMI_MIRROR_WHEEL_STEPS).roundToInt()
+            reports.add(
+                xiaomiMirrorTouchReport(
+                    touching = true,
+                    xiaomiMirrorPointerAxis(startX, screenWidth),
+                    xiaomiMirrorPointerAxis(stepY, screenHeight)
+                )
+            )
+        }
+        reports.add(
+            xiaomiMirrorTouchReport(
+                touching = false,
+                pointerX,
+                xiaomiMirrorPointerAxis(endY.roundToInt(), screenHeight)
+            )
+        )
+        return reports
     }
 
     private fun xiaomiMirrorPointerAxis(value: Int, size: Int): Int {
@@ -7078,6 +7131,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_POINTER_REPORT_ID = 2
         private const val XIAOMI_MIRROR_GLOBAL_REPORT_ID = 3
         private const val XIAOMI_MIRROR_POINTER_AXIS_MAX = 32_767
+        private const val XIAOMI_MIRROR_WHEEL_STEPS = 6
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_MAX = 0x03ff
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_HOME = 0x0223
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_BACK = 0x0224
