@@ -451,6 +451,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 args: args
             )
             if let requestId {
+                if let cloudflareMirrorSessionId {
+                    xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+                        sessionId: cloudflareMirrorSessionId,
+                        lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+                        reason: "screen_route_start"
+                    )
+                }
                 armPendingXiaomiScreenCommand(
                     requestId: requestId,
                     command: command,
@@ -1406,6 +1413,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 sourceSessionID: event.sessionID,
                 reason: event.reason
             )
+            if let cloudflareMirrorSessionId {
+                xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+                    sessionId: cloudflareMirrorSessionId,
+                    lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+                    reason: "screen_recovery_session_rebuild"
+                )
+            }
             armPendingXiaomiScreenCommand(
                 requestId: requestId,
                 command: command,
@@ -1552,6 +1566,13 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info("xiaomi.mac.screen_recovery_state_reset reason=\(reason)")
     }
 
+    private static func xiaomiScreenSourceRecoveryCooldown(forDecodedFrames decodedFrames: UInt64?) -> TimeInterval {
+        guard let decodedFrames, decodedFrames >= xiaomiScreenStartupDecodedFrameThreshold else {
+            return xiaomiScreenSourceRecoveryStartupCooldownSeconds
+        }
+        return xiaomiScreenSourceRecoveryCooldownSeconds
+    }
+
     private func shouldSuppressXiaomiScreenSourceRecoveryForCooldown(
         event: XiaomiMirrorRTSPRecoveryEvent,
         phase: String
@@ -1582,12 +1603,13 @@ final class EdgeLinkRuntime: ObservableObject {
             return true
         }
         let now = Date()
+        let cooldownSeconds = Self.xiaomiScreenSourceRecoveryCooldown(forDecodedFrames: event.decodedFrames)
         let elapsed = now.timeIntervalSince(xiaomiScreenLastSourceRecoveryAt)
         guard elapsed >= 0,
-              elapsed < Self.xiaomiScreenSourceRecoveryCooldownSeconds else {
+              elapsed < cooldownSeconds else {
             return false
         }
-        let remainingMs = Int((Self.xiaomiScreenSourceRecoveryCooldownSeconds - elapsed) * 1_000)
+        let remainingMs = Int((cooldownSeconds - elapsed) * 1_000)
         let reason = xiaomiScreenLastSourceRecoverySessionID == event.sessionID ? "source_cooldown_same_session" : "source_cooldown"
         DiagnosticsLog.info(
             "xiaomi.mac.screen_recovery_suppressed reason=\(reason) phase=\(phase) " +
@@ -1614,7 +1636,7 @@ final class EdgeLinkRuntime: ObservableObject {
             "xiaomi.mac.screen_recovery_source_cooldown_started requestId=\(requestId) " +
                 "sourceSession=\(sourceSessionID.uuidString) reason=\(reason) " +
                 "decodedFrames=\(decodedFrames) " +
-                "cooldownMs=\(Int(Self.xiaomiScreenSourceRecoveryCooldownSeconds * 1_000))"
+                "cooldownMs=\(Int(Self.xiaomiScreenSourceRecoveryCooldown(forDecodedFrames: decodedFrames) * 1_000))"
         )
     }
 
@@ -1626,8 +1648,11 @@ final class EdgeLinkRuntime: ObservableObject {
             return true
         }
         if event.reason == "no_packets_beyond_6s" {
+            let mediaGate = event.decodedFrames < Self.xiaomiScreenStartupDecodedFrameThreshold
+                ? Self.xiaomiScreenSessionRebuildStartupNoPacketSeconds
+                : Self.xiaomiScreenSessionRebuildAfterNoPacketSeconds
             return attempt > xiaomiScreenSourceRecoveryMaxAttempts &&
-                event.elapsedMediaSeconds >= xiaomiScreenSessionRebuildAfterNoPacketSeconds
+                event.elapsedMediaSeconds >= mediaGate
         }
         if Self.isXiaomiScreenFrameStall(event.reason) {
             return shouldEscalateXiaomiScreenFrameStallToSessionRebuild(event)
@@ -3665,7 +3690,10 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSourceRecoveryMaxAttempts = 2
     private static let xiaomiScreenSessionRebuildAfterNoFrameSeconds: Double = 18
     private static let xiaomiScreenSessionRebuildAfterNoPacketSeconds: Double = 30
+    private static let xiaomiScreenSessionRebuildStartupNoPacketSeconds: Double = 10
     private static let xiaomiScreenSourceRecoveryCooldownSeconds: TimeInterval = 10
+    private static let xiaomiScreenSourceRecoveryStartupCooldownSeconds: TimeInterval = 3
+    private static let xiaomiScreenStartupDecodedFrameThreshold: UInt64 = 300
     private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 45
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let phoneRelayDebugDefaultNumber = "800"

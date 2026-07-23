@@ -95,6 +95,7 @@ private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
 private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
 private const val MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
+private const val SCREEN_MIRROR_BRIDGE_STOP_GRACE_MS = 120_000L
 private const val MILINK_COMMAND_MIRROR_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
@@ -2221,8 +2222,8 @@ private class AndroidCommandDispatcher(
                 null
             }
             EnvelopeTypes.SCREEN_STOP -> {
-                AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
-                AndroidMirrorScreenRemoteKeeper.stop("screen_stop")
+                AndroidMiLinkMirrorMediaBridge.stopAfterGrace("screen_stop", SCREEN_MIRROR_BRIDGE_STOP_GRACE_MS)
+                AndroidMirrorScreenRemoteKeeper.stopAfterGrace("screen_stop", SCREEN_MIRROR_BRIDGE_STOP_GRACE_MS)
                 onScreenStopReceived()
                 screenSession.stop()
                 null

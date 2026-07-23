@@ -1766,7 +1766,7 @@ class AndroidMiLinkCommandBridge(
         const val mirrorIconClickProviderDeadlineMs = 2_000L
         const val mirrorBtMacFallbackDelayMs = 3_000L
         const val mirrorNativeShortcutProviderDeadlineMs = 8_000L
-        const val mirrorFakeScreenProviderQuickDeadlineMs = 4_000L
+        const val mirrorFakeScreenProviderQuickDeadlineMs = 2_000L
         const val mirrorSourceRecoveryProviderDeadlineMs = 1_500L
         const val mirrorKeyboardProviderDeadlineMs = 800L
         const val KEY_BT_MAC = "bt_mac"

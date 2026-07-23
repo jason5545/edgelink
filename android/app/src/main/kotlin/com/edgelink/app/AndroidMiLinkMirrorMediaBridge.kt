@@ -42,6 +42,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val OFFICIAL_RTSP_AUTH_KEY_TYPE = "3"
     private const val OFFICIAL_RTSP_AUTH_ALGORITHM_TYPES = "7"
     private const val OFFICIAL_RTSP_PREFERRED_AUTH_ALGORITHM_VAL = "4"
+    private const val SCREEN_STOP_GRACE_MS = 120_000L
     private val OFFICIAL_SCREEN_AUTH_KEY = "EdgeLinkMirrorK!".toByteArray(Charsets.UTF_8)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -49,6 +50,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private var activeJob: Job? = null
     private var activeSessionId: String? = null
     private var activeSession: MirrorMediaBridgeSession? = null
+    private var pendingStopJob: Job? = null
 
     fun start(
         request: AndroidMiLinkMirrorCloudBridgeRequest,
@@ -60,6 +62,8 @@ object AndroidMiLinkMirrorMediaBridge {
             .distinct()
         scope.launch {
             lifecycleMutex.withLock {
+                pendingStopJob?.cancel()
+                pendingStopJob = null
                 val existing = activeSession
                 if (existing != null && activeJob?.isActive == true) {
                     if (activeSessionId == sessionId) {
@@ -92,6 +96,8 @@ object AndroidMiLinkMirrorMediaBridge {
     fun stop(reason: String) {
         scope.launch {
             lifecycleMutex.withLock {
+                pendingStopJob?.cancel()
+                pendingStopJob = null
                 val sessionId = activeSessionId
                 activeSessionId = null
                 activeSession = null
@@ -101,6 +107,26 @@ object AndroidMiLinkMirrorMediaBridge {
                     EdgeLinkLog.info(
                         "xiaomi.mirror.android.cloudflare_bridge_stop sessionId=$sessionId reason=$reason"
                     )
+                }
+            }
+        }
+    }
+
+    fun stopAfterGrace(reason: String, graceMs: Long = SCREEN_STOP_GRACE_MS) {
+        scope.launch {
+            lifecycleMutex.withLock {
+                val sessionId = activeSessionId ?: return@withLock
+                if (activeJob?.isActive != true) {
+                    return@withLock
+                }
+                pendingStopJob?.cancel()
+                EdgeLinkLog.info(
+                    "xiaomi.mirror.android.cloudflare_bridge_stop_scheduled " +
+                        "sessionId=$sessionId reason=$reason graceMs=$graceMs"
+                )
+                pendingStopJob = scope.launch {
+                    delay(graceMs)
+                    stop("$reason:grace_expired")
                 }
             }
         }
