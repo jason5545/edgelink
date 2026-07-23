@@ -1575,7 +1575,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 coroutineScope {
                     val pingJob = launch { pingLoop(nextSession) }
                     val clipboardJob = launch { clipboardLoop(nextSession) }
-                    val smsPendingJob = launch { drainPendingSms(nextSession, identity, reason = "connected") }
+                    val smsSyncJob = launch {
+                        val backfilledKeys = runSmsBackfill(nextSession, identity)
+                        drainPendingSms(nextSession, identity, reason = "connected", skipKeys = backfilledKeys)
+                    }
                     val miLinkStatusJob = launch {
                         refreshAndSendMiLinkStatus(nextSession, identity, reason = "connected")
                     }
@@ -1585,7 +1588,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     } finally {
                         pingJob.cancelAndJoin()
                         clipboardJob.cancelAndJoin()
-                        smsPendingJob.cancelAndJoin()
+                        smsSyncJob.cancelAndJoin()
                         miLinkStatusJob.cancelAndJoin()
                         miLinkMessengerJob.cancelAndJoin()
                     }
@@ -1896,24 +1899,55 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private suspend fun drainPendingSms(
         activeSession: SecureSessionClient,
         identity: LocalIdentity,
-        reason: String
+        reason: String,
+        skipKeys: Set<String> = emptySet()
     ) {
         runCatching {
             val pending = smsSync.pendingBroadcastMessages(sourceDeviceId = identity.deviceId)
             if (pending.isEmpty()) {
                 return@runCatching
             }
+            val (covered, toSend) = pending.partition { smsDedupKey(it) in skipKeys }
+            if (covered.isNotEmpty()) {
+                smsSync.acknowledgePendingBroadcasts(covered.map { it.id })
+                EdgeLinkLog.info("sms.android.pending_covered_by_backfill count=${covered.size} reason=$reason")
+            }
             var sent = 0
-            for (body in pending) {
+            for (body in toSend) {
                 activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SMS_MESSAGE, body))
                 smsSync.acknowledgePendingBroadcasts(listOf(body.id))
                 sent += 1
             }
-            EdgeLinkLog.info("sms.android.pending_sent count=$sent reason=$reason")
+            if (sent > 0) {
+                EdgeLinkLog.info("sms.android.pending_sent count=$sent reason=$reason")
+            }
         }.onFailure { error ->
             EdgeLinkLog.error("sms.android.pending_send_failed reason=$reason", error)
         }
     }
+
+    private suspend fun runSmsBackfill(activeSession: SecureSessionClient, identity: LocalIdentity): Set<String> {
+        return runCatching {
+            val batch = smsSync.backfillInbox(sourceDeviceId = identity.deviceId)
+            if (batch.messages.isEmpty()) {
+                return@runCatching emptySet()
+            }
+            var sent = 0
+            for (body in batch.messages) {
+                activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.SMS_MESSAGE, body))
+                sent += 1
+            }
+            batch.marker?.let(smsSync::saveMarkerIfNewer)
+            EdgeLinkLog.info("sms.android.backfill_sent count=$sent")
+            batch.messages.mapTo(mutableSetOf()) { smsDedupKey(it) }
+        }.getOrElse { error ->
+            EdgeLinkLog.error("sms.android.backfill_failed", error)
+            emptySet()
+        }
+    }
+
+    private fun smsDedupKey(body: SmsMessageBody): String =
+        "${body.address}|${body.ts}|${body.text}"
 
     private suspend fun sendLatestMiLinkStatus(activeSession: SecureSessionClient, identity: LocalIdentity) {
         val status = latestMiLinkStatus ?: return

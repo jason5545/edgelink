@@ -63,10 +63,10 @@ class AndroidSmsSync(
 
     fun backfillInbox(sourceDeviceId: String?): SmsBackfillBatch {
         if (!readAccessGranted()) {
+            EdgeLinkLog.info("sms.android.backfill_skipped reason=read_not_granted")
             return SmsBackfillBatch(emptyList(), null)
         }
 
-        val marker = currentMarker()
         val rows = mutableListOf<SmsRow>()
         val projection = arrayOf(
             BaseColumns._ID,
@@ -74,30 +74,15 @@ class AndroidSmsSync(
             Telephony.Sms.BODY,
             Telephony.Sms.DATE
         )
-        val hasMarker = marker.dateMs > 0L
-        val selection = if (hasMarker) {
-            "(${Telephony.Sms.DATE} > ?) OR (${Telephony.Sms.DATE} = ? AND ${BaseColumns._ID} > ?)"
-        } else {
-            null
-        }
-        val selectionArgs = if (hasMarker) {
-            arrayOf(marker.dateMs.toString(), marker.dateMs.toString(), marker.rowId.toString())
-        } else {
-            null
-        }
-        val sortOrder = if (hasMarker) {
-            "${Telephony.Sms.DATE} ASC, ${BaseColumns._ID} ASC"
-        } else {
-            "${Telephony.Sms.DATE} DESC, ${BaseColumns._ID} DESC"
-        }
 
         appContext.contentResolver.query(
             Telephony.Sms.Inbox.CONTENT_URI,
             projection,
-            selection,
-            selectionArgs,
-            sortOrder
+            null,
+            null,
+            "${Telephony.Sms.DATE} DESC, ${BaseColumns._ID} DESC"
         )?.use { cursor ->
+            EdgeLinkLog.info("sms.android.backfill_query cursorCount=${cursor.count}")
             val idIndex = cursor.getColumnIndexOrThrow(BaseColumns._ID)
             val addressIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
             val bodyIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)
@@ -115,7 +100,7 @@ class AndroidSmsSync(
             }
         }
 
-        val orderedRows = if (hasMarker) rows else rows.asReversed()
+        val orderedRows = rows.asReversed()
         val bodies = orderedRows.map { row ->
             SmsMessageBody(
                 id = "sms:inbox:${row.rowId}",
@@ -128,7 +113,7 @@ class AndroidSmsSync(
                 ts = row.dateMs / 1000
             )
         }
-        val nextMarker = orderedRows.lastOrNull()?.let { SmsMarker(dateMs = it.dateMs, rowId = it.rowId) }
+        val nextMarker = rows.firstOrNull()?.let { SmsMarker(dateMs = it.dateMs, rowId = it.rowId) }
         return SmsBackfillBatch(bodies, nextMarker)
     }
 

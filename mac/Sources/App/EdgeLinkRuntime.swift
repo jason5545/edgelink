@@ -2961,7 +2961,13 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func handleSmsMessage(_ message: SmsMessageBody) {
-        smsMessages.removeAll { $0.id == message.id }
+        smsMessages.removeAll { existing in
+            existing.id == message.id ||
+                (existing.address == message.address &&
+                    existing.text == message.text &&
+                    existing.direction == message.direction &&
+                    abs(existing.ts - message.ts) <= 300)
+        }
         smsMessages.insert(message, at: 0)
 
         DiagnosticsLog.info("sms.mac.message_received id=\(message.id) addressFp=\(Self.fingerprint(message.address)) backfill=\(message.isBackfill)")
