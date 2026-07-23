@@ -1901,9 +1901,29 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) &&
                             shouldForceMirrorScreenTerminalPresent()
                         ) {
+                            // The fake remote has no stock peer to negotiate
+                            // with, so the stock startShare hangs ~15s and
+                            // returns enable=false. Arm the route, kick the
+                            // encoder, and answer locally instead.
                             closeStaleFakeMirrorControlSource("provider_start_share")
+                            armFakeMirrorSourceRouteWindow()
+                            val shareSourceResult = requestFakeMirrorSourceIDR("provider_start_share")
+                            val shareCodecResult = requestLiveMirrorHEVCEncoderSync("provider_start_share")
+                            scheduleFakeMirrorSourceIDRBurst("provider_start_share")
+                            log(
+                                "mirror startShare answered locally " +
+                                    "$shareSourceResult $shareCodecResult"
+                            )
+                            param.result = Bundle().apply {
+                                putBoolean("enable", true)
+                                putInt("value", 0)
+                                putBoolean("edgelinkRecoveryAccepted", true)
+                                putString("recoveryMethod", "startShare")
+                                putString("recoveryResult", "$shareSourceResult $shareCodecResult")
+                            }
+                            return
                         }
-                        if ((!edgeLinkRecoveryMethod && !startShareRecovery) ||
+                        if (!edgeLinkRecoveryMethod ||
                             !extras.booleanCompat("recovery") ||
                             !MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) ||
                             !shouldForceMirrorScreenTerminalPresent()

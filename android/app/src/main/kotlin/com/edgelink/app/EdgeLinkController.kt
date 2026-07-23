@@ -1580,8 +1580,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 }
                 EdgeLinkLog.error("relay.android.disconnected hostId=${peer.deviceId} clientId=${identity.deviceId}", error)
                 session = null
-                AndroidMiLinkMirrorMediaBridge.stop("relay_disconnected")
-                AndroidMirrorScreenRemoteKeeper.stop("relay_disconnected")
+                // Keep the local mirror bridge and keeper alive across relay
+                // reconnects: they own the local RTSP session to the Xiaomi
+                // capture source, and tearing it down wedges the encoder
+                // (stock startShare cannot revive the fake remote). The bridge
+                // send closure no-ops while session is null and re-binds on
+                // the next startMainDisplay.
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
                 val sleepSuppressed = macSleepSuppressed && autoReconnect
