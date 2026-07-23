@@ -1901,12 +1901,20 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) &&
                             shouldForceMirrorScreenTerminalPresent()
                         ) {
+                            closeStaleFakeMirrorControlSource("provider_start_share")
+                            armFakeMirrorSourceRouteWindow()
+                            if (lastFakeMirrorControlSource == null) {
+                                // No live source yet: only the stock share
+                                // flow constructs MirrorControlSource, so let
+                                // it run once (its result is unreliable, the
+                                // created source is what matters).
+                                log("mirror startShare deferred to stock: no live source")
+                                return
+                            }
                             // The fake remote has no stock peer to negotiate
                             // with, so the stock startShare hangs ~15s and
                             // returns enable=false. Arm the route, kick the
                             // encoder, and answer locally instead.
-                            closeStaleFakeMirrorControlSource("provider_start_share")
-                            armFakeMirrorSourceRouteWindow()
                             val shareSourceResult = requestFakeMirrorSourceIDR("provider_start_share")
                             val shareCodecResult = requestLiveMirrorHEVCEncoderSync("provider_start_share")
                             scheduleFakeMirrorSourceIDRBurst("provider_start_share")
