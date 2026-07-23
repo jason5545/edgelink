@@ -29,7 +29,7 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 actions: [
                     UNNotificationAction(
                         identifier: Self.copyVerificationCodeActionIdentifier,
-                        title: "複製",
+                        title: String(localized: "複製"),
                         options: []
                     )
                 ],
@@ -128,7 +128,7 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 }
 
                 let content = UNMutableNotificationContent()
-                content.title = "驗證碼 \(candidate.displayCode)"
+                content.title = String(localized: "驗證碼 \(candidate.displayCode)")
                 content.subtitle = message.address
                 content.body = Self.verificationNotificationBody(candidate: candidate, message: message)
                 content.sound = .default

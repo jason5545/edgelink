@@ -2,6 +2,7 @@ name: EdgeLink
 options:
   deploymentTarget:
     macOS: "13.0"
+  developmentLanguage: zh-Hant
 packages:
   WebRTC:
     url: https://github.com/stasel/WebRTC.git

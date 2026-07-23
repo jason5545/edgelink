@@ -186,7 +186,7 @@ final class MacIncomingCallPresenter {
             return displayName
         }
         let handle = status.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return handle.isEmpty ? "未知來電" : handle
+        return handle.isEmpty ? String(localized: "未知來電") : handle
     }
 
     private static func callerDetail(for status: PhoneCallStatusBody) -> String {
@@ -195,7 +195,7 @@ final class MacIncomingCallPresenter {
         if !handle.isEmpty, handle != name {
             return "iPhone • \(handle)"
         }
-        return "iPhone 行動電話"
+        return String(localized: "iPhone 行動電話")
     }
 
     private static func logSafe(_ value: String) -> String {
@@ -221,8 +221,8 @@ final class MacIncomingCallPresenter {
 
 @MainActor
 private final class IncomingCallViewModel: ObservableObject {
-    @Published var callerName = "未知來電"
-    @Published var callerDetail = "iPhone 行動電話"
+    @Published var callerName = String(localized: "未知來電")
+    @Published var callerDetail = String(localized: "iPhone 行動電話")
     @Published var canAnswer = true
     @Published var canDecline = true
     var onAnswer: (() -> Void)?
@@ -273,14 +273,14 @@ private struct IncomingCallBanner: View {
 
             HStack(spacing: 10) {
                 CallActionButton(
-                    title: "拒絕",
+                    title: String(localized: "拒絕"),
                     systemImage: "phone.down.fill",
                     color: Color(nsColor: .systemRed),
                     isEnabled: model.canDecline,
                     action: { model.onDecline?() }
                 )
                 CallActionButton(
-                    title: "接聽",
+                    title: String(localized: "接聽"),
                     systemImage: "phone.fill",
                     color: Color(nsColor: .systemGreen),
                     isEnabled: model.canAnswer,

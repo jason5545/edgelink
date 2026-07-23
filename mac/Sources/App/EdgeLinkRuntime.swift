@@ -50,7 +50,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var xiaomiMiLinkCommandStatus = ""
     @Published private(set) var xiaomiHyperConnectAvailable = XiaomiHyperConnectBridge.isInstalled
-    @Published private(set) var xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：準備中"
+    @Published private(set) var xiaomiMiShareDiscoveryStatus = String(localized: "小米快傳 discovery：準備中")
     @Published private(set) var xiaomiMiSharePublishedDeviceId = ""
     @Published private(set) var xiaomiMiShareDiscoveredPeers: [XiaomiMiShareDiscoveredPeer] = []
     @Published private(set) var isPhoneScreenSessionActive = false
@@ -360,7 +360,7 @@ final class EdgeLinkRuntime: ObservableObject {
         if xiaomiScreenRoute?.hasPrefix("xiaomi.") == true || screenSession.isUsingXiaomiMirrorRoute {
             guard Self.allowXiaomiScreenPrimaryRoute else {
                 screenSession.setXiaomiMirrorRouteActive(false)
-                xiaomiMiLinkCommandStatus = "小米鏡像已停用"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像已停用")
                 DiagnosticsLog.warn(
                     "xiaomi.mac.screen_no_fallback route=\(xiaomiScreenRoute ?? "unknown") " +
                         "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
@@ -374,7 +374,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             if let pending = pendingXiaomiScreenFallback {
                 screenSession.setXiaomiMirrorRouteActive(true)
-                xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像啟動中")
                 DiagnosticsLog.info(
                     "xiaomi.mac.screen_start_gate reason=pending requestId=\(pending.requestId) " +
                         "route=\(pending.route) elapsedMs=\(pending.elapsedMs)"
@@ -383,7 +383,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             if xiaomiScreenRecoveryTask != nil {
                 screenSession.setXiaomiMirrorRouteActive(true)
-                xiaomiMiLinkCommandStatus = "小米鏡像恢復中"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像恢復中")
                 DiagnosticsLog.info(
                     "xiaomi.mac.screen_start_gate reason=recovering " +
                         "attempt=\(xiaomiScreenRecoveryAttempt)"
@@ -464,7 +464,7 @@ final class EdgeLinkRuntime: ObservableObject {
             activeXiaomiMirrorCloudflareSessionId = nil
             xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "screen_command_failed")
             DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")")
-            xiaomiMiLinkCommandStatus = "小米鏡像指令未送出"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像指令未送出")
             return
         }
         screenSession.setXiaomiMirrorRouteActive(false)
@@ -475,7 +475,7 @@ final class EdgeLinkRuntime: ObservableObject {
         guard deferredViewPhoneScreenTask == nil else {
             return
         }
-        xiaomiMiLinkCommandStatus = "等待小米鏡像路由…"
+        xiaomiMiLinkCommandStatus = String(localized: "等待小米鏡像路由…")
         screenSession.showConnectingWindow()
         DiagnosticsLog.info("xiaomi.mac.screen_route_deferred reason=awaiting_milink_status")
         deferredViewPhoneScreenTask = Task { [weak self] in
@@ -522,7 +522,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
                 self.pendingXiaomiScreenFallbackTask = nil
                 self.pendingXiaomiScreenFallback = nil
-                self.xiaomiMiLinkCommandStatus = "小米鏡像未回應"
+                self.xiaomiMiLinkCommandStatus = String(localized: "小米鏡像未回應")
                 DiagnosticsLog.warn(
                     "xiaomi.mac.screen_no_fallback requestId=\(requestId) command=\(pending.command) " +
                         "route=\(pending.route) reason=timeout timeoutMs=\(pending.timeoutMs) " +
@@ -540,7 +540,7 @@ final class EdgeLinkRuntime: ObservableObject {
             preferredRoute: preferredScreenRoute
         )?.hasPrefix("xiaomi.") == true || screenSession.isUsingXiaomiMirrorRoute {
             screenSession.setXiaomiMirrorRouteActive(true)
-            xiaomiMiLinkCommandStatus = "小米鏡像路由中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像路由中")
             DiagnosticsLog.warn(
                 "screen.mac.webrtc_start_blocked reason=xiaomi_route_no_webrtc_fallback " +
                     "requestedReason=\(reason) preferredRoute=\(preferredScreenRoute ?? "unknown")"
@@ -671,11 +671,11 @@ final class EdgeLinkRuntime: ObservableObject {
         let recipient = rawRecipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !recipient.isEmpty, !text.isEmpty else {
-            smsSendStatus = "請填收件人與訊息"
+            smsSendStatus = String(localized: "請填收件人與訊息")
             return
         }
         guard let session = currentSession, isConnected else {
-            smsSendStatus = "SMS 目前不可用"
+            smsSendStatus = String(localized: "SMS 目前不可用")
             DiagnosticsLog.warn("sms.mac.send_ignored not_connected")
             return
         }
@@ -683,7 +683,7 @@ final class EdgeLinkRuntime: ObservableObject {
         let requestId = UUID().uuidString
         let body = SmsSendBody(requestId: requestId, to: recipient, text: text)
         pendingSmsSends[requestId] = body
-        smsSendStatus = "正在送出 SMS"
+        smsSendStatus = String(localized: "正在送出 SMS")
 
         Task {
             do {
@@ -693,7 +693,7 @@ final class EdgeLinkRuntime: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.pendingSmsSends.removeValue(forKey: requestId)
-                    self.smsSendStatus = "SMS 送出失敗"
+                    self.smsSendStatus = String(localized: "SMS 送出失敗")
                 }
                 DiagnosticsLog.error("sms.mac.send_request_failed requestId=\(requestId)", error)
             }
@@ -704,7 +704,7 @@ final class EdgeLinkRuntime: ObservableObject {
     func dialPhone(number rawNumber: String) -> String? {
         let number = rawNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !number.isEmpty else {
-            phoneCallStatus = "請填電話號碼"
+            phoneCallStatus = String(localized: "請填電話號碼")
             return nil
         }
         rememberDialedPhoneNumber(number)
@@ -729,11 +729,11 @@ final class EdgeLinkRuntime: ObservableObject {
     @discardableResult
     func sendPhoneDTMF(sequence rawSequence: String) -> String? {
         guard isPhoneCallActive else {
-            phoneCallStatus = "通話中才能送按鍵"
+            phoneCallStatus = String(localized: "通話中才能送按鍵")
             return nil
         }
         guard let sequence = Self.sanitizeDTMFSequence(rawSequence) else {
-            phoneCallStatus = "請輸入客服按鍵"
+            phoneCallStatus = String(localized: "請輸入客服按鍵")
             return nil
         }
         return sendPhoneAction(action: "dtmf", number: sequence)
@@ -745,8 +745,8 @@ final class EdgeLinkRuntime: ObservableObject {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.canCreateDirectories = false
-        panel.title = "小米快傳"
-        panel.prompt = "傳送"
+        panel.title = String(localized: "小米快傳")
+        panel.prompt = String(localized: "傳送")
         guard panel.runModal() == .OK else {
             return
         }
@@ -754,14 +754,14 @@ final class EdgeLinkRuntime: ObservableObject {
         guard let endpoint = xiaomiMiShareDiscovery.currentPhoneMeshEndpoint(),
               let deviceIdHex = xiaomiMiShareDiscovery.localDeviceIdHex
         else {
-            xiaomiMiLinkCommandStatus = "看不到手機，請確認手機已開啟小米快傳"
+            xiaomiMiLinkCommandStatus = String(localized: "看不到手機，請確認手機已開啟小米快傳")
             DiagnosticsLog.warn("xiaomi.mishare.send_no_phone_endpoint")
             if XiaomiHyperConnectBridge.isInstalled {
                 do {
                     try XiaomiHyperConnectBridge.openTransfer(fileURLs: panel.urls)
-                    xiaomiMiLinkCommandStatus = "已交給小米快傳"
+                    xiaomiMiLinkCommandStatus = String(localized: "已交給小米快傳")
                 } catch {
-                    xiaomiMiLinkCommandStatus = "小米快傳開啟失敗"
+                    xiaomiMiLinkCommandStatus = String(localized: "小米快傳開啟失敗")
                 }
             }
             return
@@ -777,12 +777,12 @@ final class EdgeLinkRuntime: ObservableObject {
         )
         session.onStatus = { [weak self] status in
             DispatchQueue.main.async {
-                self?.xiaomiMiLinkCommandStatus = "小米快傳：\(status)"
+                self?.xiaomiMiLinkCommandStatus = String(localized: "小米快傳：\(status)")
             }
         }
         lyraFileSendSession = session
         session.start()
-        xiaomiMiLinkCommandStatus = "小米快傳：連接手機…"
+        xiaomiMiLinkCommandStatus = String(localized: "小米快傳：連接手機…")
         DiagnosticsLog.info(
             "xiaomi.mishare.send_started to=\(endpoint.host):\(endpoint.port) files=\(files.count)"
         )
@@ -827,7 +827,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     func restartXiaomiMiShareDiscovery() {
         guard let localIdentity else {
-            xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：identity 尚未就緒"
+            xiaomiMiShareDiscoveryStatus = String(localized: "小米快傳 discovery：identity 尚未就緒")
             DiagnosticsLog.warn("xiaomi.mishare.discovery_restart_ignored identity_missing")
             return
         }
@@ -848,26 +848,26 @@ final class EdgeLinkRuntime: ObservableObject {
 
         let publishText: String
         if snapshot.isPublishing, let deviceId = snapshot.publishedDeviceIdHex {
-            publishText = "Mac 已廣播 \(deviceId)"
+            publishText = String(localized: "Mac 已廣播 \(deviceId)")
         } else if snapshot.isBrowsing {
-            publishText = "Mac 廣播準備中"
+            publishText = String(localized: "Mac 廣播準備中")
         } else {
-            publishText = "Mac 尚未開始"
+            publishText = String(localized: "Mac 尚未開始")
         }
 
         let peerText: String
         if snapshot.peers.isEmpty {
-            peerText = "未看到手機"
+            peerText = String(localized: "未看到手機")
         } else {
             let names = snapshot.peers.prefix(2).map(\.displayLabel).joined(separator: "、")
-            let suffix = snapshot.peers.count > 2 ? " 等 \(snapshot.peers.count) 台" : ""
-            peerText = "看到 \(names)\(suffix)"
+            let suffix = snapshot.peers.count > 2 ? String(localized: " 等 \(snapshot.peers.count) 台") : ""
+            peerText = String(localized: "看到 \(names)\(suffix)")
         }
 
         if let error = snapshot.lastError {
-            xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：\(publishText)，\(peerText)；\(error)"
+            xiaomiMiShareDiscoveryStatus = String(localized: "小米快傳 discovery：\(publishText)，\(peerText)；\(error)")
         } else {
-            xiaomiMiShareDiscoveryStatus = "小米快傳 discovery：\(publishText)，\(peerText)"
+            xiaomiMiShareDiscoveryStatus = String(localized: "小米快傳 discovery：\(publishText)，\(peerText)")
         }
     }
 
@@ -1289,7 +1289,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenRecoveryAttempt = attempt
         let recoveryWillRebuildSession = Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt)
         if recoveryWillRebuildSession || !isPhoneScreenSessionActive {
-            xiaomiMiLinkCommandStatus = "小米鏡像恢復中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像恢復中")
         }
         if attempt > Self.xiaomiScreenRecoveryHighAttemptWarningThreshold {
             DiagnosticsLog.warn(
@@ -1352,7 +1352,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         guard Self.allowXiaomiScreenPrimaryRoute else {
-            xiaomiMiLinkCommandStatus = "小米鏡像已停用"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像已停用")
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_recovery_skipped reason=disabled_by_user_default " +
                     "rtspSession=\(event.sessionID.uuidString) route=\(xiaomiScreenRoute)"
@@ -1394,7 +1394,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
             )
             guard let requestId = sendMiLinkCommand(command: command, args: args) else {
-                xiaomiMiLinkCommandStatus = "小米鏡像重建指令未送出"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建指令未送出")
                 DiagnosticsLog.warn(
                     "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
                         "attempt=\(attempt) reason=\(event.reason) action=session_rebuild"
@@ -1412,7 +1412,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 route: xiaomiScreenRoute,
                 timeoutMs: timeoutMs
             )
-            xiaomiMiLinkCommandStatus = "小米鏡像重建連線中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建連線中")
             DiagnosticsLog.info(
                 "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
                     "command=\(command) attempt=\(attempt) action=session_rebuild"
@@ -1446,7 +1446,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
         )
         guard let requestId = sendMiLinkCommand(command: command, args: args) else {
-            xiaomiMiLinkCommandStatus = "小米鏡像恢復指令未送出"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像恢復指令未送出")
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
                     "attempt=\(attempt) reason=\(event.reason)"
@@ -1460,7 +1460,7 @@ final class EdgeLinkRuntime: ObservableObject {
             decodedFrames: event.decodedFrames
         )
         if !isPhoneScreenSessionActive {
-            xiaomiMiLinkCommandStatus = "小米鏡像要求來源刷新"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像要求來源刷新")
         }
         DiagnosticsLog.info(
             "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
@@ -1733,7 +1733,7 @@ final class EdgeLinkRuntime: ObservableObject {
     ) -> String? {
         guard let session = currentSession, isConnected else {
             if updatesStatus {
-                xiaomiMiLinkCommandStatus = "小米服務目前未連線"
+                xiaomiMiLinkCommandStatus = String(localized: "小米服務目前未連線")
             }
             DiagnosticsLog.warn("xiaomi.mac.command_ignored command=\(command) not_connected")
             return nil
@@ -1747,7 +1747,7 @@ final class EdgeLinkRuntime: ObservableObject {
             ts: Int64(Date().timeIntervalSince1970)
         )
         if updatesStatus {
-            xiaomiMiLinkCommandStatus = "小米服務執行中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米服務執行中")
         }
         Task { @MainActor [weak self] in
             await self?.sendMiLinkCommandBody(body, session: session)
@@ -2052,7 +2052,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
             }
             if !Self.isXiaomiMirrorKeyboardCommand(body.command) {
-                xiaomiMiLinkCommandStatus = "小米服務送出失敗"
+                xiaomiMiLinkCommandStatus = String(localized: "小米服務送出失敗")
             }
             DiagnosticsLog.error("xiaomi.mac.command_send_failed requestId=\(body.requestId) command=\(body.command)", error)
         }
@@ -2061,13 +2061,13 @@ final class EdgeLinkRuntime: ObservableObject {
     @discardableResult
     private func sendPhoneAction(action: String, number: String? = nil) -> String? {
         guard let session = currentSession, isConnected else {
-            phoneCallStatus = "電話目前不可用"
+            phoneCallStatus = String(localized: "電話目前不可用")
             DiagnosticsLog.warn("phone.mac.action_ignored action=\(action) not_connected")
             return nil
         }
 
         let requestId = UUID().uuidString
-        phoneCallStatus = "\(Self.localizedPhoneAction(action))中"
+        phoneCallStatus = Self.localizedPhoneActionInProgress(action)
         if action == "dial" || action == "answer" {
             Task { @MainActor [weak self] in
                 guard let self else {
@@ -2171,7 +2171,7 @@ final class EdgeLinkRuntime: ObservableObject {
             if body.action == "dial" || body.action == "answer" {
                 stopPhoneCallRelayAudio(reason: "phone_action_send_failed_\(body.action)")
             }
-            phoneCallStatus = "\(Self.localizedPhoneAction(body.action))失敗"
+            phoneCallStatus = Self.localizedPhoneActionFailed(body.action)
             DiagnosticsLog.error("phone.mac.action_request_failed requestId=\(body.requestId) action=\(body.action)", error)
         }
     }
@@ -2182,7 +2182,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
 
-        phoneCallStatus = "手機通話接到 Mac 中"
+        phoneCallStatus = String(localized: "手機通話接到 Mac 中")
         Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -2204,10 +2204,10 @@ final class EdgeLinkRuntime: ObservableObject {
             )
             if success {
                 self.isPhoneCallActive = true
-                self.phoneCallStatus = "手機通話已接到 Mac"
+                self.phoneCallStatus = String(localized: "手機通話已接到 Mac")
             } else {
                 self.stopPhoneCallRelayAudio(reason: "phone_relay_endpoint_unavailable")
-                self.phoneCallStatus = "接手機通話失敗"
+                self.phoneCallStatus = String(localized: "接手機通話失敗")
             }
             await self.sendPhoneRelayEndpoint(body, session: session)
         }
@@ -2227,7 +2227,7 @@ final class EdgeLinkRuntime: ObservableObject {
         } catch {
             stopPhoneCallRelayAudio(reason: "phone_relay_endpoint_send_failed")
             isPhoneCallActive = false
-            phoneCallStatus = "接手機通話失敗"
+            phoneCallStatus = String(localized: "接手機通話失敗")
             DiagnosticsLog.error("phone.mac.relay_endpoint_send_failed requestId=\(body.requestId)", error)
         }
     }
@@ -3119,16 +3119,16 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info("xiaomi.mirror.cloudflare.status_ui sessionId=\(body.sessionId) event=\(event)")
         switch event {
         case "bridge_starting", "local_rtsp_connected":
-            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像連線中")
         case "bridge_ready":
-            xiaomiMiLinkCommandStatus = "小米鏡像串流準備中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像串流準備中")
         case "source_start":
-            xiaomiMiLinkCommandStatus = "小米鏡像串流中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像串流中")
         case "bridge_failed":
-            xiaomiMiLinkCommandStatus = "小米鏡像橋接失敗"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像橋接失敗")
         case "bridge_stopped", "source_stop":
             if !xiaomiScreenUserStopped {
-                xiaomiMiLinkCommandStatus = "小米鏡像已停止"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像已停止")
             }
         default:
             break
@@ -3148,12 +3148,12 @@ final class EdgeLinkRuntime: ObservableObject {
         if updatesCommandStatus {
             if result.command == "xiaomi.mirror.requestSourceRecovery" {
                 if !isPhoneScreenSessionActive {
-                    xiaomiMiLinkCommandStatus = result.success ? "小米鏡像來源已刷新" : "小米鏡像來源刷新失敗"
+                    xiaomiMiLinkCommandStatus = result.success ? String(localized: "小米鏡像來源已刷新") : String(localized: "小米鏡像來源刷新失敗")
                 }
             } else if isMirrorPending {
-                xiaomiMiLinkCommandStatus = "小米鏡像啟動中"
+                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像啟動中")
             } else {
-                xiaomiMiLinkCommandStatus = result.success ? "小米服務已接手" : "小米服務失敗：\(result.message)"
+                xiaomiMiLinkCommandStatus = result.success ? String(localized: "小米服務已接手") : String(localized: "小米服務失敗：\(result.message)")
             }
         }
         let pending = pendingXiaomiScreenFallback
@@ -3195,7 +3195,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
         if let cloudSessionId = Self.xiaomiMirrorCloudflareSessionId(from: result) {
             activeXiaomiMirrorCloudflareSessionId = cloudSessionId
-            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像連線中")
             xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
                 sessionId: cloudSessionId,
                 lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
@@ -3212,7 +3212,7 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         if isMirrorPending, let sourceEndpoint = Self.xiaomiMirrorAndroidSourceEndpoint(from: result) {
-            xiaomiMiLinkCommandStatus = "小米鏡像連線中"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像連線中")
             DiagnosticsLog.info(
                 "xiaomi.mac.screen_pending_active_client requestId=\(result.requestId) command=\(pending.command) " +
                     "route=\(pending.route) elapsedMs=\(pending.elapsedMs) " +
@@ -3227,7 +3227,7 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         if isMirrorPending {
-            xiaomiMiLinkCommandStatus = "小米鏡像未完成"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像未完成")
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_no_fallback requestId=\(result.requestId) command=\(pending.command) " +
                     "route=\(pending.route) reason=pending elapsedMs=\(pending.elapsedMs) " +
@@ -3243,7 +3243,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     "elapsedMs=\(pending.elapsedMs) data=\(Self.formatDiagnosticsData(result.data))"
             )
         } else {
-            xiaomiMiLinkCommandStatus = "小米鏡像失敗"
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像失敗")
             activeXiaomiMirrorCloudflareSessionId = nil
             xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "command_result_failed")
             DiagnosticsLog.warn(
@@ -3359,7 +3359,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleSmsSendResult(_ result: SmsSendResultBody) {
         let pending = pendingSmsSends.removeValue(forKey: result.requestId)
         if result.success {
-            smsSendStatus = "SMS 已送出佇列"
+            smsSendStatus = String(localized: "SMS 已送出佇列")
             if let pending {
                 handleSmsMessage(
                     SmsMessageBody(
@@ -3376,7 +3376,8 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             DiagnosticsLog.info("sms.mac.send_result requestId=\(result.requestId) success=true toFp=\(Self.fingerprint(result.to))")
         } else {
-            smsSendStatus = "SMS 失敗：\(result.error ?? "未知錯誤")"
+            let smsErrorMessage = result.error ?? String(localized: "未知錯誤")
+            smsSendStatus = String(localized: "SMS 失敗：\(smsErrorMessage)")
             DiagnosticsLog.warn("sms.mac.send_result requestId=\(result.requestId) success=false error=\(result.error ?? "unknown")")
         }
     }
@@ -3390,7 +3391,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 stopPhoneCallRelayAudio(reason: "phone_call_status_all_ended")
             }
             isPhoneCallActive = false
-            phoneCallStatus = "通話已結束"
+            phoneCallStatus = String(localized: "通話已結束")
             DiagnosticsLog.info("phone.mac.call_status_all reason=\(status.reason) state=\(status.state)")
             return
         }
@@ -3400,7 +3401,7 @@ final class EdgeLinkRuntime: ObservableObject {
         case "ringing":
             phoneCallStatuses[status.callId] = status
             incomingPhoneCallLabel = caller
-            phoneCallStatus = "手機來電：\(caller)"
+            phoneCallStatus = String(localized: "手機來電：\(caller)")
             incomingCallPresenter.reportIncomingCall(status)
         case "active", "dialing", "connecting", "held":
             phoneCallStatuses[status.callId] = status
@@ -3421,7 +3422,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     stopPhoneCallRelayAudio(reason: "phone_call_status_\(status.state)")
                 }
                 isPhoneCallActive = false
-                phoneCallStatus = "通話已結束"
+                phoneCallStatus = String(localized: "通話已結束")
             }
         default:
             phoneCallStatuses[status.callId] = status
@@ -3434,14 +3435,14 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handleIncomingCallUIAnswer(callId: String) {
         incomingPhoneCallLabel = ""
-        phoneCallStatus = "接聽手機來電中"
+        phoneCallStatus = String(localized: "接聽手機來電中")
         _ = answerPhoneCall()
         DiagnosticsLog.info("phone.mac.incoming_ui_answer callId=\(callId)")
     }
 
     private func handleIncomingCallUIHangUp(callId: String) {
         incomingPhoneCallLabel = ""
-        phoneCallStatus = "拒接手機來電中"
+        phoneCallStatus = String(localized: "拒接手機來電中")
         _ = hangUpPhoneCall()
         DiagnosticsLog.info("phone.mac.incoming_ui_hangup callId=\(callId)")
     }
@@ -3451,7 +3452,6 @@ final class EdgeLinkRuntime: ObservableObject {
         if result.requestId == phoneRelayDebugDialRequestID && !result.success {
             phoneRelayDebugDialError = result.error ?? "unknown"
         }
-        let action = Self.localizedPhoneAction(result.action)
         if result.success {
             if result.action == "dial" || result.action == "answer" {
                 isPhoneCallActive = true
@@ -3460,21 +3460,24 @@ final class EdgeLinkRuntime: ObservableObject {
                 let isRemoteHangup = pendingAction == nil
                 stopPhoneCallRelayAudio(reason: isRemoteHangup ? "remote_phone_hangup" : "phone_action_result_hangup")
                 isPhoneCallActive = false
-                phoneCallStatus = isRemoteHangup ? "通話已結束" : "\(action)已送出"
+                phoneCallStatus = isRemoteHangup
+                    ? String(localized: "通話已結束")
+                    : Self.localizedPhoneActionSent(result.action)
                 DiagnosticsLog.info(
                     "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) " +
                         "success=true remoteHangup=\(isRemoteHangup)"
                 )
                 return
             }
-            phoneCallStatus = "\(action)已送出"
+            phoneCallStatus = Self.localizedPhoneActionSent(result.action)
             DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
         } else {
             if result.action == "dial" || result.action == "answer" {
                 stopPhoneCallRelayAudio(reason: "phone_action_failed_\(result.action)")
                 isPhoneCallActive = false
             }
-            phoneCallStatus = "\(action)失敗：\(result.error ?? "未知錯誤")"
+            let phoneActionError = result.error ?? String(localized: "未知錯誤")
+            phoneCallStatus = Self.localizedPhoneActionFailureMessage(result.action, error: phoneActionError)
             DiagnosticsLog.warn(
                 "phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=false error=\(result.error ?? "unknown")"
             )
@@ -3509,18 +3512,63 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    private static func localizedPhoneAction(_ action: String) -> String {
+    private static func localizedPhoneActionInProgress(_ action: String) -> String {
         switch action {
         case "dial":
-            return "撥號"
+            return String(localized: "撥號中")
         case "answer":
-            return "接聽"
+            return String(localized: "接聽中")
         case "hangup":
-            return "掛斷"
+            return String(localized: "掛斷中")
         case "dtmf":
-            return "按鍵"
+            return String(localized: "按鍵中")
         default:
-            return "電話操作"
+            return String(localized: "電話操作中")
+        }
+    }
+
+    private static func localizedPhoneActionFailed(_ action: String) -> String {
+        switch action {
+        case "dial":
+            return String(localized: "撥號失敗")
+        case "answer":
+            return String(localized: "接聽失敗")
+        case "hangup":
+            return String(localized: "掛斷失敗")
+        case "dtmf":
+            return String(localized: "按鍵失敗")
+        default:
+            return String(localized: "電話操作失敗")
+        }
+    }
+
+    private static func localizedPhoneActionSent(_ action: String) -> String {
+        switch action {
+        case "dial":
+            return String(localized: "撥號已送出")
+        case "answer":
+            return String(localized: "接聽已送出")
+        case "hangup":
+            return String(localized: "掛斷已送出")
+        case "dtmf":
+            return String(localized: "按鍵已送出")
+        default:
+            return String(localized: "電話操作已送出")
+        }
+    }
+
+    private static func localizedPhoneActionFailureMessage(_ action: String, error: String) -> String {
+        switch action {
+        case "dial":
+            return String(localized: "撥號失敗：\(error)")
+        case "answer":
+            return String(localized: "接聽失敗：\(error)")
+        case "hangup":
+            return String(localized: "掛斷失敗：\(error)")
+        case "dtmf":
+            return String(localized: "按鍵失敗：\(error)")
+        default:
+            return String(localized: "電話操作失敗：\(error)")
         }
     }
 
@@ -3533,21 +3581,21 @@ final class EdgeLinkRuntime: ObservableObject {
            !handle.isEmpty {
             return handle
         }
-        return "未知號碼"
+        return String(localized: "未知號碼")
     }
 
     private static func localizedPhoneCallStatus(_ status: PhoneCallStatusBody, caller: String) -> String {
         switch status.state {
         case "dialing":
-            return "手機撥號中：\(caller)"
+            return String(localized: "手機撥號中：\(caller)")
         case "connecting":
-            return "手機通話連線中：\(caller)"
+            return String(localized: "手機通話連線中：\(caller)")
         case "held":
-            return "手機通話保留中：\(caller)"
+            return String(localized: "手機通話保留中：\(caller)")
         case "active":
-            return "手機通話中：\(caller)"
+            return String(localized: "手機通話中：\(caller)")
         default:
-            return "手機通話：\(caller)"
+            return String(localized: "手機通話：\(caller)")
         }
     }
 

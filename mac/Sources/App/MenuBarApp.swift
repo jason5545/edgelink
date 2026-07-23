@@ -46,13 +46,13 @@ private enum MenuBarSection: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .status:
-            return "狀態"
+            return String(localized: "狀態")
         case .phone:
-            return "手機"
+            return String(localized: "手機")
         case .miShare:
-            return "快傳"
+            return String(localized: "快傳")
         case .settings:
-            return "設定"
+            return String(localized: "設定")
         }
     }
 }
@@ -268,7 +268,7 @@ private struct XiaomiMiShareDiscoveryPanel: View {
     private func miSharePeerLine(_ peer: XiaomiMiShareDiscoveredPeer) -> String {
         let deviceId = peer.deviceIdHex.map { " \($0)" } ?? ""
         let channel = peer.channel.map { " CH=\($0)" } ?? ""
-        return "手機 \(peer.displayLabel)\(deviceId)\(channel)"
+        return String(localized: "手機 \(peer.displayLabel)\(deviceId)\(channel)")
     }
 }
 
@@ -282,7 +282,7 @@ private struct LatestVerificationCodePanel: View {
                     Text(candidate.displayCode)
                         .font(.system(.title3, design: .monospaced))
                         .lineLimit(1)
-                    Text(candidate.sourceAddress ?? "驗證碼")
+                    Text(candidate.sourceAddress ?? String(localized: "驗證碼"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -311,7 +311,7 @@ private struct StatusSummary: View {
                 .font(.headline)
             Text(localizedConnectionStatus(runtime.connectionStatus))
                 .font(.subheadline)
-            Text(runtime.peerDeviceId.isEmpty ? "尚未配對 Android" : runtime.peerName)
+            Text(runtime.peerDeviceId.isEmpty ? String(localized: "尚未配對 Android") : runtime.peerName)
                 .lineLimit(1)
             Text("本機 \(runtime.localDeviceId)")
                 .font(.caption)
@@ -590,23 +590,23 @@ private struct WindowFrameAutosaver: NSViewRepresentable {
 private func localizedConnectionStatus(_ status: String) -> String {
     switch status {
     case "Starting":
-        return "啟動中"
+        return String(localized: "啟動中")
     case "Registering":
-        return "註冊裝置中"
+        return String(localized: "註冊裝置中")
     case "No paired Android":
-        return "尚未配對 Android"
+        return String(localized: "尚未配對 Android")
     case "Setup failed":
-        return "初始化失敗"
+        return String(localized: "初始化失敗")
     case "Reconnecting":
-        return "重新連線中"
+        return String(localized: "重新連線中")
     case "Connecting relay":
-        return "連線到 relay"
+        return String(localized: "連線到 relay")
     case "Handshaking":
-        return "握手中"
+        return String(localized: "握手中")
     case "Connected":
-        return "已連線"
+        return String(localized: "已連線")
     case "Disconnected":
-        return "已中斷"
+        return String(localized: "已中斷")
     default:
         return status
     }
@@ -615,17 +615,17 @@ private func localizedConnectionStatus(_ status: String) -> String {
 private func localizedPairingStatus(_ status: String) -> String {
     switch status {
     case "Registering":
-        return "註冊裝置中"
+        return String(localized: "註冊裝置中")
     case "Opening pairing":
-        return "正在開啟配對"
+        return String(localized: "正在開啟配對")
     case "Compare code":
-        return "確認兩邊數字相同"
+        return String(localized: "確認兩邊數字相同")
     case "Waiting for Android":
-        return "等待 Android 確認"
+        return String(localized: "等待 Android 確認")
     case "Pairing failed":
-        return "配對失敗"
+        return String(localized: "配對失敗")
     case "Paired":
-        return "已配對"
+        return String(localized: "已配對")
     default:
         return status
     }
@@ -638,7 +638,7 @@ private func xiaomiMiLinkSummary(_ status: MiLinkStatusBody?) -> String? {
     let services = status.services ?? []
     let available = services.filter(\.available)
     guard status.available || !available.isEmpty else {
-        return "Mi 優先：未就緒"
+        return String(localized: "Mi 優先：未就緒")
     }
 
     let names = available
@@ -646,20 +646,21 @@ private func xiaomiMiLinkSummary(_ status: MiLinkStatusBody?) -> String? {
         .map { service in
             switch service.category {
             case "fileTransfer":
-                return "快傳"
+                return String(localized: "快傳")
             case "screen":
-                return service.serviceName == "synergy" ? "妙享" : "鏡像"
+                return service.serviceName == "synergy" ? String(localized: "妙享") : String(localized: "鏡像")
             case "recentApps":
                 return "RecentApps"
             case "audio":
-                return "音訊"
+                return String(localized: "音訊")
             default:
                 return service.serviceName
             }
         }
     let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? names
     if uniqueNames.isEmpty {
-        return "Mi 優先：探測中"
+        return String(localized: "Mi 優先：探測中")
     }
-    return "Mi 優先：" + uniqueNames.joined(separator: " / ")
+    let joinedNames = uniqueNames.joined(separator: " / ")
+    return String(localized: "Mi 優先：\(joinedNames)")
 }

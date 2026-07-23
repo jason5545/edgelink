@@ -151,7 +151,7 @@ final class XiaomiMiShareDiscovery: NSObject {
             )
         } catch {
             isPublishing = false
-            lastError = "Lyra mDNS 廣播失敗"
+            lastError = String(localized: "Lyra mDNS 廣播失敗")
             DiagnosticsLog.error("xiaomi.mishare.discovery_publish_payload_failed deviceId=\(deviceIdHex)", error)
         }
     }
@@ -326,7 +326,7 @@ extension XiaomiMiShareDiscovery: NetServiceBrowserDelegate {
 
     func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
         isBrowsing = false
-        lastError = "Bonjour 搜尋失敗 \(errorDict)"
+        lastError = String(localized: "Bonjour 搜尋失敗 \(errorDict)")
         DiagnosticsLog.warn("xiaomi.mishare.discovery_browser_failed error=\(errorDict)")
         emitSnapshot()
     }

@@ -18,15 +18,15 @@ enum XiaomiLyraMDNSPublisherError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noActiveIPv4Interface:
-            return "找不到可用的 IPv4 網路介面"
+            return String(localized: "找不到可用的 IPv4 網路介面")
         case let .createConnectionFailed(code):
-            return "mDNS connection 建立失敗 code=\(code)"
+            return String(localized: "mDNS connection 建立失敗 code=\(code)")
         case let .registerServiceFailed(interface, code):
-            return "mDNS service 註冊失敗 interface=\(interface) code=\(code)"
+            return String(localized: "mDNS service 註冊失敗 interface=\(interface) code=\(code)")
         case let .registerRecordFailed(record, interface, code):
-            return "mDNS record 註冊失敗 record=\(record) interface=\(interface) code=\(code)"
+            return String(localized: "mDNS record 註冊失敗 record=\(record) interface=\(interface) code=\(code)")
         case let .recordEncodingFailed(error):
-            return "mDNS record 編碼失敗 \(error)"
+            return String(localized: "mDNS record 編碼失敗 \(error)")
         }
     }
 }

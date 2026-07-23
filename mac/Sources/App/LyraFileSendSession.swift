@@ -149,7 +149,7 @@ final class LyraFileSendSession {
             do {
                 try self.socket.start()
             } catch {
-                self.fail("mesh socket 啟動失敗")
+                self.fail(String(localized: "mesh socket 啟動失敗"))
                 return
             }
             self.startWatchdog()
@@ -169,7 +169,7 @@ final class LyraFileSendSession {
         timer.setEventHandler { [weak self] in
             guard let self, !self.cancelled else { return }
             if self.stage != .done, Date().timeIntervalSince(self.lastProgress) > 30 {
-                self.fail("逾時（stage=\(self.stage)）")
+                self.fail(String(localized: "逾時（stage=\(self.stage)）"))
             }
         }
         watchdog = timer
@@ -186,7 +186,7 @@ final class LyraFileSendSession {
     private func fail(_ message: String) {
         DiagnosticsLog.warn("xiaomi.mishare.send_failed stage=\(stage) reason=\(message)")
         stage = .failed(message)
-        onStatus?("傳送失敗：\(message)")
+        onStatus?(String(localized: "傳送失敗：\(message)"))
         finishLocked()
     }
 
@@ -216,7 +216,7 @@ final class LyraFileSendSession {
 
     private func sendPhysSyncRequest(attempt: Int = 0) {
         if attempt == 0 {
-            progress(.physSync, "連接手機…")
+            progress(.physSync, String(localized: "連接手機…"))
         }
         guard attempt < 5, stage == .physSync, !cancelled else { return }
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
@@ -259,7 +259,7 @@ final class LyraFileSendSession {
     }
 
     private func sendLogiSyncInfoOld() {
-        progress(.logiSyncOld, "同步裝置資訊…")
+        progress(.logiSyncOld, String(localized: "同步裝置資訊…"))
         logiConnId = .random(in: 1...UInt32.max)
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         syncAuthPrivateKey = privateKey
@@ -282,7 +282,7 @@ final class LyraFileSendSession {
     }
 
     private func sendSyncAuthHello() {
-        progress(.syncAuth, "同步認證…")
+        progress(.syncAuth, String(localized: "同步認證…"))
         logiConnId = .random(in: 1...UInt32.max)
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         syncAuthPrivateKey = privateKey
@@ -341,7 +341,7 @@ final class LyraFileSendSession {
     }
 
     private func sendSyncAuthCred() {
-        progress(.syncAuthCred, "同步憑證…")
+        progress(.syncAuthCred, String(localized: "同步憑證…"))
         let inner = LogiConnInnerFrame(
             frameType: 4,
             payload: .disconnect(LyraMeshResponder.officialMacSyncAuthCredential)
@@ -360,7 +360,7 @@ final class LyraFileSendSession {
     }
 
     private func sendUpgrade(family: UInt64) {
-        progress(.upgrade, "建立加密通道…")
+        progress(.upgrade, String(localized: "建立加密通道…"))
         let privateKey = P256.KeyAgreement.PrivateKey()
         keyAgreementKey = privateKey
         var clientRandom = Data(count: 32)
@@ -462,12 +462,12 @@ final class LyraFileSendSession {
             )
             sendLogiConnRequest()
         } catch {
-            fail("ECDH 失敗")
+            fail(String(localized: "ECDH 失敗"))
         }
     }
 
     private func sendLogiConnRequest() {
-        progress(.logiConnRequest, "建立傳輸通道…")
+        progress(.logiConnRequest, String(localized: "建立傳輸通道…"))
         channelId = UInt32.random(in: 100...60000)
         transKey = Self.randomBytes(32)
         transRandom = Self.randomBytes(32)
@@ -512,7 +512,7 @@ final class LyraFileSendSession {
 
     private func sendEncryptedLogiConn(inner: LogiConnInnerFrame, label: String) {
         guard let channelKeyCS else {
-            fail("缺少通道金鑰")
+            fail(String(localized: "缺少通道金鑰"))
             return
         }
         do {
@@ -532,7 +532,7 @@ final class LyraFileSendSession {
             let miFrame = MiConnectFrame(version: 0, logiConnFrames: [logiConn])
             send(frame: LyraMeshPack.Frame(packType: 2, payload: miFrame.serialized()), label: label)
         } catch {
-            fail("通道加密失敗")
+            fail(String(localized: "通道加密失敗"))
         }
     }
 
@@ -584,7 +584,7 @@ final class LyraFileSendSession {
         switch physConn.payload {
         case .syncDeviceInfoResponse:
             if stage == .physSync {
-                progress(.cookie, "cookie 交握…")
+                progress(.cookie, String(localized: "cookie 交握…"))
                 sendCookie(phase: 1)
             }
         case let .keepAliveResponse(responseData) where physConn.field2 == 5:
@@ -635,7 +635,7 @@ final class LyraFileSendSession {
                 queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self, !self.cancelled else { return }
                     self.sendPeerPortRequest()
-                    self.progress(.channelWait, "等待手機通道端口…")
+                    self.progress(.channelWait, String(localized: "等待手機通道端口…"))
                 }
             } else {
                 DiagnosticsLog.info(
@@ -932,7 +932,7 @@ final class LyraFileSendSession {
         if serverKey.count == 32 {
             self.serverKey = serverKey
         }
-        progress(.channelNegotiate, "通道協商…")
+        progress(.channelNegotiate, String(localized: "通道協商…"))
         DiagnosticsLog.info(
             "xiaomi.mishare.send_peer_port port=\(port) serverChannelId=\(serverChannelId) keyBytes=\(serverKey.count)"
         )
@@ -947,7 +947,7 @@ final class LyraFileSendSession {
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
             DiagnosticsLog.info("xiaomi.mishare.send_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
             self?.channelReady = true
-            self?.progress(.expressHandshakeWait, "等待手機 express handshake…")
+            self?.progress(.expressHandshakeWait, String(localized: "等待手機 express handshake…"))
         }
         socket.onMessage = { [weak self] message, _ in
             self?.handleChannelMessage(message)
@@ -956,7 +956,7 @@ final class LyraFileSendSession {
             try socket.connect(host: host, port: nwPort, socketKey: transKey)
             channelSocket = socket
         } catch {
-            fail("通道連接失敗")
+            fail(String(localized: "通道連接失敗"))
             return
         }
         queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -1071,7 +1071,7 @@ final class LyraFileSendSession {
     }
 
     private func sendFileSendRequest() {
-        progress(.fileRequestWait, "等待手機接受…")
+        progress(.fileRequestWait, String(localized: "等待手機接受…"))
         var request = Data()
         LyraProtoWriter.appendVarintField(1, value: requestId, to: &request)
         LyraProtoWriter.appendLengthDelimitedField(2, value: Data(displayName.utf8), to: &request)
@@ -1107,13 +1107,13 @@ final class LyraFileSendSession {
             let rejectReason = fields.first(where: { $0.number == 3 && $0.wireType == 0 })?.varintValue ?? 0
             guard stage == .fileRequestWait else { return }
             if rejectReason != 0 {
-                fail("手機拒絕接收（reason=\(rejectReason)）")
+                fail(String(localized: "手機拒絕接收（reason=\(rejectReason)）"))
                 return
             }
             startNextFile()
         case 8:
-            progress(.done, "傳送完成")
-            onStatus?("已傳送 \(files.count) 個檔案")
+            progress(.done, String(localized: "傳送完成"))
+            onStatus?(String(localized: "已傳送 \(files.count) 個檔案"))
             finishLocked()
         default:
             break
@@ -1125,7 +1125,7 @@ final class LyraFileSendSession {
             var complete = Data()
             LyraProtoWriter.appendVarintField(1, value: requestId, to: &complete)
             LyraProtoWriter.appendLengthDelimitedField(2, value: Data(jobId.utf8), to: &complete)
-            progress(.completeWait, "完成確認…")
+            progress(.completeWait, String(localized: "完成確認…"))
             sendFileProtocolMessage(tag: 7, body: complete)
             return
         }
@@ -1135,10 +1135,10 @@ final class LyraFileSendSession {
         currentOffset = 0
         currentFileHandle = try? FileHandle(forReadingFrom: file.url)
         guard currentFileHandle != nil else {
-            fail("無法讀取 \(file.name)")
+            fail(String(localized: "無法讀取 \(file.name)"))
             return
         }
-        progress(.streamBeginWait, "傳送 \(file.name)…")
+        progress(.streamBeginWait, String(localized: "傳送 \(file.name)…"))
         let begin = LyraExpressTLV.oneOfNode(
             tag: 0xFFFF,
             selectedTag: 3,
@@ -1163,7 +1163,7 @@ final class LyraFileSendSession {
         guard stage == .streamBeginWait, streamId == currentStreamId else {
             return
         }
-        progress(.streaming, "傳輸中…")
+        progress(.streaming, String(localized: "傳輸中…"))
         sendNextChunk()
     }
 
@@ -1176,7 +1176,7 @@ final class LyraFileSendSession {
                 try handle.seek(toOffset: UInt64(currentOffset))
                 chunk = try handle.read(upToCount: Self.chunkSize) ?? Data()
             } catch {
-                fail("讀檔失敗")
+                fail(String(localized: "讀檔失敗"))
                 return
             }
         } else {
@@ -1224,11 +1224,11 @@ final class LyraFileSendSession {
             connection.send(content: frame, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if let error {
-                    self.fail("資料傳輸失敗：\(error.localizedDescription)")
+                    self.fail(String(localized: "資料傳輸失敗：\(error.localizedDescription)"))
                     return
                 }
                 if isEOF {
-                    self.progress(.streamEndWait, "等待手機確認 \(self.files[self.currentFileIndex].name)…")
+                    self.progress(.streamEndWait, String(localized: "等待手機確認 \(self.files[self.currentFileIndex].name)…"))
                     DiagnosticsLog.info(
                         "xiaomi.mishare.send_stream_eof streamId=\(self.currentStreamId) bytes=\(sentOffset)"
                     )
@@ -1238,7 +1238,7 @@ final class LyraFileSendSession {
                 self.sendNextChunk()
             })
         } catch {
-            fail("加密失敗")
+            fail(String(localized: "加密失敗"))
         }
     }
 
@@ -1254,7 +1254,7 @@ final class LyraFileSendSession {
         currentFileHandle?.closeFile()
         currentFileHandle = nil
         guard result == 0 else {
-            fail("手機接收失敗（result=\(result)）")
+            fail(String(localized: "手機接收失敗（result=\(result)）"))
             return
         }
         currentFileIndex += 1

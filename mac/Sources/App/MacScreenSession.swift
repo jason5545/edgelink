@@ -687,7 +687,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             isScreenSessionActive = true
             onSessionActivityChanged?(true)
         }
-        status = "連線中"
+        status = String(localized: "連線中")
         showWindow()
         DiagnosticsLog.info("screen.mac.connecting_window_shown")
     }
@@ -757,7 +757,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             backing: .buffered,
             defer: false
         )
-        window.title = "手機"
+        window.title = String(localized: "手機")
         window.minSize = NSSize(width: 260, height: 360)
         window.contentView = NSHostingView(rootView: content)
         window.center()
@@ -1877,9 +1877,9 @@ struct PhoneScreenView: View {
 
     private var bottomControls: some View {
         HStack(spacing: 14) {
-            globalButton(systemName: "rectangle.stack", action: "recents", help: "Recents")
-            globalButton(systemName: "circle", action: "home", help: "Home")
-            globalButton(systemName: "chevron.backward", action: "back", help: "Back")
+            globalButton(systemName: "rectangle.stack", action: "recents", help: String(localized: "Recents"))
+            globalButton(systemName: "circle", action: "home", help: String(localized: "Home"))
+            globalButton(systemName: "chevron.backward", action: "back", help: String(localized: "Back"))
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 9)
