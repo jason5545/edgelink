@@ -13,6 +13,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     public var onRawDatagram: ((Data, NWEndpoint) -> Void)?
     public var onStateChanged: ((NWListener.State) -> Void)?
     public var onDecryptFailure: ((String) -> Void)?
+    public var onDecryptSuccess: ((String) -> Void)?
     public var onOfficialPacket: ((Data, Int) -> Void)?
 
     public private(set) var boundPort: UInt16?
@@ -252,6 +253,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     }
 
     public var candidateKeys: [Data] = []
+    public var suppressNegotiationReply = false
 
     private func decryptionKeys() -> [SymmetricKey] {
         var keys: [SymmetricKey] = []
@@ -264,18 +266,37 @@ public final class LyraChannelSocket: @unchecked Sendable {
         return keys
     }
 
+    private func keyLabels() -> [String] {
+        var labels: [String] = []
+        if socketKey != nil {
+            labels.append("transKey")
+        }
+        let candidateNames = ["transRandom", "colonHexKey"]
+        var index = 0
+        for candidate in candidateKeys where candidate.count >= 16 {
+            labels.append(index < candidateNames.count ? candidateNames[index] : "candidate[\(index)]")
+            index += 1
+        }
+        return labels
+    }
+
     private func openPacketAndFragment(_ frame: Data) -> (chunk: Data, offset: Int, total: Int, isLast: Bool)? {
-        for key in decryptionKeys() {
+        let labels = keyLabels()
+        for (index, key) in decryptionKeys().enumerated() {
             guard let (fragment, _) = try? LyraSocketPacket.decode(frame, key: key) else {
                 continue
             }
+            let label = index < labels.count ? labels[index] : "key[\(index)]"
             if let decoded = try? LyraChannelFragment.decode(fragment: fragment, key: key) {
+                onDecryptSuccess?("socket_packet_8104 key=\(label) fragmented bytes=\(frame.count)")
                 return decoded
             }
             if let oneOf = try? LyraExpressTLVParser.parseOneOf(fragment) {
                 _ = oneOf
+                onDecryptSuccess?("socket_packet_8104 key=\(label) oneof bytes=\(frame.count)")
                 return (fragment, 0, 1, true)
             }
+            onDecryptSuccess?("socket_packet_8104 key=\(label) gcm_ok_but_payload_unparsed bytes=\(frame.count)")
         }
         return nil
     }
@@ -321,9 +342,12 @@ public final class LyraChannelSocket: @unchecked Sendable {
                 let frame = Data(state.packetBuffer.prefix(frameLength))
                 state.packetBuffer.removeFirst(frameLength)
                 var plaintext: Data?
-                for key in decryptionKeys() {
+                var matchedLabel: String?
+                let labels = keyLabels()
+                for (index, key) in decryptionKeys().enumerated() {
                     if let opened = try? LyraSocketPacket.decodeOfficial(frame, key: key) {
                         plaintext = opened
+                        matchedLabel = index < labels.count ? labels[index] : "key[\(index)]"
                         break
                     }
                 }
@@ -331,6 +355,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
                     onDecryptFailure?("official_packet bytes=\(frame.count)")
                     continue
                 }
+                onDecryptSuccess?("official_packet_8258 key=\(matchedLabel ?? "?") bytes=\(frame.count)")
                 onOfficialPacket?(plaintext, frameLength)
                 deliver(chunk: plaintext, offset: 0, total: 1, state: &state, endpoint: endpoint)
             } else {
@@ -370,6 +395,12 @@ public final class LyraChannelSocket: @unchecked Sendable {
             let peerChannelId = children[0]
             let version = children[1]
             let mtu = children[2]
+            if suppressNegotiationReply {
+                state.negotiated = true
+                onNegotiated?(peerChannelId, mtu)
+                _ = version
+                return
+            }
             let reply = LyraExpressTLV.oneOfNode(
                 tag: 0xFFFF,
                 selectedTag: 4,

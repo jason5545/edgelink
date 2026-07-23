@@ -446,6 +446,9 @@ final class LyraMeshResponder {
         socket.onDecryptFailure = { reason in
             DiagnosticsLog.warn("xiaomi.mishare.channel_decrypt_failed \(reason)")
         }
+        socket.onDecryptSuccess = { detail in
+            DiagnosticsLog.info("xiaomi.mishare.channel_decrypt_ok \(detail)")
+        }
         socket.onOfficialPacket = { plaintext, frameLength in
             DiagnosticsLog.info(
                 "xiaomi.mishare.official_packet_decrypted frameBytes=\(frameLength) plainBytes=\(plaintext.count) " +

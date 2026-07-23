@@ -937,6 +937,7 @@ final class LyraFileSendSession {
             "xiaomi.mishare.send_peer_port port=\(port) serverChannelId=\(serverChannelId) keyBytes=\(serverKey.count)"
         )
         let socket = LyraChannelSocket()
+        socket.suppressNegotiationReply = true
         socket.debugHandler = { message in
             DiagnosticsLog.info("xiaomi.mishare.send_channel.\(message)")
         }
@@ -964,7 +965,7 @@ final class LyraFileSendSession {
     }
 
     private func sendChannelNegotiation(attempt: Int) {
-        guard !cancelled, !channelReady, attempt < 10, let socket = channelSocket else { return }
+        guard !cancelled, !channelReady, attempt < 3, let socket = channelSocket else { return }
         do {
             try socket.sendClientNegotiation(channelId: serverChannelId, version: 1, mtu: 0xFF00)
             DiagnosticsLog.info(
@@ -973,7 +974,7 @@ final class LyraFileSendSession {
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.send_channel_negotiation_failed", error)
         }
-        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             self?.sendChannelNegotiation(attempt: attempt + 1)
         }
     }
@@ -1045,9 +1046,9 @@ final class LyraFileSendSession {
 
     private func sendEventFrame(_ inner: Data) {
         do {
-            try channelSocket?.sendVariantOfficial(
+            try channelSocket?.sendVariant(
                 channelFrame: LyraChannelSocket.wrapChannelFrame(inner),
-                key: colonHexKey
+                key: transKey, singleLayer: true
             )
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.send_event_failed", error)
