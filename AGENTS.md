@@ -4,10 +4,7 @@
 - Keep `mac/project.yml` as the source of truth for Xcode signing settings, then run `xcodegen generate` from `mac/` after editing it.
 - Install the built app into `/Applications` with `ditto`, not Finder drag/drop:
   `ditto /private/tmp/edgelink-derived-data/Build/Products/Debug/EdgeLinkMac.app /Applications/EdgeLinkMac.app`
-- The system incoming-call UI is provided by the Mac Catalyst helper `EdgeLinkCallUI.app`. Build it with:
-  `xcodebuild -project EdgeLink.xcodeproj -scheme EdgeLinkCallUI -configuration Debug -derivedDataPath /private/tmp/edgelink-callui-derived-data -destination 'platform=macOS,variant=Mac Catalyst' build`
-- Install the helper next to the main app with:
-  `ditto /private/tmp/edgelink-callui-derived-data/Build/Products/Debug-maccatalyst/EdgeLinkCallUI.app /Applications/EdgeLinkCallUI.app`
+- The incoming-call UI lives in the main app (`MacIncomingCallPresenter`). The old Mac Catalyst helper `EdgeLinkCallUI.app` was removed; do not rebuild or reinstall it, and delete any stale `/Applications/EdgeLinkCallUI.app` copy.
 - Repeated Keychain password prompts usually mean the identity item was created by an old ad-hoc/DerivedData build. Do not delete it, because that changes the device ID and breaks pairing. Launch the stable `/Applications` build once and let `KeychainIdentityStore` migrate the item to the current signed app.
 
 ## Xiaomi HyperConnect research artifact
