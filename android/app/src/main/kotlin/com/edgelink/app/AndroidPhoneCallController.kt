@@ -4,15 +4,25 @@ import android.content.Context
 import com.edgelink.core.PhoneActionBody
 import com.edgelink.core.PhoneActionResultBody
 import java.time.Instant
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 private const val PHONE_ACTION_DIAL = "dial"
 private const val PHONE_ACTION_ANSWER = "answer"
 private const val PHONE_ACTION_HANGUP = "hangup"
 private const val PHONE_ACTION_DTMF = "dtmf"
 private const val PHONE_CALL_RELAY_LATCH_TTL_MS = 30_000L
+private const val PHONE_CALL_RELAY_LATCH_RENEW_MS = 15_000L
 
 class AndroidPhoneCallController(context: Context) {
     private val appContext = context.applicationContext
+    private val latchRenewalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var latchGeneration = 0L
 
     suspend fun handle(body: PhoneActionBody): PhoneActionResultBody {
         val now = Instant.now().epochSecond
@@ -190,7 +200,28 @@ class AndroidPhoneCallController(context: Context) {
             EdgeLinkLog.warn("phone.android.relay_latch_arm_failed action=$action", error)
         }
         if (latchResult.getOrNull()?.success == true) {
+            latchGeneration += 1
+            startLatchRenewal(latchGeneration)
             pokePhoneContinuityRelay(action)
+        }
+    }
+
+    private fun startLatchRenewal(generation: Long) {
+        latchRenewalScope.launch {
+            while (currentCoroutineContext().isActive) {
+                delay(PHONE_CALL_RELAY_LATCH_RENEW_MS)
+                if (generation != latchGeneration || !EdgeLinkInCallService.hasOngoingCall()) {
+                    break
+                }
+                val result = runCatching {
+                    AndroidShizukuSupport.armPhoneCallRelay(appContext, PHONE_CALL_RELAY_LATCH_TTL_MS)
+                }.getOrNull()
+                if (result?.success == true) {
+                    EdgeLinkLog.info("phone.android.relay_latch_renewed")
+                } else {
+                    EdgeLinkLog.warn("phone.android.relay_latch_renew_failed message=${result?.message}")
+                }
+            }
         }
     }
 
@@ -209,6 +240,7 @@ class AndroidPhoneCallController(context: Context) {
     }
 
     private suspend fun clearPhoneRelayLatch(reason: String) {
+        latchGeneration += 1
         runCatching {
             AndroidShizukuSupport.clearPhoneCallRelay(appContext)
         }.onSuccess { result ->
