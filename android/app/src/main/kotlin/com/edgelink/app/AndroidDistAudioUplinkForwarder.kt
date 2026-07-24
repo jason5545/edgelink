@@ -38,6 +38,7 @@ object AndroidDistAudioUplinkForwarder {
         packetQueue.clear()
         packetsReceived = 0
         aacFramesDecoded = 0
+        pcmBytesDecoded = 0
         pcmBytesSent = 0
         workerThread = Thread({ runWorker() }, "EdgeLinkDistAudioUplink").apply { start() }
         EdgeLinkLog.info("callrelay.android.dist_uplink_start reason=$reason")

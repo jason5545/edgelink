@@ -234,6 +234,7 @@ object AndroidCallRelayBridge {
         private val statusHandler: suspend (String) -> Unit
     ) {
         private val pendingRequests = mutableMapOf<String, String>()
+        private val pendingRequestSentAtMs = mutableMapOf<String, Long>()
         private val rtspCharset: Charset = Charsets.ISO_8859_1
         private val sinkServer = LocalMiLinkRTSPSinkServer(
             relaySessionId = relaySessionId,
@@ -306,6 +307,7 @@ object AndroidCallRelayBridge {
 
         private fun resetSourceControlState() {
             pendingRequests.clear()
+            pendingRequestSentAtMs.clear()
             tcpBuffer = ByteArray(0)
             nextCSeq = 1
             sentOptions = false
@@ -369,14 +371,18 @@ object AndroidCallRelayBridge {
                     )
                     sendOptionsIfNeeded("connect_kickstart")
                 }
-                if (sentPLAY && playSentAtMs > 0 &&
-                    pendingRequests.containsValue("PLAY") &&
-                    now - playSentAtMs >= RTSP_PLAY_RESPONSE_TIMEOUT_MS
+                val stalledRequest = pendingRequestSentAtMs.entries
+                    .filter { it.key in pendingRequests.keys }
+                    .minByOrNull { it.value }
+                if (stalledRequest != null &&
+                    now - stalledRequest.value >= RTSP_PLAY_RESPONSE_TIMEOUT_MS
                 ) {
+                    val method = pendingRequests[stalledRequest.key].orEmpty()
                     EdgeLinkLog.info(
-                        "callrelay.android.local_rtsp_play_timeout sessionId=$relaySessionId"
+                        "callrelay.android.local_rtsp_response_timeout sessionId=$relaySessionId " +
+                            "method=$method cseq=${stalledRequest.key}"
                     )
-                    throw java.io.IOException("RTSP PLAY response timeout")
+                    throw java.io.IOException("RTSP $method response timeout")
                 }
                 val read = try {
                     withContext(Dispatchers.IO) { input.read(scratch) }
@@ -516,6 +522,7 @@ object AndroidCallRelayBridge {
 
         private suspend fun handleRTSPResponse(firstLine: String, headerText: String, cseq: String) {
             val requestMethod = pendingRequests.remove(cseq)
+            pendingRequestSentAtMs.remove(cseq)
             rtspHeader("Session", headerText)
                 ?.substringBefore(";")
                 ?.trim()
@@ -608,6 +615,7 @@ object AndroidCallRelayBridge {
         ) {
             val cseq = nextCSeq++.toString()
             pendingRequests[cseq] = method
+            pendingRequestSentAtMs[cseq] = android.os.SystemClock.elapsedRealtime()
             sendRTSP(
                 buildRTSPMessage(
                     firstLine = "$method $uri RTSP/1.0",
