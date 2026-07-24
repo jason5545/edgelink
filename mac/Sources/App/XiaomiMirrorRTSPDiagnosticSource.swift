@@ -3135,6 +3135,13 @@ private final class XiaomiMirrorRTPMediaSender {
         )
     }
 
+    private static func elapsedSeconds(since timestamp: UInt64, now: UInt64) -> Double {
+        // Timestamps are also written from mptDecodeQueue (decoded-frame
+        // callbacks), so a concurrently-written value can be newer than the
+        // watchdog's `now`; clamp instead of trapping on UInt64 underflow.
+        Double(now >= timestamp ? now - timestamp : 0) / 1_000_000_000
+    }
+
     private func checkMPTSinkPacketWatchdog() {
         guard mptSinkOnly, !stopped else {
             return
@@ -3144,9 +3151,9 @@ private final class XiaomiMirrorRTPMediaSender {
         // delivered ones: a lost KCP segment blocks delivery while the
         // source keeps sending, and must go through resync instead of
         // source recovery.
-        let elapsedMediaSeconds = Double(now - lastMPTAnyPushUptimeNanoseconds) / 1_000_000_000
+        let elapsedMediaSeconds = Self.elapsedSeconds(since: lastMPTAnyPushUptimeNanoseconds, now: now)
         let elapsedFrameSeconds = mptSinkDecodedFrames > 0 || mptSinkRTPPacketsReceived > 20
-            ? Double(now - lastMPTDecodedFrameUptimeNanoseconds) / 1_000_000_000
+            ? Self.elapsedSeconds(since: lastMPTDecodedFrameUptimeNanoseconds, now: now)
             : nil
         if elapsedMediaSeconds >= Self.mptSinkNoPacketTimeoutSeconds {
             let stall = mptStallSnapshot(
