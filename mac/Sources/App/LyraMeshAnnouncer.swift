@@ -17,6 +17,8 @@ final class LyraMeshAnnouncer {
     private var logiConnId: UInt32 = 0
     private var peerNetId: UInt32 = 0
     private var announceTimer: DispatchSourceTimer?
+    private var lastActivity = Date.distantPast
+    private static let staleTimeout: TimeInterval = 20
     private let queue = DispatchQueue(label: "edgelink.lyra.announcer")
     private let deviceIdHexProvider: () -> String?
     private let displayNameProvider: () -> String
@@ -32,8 +34,15 @@ final class LyraMeshAnnouncer {
     func start(host: String, port: UInt16) {
         queue.async { [weak self] in
             guard let self else { return }
-            if self.host == host, self.port == port, self.state != .idle {
+            if self.host == host, self.port == port, self.state == .logiSynced,
+               Date().timeIntervalSince(self.lastActivity) < Self.staleTimeout {
                 return
+            }
+            if self.host == host, self.port == port, self.state != .idle {
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.announcer_resync state=\(self.state) " +
+                        "idleSeconds=\(Int(Date().timeIntervalSince(self.lastActivity)))"
+                )
             }
             self.stopLocked()
             self.host = host
@@ -66,10 +75,14 @@ final class LyraMeshAnnouncer {
         host = nil
         port = 0
         peerNetId = 0
+        lastActivity = .distantPast
     }
 
     private func sendPhysSyncRequest() {
         guard let deviceIdHex = deviceIdHexProvider(), let host else {
+            DiagnosticsLog.warn(
+                "xiaomi.mishare.announcer_sync_skipped identity=\(deviceIdHexProvider() != nil) host=\(host ?? "nil")"
+            )
             return
         }
         physConnId = .random(in: 1...UInt32.max)
@@ -173,6 +186,7 @@ final class LyraMeshAnnouncer {
     }
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
+        lastActivity = Date()
         if frame.packType == 5 {
             DiagnosticsLog.info(
                 "xiaomi.mishare.announcer_payload bytes=\(frame.payload.count) " +
@@ -181,6 +195,11 @@ final class LyraMeshAnnouncer {
             return
         }
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mishare.announcer_frame_parse_failed packType=\(frame.packType) " +
+                    "bytes=\(frame.payload.count) " +
+                    "hex=\(frame.payload.prefix(48).map { String(format: "%02x", $0) }.joined())"
+            )
             return
         }
         if let physConn = miFrame.physConnFrame {
@@ -199,12 +218,22 @@ final class LyraMeshAnnouncer {
                 let miResponse = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: responsePhysConn)
                 try? reply(LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized()))
                 _ = requestData
+            case .disconnectRequest, .disconnectResponse:
+                DiagnosticsLog.warn("xiaomi.mishare.announcer_disconnected state=\(state)")
+                stopLocked()
             default:
-                break
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.announcer_phys_other field2=\(physConn.field2) " +
+                        "payload=\(String(describing: physConn.payload))"
+                )
             }
         }
         for logiConn in miFrame.logiConnFrames {
             guard let inner = LogiConnInnerFrame(parsing: logiConn.inner) else {
+                DiagnosticsLog.warn(
+                    "xiaomi.mishare.announcer_logi_parse_failed bytes=\(logiConn.inner.count) " +
+                        "hex=\(logiConn.inner.prefix(48).map { String(format: "%02x", $0) }.joined())"
+                )
                 continue
             }
             if case .syncInfo = inner.payload {
@@ -214,6 +243,12 @@ final class LyraMeshAnnouncer {
                 )
                 state = .logiSynced
                 sendAnnounce()
+            } else {
+                DiagnosticsLog.info(
+                    "xiaomi.mishare.announcer_logi_other frameType=\(inner.frameType) " +
+                        "bytes=\(logiConn.inner.count) " +
+                        "hex=\(logiConn.inner.prefix(48).map { String(format: "%02x", $0) }.joined())"
+                )
             }
         }
     }
