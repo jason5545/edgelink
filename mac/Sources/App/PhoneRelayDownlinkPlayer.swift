@@ -32,6 +32,7 @@ final class PhoneRelayDownlinkPlayer {
     private var sharedEngine: AVAudioEngine?
     private var audioPlayer: AVAudioPlayerNode?
     private var playerEngine: AVAudioEngine?
+    private var stoppedPlayer: AVAudioPlayerNode?
     private var demuxer = PhoneRelayTSDemuxer()
     private var rtpPackets = 0
     private var tsBytes = 0
@@ -146,10 +147,16 @@ final class PhoneRelayDownlinkPlayer {
     }
 
     private func stopPlayerNodeLocked() {
-        audioPlayer?.stop()
-        if let player = audioPlayer, let engine = player.engine {
-            engine.detach(player)
+        guard let player = audioPlayer else {
+            return
         }
+        player.stop()
+        // Never call engine.detach here: the shared engine can be stopped
+        // concurrently on PhoneRelayAudioController's queue, which tears
+        // down the render graph and makes detachNode: throw an uncatchable
+        // NSException. Keep the stopped node attached (cached for reuse if
+        // the same engine survives) and let engine dealloc clean it up.
+        stoppedPlayer = player
         audioPlayer = nil
         playerEngine = nil
     }
@@ -192,16 +199,21 @@ final class PhoneRelayDownlinkPlayer {
             DiagnosticsLog.warn("callrelay.mac.cloudflare_player_unavailable pcm_format")
             return
         }
-        let player = AVAudioPlayerNode()
         if let sharedEngine {
-            sharedEngine.attach(player)
-            sharedEngine.connect(player, to: sharedEngine.mainMixerNode, format: format)
+            let player: AVAudioPlayerNode
+            if let cached = stoppedPlayer, cached.engine === sharedEngine {
+                player = cached
+                stoppedPlayer = nil
+            } else {
+                player = AVAudioPlayerNode()
+                sharedEngine.attach(player)
+                sharedEngine.connect(player, to: sharedEngine.mainMixerNode, format: format)
+            }
             if !sharedEngine.isRunning {
                 do {
                     try sharedEngine.start()
                 } catch {
                     DiagnosticsLog.error("callrelay.mac.cloudflare_player_start_failed", error)
-                    sharedEngine.detach(player)
                     return
                 }
             }
@@ -216,6 +228,7 @@ final class PhoneRelayDownlinkPlayer {
             return
         }
         let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
         engine.prepare()
