@@ -32,6 +32,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val DEFAULT_LOCAL_RTSP_PORT = 7_102
     private const val RTSP_KICKSTART_DELAY_MS = 800L
     private const val RTSP_PLAY_RESPONSE_TIMEOUT_MS = 2_500L
+    private const val RTSP_KEEPALIVE_INTERVAL_MS = 30_000L
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
     private const val RTP_BATCH_MAX_DELAY_MS = 10L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
@@ -219,6 +220,7 @@ object AndroidMiLinkMirrorMediaBridge {
             )
             val udpJob = launch { receiveRTP(udp) }
             val batchJob = launch { flushRTPBatches() }
+            val rtspKeepaliveJob = launch { rtspKeepaliveLoop() }
             try {
                 while (currentCoroutineContext().isActive) {
                     try {
@@ -256,6 +258,7 @@ object AndroidMiLinkMirrorMediaBridge {
                 sendStatus("bridge_failed")
             } finally {
                 udpJob.cancel()
+                rtspKeepaliveJob.cancel()
                 rtpBatchQueue.close()
                 batchJob.cancelAndJoin()
                 runCatching { udp.close() }
@@ -698,6 +701,26 @@ object AndroidMiLinkMirrorMediaBridge {
                 "xiaomi.mirror.android.cloudflare_rtsp_setup_sent sessionId=$sessionId " +
                     "reason=$reason rtpPort=$port userid=$userId"
             )
+        }
+
+        private suspend fun rtspKeepaliveLoop() {
+            while (currentCoroutineContext().isActive) {
+                delay(RTSP_KEEPALIVE_INTERVAL_MS)
+                if (!sentPLAY || sessionHeader == null) {
+                    continue
+                }
+                runCatching {
+                    sendRTSPRequest(
+                        method = "GET_PARAMETER",
+                        uri = presentationURL ?: "rtsp://localhost/wfd1.0/streamid=0",
+                        headers = sessionHeader?.let { listOf("Session" to it) } ?: emptyList(),
+                        label = "KEEPALIVE"
+                    )
+                    EdgeLinkLog.info(
+                        "xiaomi.mirror.android.cloudflare_rtsp_keepalive_sent sessionId=$sessionId"
+                    )
+                }
+            }
         }
 
         private suspend fun sendPLAYIfNeeded(reason: String) {
