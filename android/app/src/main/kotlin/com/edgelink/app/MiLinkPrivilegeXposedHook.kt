@@ -297,7 +297,7 @@ internal object MiLinkPrivilegeHookPolicy {
         rawValue?.trim()?.toIntOrNull()?.takeIf { it in 1..65535 }
 
     fun fakeMirrorRemotePlatform(mode: String): String =
-        if (mode == "car") FAKE_MIRROR_PLATFORM_PAD_CAR else FAKE_MIRROR_PLATFORM_WINDOWS
+        if (mode == "car") FAKE_MIRROR_PLATFORM_PAD_CAR else FAKE_MIRROR_PLATFORM_PAD
 
     fun shouldIncludeFakeMirrorRemote(
         mode: String,
@@ -307,17 +307,15 @@ internal object MiLinkPrivilegeHookPolicy {
         val manufacturerOk = manufacturer.isNullOrBlank() ||
             manufacturer.equals("xiaomi", ignoreCase = true)
         val platformOk = platform.isNullOrBlank() ||
-            platform.equals(fakeMirrorRemotePlatform(mode), ignoreCase = true) ||
-            (mode != "car" && platform.equals(FAKE_MIRROR_PLATFORM_PAD, ignoreCase = true))
+            platform.equals(fakeMirrorRemotePlatform(mode), ignoreCase = true)
         return manufacturerOk && platformOk
     }
 
     fun fakeMirrorRemoteProductType(mode: String): String =
-        if (mode == "car") FAKE_MIRROR_PLATFORM_PAD_CAR else FAKE_MIRROR_PLATFORM_WINDOWS
+        if (mode == "car") FAKE_MIRROR_PLATFORM_PAD_CAR else FAKE_MIRROR_PLATFORM_PAD
 
     const val FAKE_MIRROR_PLATFORM_PAD = "AndroidPad"
     const val FAKE_MIRROR_PLATFORM_PAD_CAR = "AndroidPadCar"
-    const val FAKE_MIRROR_PLATFORM_WINDOWS = "Windows"
 
     fun isFakeMirrorRemoteId(deviceId: String?): Boolean =
         deviceId == FAKE_MIRROR_REMOTE_ID
@@ -658,7 +656,9 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         val relayClass = param.thisObject.javaClass
                         val terminalClass = findTargetClass(classLoader, XIAOMI_MIRROR_TERMINAL)
                         val attachedId = findAttachedFakeMirrorTerminalId(relayClass, terminalClass, param.thisObject)
-                        if (attachedId == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID) {
+                        if (attachedId == MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID ||
+                            currentFakeMirrorProviderMode() != null
+                        ) {
                             param.args[0] = false
                             log("mirror call active suppressed for fake remote")
                         }
@@ -675,7 +675,87 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookInCallUiRelayHelpers(classLoader)
         hookInCallUiRelayDeviceList(classLoader)
         hookInCallUiRelaySelection(classLoader)
+        hookInCallUiCurDistAudioRoute(classLoader)
     }
+
+    @Volatile private var incallUiSyntheticRoute: Any? = null
+
+    private fun hookInCallUiCurDistAudioRoute(classLoader: ClassLoader) {
+        runCatching {
+            val providerClass = findTargetClass(classLoader, INCALLUI_DIST_AUDIO_DEVICE_PROVIDER)
+            XposedHelpers.findAndHookMethod(
+                INCALLUI_DIST_AUDIO_DEVICE_PROVIDER,
+                classLoader,
+                "getCurDistAudioRoute",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (param.result != null) {
+                            return
+                        }
+                        val routes = runCatching {
+                            providerClass.getDeclaredField("mDistAudioRoutes")
+                                .apply { isAccessible = true }
+                                .get(param.thisObject) as? Map<*, *>
+                        }.getOrNull()
+                        val registered = routes?.get(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                        if (registered != null) {
+                            param.result = registered
+                            log("incallui cur dist audio route synthesized for fake remote")
+                            return
+                        }
+                        val synthetic = incallUiSyntheticRoute
+                            ?: buildInCallUiSyntheticRoute(classLoader)?.also { incallUiSyntheticRoute = it }
+                        if (synthetic != null) {
+                            param.result = synthetic
+                            log("incallui cur dist audio route fabricated for fake remote")
+                        }
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook incallui cur dist audio route: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun buildInCallUiSyntheticRoute(classLoader: ClassLoader): Any? =
+        runCatching {
+            val deviceInfoBuilderClass = findTargetClass(classLoader, INCALLUI_DIST_AUDIO_DEVICE_INFO_BUILDER)
+            val deviceInfoBuilder = deviceInfoBuilderClass.getDeclaredConstructor().newInstance()
+            deviceInfoBuilderClass.getMethod("setDeviceId", String::class.java)
+                .invoke(deviceInfoBuilder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+            deviceInfoBuilderClass.getMethod("setDeviceName", String::class.java)
+                .invoke(deviceInfoBuilder, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+            deviceInfoBuilderClass.getMethod("setDeviceType", Integer.TYPE)
+                .invoke(deviceInfoBuilder, DIST_AUDIO_FAKE_DEVICE_TYPE)
+            val deviceInfo = deviceInfoBuilderClass.getMethod("build").invoke(deviceInfoBuilder)
+            val attributes = AudioAttributes.Builder()
+                .setFlags(DIST_AUDIO_ROUTE_FLAGS)
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(DIST_AUDIO_ROUTE_SAMPLE_RATE)
+                .setChannelMask(DIST_AUDIO_ROUTE_CHANNEL_MASK)
+                .build()
+            val routeBuilderClass = findTargetClass(classLoader, INCALLUI_DIST_AUDIO_ROUTE_BUILDER)
+            val builder = routeBuilderClass.getDeclaredConstructor().newInstance()
+            routeBuilderClass
+                .getMethod("setDistAudioDeviceInfo", findTargetClass(classLoader, INCALLUI_DIST_AUDIO_DEVICE_INFO))
+                .invoke(builder, deviceInfo)
+            routeBuilderClass
+                .getMethod("setAudioAttributes", AudioAttributes::class.java)
+                .invoke(builder, attributes)
+            routeBuilderClass
+                .getMethod("setPlayerFormat", AudioFormat::class.java)
+                .invoke(builder, format)
+            routeBuilderClass
+                .getMethod("setRecorderFormat", AudioFormat::class.java)
+                .invoke(builder, format)
+            routeBuilderClass.getMethod("build").invoke(builder)
+        }.onFailure { error ->
+            log("failed to fabricate incallui dist audio route: ${error.javaClass.simpleName}: ${error.message}")
+        }.getOrNull()
 
     private fun hookInCallUiCallRelayExtras(classLoader: ClassLoader) {
         runCatching {
@@ -7365,6 +7445,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val INCALLUI_CALL = "com.android.incallui.Call"
         private const val INCALLUI_RELAY_UTILS = "com.android.incallui.relay.RelayUtils"
         private const val INCALLUI_RELAY_PRESENTER = "com.android.incallui.relay.RelayPresenter"
+        private const val INCALLUI_DIST_AUDIO_DEVICE_PROVIDER = "com.android.incallui.relay.DistAudioDeviceProvider"
+        private const val INCALLUI_DIST_AUDIO_DEVICE_INFO = "com.miui.audiomonitor.distaudio.data.DistAudioDeviceInfo"
+        private const val INCALLUI_DIST_AUDIO_DEVICE_INFO_BUILDER =
+            "com.miui.audiomonitor.distaudio.data.DistAudioDeviceInfo\$Builder"
+        private const val INCALLUI_DIST_AUDIO_ROUTE_BUILDER =
+            "com.miui.audiomonitor.distaudio.data.DistAudioRoute\$Builder"
         private const val TELECOM_SIMPLE_FEATURES = "com.android.server.telecom.SimpleFeatures"
         private const val TELECOM_CALL = "com.android.server.telecom.Call"
         private const val INCALLUI_EXTRA_RELAY_CALL = "telecomm.EXTRA_RELAY_CALL"

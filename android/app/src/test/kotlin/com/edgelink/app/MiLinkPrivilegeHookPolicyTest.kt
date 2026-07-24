@@ -466,13 +466,6 @@ class MiLinkPrivilegeHookPolicyTest {
                 platform = "AndroidPad"
             )
         )
-        assertTrue(
-            MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
-                mode = "pad",
-                manufacturer = "xiaomi",
-                platform = "Windows"
-            )
-        )
         assertFalse(
             MiLinkPrivilegeHookPolicy.shouldIncludeFakeMirrorRemote(
                 mode = "pad",
