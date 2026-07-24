@@ -47,6 +47,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var incomingPhoneCallLabel = ""
     @Published private(set) var lastDialedPhoneNumber: String
     @Published private(set) var isPhoneCallActive = false
+    @Published private(set) var phoneRelayEchoCancellationEnabled: Bool
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var xiaomiMiLinkCommandStatus = ""
@@ -72,7 +73,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private let screenSession = MacScreenSession()
     private let turnCredentialClient: TurnCredentialClient
     private let presenceClient: PresenceClient
-    private let callRelayCloudflareBridge = CallRelayCloudflareBridge()
+    private let phoneRelayAudioController = PhoneRelayAudioController()
+    private let callRelayCloudflareBridge: CallRelayCloudflareBridge
+    private let phoneRelaySession = MacPhoneRelaySession()
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
@@ -104,6 +107,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var phoneCallStatuses: [String: PhoneCallStatusBody] = [:]
     private var androidMicRelayArmed = false
     private var phoneRelayProbeRunning = false
+    private var phoneRelaySessionRunning = false
+    private var phoneRelayUplinkActive = false
     private var phoneRelayDebugTask: Task<Void, Never>?
     private var phoneRelayDebugSessionID: UUID?
     private var phoneRelayDebugDialRequestID: String?
@@ -158,6 +163,7 @@ final class EdgeLinkRuntime: ObservableObject {
         macNotificationSyncEnabled = UserDefaults.standard.object(forKey: Self.macNotificationSyncDefaultsKey) as? Bool ?? true
         verificationCodeSystemBridgeEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeSystemBridgeDefaultsKey) as? Bool ?? true
         verificationCodeAutoCopyEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeAutoCopyDefaultsKey) as? Bool ?? true
+        phoneRelayEchoCancellationEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayEchoCancellationDefaultsKey) as? Bool ?? true
         lastDialedPhoneNumber = UserDefaults.standard.string(forKey: Self.lastDialedPhoneNumberDefaultsKey) ?? ""
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
@@ -165,6 +171,8 @@ final class EdgeLinkRuntime: ObservableObject {
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
         turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
         presenceClient = PresenceClient(baseURL: workerBaseURL)
+        callRelayCloudflareBridge = CallRelayCloudflareBridge(downlinkPlayer: phoneRelayAudioController.downlinkPlayer)
+        phoneRelayAudioController.echoCancellationEnabled = phoneRelayEchoCancellationEnabled
         notificationPresenter.onCopyVerificationCode = { [weak self] code in
             Task { @MainActor in
                 self?.copyVerificationCode(code, reason: "notification_action")
@@ -229,6 +237,26 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
             Task { @MainActor in
                 self?.handlePhoneRelayPCMStats(stats)
+            }
+        }
+        phoneRelaySession.onDownlinkRTPPacket = { [weak self] packet in
+            guard let self else {
+                return
+            }
+            if let stats = self.phoneRelayAudioController.downlinkPlayer.writeRTPPacket(packet) {
+                Task { @MainActor in
+                    self.handleCallRelayGatewayPlaybackStats(stats)
+                }
+            }
+        }
+        phoneRelaySession.onUplinkDestination = { [weak self] _, _ in
+            Task { @MainActor in
+                self?.startPhoneRelayUplink(reason: "lan_destination")
+            }
+        }
+        phoneRelaySession.onTeardown = { [weak self] reason in
+            Task { @MainActor in
+                self?.stopPhoneRelayUplink(reason: "lan_\(reason)")
             }
         }
         xiaomiMiShareDiscovery.onSnapshotChanged = { [weak self] snapshot in
@@ -319,6 +347,13 @@ final class EdgeLinkRuntime: ObservableObject {
         if enabled {
             verificationCodeBridge.warmObservers()
         }
+    }
+
+    func setPhoneRelayEchoCancellationEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.phoneRelayEchoCancellationDefaultsKey)
+        phoneRelayEchoCancellationEnabled = enabled
+        phoneRelayAudioController.echoCancellationEnabled = enabled
+        DiagnosticsLog.info("phonerelay.mac.echo_cancellation_enabled enabled=\(enabled)")
     }
 
     func setVerificationCodeAutoCopyEnabled(_ enabled: Bool) {
@@ -2159,17 +2194,19 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelaySourceSequence = 0
         phoneRelaySourceSendFailed = false
         callRelayCloudflareBridge.start(sessionId: sessionId)
-        ensurePhoneRelayProbeEnabled(reason: "phone_action_\(action)_cloudflare")
-        phoneRelayProbe.armSourceRTP(reason: "phone_action_\(action)_cloudflare")
+        phoneRelayAudioController.echoCancellationEnabled = phoneRelayEchoCancellationEnabled
+        phoneRelayAudioController.startDownlink()
+        startPhoneRelaySession(reason: "phone_action_\(action)")
         let lanCandidateReady = await waitForPhoneRelayLANCandidateReady()
         let lanHost = lanCandidateReady
             ? Self.phoneRelayAdvertisedHost()
             : nil
         DiagnosticsLog.info(
-            "phone.mac.relay_endpoint action=\(action) mode=cloudflare_secure " +
+            "phone.mac.relay_endpoint action=\(action) mode=secure_channel " +
                 "phoneLocal=127.0.0.1:\(Self.phoneRelayProbePort) sessionId=\(sessionId) " +
                 "lanCandidate=\(lanHost ?? "none"):\(Self.phoneRelayProbePort) " +
-                "lanProbePort=\(lanHost == nil ? 0 : Int(LANTransport.reachabilityProbePort))"
+                "lanProbePort=\(lanHost == nil ? 0 : Int(LANTransport.reachabilityProbePort)) " +
+                "aec=\(phoneRelayEchoCancellationEnabled)"
         )
         return PhoneRelayEndpoint(
             host: "127.0.0.1",
@@ -2181,11 +2218,82 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
+    private func startPhoneRelaySession(reason: String) {
+        guard !phoneRelaySessionRunning else {
+            return
+        }
+        guard !phoneRelayProbeRunning else {
+            DiagnosticsLog.warn(
+                "phonerelay.mac.session_start_skipped reason=\(reason) probe_running=true port=\(Self.phoneRelayProbePort)"
+            )
+            return
+        }
+        do {
+            try phoneRelaySession.start(port: Self.phoneRelayProbePort)
+            phoneRelaySessionRunning = true
+            DiagnosticsLog.info("phonerelay.mac.session_started reason=\(reason) port=\(Self.phoneRelayProbePort)")
+        } catch {
+            phoneRelaySessionRunning = false
+            DiagnosticsLog.error("phonerelay.mac.session_start_failed reason=\(reason)", error)
+        }
+    }
+
+    private func stopPhoneRelaySession(reason: String) {
+        guard phoneRelaySessionRunning else {
+            return
+        }
+        phoneRelaySessionRunning = false
+        phoneRelaySession.stop(reason: reason)
+        DiagnosticsLog.info("phonerelay.mac.session_stopped reason=\(reason)")
+    }
+
+    private func startPhoneRelayUplink(reason: String) {
+        guard !phoneRelayUplinkActive else {
+            return
+        }
+        guard activePhoneRelaySessionId != nil else {
+            DiagnosticsLog.info("phonerelay.mac.uplink_start_skipped reason=\(reason) no_active_session")
+            return
+        }
+        phoneRelayUplinkActive = true
+        phoneRelayAudioController.echoCancellationEnabled = phoneRelayEchoCancellationEnabled
+        phoneRelayAudioController.startUplink { [weak self] packet in
+            Task { @MainActor in
+                self?.routePhoneRelayUplinkPacket(packet)
+            }
+        }
+        phoneRelaySession.setUplinkActive(true)
+        DiagnosticsLog.info(
+            "phonerelay.mac.uplink_start reason=\(reason) aec=\(phoneRelayEchoCancellationEnabled)"
+        )
+    }
+
+    private func stopPhoneRelayUplink(reason: String) {
+        guard phoneRelayUplinkActive else {
+            return
+        }
+        phoneRelayUplinkActive = false
+        phoneRelayAudioController.stopUplink(reason: reason)
+        phoneRelaySession.setUplinkActive(false)
+        DiagnosticsLog.info("phonerelay.mac.uplink_stop reason=\(reason)")
+    }
+
+    private func routePhoneRelayUplinkPacket(_ packet: Data) {
+        if phoneRelaySessionRunning, phoneRelaySession.hasUplinkDestination {
+            phoneRelaySession.sendUplinkRTP(packet)
+            return
+        }
+        Task {
+            await sendPhoneRelaySourcePacket(packet)
+        }
+    }
+
     private func waitForPhoneRelayLANCandidateReady() async -> Bool {
         for attempt in 0...12 {
-            if phoneRelayProbeRunning,
-               phoneRelayProbe.isTCPListenerReady(),
-               lanTransport.isReachabilityProbeReady {
+            let listenerReady = phoneRelaySessionRunning
+                ? phoneRelaySession.isTCPListenerReady()
+                : (phoneRelayProbeRunning && phoneRelayProbe.isTCPListenerReady())
+            if listenerReady, lanTransport.isReachabilityProbeReady {
                 return true
             }
             guard attempt < 12, !Task.isCancelled else {
@@ -2294,12 +2402,9 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info("callrelay.mac.cloudflare_status sessionId=\(body.sessionId) event=\(event)")
         switch event {
         case "source_start":
-            phoneRelayProbe.startExternalSourceRTP(reason: "cloudflare_source_start") { [weak self] packet in
-                Task { @MainActor in
-                    await self?.sendPhoneRelaySourcePacket(packet)
-                }
-            }
+            startPhoneRelayUplink(reason: "cloudflare_source_start")
         case "source_stop", "bridge_failed", "bridge_stopped":
+            stopPhoneRelayUplink(reason: "cloudflare_\(event)")
             phoneRelayProbe.stopExternalSourceRTP(reason: "cloudflare_\(event)")
         default:
             break
@@ -3529,6 +3634,9 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func stopPhoneCallRelayAudio(reason: String) {
+        stopPhoneRelayUplink(reason: reason)
+        phoneRelayAudioController.stopDownlink(reason: reason)
+        stopPhoneRelaySession(reason: reason)
         stopPhoneRelayProbe(reason: reason)
         phoneRelayProbe.stopExternalSourceRTP(reason: reason)
         callRelayCloudflareBridge.stop(reason: reason)
@@ -3541,8 +3649,14 @@ final class EdgeLinkRuntime: ObservableObject {
         let source = status.sourceName ?? status.source.map(String.init) ?? "unknown"
         if status.active {
             androidMicRelayArmed = true
-            ensurePhoneRelayProbeEnabled(reason: "android_mic_\(source)")
-            phoneRelayProbe.armSourceRTP(reason: "android_mic_\(source)")
+            if phoneRelaySessionRunning {
+                DiagnosticsLog.info(
+                    "mic.mac.android_probe_skipped source=\(source) reason=phone_relay_session_running"
+                )
+            } else {
+                ensurePhoneRelayProbeEnabled(reason: "android_mic_\(source)")
+                phoneRelayProbe.armSourceRTP(reason: "android_mic_\(source)")
+            }
             DiagnosticsLog.info(
                 "mic.mac.android_active source=\(source) count=\(status.activeRecordingCount) " +
                     "session=\(status.sessionId.map(String.init) ?? "none") reason=\(status.reason)"
@@ -3696,6 +3810,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let verificationCodeSystemBridgeDefaultsKey = "verificationCodeSystemBridgeEnabled"
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
     private static let lastDialedPhoneNumberDefaultsKey = "lastDialedPhoneNumber"
+    private static let phoneRelayEchoCancellationDefaultsKey = "phoneRelayEchoCancellationEnabled"
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102

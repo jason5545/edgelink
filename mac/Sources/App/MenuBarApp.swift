@@ -225,6 +225,15 @@ private struct SettingsSection: View {
             .toggleStyle(.switch)
 
             Toggle(
+                "通話回音消除",
+                isOn: Binding(
+                    get: { runtime.phoneRelayEchoCancellationEnabled },
+                    set: { runtime.setPhoneRelayEchoCancellationEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+
+            Toggle(
                 "自動複製驗證碼",
                 isOn: Binding(
                     get: { runtime.verificationCodeAutoCopyEnabled },

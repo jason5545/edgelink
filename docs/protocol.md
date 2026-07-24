@@ -450,7 +450,75 @@ Android -> Mac metadata envelope：
 
 Mac 麥克風 audio track 必須由使用者明確啟用；EdgeLinkMac 目前用「通話麥克風」開關啟用
 `edgelink-mac-microphone` track，並沿用 `edgelink-screen` WebRTC session 送到 Android。
-這條 track 是通話音訊路徑的 Mac -> Android 半邊骨架，不代表 Xiaomi PHONERELAY 已經接上。
+
+#### PHONERELAY 通話音訊（正式路徑）
+
+PHONERELAY 通話音訊已於真實通話（IVR）驗證，現由正式通話流程持有，不再是 probe。
+通話控制（dial/answer/hangup/DTMF）走 `phone.action`；音訊有兩條互斥傳輸路，
+由 Android 端依 `lanHost`/`lanProbePort` reachability 選路，Mac 兩者同時準備：
+
+1. Secure channel relay（預設）：Android 端 `AndroidCallRelayBridge` 在手機本機與
+   通話音訊 endpoint 做 RTSP/RTP 橋接，RTP 封包以 base64 裝入 `phone.relay.media`
+   envelope（`kind=rtp`，`direction=android_to_mac` / `mac_to_android`）。
+2. LAN direct（同網段且 reachability probe 通過）：手機直接連 Mac 正式
+   `MacPhoneRelaySession` 的 RTSP listener（TCP/UDP 7102），RTP 不走 secure channel。
+
+埠號：
+
+- RTSP：TCP 7102（雙向控制；兩端都同時實作 server 與 client 角色）。
+- 下行 RTP/RTCP（手機 -> Mac）：UDP 19000/19001。
+- 上行 RTP（Mac -> 手機）：Mac 從 UDP 19002 送出；目的埠為對端回報的
+  `wfd_client_rtp_ports` 或 SETUP `Transport: client_port`。UDP 19003 保留給上行 RTCP。
+
+RTSP 方法序：
+
+- 下行：手機送 OPTIONS/GET_PARAMETER/SET_PARAMETER；Mac 回 audio-only WFD 參數
+  （`wfd_audio_codecs: AAC 00000001 00`、`wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play`），
+  收到 `wfd_trigger_method: SETUP` 後 Mac 送 sink 側 SETUP/PLAY。
+- 上行：Mac 送 GET_PARAMETER（取 `wfd_client_rtp_ports`）-> SET_PARAMETER
+  （`wfd_presentation_URL` + trigger SETUP）-> SETUP/PLAY。目前對端對 source 側
+  SETUP/PLAY 回 405，但仍建立 RTP sink 並解碼上行流；405 視為非致命。
+
+封包格式：
+
+- RTP payload type 33（marker bit 設置），90 kHz clock，timestamp 每封包 +1800；
+  Mac 上行 SSRC 固定為 `0xed9e1101`。
+- RTP payload = MPEG-TS，每包至多 5 個 188-byte TS packet，不完整的尾段由 40 ms
+  flush timer 補齊送出。
+- 上行 TS：PAT（PMT PID 0x1000）/PMT 每 5 個 PES 重複；音訊 PID 0x1100，
+  stream_type 0x0F（AAC ADTS），PES stream_id 0xC0；每個 PES 第一個 TS packet 的
+  adaptation field 帶 PCR；每個 AAC access unit 加 7-byte ADTS header、一個 access
+  unit 一個 PES。音訊為 AAC-LC 48 kHz mono 64 kbps，由 AVFoundation 編碼、
+  EdgeLinkKit 自幹 TS muxer 封裝，不依賴外部 ffmpeg。
+- 下行 TS：音訊 PID 0x1100 的 PES payload 為 8 kHz mono s16 PCM，Mac 端以
+  AVAudioPlayerNode 內建播放，不依賴外部 ffplay。
+
+狀態機與降級：
+
+- dial/answer 或 `phone.relay.start` -> Mac 準備 endpoint（下行播放器 + RTSP
+  listener + secure session）。
+- Android bridge 回 `source_start`，或 LAN 模式學到上行 destination -> 啟動上行
+  管線（mic -> AAC -> TS -> RTP）。
+- `source_stop` / PAUSE / TEARDOWN / hangup / 通話狀態全滅 / 傳輸中斷 -> 停上行；
+  通話結束 -> 停下行與 RTSP listener。手機拿起來講（路由切換）由 Android 端
+  關閉 source/sink 並回 `source_stop` 處理。
+- 上行管線建立失敗（mic 權限、編碼器、音訊引擎）-> 降級為純 call control，
+  不影響 `phone.action`；`bridge_failed` -> 停上行、保留下行至通話結束。
+
+回音消除（AEC）：
+
+- 「通話回音消除」開關（`phoneRelayEchoCancellationEnabled`，預設 ON，持久化，
+  狀態寫入 diagnostics 的 `phonerelay.mac.*` 事件）。
+- ON：mic 擷取走 Apple voice processing（`setVoiceProcessingEnabled(true)`），並設定
+  `voiceProcessingOtherAudioDuckingConfiguration`（advanced ducking on、level min）；
+  下行播放 attach 到同一個 voice processing engine，避免下行自己也被系統 duck。
+  副作用與 FaceTime 相同：通話中系統會 duck 其他 app 音訊。
+- OFF：上行與下行各自使用獨立 AVAudioEngine，無系統副作用，但也無 AEC 與
+  Voice Isolation。
+
+`MiLinkPhoneRelayProbe` 保留為 diagnostics 工具（hidden defaults 啟用，含外部
+ffplay/ffmpeg 實驗路徑），正式路徑不依賴它。協商觀察細節見
+`docs/milink-apk-notes.md`。
 
 SDP / ICE signaling 仍是 secure frame envelope，雙向傳送：
 
