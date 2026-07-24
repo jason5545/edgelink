@@ -86,6 +86,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_start"
     const val MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY = "debug.edgelink.mirror_fake_remote_audio_sink_arg"
     const val MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY = "debug.edgelink.mirror_fake_remote_plain_rtp"
+    const val MIRROR_FAKE_TRUSTED_TYPE_PROPERTY = "debug.edgelink.mirror_fake_trusted_type"
+    const val MIRROR_ISLAND_REPOST_PROPERTY = "debug.edgelink.mirror_island_repost"
     const val MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_ip"
     const val MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY = "debug.edgelink.mirror_fake_remote_peer_port"
     const val MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY = "debug.edgelink.mirror_fake_remote_local_ip"
@@ -408,6 +410,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         if (MiLinkPrivilegeHookPolicy.shouldHookMainService(lpparam.packageName, lpparam.processName)) {
             hookCastClientServiceCheck(lpparam.classLoader)
             hookMirrorHEVCEncoderRecovery()
+            hookCirculateDeviceTypeDiagnostics(lpparam.classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookDistributedHardware(lpparam.packageName, lpparam.processName)) {
             hookMirrorHEVCEncoderRecovery()
@@ -437,6 +440,32 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiShare(lpparam.packageName, lpparam.processName)) {
             hookMiShareLyraTrustInjection(lpparam.classLoader)
+        }
+    }
+
+    private fun hookCirculateDeviceTypeDiagnostics(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                CIRCULATE_DEVICE_LIST_UTILS,
+                classLoader,
+                "g",
+                Context::class.java,
+                findTargetClass(classLoader, CIRCULATE_DEVICE_INFO),
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val info = param.args.getOrNull(1) ?: return
+                        val summary = runCatching { info.toString() }.getOrDefault("")
+                        if (!summary.contains(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID) &&
+                            !summary.contains(MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
+                        ) {
+                            return
+                        }
+                        log("circulate device type label summary=$summary result=${param.result}")
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook circulate device type label: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -629,7 +658,54 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
+    private val islandDebugPollerStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun startIslandDebugPollerIfNeeded(classLoader: ClassLoader) {
+        if (!islandDebugPollerStarted.compareAndSet(false, true)) {
+            return
+        }
+        thread(name = "EdgeLinkIslandDebug") {
+            var lastTrigger = ""
+            while (true) {
+                runCatching {
+                    val trigger = readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_ISLAND_REPOST_PROPERTY).trim()
+                    if (trigger.isNotEmpty() && trigger != lastTrigger) {
+                        lastTrigger = trigger
+                        val type = currentFakeMirrorTrustedDeviceType()
+                        val context = findTargetClass(classLoader, XIAOMI_MIRROR_APPLICATION)
+                            .getMethod("z").invoke(null) as? Context
+                        if (context != null) {
+                            ensureFakeMirrorCastBusinessDevice(
+                                classLoader,
+                                MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID
+                            )
+                            val islandClass = findTargetClass(classLoader, XIAOMI_MIRROR_ISLAND_UTILS)
+                            islandClass
+                                .getMethod(
+                                    "m",
+                                    Boolean::class.javaPrimitiveType,
+                                    Context::class.java,
+                                    String::class.java,
+                                    Boolean::class.javaPrimitiveType
+                                )
+                                .invoke(
+                                    null,
+                                    false,
+                                    context,
+                                    MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID,
+                                    false
+                                )
+                            log("island debug reposted type=$type trigger=$trigger")
+                        }
+                    }
+                }
+                Thread.sleep(1_000)
+            }
+        }
+    }
+
     private fun hookMirrorRemoteExperiment(classLoader: ClassLoader) {
+        startIslandDebugPollerIfNeeded(classLoader)
         hookMirrorRemoteProviderResults(classLoader)
         hookMirrorTerminalLookup(classLoader)
         hookMirrorDeviceTypeChecks(classLoader)
@@ -639,6 +715,63 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         hookMirrorAudioStartGuard(classLoader)
         hookMirrorCallActiveGuard(classLoader)
         hookMirrorPlainAudioRelay(classLoader)
+        hookMirrorIslandTypeDiagnostics(classLoader)
+    }
+
+    private fun hookMirrorIslandTypeDiagnostics(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_ISLAND_UTILS,
+                classLoader,
+                "h",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                            return
+                        }
+                        log("mirror island device type lookup deviceId=$deviceId result=${param.result} override=14")
+                        param.result = 14
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_ISLAND_UTILS,
+                classLoader,
+                "g",
+                Context::class.java,
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(1) as? String
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                            return
+                        }
+                        log("mirror island device name lookup deviceId=$deviceId result=${param.result} override=MacBook")
+                        param.result = "MacBook"
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                XIAOMI_MIRROR_LYRA_UTILS_ALT,
+                classLoader,
+                "z",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val deviceId = param.args.getOrNull(0) as? String
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(deviceId)) {
+                            return
+                        }
+                        log("mirror market name lookup deviceId=$deviceId result=${param.result} override=MacBook")
+                        param.result = "MacBook"
+                    }
+                }
+            )
+        }.onFailure { error ->
+            log("failed to hook mirror island type lookup: ${error.javaClass.simpleName}: ${error.message}")
+        }
     }
 
     private fun hookMirrorCallActiveGuard(classLoader: ClassLoader) {
@@ -5549,6 +5682,12 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             log("failed to inject fake lyra device: ${error.javaClass.simpleName}: ${error.message}")
         }.getOrNull()
 
+    private fun currentFakeMirrorTrustedDeviceType(): Int =
+        readSystemProperty(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_TRUSTED_TYPE_PROPERTY)
+            .trim()
+            .toIntOrNull()
+            ?: FAKE_MIRROR_TRUSTED_DEVICE_TYPE
+
     private fun createFakeMirrorTrustedDeviceInfo(classLoader: ClassLoader, deviceId: String): Any? =
         runCatching {
             val trustedInfoClass = findTargetClass(classLoader, XIAOMI_CONTINUITY_TRUSTED_DEVICE_INFO)
@@ -5557,7 +5696,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             trustedInfoClass.getMethod("l", String::class.java)
                 .invoke(trustedInfo, MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_NAME)
             trustedInfoClass.getMethod("m", Integer.TYPE)
-                .invoke(trustedInfo, FAKE_MIRROR_TRUSTED_DEVICE_TYPE)
+                .invoke(trustedInfo, currentFakeMirrorTrustedDeviceType())
             writeReflectiveIntFieldAny(
                 trustedInfo,
                 FAKE_MIRROR_TRUSTED_MEDIUM_TYPES,
@@ -7387,6 +7526,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE = "com.xiaomi.mirror.connection.C0701g"
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE_OBFUSCATED = "com.xiaomi.mirror.connection.g"
         private const val XIAOMI_MIRROR_CAST_BUSINESS_WRAPPER = "N2.d"
+        private const val XIAOMI_MIRROR_ISLAND_UTILS = "com.xiaomi.mirror.cast.a"
+        private const val XIAOMI_MIRROR_LYRA_UTILS_ALT = "p184x3.z"
+        private const val CIRCULATE_DEVICE_LIST_UTILS = "com.miui.circulate.world.ui.devicelist.q"
+        private const val CIRCULATE_DEVICE_INFO = "com.miui.circulate.api.service.CirculateDeviceInfo"
         private const val XIAOMI_MIRROR_LYRA_BUSINESS = "N2.a"
         private const val XIAOMI_MIRROR_LYRA_UTILS = "x3.z"
         private const val XIAOMI_MIRROR_NATIVE_LOG_MANAGER = "o4.Q\$a"
