@@ -174,9 +174,9 @@ final class TunnelProtocolTests: XCTestCase {
     // MARK: - Constants
 
     func testConstants() {
-        XCTAssertEqual(TunnelConstants.initialCredit, 64 * 1024)
+        XCTAssertEqual(TunnelConstants.initialCredit, 1024 * 1024)
         XCTAssertEqual(TunnelConstants.streamIdleTimeout, 60)
         XCTAssertEqual(TunnelConstants.tunnelIdleTimeout, 300)
-        XCTAssertEqual(TunnelChunker.maxChunkSize, 48 * 1024)
+        XCTAssertEqual(TunnelChunker.maxChunkSize, 32 * 1024)
     }
 }

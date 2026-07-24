@@ -136,10 +136,10 @@ class TunnelProtocolTest {
 
     @Test
     fun constants() {
-        assertEquals(64 * 1024, TunnelConstants.INITIAL_CREDIT)
+        assertEquals(1024 * 1024, TunnelConstants.INITIAL_CREDIT)
         assertEquals(60_000L, TunnelConstants.STREAM_IDLE_TIMEOUT_MS)
         assertEquals(300_000L, TunnelConstants.TUNNEL_IDLE_TIMEOUT_MS)
-        assertEquals(48 * 1024, TunnelChunker.MAX_CHUNK_SIZE)
+        assertEquals(32 * 1024, TunnelChunker.MAX_CHUNK_SIZE)
     }
 
     @Test
