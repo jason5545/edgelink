@@ -38,6 +38,7 @@ struct EdgeLinkMacApp: App {
 private enum MenuBarSection: String, CaseIterable, Identifiable {
     case status
     case phone
+    case tunnel
     case miShare
     case settings
 
@@ -49,6 +50,8 @@ private enum MenuBarSection: String, CaseIterable, Identifiable {
             return String(localized: "狀態")
         case .phone:
             return String(localized: "手機")
+        case .tunnel:
+            return String(localized: "隧道")
         case .miShare:
             return String(localized: "快傳")
         case .settings:
@@ -80,6 +83,8 @@ private struct MenuBarPopover: View {
                     StatusSection(runtime: runtime)
                 case .phone:
                     PhoneSection(runtime: runtime, openWindow: openWindow)
+                case .tunnel:
+                    TunnelSection(runtime: runtime)
                 case .miShare:
                     MiShareSection(runtime: runtime)
                 case .settings:
@@ -196,6 +201,47 @@ private struct MiShareSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+            }
+        }
+    }
+}
+
+private struct TunnelSection: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                runtime.enableAdbTunnel()
+            } label: {
+                Label("啟用 ADB 隧道", systemImage: "terminal")
+            }
+            .disabled(!runtime.isConnected)
+
+            if let adbPort = runtime.tunnelAdbPort {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("adb connect localhost:\(String(adbPort))")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+
+            if !runtime.tunnelStatusText.isEmpty {
+                Text(runtime.tunnelStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+
+            if runtime.tunnelAdbPort != nil {
+                Divider()
+                Button(role: .destructive) {
+                    runtime.disableAdbTunnel()
+                } label: {
+                    Label("停止 ADB 隧道", systemImage: "stop.circle")
+                }
             }
         }
     }

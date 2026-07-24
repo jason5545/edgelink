@@ -51,6 +51,12 @@ public enum EnvelopeType {
     public static let androidMicStatus = "android.mic.status"
     public static let macSleep = "mac.sleep"
     public static let macAwake = "mac.awake"
+    public static let tunnelOpen = "tunnel.open"
+    public static let tunnelOpenResult = "tunnel.open.result"
+    public static let tunnelData = "tunnel.data"
+    public static let tunnelClose = "tunnel.close"
+    public static let tunnelError = "tunnel.error"
+    public static let tunnelFlow = "tunnel.flow"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {

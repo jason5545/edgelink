@@ -26,6 +26,12 @@ import com.edgelink.core.LocalIdentity
 import com.edgelink.core.MiLinkCommandBody
 import com.edgelink.core.MiLinkCommandResultBody
 import com.edgelink.core.MiLinkFrameBody
+import com.edgelink.core.TunnelCloseBody
+import com.edgelink.core.TunnelDataBody
+import com.edgelink.core.TunnelErrorBody
+import com.edgelink.core.TunnelFlowBody
+import com.edgelink.core.TunnelOpenBody
+import com.edgelink.core.TunnelOpenResultBody
 import com.edgelink.core.MiLinkMirrorMediaBody
 import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
@@ -256,6 +262,16 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onMacAwake = {
             handleMacAwake()
+        },
+        onTunnelEnvelope = { type, body ->
+            tunnelManager.handleEnvelope(type, body)
+        }
+    )
+
+    private val tunnelManager = AndroidTunnelManager(
+        scope = scope,
+        sendEnvelope = { type, body ->
+            sendTunnelEnvelope(type, body)
         }
     )
 
@@ -2112,6 +2128,20 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         sendPlaintext(EnvelopeCodec.encode(type, body))
     }
 
+    private suspend fun sendTunnelEnvelope(type: String, body: Any) {
+        val json = EnvelopeCodec.json
+        val payload = when (body) {
+            is TunnelOpenBody -> EnvelopeCodec.encode(type, body)
+            is TunnelOpenResultBody -> EnvelopeCodec.encode(type, body)
+            is TunnelDataBody -> EnvelopeCodec.encode(type, body)
+            is TunnelCloseBody -> EnvelopeCodec.encode(type, body)
+            is TunnelErrorBody -> EnvelopeCodec.encode(type, body)
+            is TunnelFlowBody -> EnvelopeCodec.encode(type, body)
+            else -> return
+        }
+        sendPlaintext(payload)
+    }
+
     private fun sendPlaintext(plaintext: ByteArray) {
         val activeSession = session ?: return
         scope.launch(Dispatchers.IO) {
@@ -2149,7 +2179,8 @@ private class AndroidCommandDispatcher(
     private val onPhoneRelayEndpoint: suspend (PhoneRelayEndpointBody) -> Unit,
     private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit,
     private val onMacSleep: () -> Unit,
-    private val onMacAwake: () -> Unit
+    private val onMacAwake: () -> Unit,
+    private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> }
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2282,6 +2313,15 @@ private class AndroidCommandDispatcher(
                 ControlTimeline.mark()
                 screenSession.noteControlEvent("key:${envelope.b.key}:${envelope.b.down}")
                 RemoteInputService.dispatchKey(envelope.b)
+                null
+            }
+            EnvelopeTypes.TUNNEL_OPEN, EnvelopeTypes.TUNNEL_OPEN_RESULT,
+            EnvelopeTypes.TUNNEL_DATA, EnvelopeTypes.TUNNEL_CLOSE,
+            EnvelopeTypes.TUNNEL_ERROR, EnvelopeTypes.TUNNEL_FLOW -> {
+                val type = EnvelopeCodec.type(plaintext)
+                val envelope = EnvelopeCodec.json.decodeFromString<kotlinx.serialization.json.JsonObject>(plaintext.decodeToString())
+                val body = envelope["b"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())
+                onTunnelEnvelope(type, body)
                 null
             }
             else -> null

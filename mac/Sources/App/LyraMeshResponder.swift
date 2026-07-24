@@ -69,6 +69,7 @@ final class LyraMeshResponder {
     private var eventBytesBuffer = Data()
     private var streamReceives: [UInt32: StreamReceive] = [:]
     private var expressBuffers: [ObjectIdentifier: Data] = [:]
+    var tunnelManager: LyraTunnelManager?
 
     private struct StreamReceive {
         var streamId: UInt32
@@ -119,6 +120,10 @@ final class LyraMeshResponder {
         lastEndpointDescription = endpoint.debugDescription
         if frame.packType == 5 {
             handlePayloadV2(frame: frame, endpoint: endpoint)
+            return
+        }
+        if frame.packType == LyraTransDataType.tunnel {
+            handleTunnelPayload(frame: frame, endpoint: endpoint)
             return
         }
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
@@ -373,6 +378,15 @@ final class LyraMeshResponder {
         if channelKey != nil || !syncKeyCandidates.isEmpty || syncSessionKey != nil {
             DiagnosticsLog.warn("xiaomi.mishare.channel_payload_decrypt_failed bytes=\(body.count)")
         }
+    }
+
+    private func handleTunnelPayload(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) {
+        let payload = frame.payload
+        DiagnosticsLog.info(
+            "xiaomi.tunnel.rx from=\(endpoint.debugDescription) bytes=\(payload.count) " +
+                "hex=\(payload.prefix(32).map { String(format: "%02x", $0) }.joined())"
+        )
+        tunnelManager?.handleTunnelPayload(payload)
     }
 
     private func startChannelNegotiation(

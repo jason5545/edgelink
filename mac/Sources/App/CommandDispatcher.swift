@@ -18,6 +18,7 @@ final class CommandDispatcher {
     private let onMiLinkFrame: @Sendable (MiLinkFrameBody) -> Void
     private let onMiLinkMirrorMedia: @Sendable (MiLinkMirrorMediaBody) -> Void
     private let onMiLinkCommandResult: @Sendable (MiLinkCommandResultBody) -> Void
+    private let onTunnelEnvelope: @Sendable (String, Data) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -37,7 +38,8 @@ final class CommandDispatcher {
         onMiLinkStatus: @escaping @Sendable (MiLinkStatusBody) -> Void = { _ in },
         onMiLinkFrame: @escaping @Sendable (MiLinkFrameBody) -> Void = { _ in },
         onMiLinkMirrorMedia: @escaping @Sendable (MiLinkMirrorMediaBody) -> Void = { _ in },
-        onMiLinkCommandResult: @escaping @Sendable (MiLinkCommandResultBody) -> Void = { _ in }
+        onMiLinkCommandResult: @escaping @Sendable (MiLinkCommandResultBody) -> Void = { _ in },
+        onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in }
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
@@ -55,6 +57,7 @@ final class CommandDispatcher {
         self.onMiLinkFrame = onMiLinkFrame
         self.onMiLinkMirrorMedia = onMiLinkMirrorMedia
         self.onMiLinkCommandResult = onMiLinkCommandResult
+        self.onTunnelEnvelope = onTunnelEnvelope
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -156,6 +159,10 @@ final class CommandDispatcher {
             DispatchQueue.main.async { [screenSession] in
                 screenSession?.handleIce(envelope.b)
             }
+            return nil
+        case EnvelopeType.tunnelOpen, EnvelopeType.tunnelOpenResult, EnvelopeType.tunnelData,
+             EnvelopeType.tunnelClose, EnvelopeType.tunnelError, EnvelopeType.tunnelFlow:
+            onTunnelEnvelope(header.t, plaintext)
             return nil
         default:
             return nil

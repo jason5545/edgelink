@@ -796,3 +796,78 @@ Cloudflare：
 - Worker 原生 fetch router。
 - `RegistryDO`、`PairingDO`、`RelayDO` 三個 Durable Object class。
 - PairingDO claim 要限速；Relay frame 上限 64 KB。
+
+## 9. TCP Tunnel (Port Forwarding)
+
+EdgeLink 提供裝置間通用 TCP 隧道，支援 adb over tunnel、任意 port forward（local/remote）。
+兩條路線並存，依 device profile 選路：
+
+- **Route (a) micont 相容 tunnel**：Xiaomi 裝置走 Lyra mesh + LogiConn TransDataType 6，
+  手機原生 TunnelManager 當對端。協議細節見 `docs/lyra-netbus-notes.md`。
+- **Route (b) EdgeLink 自有 tunnel**：任何 Android 裝置，走 E2EE secure envelope。
+
+### Envelope 格式（Route b）
+
+所有 tunnel envelope 走現有 E2EE secure frame（JSON envelope，64 KB frame 上限）。
+大於 48 KB 的 TCP 資料切塊為多個 `tunnel.data` envelope。
+
+```json
+{"t":"tunnel.open","b":{"tunnelId":"uuid","direction":"local|remote","targetHost":"127.0.0.1","targetPort":5555,"label":"adb"}}
+{"t":"tunnel.open.result","b":{"tunnelId":"uuid","ok":true,"error":null,"listenPort":15555}}
+{"t":"tunnel.data","b":{"tunnelId":"uuid","streamId":1,"seq":0,"payload":"<base64>","fin":false}}
+{"t":"tunnel.close","b":{"tunnelId":"uuid","streamId":1,"fin":true,"reset":false}}
+{"t":"tunnel.error","b":{"tunnelId":"uuid","streamId":null,"code":"target_refused","message":"..."}}
+{"t":"tunnel.flow","b":{"tunnelId":"uuid","streamId":1,"credit":65536}}
+```
+
+### 方向
+
+- `direction: "local"`（local forward，ssh -L 類）：Mac 開 listen port，手機端 dial 目標。
+- `direction: "remote"`（remote forward，ssh -R 類）：手機開 listen port，Mac 端 dial 目標。
+
+### 狀態機
+
+每條 stream：`opening → open → halfClosedLocal / halfClosedRemote → closed`。
+
+- `tunnel.data` 帶 `fin: true` 表示該方向 FIN（half-close）。
+- `tunnel.close` 帶 `reset: true` 表示 RST（立即斷線，不等 FIN）。
+- 兩端都 FIN 或任一端 RST → stream closed。
+
+### Flow Control
+
+- 初始 credit：每 stream 每方向 64 KB。
+- `tunnel.flow` 授予額外 credit。Sender 不可超過可用 credit。
+- Receiver 消化本機 socket buffer 後回 `tunnel.flow` 補充 credit。
+- 單條 stream 卡死不影響其他 stream（獨立 credit）。
+
+### 錯誤碼
+
+| code | 語意 |
+|------|------|
+| `target_refused` | 目標連線被拒 |
+| `target_timeout` | 目標連線逾時 |
+| `not_allowed` | 目標不在 allowlist |
+| `tunnel_not_found` | tunnelId 不存在 |
+| `stream_not_found` | streamId 不存在 |
+| `flow_violation` | 超過 credit 限制 |
+| `internal_error` | 其他內部錯誤 |
+
+### 安全限制
+
+- 預設 allowlist：只允許 loopback 目標（`127.0.0.1`、`::1`、`localhost`）。
+- adb 場景：port 5555 寫死允許。
+- 雙端各自維護 allowlist；非 allowlist 目標回 `not_allowed`。
+- 不允許 wildcard / 0.0.0.0 / public IP（除非明確加入 allowlist）。
+
+### 降級與重連
+
+- Tunnel 不可用不影響既有功能（clipboard、notification、screen 等）。
+- LAN↔relay handover：所有 active stream 收 RST；tunnel 定義存活，重連後可開新 stream。
+- Idle timeout：stream 60 秒無資料 → close；tunnel 5 分鐘無 stream → tear down。
+- Route (a) 失敗時 fallback 到 route (b)（若對端非 Xiaomi 或 tunnel 協商失敗）。
+
+### 切塊
+
+- 單一 `tunnel.data` envelope 的 `payload` 最大 48 KB（base64 編碼前）。
+- 超過 48 KB 的 TCP read 切為多個 chunk，各自帶递增 `seq`。
+- 最後一個 chunk 帶 `fin: true`（若該方向已 FIN）。

@@ -32,6 +32,8 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var connectionStatus = "Starting"
     @Published private(set) var isConnected = false
     @Published private(set) var canDisconnect = false
+    @Published private(set) var tunnelAdbPort: Int?
+    @Published private(set) var tunnelStatusText = ""
     @Published private(set) var pairingSAS = ""
     @Published private(set) var pairingPeerName = ""
     @Published private(set) var pairingStatus = ""
@@ -80,6 +82,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
     private var lyraFileSendSession: LyraFileSendSession?
+    private let tunnelManager = TunnelManager()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
     private var localIdentity: LocalIdentity?
@@ -2810,6 +2813,11 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.handleMiLinkCommandResult(result)
                         }
+                    },
+                    onTunnelEnvelope: { [weak self] type, plaintext in
+                        Task { @MainActor in
+                            self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -3181,6 +3189,48 @@ final class EdgeLinkRuntime: ObservableObject {
                     )
                 )
             }
+        }
+    }
+
+    private func handleTunnelEnvelope(type: String, plaintext: Data) {
+        Task {
+            await tunnelManager.handleEnvelope(type: type, plaintext: plaintext)
+        }
+    }
+
+    func enableAdbTunnel() {
+        Task {
+            do {
+                await tunnelManager.setSendHandler { [weak self] data in
+                    guard let self else { return }
+                    try await self.currentSession?.sendPlaintext(data)
+                }
+                let port = try await tunnelManager.startLocalForward(
+                    targetHost: "127.0.0.1",
+                    targetPort: 5555,
+                    label: "adb"
+                )
+                tunnelAdbPort = port
+                tunnelStatusText = "隧道已建立，Mac 端 listen port \(port)"
+                DiagnosticsLog.info("tunnel.mac.adb_enabled port=\(port)")
+            } catch {
+                tunnelStatusText = "隧道建立失敗：\(error.localizedDescription)"
+                DiagnosticsLog.warn("tunnel.mac.adb_failed error=\(error)")
+            }
+        }
+    }
+
+    func disableAdbTunnel() {
+        Task {
+            if let port = tunnelAdbPort {
+                let tunnels = await tunnelManager.activeTunnels()
+                for tunnel in tunnels where tunnel.label == "adb" {
+                    await tunnelManager.removeTunnel(tunnelId: tunnel.tunnelId)
+                }
+            }
+            tunnelAdbPort = nil
+            tunnelStatusText = ""
+            DiagnosticsLog.info("tunnel.mac.adb_disabled")
         }
     }
 

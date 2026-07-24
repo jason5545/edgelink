@@ -547,3 +547,86 @@ logs 15069 (lyra-* tags).
   phone never TCP-connects before HSHK completes — the data socket
   (`ExpressDataSocket::NewServer` = raw TCP bind+getsockname) is used only
   after the event-channel handshake.
+
+## micont TCP Tunnel (Route a)
+
+### Evidence summary
+
+From `captures/xiaomi-hyperconnect/3.0.300-285/index/` and `captures/mi-connect-service/index/`:
+
+The Lyra netbus stack has a dedicated TCP tunnel subsystem at
+`lyra::netbus::conn::tunnel::TcpTunnel`. It rides on a LogiConn with
+`tcp_tunnel_profile` in `LogiConnRequestOptions` and uses TransDataType 6
+(tunnel), separate from payload-v2 (type 5) used by miexpress/file-transfer.
+
+Key symbols:
+- `LogiConnHandler::DoLogiSendTunnelFrame(BufferData)` — sends tunnel frames
+- `LogiConnClient/Server::OnReceiveTunnelPayload(LogiConnID, BufferData)` — receives
+- `LogiConnClient::OnTunnelDataOutput(uint32_t, BufferData)` — data output
+- `LogiConnClient::OnTunnelConnectionCountChanged(uint32_t, uint32_t)`
+- `LogiConnClient::OnTunnelError(uint32_t, uint32_t)`
+- `LogiConnClient::OnLogiConnReqTunnelControlData(LogiConnID, bool)`
+- `TcpTunnel::StubConnectToServer(uint32_t, SocketAddress, TunnelFeature)` — stub dials target
+- `TcpTunnel::ProxyConnectSuccess(uint32_t, uint32_t, TunnelFeature)`
+- `TcpTunnel::ProxyOrStubInputData(uint32_t, BufferData)` — data from local socket
+- `TcpTunnel::StartTunnelAckTask(uint32_t)` — periodic ACK
+- `TcpTunnel::OnClose(AsyncStreamSocket*, int)`
+- `TcpTunnel::StopOutputData(uint32_t, TunnelStopReason)`
+- `TcpTunnel::SocketInfo` — per-connection state map keyed by uint32 handle
+- `CreateTcpTunnelProxyByOptions(LogiConnHandler::Ptr)` / `CreateTcpTunnelStubByOptions`
+- `micont::channel::options::ChannelTcpTunnelProfile`
+
+### Tunnel Action Frames (protobuf, package `lyra.netbus.conn.tunnel`)
+
+- `TunnelActionFrameConnect{destination_address}` — proxy requests TCP dial
+- `TunnelActionFrameAccept` — stub confirms
+- `TunnelActionFrameReject` — stub refuses
+- `TunnelActionFramePushData` — carries TCP payload
+- `TunnelActionFrameAckData` — flow control ACK
+- `TunnelActionFramePause` / `TunnelActionFrameResume` — flow control
+- `TunnelActionFrameFinish` — half-close (FIN)
+- `TunnelActionFrameError` — error with code
+- `TunnelActionFrame` — oneof wrapper
+- `TunnelActionFramePack` — batch of action frames
+- `TunnelPortPairInfoFrame` — port pair metadata
+- `TunnelFeatureFrame` — feature/capability negotiation
+
+### Higher-level profile (protobuf, package `MiConnectProto`)
+
+- `TcpTunnelProfile{source_address, destination_address, proxy_address}` — in LogiConnRequestOptions
+- `TunnelCapacity` — in LogiConnResponseFrame (advertises tunnel support)
+
+### Architecture
+
+- Tunnel does NOT need miexpress or the 2172-byte channel-init payload.
+- It uses TransDataType 6, a separate data path from payload-v2 (type 5).
+- The phone's TunnelManager (part of MiConnectService/connect_service) handles
+  the stub side: dials local targets like adbd (127.0.0.1:5555).
+- `AsyncTcpStreamSocket` / `AsyncStreamSocket` = local TCP socket abstraction.
+- `ITunnelCallback` = callback interface for tunnel events.
+
+### Unknowns (require live capture or further disassembly)
+
+1. Protobuf field numbers for TunnelActionFrame* sub-messages.
+   Best-guess: sequential (1=tunnel_handle, 2=destination_address/data, 3=feature/seq).
+2. Service name for the tunnel LogiConn (likely `com.xiaomi.hyperconnect:<something>`).
+3. TransDataType 6 wire framing: likely `[netId][flag][tunnel_payload]` similar to type 5.
+4. Whether the phone's TunnelManager accepts tunnel from Xposed-injected trust context.
+
+### Probe strategy
+
+- `LyraMeshResponder` handles `frame.packType == 6` and routes to `LyraTunnelManager`.
+- Probe mode logs all tunnel frames (hex dump) to diagnostics.
+- Phone logcat (`lyra-*` tags) shows tunnel errors: "tunnel_handle is invalid",
+  "tunnel invalid proto", "tunnel unsupported proto".
+- Next: attempt tunnel LogiConn with best-guess parameters, observe phone response,
+  refine field numbers from live capture.
+
+### Implementation status
+
+- `mac/Sources/EdgeLinkKit/Lyra/LyraTunnelProtocol.swift`: all tunnel action frame
+  types with protobuf encode/decode (best-guess field numbers).
+- `mac/Sources/App/LyraTunnelManager.swift`: proxy/stub engine, NWListener for local
+  forward, flow control via AckData/Pause/Resume, half-close via Finish.
+- `mac/Sources/App/LyraMeshResponder.swift`: TransDataType 6 routing + probe logging.
+- Awaiting live-device verification to confirm field numbers and service name.

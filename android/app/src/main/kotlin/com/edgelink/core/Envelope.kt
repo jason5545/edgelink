@@ -50,6 +50,12 @@ object EnvelopeTypes {
     const val ANDROID_MIC_STATUS = "android.mic.status"
     const val MAC_SLEEP = "mac.sleep"
     const val MAC_AWAKE = "mac.awake"
+    const val TUNNEL_OPEN = "tunnel.open"
+    const val TUNNEL_OPEN_RESULT = "tunnel.open.result"
+    const val TUNNEL_DATA = "tunnel.data"
+    const val TUNNEL_CLOSE = "tunnel.close"
+    const val TUNNEL_ERROR = "tunnel.error"
+    const val TUNNEL_FLOW = "tunnel.flow"
 }
 
 object EnvelopeCodec {
