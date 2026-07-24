@@ -8,5 +8,7 @@
     <item>com.android.incallui</item>
     <item>com.android.phone</item>
     <item>com.android.server.telecom</item>
+    <item>com.miui.audiomonitor</item>
+    <item>com.miui.mishare.connectivity</item>
   </string-array>
 </resources>
