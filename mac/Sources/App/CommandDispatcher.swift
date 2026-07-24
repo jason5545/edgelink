@@ -6,6 +6,7 @@ final class CommandDispatcher {
     private let clipboardSync: ClipboardSync
     private let notificationPresenter: MacNotificationPresenter
     private let screenSession: MacScreenSession?
+    private let clipboardHistoryStore: ClipboardHistoryStore?
     private let onStatusPong: @Sendable () -> Void
     private let onSmsMessage: @Sendable (SmsMessageBody) -> Void
     private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
@@ -20,6 +21,8 @@ final class CommandDispatcher {
     private let onMiLinkCommandResult: @Sendable (MiLinkCommandResultBody) -> Void
     private let onBatteryStatus: @Sendable (BatteryStatusBody) -> Void
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
+    private let onStatusCaps: @Sendable (StatusCapsBody) -> Void
+    private let onClipboardHistoryResponse: @Sendable (ClipboardHistoryResponseBody) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -28,6 +31,7 @@ final class CommandDispatcher {
         clipboardSync: ClipboardSync = ClipboardSync(),
         notificationPresenter: MacNotificationPresenter = MacNotificationPresenter(),
         screenSession: MacScreenSession? = nil,
+        clipboardHistoryStore: ClipboardHistoryStore? = nil,
         onStatusPong: @escaping @Sendable () -> Void = {},
         onSmsMessage: @escaping @Sendable (SmsMessageBody) -> Void = { _ in },
         onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in },
@@ -41,12 +45,15 @@ final class CommandDispatcher {
         onMiLinkMirrorMedia: @escaping @Sendable (MiLinkMirrorMediaBody) -> Void = { _ in },
         onMiLinkCommandResult: @escaping @Sendable (MiLinkCommandResultBody) -> Void = { _ in },
         onBatteryStatus: @escaping @Sendable (BatteryStatusBody) -> Void = { _ in },
-        onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in }
+        onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
+        onStatusCaps: @escaping @Sendable (StatusCapsBody) -> Void = { _ in },
+        onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in }
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
         self.notificationPresenter = notificationPresenter
         self.screenSession = screenSession
+        self.clipboardHistoryStore = clipboardHistoryStore
         self.onStatusPong = onStatusPong
         self.onSmsMessage = onSmsMessage
         self.onSmsSendResult = onSmsSendResult
@@ -61,6 +68,8 @@ final class CommandDispatcher {
         self.onMiLinkCommandResult = onMiLinkCommandResult
         self.onBatteryStatus = onBatteryStatus
         self.onTunnelEnvelope = onTunnelEnvelope
+        self.onStatusCaps = onStatusCaps
+        self.onClipboardHistoryResponse = onClipboardHistoryResponse
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -85,7 +94,42 @@ final class CommandDispatcher {
             return nil
         case EnvelopeType.clipboardSet:
             let envelope = try decoder.decode(Envelope<ClipboardSetBody>.self, from: plaintext)
-            clipboardSync.applyRemoteText(envelope.b.text, hash: envelope.b.hash)
+            let body = envelope.b
+            let kind = ClipboardKind(rawValue: body.kind ?? ClipboardKind.text.rawValue) ?? .text
+            if kind == .text || kind == .html {
+                clipboardSync.applyRemoteText(body.text, hash: body.hash)
+            }
+            if let store = clipboardHistoryStore {
+                let source = body.sourceDeviceId
+                let item = ClipboardHistoryItemBody(
+                    id: "\(source ?? "remote")#\(body.ts)-0",
+                    kind: kind.rawValue,
+                    ts: body.ts,
+                    hash: body.hash,
+                    text: body.text.isEmpty ? nil : body.text,
+                    thumbnailBase64: body.thumbnailBase64,
+                    sourceDeviceId: source
+                )
+                store.append(item)
+                store.prune()
+            }
+            return nil
+        case EnvelopeType.statusCaps:
+            let envelope = try decoder.decode(Envelope<StatusCapsBody>.self, from: plaintext)
+            onStatusCaps(envelope.b)
+            return nil
+        case EnvelopeType.clipboardHistoryRequest:
+            let envelope = try decoder.decode(Envelope<ClipboardHistoryRequestBody>.self, from: plaintext)
+            if let store = clipboardHistoryStore {
+                let items = store.recent(sinceTs: envelope.b.sinceTs, limit: envelope.b.limit ?? 50)
+                return try encoder.encode(
+                    Envelope(t: EnvelopeType.clipboardHistoryResponse, b: ClipboardHistoryResponseBody(items: items))
+                )
+            }
+            return nil
+        case EnvelopeType.clipboardHistoryResponse:
+            let envelope = try decoder.decode(Envelope<ClipboardHistoryResponseBody>.self, from: plaintext)
+            onClipboardHistoryResponse(envelope.b)
             return nil
         case EnvelopeType.notificationPost:
             let envelope = try decoder.decode(Envelope<NotificationPostBody>.self, from: plaintext)

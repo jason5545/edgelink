@@ -1,11 +1,14 @@
 import AppKit
 import CryptoKit
+import EdgeLinkKit
 import Foundation
 
 struct ClipboardSnapshot: Equatable {
     let text: String
     let timestampSeconds: Int64
     let hash: String
+    let kind: ClipboardKind
+    let thumbnailBase64: String?
 }
 
 final class ClipboardSync {
@@ -15,16 +18,37 @@ final class ClipboardSync {
     private var suppressedHash: String?
     private var protectedOutboundHashes: [String: Date] = [:]
 
-    func pollLocalText() -> ClipboardSnapshot? {
+    func pollLocalClip() -> ClipboardSnapshot? {
         let pasteboard = NSPasteboard.general
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return nil }
         lastChangeCount = current
 
-        guard let text = pasteboard.string(forType: .string), !text.isEmpty else {
+        let types = pasteboard.types ?? []
+        let hasImage = types.contains(.tiff) || types.contains(.png)
+        let stringText = pasteboard.string(forType: .string) ?? ""
+
+        var kind: ClipboardKind = .text
+        var text = ""
+        var thumbnailBase64: String?
+        if hasImage {
+            kind = .image
+            thumbnailBase64 = ClipboardThumbnailGenerator.thumbnailBase64(forImageIn: pasteboard)
+            text = stringText
+        } else if !stringText.isEmpty {
+            kind = .text
+            text = stringText
+        } else {
             return nil
         }
-        let hash = Self.hash(text)
+
+        let hash: String
+        if kind == .image {
+            hash = Self.hash("\u{1}" + (thumbnailBase64 ?? ""))
+        } else {
+            hash = Self.hash(text)
+        }
+
         pruneProtectedOutboundHashes()
         if protectedOutboundHashes[hash] != nil {
             DiagnosticsLog.info("clipboard.mac.local_blocked hashFp=\(Self.fingerprint(hash))")
@@ -37,7 +61,9 @@ final class ClipboardSync {
         return ClipboardSnapshot(
             text: text,
             timestampSeconds: Int64(Date().timeIntervalSince1970),
-            hash: hash
+            hash: hash,
+            kind: kind,
+            thumbnailBase64: thumbnailBase64
         )
     }
 

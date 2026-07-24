@@ -71,6 +71,14 @@ final class EdgeLinkRuntime: ObservableObject {
     private let pairingTransport: PairingTransport
     private let lanTransport = LANTransport()
     private let clipboardSync = ClipboardSync()
+    private let clipboardHistoryStore: ClipboardHistoryStore? = {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return ClipboardHistoryStore(directory: base.appendingPathComponent("EdgeLink", isDirectory: true))
+    }()
+    private var peerCapabilityHistory = false
+    private var peerCapabilityThumbnail = false
     private let notificationPresenter = MacNotificationPresenter()
     private let incomingCallPresenter = MacIncomingCallPresenter()
     private let verificationCodeBridge = MacVerificationCodeBridge()
@@ -2744,6 +2752,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     clipboardSync: clipboardSync,
                     notificationPresenter: notificationPresenter,
                     screenSession: screenSession,
+                    clipboardHistoryStore: clipboardHistoryStore,
                     onStatusPong: { [weak self] in
                         Task { @MainActor in
                             self?.recordSecurePong(generation: channelGeneration)
@@ -2827,6 +2836,16 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
                         }
+                    },
+                    onStatusCaps: { [weak self] caps in
+                        Task { @MainActor in
+                            self?.handleStatusCaps(caps)
+                        }
+                    },
+                    onClipboardHistoryResponse: { [weak self] response in
+                        Task { @MainActor in
+                            self?.handleClipboardHistoryResponse(response)
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -2887,7 +2906,20 @@ final class EdgeLinkRuntime: ObservableObject {
                     }
                 }
 
-                let clipboardTask = Task { await clipboardLoop(session: session) }
+                peerCapabilityHistory = false
+                peerCapabilityThumbnail = false
+                if let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody())) {
+                    try? await session.sendPlaintext(capsData)
+                    DiagnosticsLog.info("clipboard.mac.caps_sent hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
+                }
+                if let reqData = try? encoder.encode(
+                    Envelope(t: EnvelopeType.clipboardHistoryRequest, b: ClipboardHistoryRequestBody(limit: 50))
+                ) {
+                    try? await session.sendPlaintext(reqData)
+                    DiagnosticsLog.info("clipboard.mac.history_request_sent clientId=\(peer.deviceId)")
+                }
+
+                let clipboardTask = Task { await clipboardLoop(session: session, identity: identity) }
                 let notificationTask = Task { await macNotificationLoop(identity: identity, session: session) }
                 defer {
                     clipboardTask.cancel()
@@ -3114,17 +3146,48 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    private func clipboardLoop(session: SecureSessionHost) async {
+    private func clipboardLoop(session: SecureSessionHost, identity: LocalIdentity) async {
         while !Task.isCancelled && currentSession === session {
-            if let snapshot = clipboardSync.pollLocalText() {
-                let body = ClipboardSetBody(
-                    text: snapshot.text,
-                    ts: snapshot.timestampSeconds,
-                    hash: snapshot.hash
+            if let snapshot = clipboardSync.pollLocalClip() {
+                let deviceId = identity.deviceId
+                let historyId = "\(deviceId)#\(snapshot.timestampSeconds)-0"
+                clipboardHistoryStore?.append(
+                    ClipboardHistoryItemBody(
+                        id: historyId,
+                        kind: snapshot.kind.rawValue,
+                        ts: snapshot.timestampSeconds,
+                        hash: snapshot.hash,
+                        text: snapshot.text.isEmpty ? nil : snapshot.text,
+                        thumbnailBase64: snapshot.thumbnailBase64,
+                        sourceDeviceId: deviceId
+                    )
                 )
-                if let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardSet, b: body)) {
-                    try? await session.sendPlaintext(data)
-                    DiagnosticsLog.info("clipboard.mac.sent hashFp=\(Self.fingerprint(snapshot.hash))")
+                clipboardHistoryStore?.prune()
+
+                let shouldSend: Bool
+                var thumbnailForWire: String? = nil
+                switch snapshot.kind {
+                case .text, .html:
+                    shouldSend = true
+                case .image:
+                    shouldSend = peerCapabilityThumbnail
+                    thumbnailForWire = peerCapabilityThumbnail ? snapshot.thumbnailBase64 : nil
+                case .file:
+                    shouldSend = peerCapabilityHistory
+                }
+                if shouldSend {
+                    let body = ClipboardSetBody(
+                        text: snapshot.text,
+                        ts: snapshot.timestampSeconds,
+                        hash: snapshot.hash,
+                        kind: snapshot.kind.rawValue,
+                        thumbnailBase64: thumbnailForWire,
+                        sourceDeviceId: deviceId
+                    )
+                    if let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardSet, b: body)) {
+                        try? await session.sendPlaintext(data)
+                        DiagnosticsLog.info("clipboard.mac.sent kind=\(snapshot.kind.rawValue) hashFp=\(Self.fingerprint(snapshot.hash))")
+                    }
                 }
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
@@ -3141,6 +3204,18 @@ final class EdgeLinkRuntime: ObservableObject {
         } catch {
             DiagnosticsLog.error("screen.mac.send_failed", error)
         }
+    }
+
+    private func handleStatusCaps(_ caps: StatusCapsBody) {
+        peerCapabilityHistory = caps.clipboardHistory
+        peerCapabilityThumbnail = caps.clipboardThumbnail
+        DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail)")
+    }
+
+    private func handleClipboardHistoryResponse(_ response: ClipboardHistoryResponseBody) {
+        let inserted = clipboardHistoryStore?.importRemote(response.items) ?? 0
+        clipboardHistoryStore?.prune()
+        DiagnosticsLog.info("clipboard.mac.history_imported count=\(response.items.count) inserted=\(inserted)")
     }
 
     private func macNotificationLoop(identity: LocalIdentity, session: SecureSessionHost) async {

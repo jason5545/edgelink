@@ -11,7 +11,12 @@ import android.os.SystemClock
 import android.provider.Settings
 import com.edgelink.core.AndroidMicStatusBody
 import com.edgelink.core.BatteryStatusBody
+import com.edgelink.core.ClipboardHistoryItemBody
+import com.edgelink.core.ClipboardHistoryRequestBody
+import com.edgelink.core.ClipboardHistoryResponseBody
+import com.edgelink.core.ClipboardKind
 import com.edgelink.core.ClipboardSetBody
+import com.edgelink.core.StatusCapsBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
 import com.edgelink.core.CtrlPointerBody
@@ -166,6 +171,11 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val presenceTransport = PresenceTransport(crypto = crypto)
     private val pairingTransport = PairingTransport()
     private val clipboardSync = AndroidClipboardSync(appContext)
+    private val clipboardHistoryStore = ClipboardHistoryStore(appContext)
+    @Volatile
+    private var peerCapabilityHistory = false
+    @Volatile
+    private var peerCapabilityThumbnail = false
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
@@ -213,6 +223,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     )
     private val dispatcher = AndroidCommandDispatcher(
         clipboardSync = clipboardSync,
+        clipboardHistoryStore = clipboardHistoryStore,
         notificationPresenter = notificationPresenter,
         screenSession = screenSession,
         smsSync = smsSync,
@@ -269,6 +280,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onTunnelEnvelope = { type, body ->
             tunnelManager.handleEnvelope(type, body)
+        },
+        onStatusCaps = { caps ->
+            handleStatusCaps(caps)
+        },
+        onClipboardHistoryResponse = { response ->
+            handleClipboardHistoryResponse(response)
         }
     )
 
@@ -1615,6 +1632,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 }
                 micActivityMonitor.sendCurrent("session_connected")
                 batteryReporter.sendCurrent("session_connected")
+                sendStatusCapsAndRequestHistory(identity)
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
                 stateFlow.update {
@@ -1627,7 +1645,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
                 coroutineScope {
                     val pingJob = launch { pingLoop(nextSession) }
-                    val clipboardJob = launch { clipboardLoop(nextSession) }
+                    val clipboardJob = launch { clipboardLoop(nextSession, identity) }
                     val smsSyncJob = launch {
                         val backfilledKeys = runSmsBackfill(nextSession, identity)
                         drainPendingSms(nextSession, identity, reason = "connected", skipKeys = backfilledKeys)
@@ -1914,23 +1932,83 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
-    private suspend fun clipboardLoop(activeSession: SecureSessionClient) {
+    private suspend fun clipboardLoop(activeSession: SecureSessionClient, identity: LocalIdentity) {
         while (coroutineContext.isActive) {
-            val snapshot = clipboardSync.pollLocalText()
+            val snapshot = clipboardSync.pollLocalClip()
             if (snapshot != null) {
-                activeSession.sendPlaintext(
-                    EnvelopeCodec.encode(
-                        EnvelopeTypes.CLIPBOARD_SET,
-                        ClipboardSetBody(
-                            text = snapshot.text,
-                            ts = snapshot.timestampSeconds,
-                            hash = snapshot.hash
-                        )
+                val deviceId = identity.deviceId
+                val historyId = "$deviceId#${snapshot.timestampSeconds}-0"
+                clipboardHistoryStore.append(
+                    ClipboardHistoryItemBody(
+                        id = historyId,
+                        kind = snapshot.kind.wireName,
+                        ts = snapshot.timestampSeconds,
+                        hash = snapshot.hash,
+                        text = snapshot.text.ifEmpty { null },
+                        thumbnailBase64 = snapshot.thumbnailBase64,
+                        sourceDeviceId = deviceId
                     )
                 )
+                clipboardHistoryStore.prune()
+
+                val shouldSend: Boolean
+                val thumbnailForWire: String?
+                when (snapshot.kind) {
+                    ClipboardKind.TEXT, ClipboardKind.HTML -> {
+                        shouldSend = true
+                        thumbnailForWire = null
+                    }
+                    ClipboardKind.IMAGE -> {
+                        shouldSend = peerCapabilityThumbnail
+                        thumbnailForWire = if (peerCapabilityThumbnail) snapshot.thumbnailBase64 else null
+                    }
+                    ClipboardKind.FILE -> {
+                        shouldSend = peerCapabilityHistory
+                        thumbnailForWire = null
+                    }
+                }
+                if (shouldSend) {
+                    activeSession.sendPlaintext(
+                        EnvelopeCodec.encode(
+                            EnvelopeTypes.CLIPBOARD_SET,
+                            ClipboardSetBody(
+                                text = snapshot.text,
+                                ts = snapshot.timestampSeconds,
+                                hash = snapshot.hash,
+                                kind = snapshot.kind.wireName,
+                                thumbnailBase64 = thumbnailForWire,
+                                sourceDeviceId = deviceId
+                            )
+                        )
+                    )
+                }
             }
             delay(700)
         }
+    }
+
+    private fun handleStatusCaps(caps: StatusCapsBody) {
+        peerCapabilityHistory = caps.clipboardHistory
+        peerCapabilityThumbnail = caps.clipboardThumbnail
+        EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail}")
+    }
+
+    private fun handleClipboardHistoryResponse(response: ClipboardHistoryResponseBody) {
+        scope.launch(Dispatchers.IO) {
+            val inserted = clipboardHistoryStore.importRemote(response.items)
+            clipboardHistoryStore.prune()
+            EdgeLinkLog.info(
+                "clipboard.android.history_imported count=${response.items.size} inserted=$inserted"
+            )
+        }
+    }
+
+    private fun sendStatusCapsAndRequestHistory(identity: LocalIdentity) {
+        peerCapabilityHistory = false
+        peerCapabilityThumbnail = false
+        sendEnvelope(EnvelopeTypes.STATUS_CAPS, StatusCapsBody())
+        sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
+        EdgeLinkLog.info("clipboard.android.caps_sent hostId=${identity.deviceId}")
     }
 
     private fun launchSmsPendingDrain(reason: String) {
@@ -2171,6 +2249,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
 private class AndroidCommandDispatcher(
     private val clipboardSync: AndroidClipboardSync,
+    private val clipboardHistoryStore: ClipboardHistoryStore?,
     private val notificationPresenter: AndroidNotificationPresenter,
     private val screenSession: AndroidScreenSession,
     private val smsSync: AndroidSmsSync,
@@ -2187,7 +2266,9 @@ private class AndroidCommandDispatcher(
     private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit,
     private val onMacSleep: () -> Unit,
     private val onMacAwake: () -> Unit,
-    private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> }
+    private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> },
+    private val onStatusCaps: (StatusCapsBody) -> Unit = {},
+    private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {}
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2204,9 +2285,53 @@ private class AndroidCommandDispatcher(
                 onMacAwake()
                 null
             }
+            EnvelopeTypes.STATUS_CAPS -> {
+                val envelope = EnvelopeCodec.decode<StatusCapsBody>(plaintext)
+                onStatusCaps(envelope.b)
+                null
+            }
             EnvelopeTypes.CLIPBOARD_SET -> {
                 val envelope = EnvelopeCodec.decode<ClipboardSetBody>(plaintext)
-                clipboardSync.applyRemoteText(envelope.b.text, envelope.b.hash)
+                val body = envelope.b
+                val kind = ClipboardKind.fromWire(body.kind) ?: ClipboardKind.TEXT
+                if (kind == ClipboardKind.TEXT || kind == ClipboardKind.HTML) {
+                    clipboardSync.applyRemoteText(body.text, body.hash)
+                }
+                if (clipboardHistoryStore != null) {
+                    val source = body.sourceDeviceId
+                    clipboardHistoryStore.append(
+                        ClipboardHistoryItemBody(
+                            id = "${source ?: "remote"}#${body.ts}-0",
+                            kind = kind.wireName,
+                            ts = body.ts,
+                            hash = body.hash,
+                            text = body.text.ifEmpty { null },
+                            thumbnailBase64 = body.thumbnailBase64,
+                            sourceDeviceId = source
+                        )
+                    )
+                    clipboardHistoryStore.prune()
+                }
+                null
+            }
+            EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST -> {
+                val envelope = EnvelopeCodec.decode<ClipboardHistoryRequestBody>(plaintext)
+                if (clipboardHistoryStore != null) {
+                    val items = clipboardHistoryStore.recent(
+                        sinceTs = envelope.b.sinceTs,
+                        limit = envelope.b.limit ?: 50
+                    )
+                    EnvelopeCodec.encode(
+                        EnvelopeTypes.CLIPBOARD_HISTORY_RESPONSE,
+                        ClipboardHistoryResponseBody(items = items)
+                    )
+                } else {
+                    null
+                }
+            }
+            EnvelopeTypes.CLIPBOARD_HISTORY_RESPONSE -> {
+                val envelope = EnvelopeCodec.decode<ClipboardHistoryResponseBody>(plaintext)
+                onClipboardHistoryResponse(envelope.b)
                 null
             }
             EnvelopeTypes.NOTIFICATION_POST -> {

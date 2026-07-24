@@ -16,6 +16,7 @@ object EmptyBody
 object EnvelopeTypes {
     const val STATUS_PING = "status.ping"
     const val STATUS_PONG = "status.pong"
+    const val STATUS_CAPS = "status.caps"
     const val INPUT_POINTER = "input.pointer"
     const val INPUT_KEY = "input.key"
     const val INPUT_TEXT = "input.text"
@@ -31,6 +32,8 @@ object EnvelopeTypes {
     const val RTC_ANSWER = "rtc.answer"
     const val RTC_ICE = "rtc.ice"
     const val CLIPBOARD_SET = "clipboard.set"
+    const val CLIPBOARD_HISTORY_REQUEST = "clipboard.history.request"
+    const val CLIPBOARD_HISTORY_RESPONSE = "clipboard.history.response"
     const val NOTIFICATION_POST = "notification.post"
     const val NOTIFICATION_REMOVE = "notification.remove"
     const val SMS_MESSAGE = "sms.message"
@@ -149,7 +152,55 @@ data class RtcIceBody(
 data class ClipboardSetBody(
     val text: String,
     val ts: Long,
-    val hash: String
+    val hash: String,
+    val kind: String? = null,
+    val thumbnailBase64: String? = null,
+    val sourceDeviceId: String? = null
+)
+
+enum class ClipboardKind(val intValue: Int) {
+    TEXT(0),
+    IMAGE(1),
+    HTML(2),
+    FILE(3);
+
+    val wireName: String get() = name.lowercase()
+
+    companion object {
+        fun fromInt(value: Int): ClipboardKind? =
+            entries.firstOrNull { it.intValue == value }
+
+        fun fromWire(name: String?): ClipboardKind? =
+            name?.let { needle -> entries.firstOrNull { it.wireName == needle } }
+    }
+}
+
+@Serializable
+data class StatusCapsBody(
+    val clipboardHistory: Boolean = true,
+    val clipboardThumbnail: Boolean = true
+)
+
+@Serializable
+data class ClipboardHistoryRequestBody(
+    val sinceTs: Long? = null,
+    val limit: Int? = null
+)
+
+@Serializable
+data class ClipboardHistoryItemBody(
+    val id: String,
+    val kind: String,
+    val ts: Long,
+    val hash: String,
+    val text: String? = null,
+    val thumbnailBase64: String? = null,
+    val sourceDeviceId: String? = null
+)
+
+@Serializable
+data class ClipboardHistoryResponseBody(
+    val items: List<ClipboardHistoryItemBody> = emptyList()
 )
 
 @Serializable

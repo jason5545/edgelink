@@ -354,7 +354,11 @@ AEAD：
 {"t":"rtc.offer","b":{"sdp":"v=0\r\n..."}}
 {"t":"rtc.answer","b":{"sdp":"v=0\r\n..."}}
 {"t":"rtc.ice","b":{"mid":"0","index":0,"candidate":"candidate:..."}}
-{"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"..."}}
+{"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"...","kind":"text"}}
+{"t":"clipboard.set","b":{"text":"","ts":1751941001,"hash":"...","kind":"image","thumbnailBase64":"iVBORw0KGgo...","sourceDeviceId":"137245816"}}
+{"t":"status.caps","b":{"clipboardHistory":true,"clipboardThumbnail":true}}
+{"t":"clipboard.history.request","b":{"sinceTs":1751940600,"limit":20}}
+{"t":"clipboard.history.response","b":{"items":[{"id":"137245816#1751941001","kind":"image","ts":1751941001,"hash":"...","thumbnailBase64":"iVBORw0KGgo...","sourceDeviceId":"137245816"}]}}
 {"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","iconPngBase64":"iVBORw0KGgo...","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
 {"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
 {"t":"status.ping","b":{}}
@@ -645,6 +649,81 @@ tools/inject-debug-sms.sh 123720 "EdgeLink local SMS test"
 Xiaomi 裝置另有相容路線：Mac 在 `milink.command.result` 處理路徑中攔截帶
 `electricQuantity` / `chargeStatus` 的 power topic 資料，轉成同一個內部狀態。
 兩條路線以 `ts` 較新者覆蓋 UI 狀態；兩條都不可用時 UI 顯示「—」。
+
+### Capability Exchange
+
+`status.caps` 在 secure session 建立後由兩端各送一次（best-effort，不重傳），advertise
+自己支援的 feature：
+
+```json
+{"t":"status.caps","b":{"clipboardHistory":true,"clipboardThumbnail":true}}
+```
+
+- `clipboardHistory`：是否支援 clipboard history（`clipboard.history.request` / `.response`）。
+- `clipboardThumbnail`：是否能在 history item / `clipboard.set` 帶 capped thumbnail。
+
+未知欄位一律忽略（前向相容）。舊版 peer 收到 `status.caps` 直接丟掉；新版 peer 收到沒帶
+caps（或舊版）視為 `clipboardHistory=false, clipboardThumbnail=false`，只走單筆文字 sync。
+
+> 設計參考：小米 `dist_clipboard` 在 service discovery 時以
+> `protocol=0x%02X v2.0: clipboard_history=%d thumbnail=%d` 協商同類旗標。EdgeLink 不抄其
+> topic / 封包 / 私有 method，只在自家 secure envelope 上放對等的 boolean 旗標。
+
+### Clipboard History & Thumbnails
+
+`clipboard.set` 除原本單筆文字同步，再加 optional 欄位把 kind 與縮圖帶進來：
+
+```json
+{"t":"clipboard.set","b":{"text":"...","ts":1751941000,"hash":"...","kind":"text"}}
+{"t":"clipboard.set","b":{"text":"","ts":1751941001,"hash":"...","kind":"image","thumbnailBase64":"iVBORw0KGgo...","sourceDeviceId":"137245816"}}
+```
+
+- `kind`：選填，`"text" | "image" | "html" | "file"`（預設 `text`，等於舊行為）。對應內部
+  DB 的 `clipboard_type` int：text=0 / image=1 / html=2 / file=3。
+- `thumbnailBase64`：選填，image item 的 capped（最大 96×96）PNG base64。只放縮圖，不放原圖。
+- `sourceDeviceId`：選填，標記此 clip 來源裝置，供 history UI 顯示 provenance。
+
+舊版 peer 收到帶 `kind`/`thumbnailBase64` 的 `clipboard.set` 會忽略未認得的 key，仍當單筆
+文字處理（decode 容錯未知 key）。
+
+歷史存取走 request/response，各自查本機 SQLite：Mac 為
+`~/Library/Application Support/EdgeLink/clipboard-history.db`，Android 為對等的
+`clipboard_history.db`，內含 EdgeLink 自建的 `clipboard_history` 表。schema 結構參考小米的
+`event_id, item_index, timestamp, clipboard_type, text_data, file_path, thumbnail`，但欄名與
+封包由 EdgeLink 自訂（clean-room）。
+
+```json
+{"t":"clipboard.history.request","b":{"sinceTs":1751940600,"limit":20}}
+```
+
+- `sinceTs`：選填，回傳 `ts > sinceTs` 的 item；省略代表不限。
+- `limit`：選填，上限（建議 ≤ 50）。
+
+```json
+{"t":"clipboard.history.response","b":{"items":[{"id":"137245816#1751941001","kind":"image","ts":1751941001,"hash":"...","thumbnailBase64":"iVBORw0KGgo...","sourceDeviceId":"137245816"}]}}
+```
+
+`ClipboardHistoryItem`：
+
+- `id`：`"{sourceDeviceId}#{ts}-{itemIndex}"` 樣式的穩定 key。
+- `kind` / `ts` / `hash`：同 `clipboard.set`。
+- `text`：選填；image/file 的 text 可為空或檔名。
+- `thumbnailBase64`：選填，capped 縮圖；只當 peer `clipboardThumbnail` 支援時才帶。
+- `sourceDeviceId`：選填。
+
+規則：
+
+- history 只存近 N 筆（先試 200），超過 prune by timestamp desc。
+- thumbnail 固定 capped（96×96、PNG），不進控制通道原始大圖。
+- 收到 `clipboard.history.response` 的 item 入本機 store（去重 by id），不回環給對端。
+- 收到 `clipboard.history.request` 時送回本機 store 的 recent items；對不支援 history 的
+  peer 不回應。
+- 螢幕鎖定 / clipboard 功能關閉時暫停寫入 history（與既有鎖屏閘一致）。
+
+> 設計參考：小米 `dist_clipboard` 的 `ClipboardHistory` SQLite schema 與
+> `RequestRemoteClipboardHistory(deviceId)`；其內部字串
+> `Clipboard history feature not yet implemented` 顯示連原廠都只搭好骨架。EdgeLink 在自家
+> protocol 上把同等概念做完。
 
 ## 7. Transports
 

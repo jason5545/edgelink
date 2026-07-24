@@ -17,6 +17,7 @@ public struct EmptyBody: Codable, Sendable {
 public enum EnvelopeType {
     public static let statusPing = "status.ping"
     public static let statusPong = "status.pong"
+    public static let statusCaps = "status.caps"
     public static let inputPointer = "input.pointer"
     public static let inputKey = "input.key"
     public static let inputText = "input.text"
@@ -32,6 +33,8 @@ public enum EnvelopeType {
     public static let rtcAnswer = "rtc.answer"
     public static let rtcIce = "rtc.ice"
     public static let clipboardSet = "clipboard.set"
+    public static let clipboardHistoryRequest = "clipboard.history.request"
+    public static let clipboardHistoryResponse = "clipboard.history.response"
     public static let notificationPost = "notification.post"
     public static let notificationRemove = "notification.remove"
     public static let smsMessage = "sms.message"
@@ -182,11 +185,99 @@ public struct ClipboardSetBody: Codable, Equatable, Sendable {
     public let text: String
     public let ts: Int64
     public let hash: String
+    public let kind: String?
+    public let thumbnailBase64: String?
+    public let sourceDeviceId: String?
 
-    public init(text: String, ts: Int64, hash: String) {
+    public init(text: String, ts: Int64, hash: String, kind: String? = nil, thumbnailBase64: String? = nil, sourceDeviceId: String? = nil) {
         self.text = text
         self.ts = ts
         self.hash = hash
+        self.kind = kind
+        self.thumbnailBase64 = thumbnailBase64
+        self.sourceDeviceId = sourceDeviceId
+    }
+}
+
+public enum ClipboardKind: String, Codable, Equatable, Sendable {
+    case text
+    case image
+    case html
+    case file
+
+    public init?(intValue value: Int) {
+        switch value {
+        case 0: self = .text
+        case 1: self = .image
+        case 2: self = .html
+        case 3: self = .file
+        default: return nil
+        }
+    }
+
+    public var intValue: Int {
+        switch self {
+        case .text: return 0
+        case .image: return 1
+        case .html: return 2
+        case .file: return 3
+        }
+    }
+}
+
+public struct StatusCapsBody: Codable, Equatable, Sendable {
+    public let clipboardHistory: Bool
+    public let clipboardThumbnail: Bool
+
+    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true) {
+        self.clipboardHistory = clipboardHistory
+        self.clipboardThumbnail = clipboardThumbnail
+    }
+}
+
+public struct ClipboardHistoryRequestBody: Codable, Equatable, Sendable {
+    public let sinceTs: Int64?
+    public let limit: Int?
+
+    public init(sinceTs: Int64? = nil, limit: Int? = nil) {
+        self.sinceTs = sinceTs
+        self.limit = limit
+    }
+}
+
+public struct ClipboardHistoryItemBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let kind: String
+    public let ts: Int64
+    public let hash: String
+    public let text: String?
+    public let thumbnailBase64: String?
+    public let sourceDeviceId: String?
+
+    public init(
+        id: String,
+        kind: String,
+        ts: Int64,
+        hash: String,
+        text: String? = nil,
+        thumbnailBase64: String? = nil,
+        sourceDeviceId: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.ts = ts
+        self.hash = hash
+        self.text = text
+        self.thumbnailBase64 = thumbnailBase64
+        self.sourceDeviceId = sourceDeviceId
+    }
+}
+
+public struct ClipboardHistoryResponseBody: Codable, Equatable, Sendable {
+    public let items: [ClipboardHistoryItemBody]
+
+    public init(items: [ClipboardHistoryItemBody]) {
+        self.items = items
     }
 }
 
