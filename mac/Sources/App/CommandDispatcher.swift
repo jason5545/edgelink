@@ -18,6 +18,7 @@ final class CommandDispatcher {
     private let onMiLinkFrame: @Sendable (MiLinkFrameBody) -> Void
     private let onMiLinkMirrorMedia: @Sendable (MiLinkMirrorMediaBody) -> Void
     private let onMiLinkCommandResult: @Sendable (MiLinkCommandResultBody) -> Void
+    private let onBatteryStatus: @Sendable (BatteryStatusBody) -> Void
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
@@ -39,6 +40,7 @@ final class CommandDispatcher {
         onMiLinkFrame: @escaping @Sendable (MiLinkFrameBody) -> Void = { _ in },
         onMiLinkMirrorMedia: @escaping @Sendable (MiLinkMirrorMediaBody) -> Void = { _ in },
         onMiLinkCommandResult: @escaping @Sendable (MiLinkCommandResultBody) -> Void = { _ in },
+        onBatteryStatus: @escaping @Sendable (BatteryStatusBody) -> Void = { _ in },
         onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in }
     ) {
         self.inputInjector = inputInjector
@@ -57,6 +59,7 @@ final class CommandDispatcher {
         self.onMiLinkFrame = onMiLinkFrame
         self.onMiLinkMirrorMedia = onMiLinkMirrorMedia
         self.onMiLinkCommandResult = onMiLinkCommandResult
+        self.onBatteryStatus = onBatteryStatus
         self.onTunnelEnvelope = onTunnelEnvelope
     }
 
@@ -135,6 +138,10 @@ final class CommandDispatcher {
         case EnvelopeType.miLinkCommandResult:
             let envelope = try decoder.decode(Envelope<MiLinkCommandResultBody>.self, from: plaintext)
             onMiLinkCommandResult(envelope.b)
+            return nil
+        case EnvelopeType.batteryStatus:
+            let envelope = try decoder.decode(Envelope<BatteryStatusBody>.self, from: plaintext)
+            onBatteryStatus(envelope.b)
             return nil
         case EnvelopeType.screenMeta:
             let envelope = try decoder.decode(Envelope<ScreenMetaBody>.self, from: plaintext)

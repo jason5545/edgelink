@@ -403,4 +403,32 @@ final class EnvelopeTests: XCTestCase {
         XCTAssertEqual(result.b.route, "xiaomi.mirror")
         XCTAssertEqual(result.b.data["value"], "0")
     }
+
+    func testBatteryStatusBodyRoundTrip() throws {
+        let fullData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.batteryStatus,
+                b: BatteryStatusBody(level: 85, charging: true, plugged: "usb", temperature: 27.5, ts: 1_751_941_000)
+            )
+        )
+        let full = try decoder.decode(Envelope<BatteryStatusBody>.self, from: fullData)
+        XCTAssertEqual(full.t, "battery.status")
+        XCTAssertEqual(full.b, BatteryStatusBody(level: 85, charging: true, plugged: "usb", temperature: 27.5, ts: 1_751_941_000))
+
+        let minimalData = try encoder.encode(
+            Envelope(
+                t: EnvelopeType.batteryStatus,
+                b: BatteryStatusBody(level: 19, charging: false, ts: 1_751_941_100)
+            )
+        )
+        let minimal = try decoder.decode(Envelope<BatteryStatusBody>.self, from: minimalData)
+        XCTAssertEqual(minimal.b.level, 19)
+        XCTAssertFalse(minimal.b.charging)
+        XCTAssertNil(minimal.b.plugged)
+        XCTAssertNil(minimal.b.temperature)
+
+        let wireData = #"{"t":"battery.status","b":{"level":42,"charging":false,"ts":1751941200}}"#.data(using: .utf8)!
+        let wire = try decoder.decode(Envelope<BatteryStatusBody>.self, from: wireData)
+        XCTAssertEqual(wire.b, BatteryStatusBody(level: 42, charging: false, ts: 1_751_941_200))
+    }
 }

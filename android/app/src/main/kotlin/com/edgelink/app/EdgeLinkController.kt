@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import com.edgelink.core.AndroidMicStatusBody
+import com.edgelink.core.BatteryStatusBody
 import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
@@ -174,6 +175,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val miLinkScreenPowerGuard = AndroidScreenPowerGuard(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
+    }
+    private val batteryReporter = AndroidBatteryReporter(appContext) { status: BatteryStatusBody ->
+        sendEnvelope(EnvelopeTypes.BATTERY_STATUS, status)
     }
     private val xiaomiMirrorScreenConfigReporter = EdgeLinkXiaomiMirrorScreenConfigReporter(
         context = appContext,
@@ -356,6 +360,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             }
         }
         micActivityMonitor.start()
+        batteryReporter.start()
         xiaomiMirrorScreenConfigReporter.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -378,6 +383,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkInCallService.setCallsIdleListener(null)
         EdgeLinkInCallService.setCallStatusListener(null)
         micActivityMonitor.stop()
+        batteryReporter.stop()
         xiaomiMirrorScreenConfigReporter.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
@@ -1608,6 +1614,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     sendXiaomiMirrorCastFrame(frame, identity, reason = "cached")
                 }
                 micActivityMonitor.sendCurrent("session_connected")
+                batteryReporter.sendCurrent("session_connected")
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
                 stateFlow.update {

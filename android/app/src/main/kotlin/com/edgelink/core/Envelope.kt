@@ -56,6 +56,7 @@ object EnvelopeTypes {
     const val TUNNEL_CLOSE = "tunnel.close"
     const val TUNNEL_ERROR = "tunnel.error"
     const val TUNNEL_FLOW = "tunnel.flow"
+    const val BATTERY_STATUS = "battery.status"
 }
 
 object EnvelopeCodec {
@@ -359,5 +360,14 @@ data class MiLinkCommandResultBody(
     val route: String,
     val message: String,
     val data: Map<String, String> = emptyMap(),
+    val ts: Long
+)
+
+@Serializable
+data class BatteryStatusBody(
+    val level: Int,
+    val charging: Boolean,
+    val plugged: String? = null,
+    val temperature: Double? = null,
     val ts: Long
 )

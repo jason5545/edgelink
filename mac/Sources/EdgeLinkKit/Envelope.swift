@@ -57,6 +57,7 @@ public enum EnvelopeType {
     public static let tunnelClose = "tunnel.close"
     public static let tunnelError = "tunnel.error"
     public static let tunnelFlow = "tunnel.flow"
+    public static let batteryStatus = "battery.status"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -658,6 +659,22 @@ public struct MiLinkFrameBody: Codable, Equatable, Sendable {
         self.dataBase64 = dataBase64
         self.bytes = bytes
         self.hasNext = hasNext
+        self.ts = ts
+    }
+}
+
+public struct BatteryStatusBody: Codable, Equatable, Sendable {
+    public let level: Int
+    public let charging: Bool
+    public let plugged: String?
+    public let temperature: Double?
+    public let ts: Int64
+
+    public init(level: Int, charging: Bool, plugged: String? = nil, temperature: Double? = nil, ts: Int64) {
+        self.level = level
+        self.charging = charging
+        self.plugged = plugged
+        self.temperature = temperature
         self.ts = ts
     }
 }

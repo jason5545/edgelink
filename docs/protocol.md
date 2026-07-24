@@ -360,6 +360,7 @@ AEAD：
 {"t":"status.ping","b":{}}
 {"t":"mac.sleep","b":{}}
 {"t":"mac.awake","b":{}}
+{"t":"battery.status","b":{"level":85,"charging":true,"plugged":"usb","temperature":27.5,"ts":1751941000}}
 ```
 
 規則：
@@ -614,6 +615,36 @@ tools/inject-debug-sms.sh 123720 "EdgeLink local SMS test"
   }
 }
 ```
+
+### Battery Status
+
+`battery.status` 由 Android 送到 Mac，best-effort（不重傳、不阻塞其他 envelope）：
+
+```json
+{
+  "t": "battery.status",
+  "b": {
+    "level": 85,
+    "charging": true,
+    "plugged": "usb",
+    "temperature": 27.5,
+    "ts": 1751941000
+  }
+}
+```
+
+- `level`：Int，0–100
+- `charging`：Bool（`BATTERY_STATUS_CHARGING` 或 `BATTERY_STATUS_FULL` 即為 true）
+- `plugged`：選填，`"usb" | "ac" | "wireless" | null`
+- `temperature`：選填，攝氏度
+- `ts`：Int，Unix seconds
+
+觸發時機：secure session 建立後立即送一次；`ACTION_BATTERY_CHANGED` broadcast
+（電量百分比、充電狀態、插頭類型任一變化）；每 60 秒 heartbeat 強制送一次。
+
+Xiaomi 裝置另有相容路線：Mac 在 `milink.command.result` 處理路徑中攔截帶
+`electricQuantity` / `chargeStatus` 的 power topic 資料，轉成同一個內部狀態。
+兩條路線以 `ts` 較新者覆蓋 UI 狀態；兩條都不可用時 UI 顯示「—」。
 
 ## 7. Transports
 

@@ -60,6 +60,9 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var isPhoneScreenSessionActive = false
     @Published private(set) var isPhoneScreenViewerVisible = false
     @Published private(set) var hasViewedPhoneScreen = false
+    @Published private(set) var phoneBatteryLevel: Int?
+    @Published private(set) var phoneBatteryCharging = false
+    @Published private(set) var phoneBatterySource = ""
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -141,6 +144,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var didAutoQueryXiaomiMirrorDevices = false
     private var didPrepareXiaomiMirrorKeyboard = false
     private var xiaomiMirrorKeyboardReadyLastAttemptAt = Date.distantPast
+    private var phoneBatteryLatestTs: Int64 = 0
 
     private struct PendingXiaomiScreenFallback {
         let requestId: String
@@ -2814,6 +2818,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handleMiLinkCommandResult(result)
                         }
                     },
+                    onBatteryStatus: { [weak self] status in
+                        Task { @MainActor in
+                            self?.handleBatteryStatus(status, source: "edgelink")
+                        }
+                    },
                     onTunnelEnvelope: { [weak self] type, plaintext in
                         Task { @MainActor in
                             self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
@@ -3338,6 +3347,12 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func handleMiLinkCommandResult(_ result: MiLinkCommandResultBody) {
+        // Route (a): intercept Xiaomi power topic results carrying battery data
+        if result.data["electricQuantity"] != nil {
+            handleMiLinkPowerTopic(data: result.data)
+        } else if result.command.lowercased().contains("power") {
+            DiagnosticsLog.info("battery.mac.milink_power_probe command=\(result.command) data=\(result.data)")
+        }
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
         let updatesCommandStatus = !Self.isXiaomiMirrorKeyboardCommand(result.command)
         if result.command == Self.xiaomiMirrorKeyboardReadyCommand {
@@ -3718,6 +3733,24 @@ final class EdgeLinkRuntime: ObservableObject {
             androidMicRelayArmed = false
             DiagnosticsLog.info("mic.mac.android_inactive reason=\(status.reason)")
         }
+    }
+
+    private func handleBatteryStatus(_ status: BatteryStatusBody, source: String) {
+        guard status.ts >= phoneBatteryLatestTs else { return }
+        phoneBatteryLatestTs = status.ts
+        phoneBatteryLevel = status.level
+        phoneBatteryCharging = status.charging
+        phoneBatterySource = source
+    }
+
+    private func handleMiLinkPowerTopic(data: [String: String]) {
+        guard let levelStr = data["electricQuantity"], let level = Int(levelStr) else { return }
+        let chargeStatus = data["chargeStatus"] ?? ""
+        let charging = chargeStatus == "charging" || chargeStatus == "full"
+        let ts = Int64(Date().timeIntervalSince1970)
+        let status = BatteryStatusBody(level: level, charging: charging, plugged: nil, temperature: nil, ts: ts)
+        handleBatteryStatus(status, source: "milink")
+        DiagnosticsLog.info("battery.mac.milink_power level=\(level) chargeStatus=\(chargeStatus)")
     }
 
     private static func localizedPhoneActionInProgress(_ action: String) -> String {

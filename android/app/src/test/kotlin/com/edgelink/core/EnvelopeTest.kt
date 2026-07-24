@@ -361,4 +361,33 @@ class EnvelopeTest {
         assertEquals("xiaomi.mirror", result.b.route)
         assertEquals("0", result.b.data["value"])
     }
+
+    @Test
+    fun batteryStatusBodyRoundTrip() {
+        val fullBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.BATTERY_STATUS,
+            BatteryStatusBody(level = 85, charging = true, plugged = "usb", temperature = 27.5, ts = 1_751_941_000)
+        )
+        assertEquals(EnvelopeTypes.BATTERY_STATUS, EnvelopeCodec.type(fullBytes))
+        val full = EnvelopeCodec.decode<BatteryStatusBody>(fullBytes)
+        assertEquals(
+            BatteryStatusBody(level = 85, charging = true, plugged = "usb", temperature = 27.5, ts = 1_751_941_000),
+            full.b
+        )
+
+        val minimalBytes = EnvelopeCodec.encode(
+            EnvelopeTypes.BATTERY_STATUS,
+            BatteryStatusBody(level = 19, charging = false, ts = 1_751_941_100)
+        )
+        val minimal = EnvelopeCodec.decode<BatteryStatusBody>(minimalBytes)
+        assertEquals(19, minimal.b.level)
+        assertEquals(false, minimal.b.charging)
+        assertEquals(null, minimal.b.plugged)
+        assertEquals(null, minimal.b.temperature)
+
+        val wireBytes = """{"t":"battery.status","b":{"level":42,"charging":false,"ts":1751941200}}"""
+            .encodeToByteArray()
+        val wire = EnvelopeCodec.decode<BatteryStatusBody>(wireBytes)
+        assertEquals(BatteryStatusBody(level = 42, charging = false, ts = 1_751_941_200), wire.b)
+    }
 }

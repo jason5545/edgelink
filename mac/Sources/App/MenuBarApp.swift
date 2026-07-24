@@ -386,6 +386,63 @@ private struct StatusSummary: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            PhoneBatteryRow(runtime: runtime)
+        }
+    }
+}
+
+private struct PhoneBatteryRow: View {
+    @ObservedObject var runtime: EdgeLinkRuntime
+
+    private var batteryIcon: String {
+        guard let level = runtime.phoneBatteryLevel else { return "battery.0" }
+        switch level {
+        case 75...: return "battery.100"
+        case 50..<75: return "battery.75"
+        case 25..<50: return "battery.50"
+        default: return "battery.25"
+        }
+    }
+
+    private var isLowBattery: Bool {
+        guard let level = runtime.phoneBatteryLevel else { return false }
+        return level <= 20
+    }
+
+    var body: some View {
+        if let level = runtime.phoneBatteryLevel {
+            HStack(spacing: 4) {
+                Image(systemName: batteryIcon)
+                    .foregroundStyle(isLowBattery ? .red : .primary)
+                Text("\(level)%")
+                    .font(.subheadline)
+                    .monospacedDigit()
+                    .foregroundStyle(isLowBattery ? .red : .primary)
+                if runtime.phoneBatteryCharging {
+                    Image(systemName: "bolt.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+                if isLowBattery {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Spacer()
+                if !runtime.phoneBatterySource.isEmpty {
+                    Text(runtime.phoneBatterySource)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        } else {
+            HStack(spacing: 4) {
+                Image(systemName: "battery.0")
+                    .foregroundStyle(.secondary)
+                Text("—")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
