@@ -1,6 +1,7 @@
 package com.edgelink.ui
 
 import android.os.Build
+import android.os.Bundle
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -58,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -78,6 +80,9 @@ import com.edgelink.app.R
 import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun EdgeLinkApp(
@@ -985,6 +990,49 @@ private fun KeyboardPanel(
         ) {
             Text(stringResource(R.string.action_send))
         }
+
+        DebugPhysicalKeyboardToggle()
+    }
+}
+
+@Composable
+private fun DebugPhysicalKeyboardToggle() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var enabled by rememberSaveable { mutableStateOf(false) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("硬體鍵盤模式 (debug)")
+        Switch(
+            checked = enabled,
+            onCheckedChange = { target ->
+                scope.launch {
+                    val accepted = withContext(Dispatchers.IO) {
+                        runCatching {
+                            context.contentResolver.call(
+                                "com.xiaomi.mirror.callprovider",
+                                "edgeLinkKeyboard",
+                                null,
+                                Bundle().apply {
+                                    if (target) {
+                                        putBoolean("prepareOnly", true)
+                                    } else {
+                                        putBoolean("releaseOnly", true)
+                                    }
+                                    putString("source", "debug_toggle")
+                                }
+                            )?.getBoolean("edgelinkKeyboardAccepted", false) == true
+                        }.getOrDefault(false)
+                    }
+                    if (accepted) {
+                        enabled = target
+                    }
+                }
+            }
+        )
     }
 }
 
