@@ -2637,7 +2637,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         wheelDy: Int
     ): XiaomiMirrorKeyboardInjectionResult? {
         if (action != "down" && action != "move" && action != "up" &&
-            action != "cancel" && action != "wheel"
+            action != "cancel" && action != "wheel" && action != "rightUp"
         ) {
             return null
         }
@@ -2657,29 +2657,88 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             when (action) {
                 "down" -> {
                     xiaomiMirrorPointerInjectDownTimeMs = now
-                    injectXiaomiMirrorMotionEvent(
-                        inputManager, injectMethod, android.view.MotionEvent.ACTION_DOWN, x, y, now
+                    injectXiaomiMirrorMouseEvent(
+                        inputManager, injectMethod, android.view.MotionEvent.ACTION_DOWN,
+                        x, y, now,
+                        buttonState = android.view.MotionEvent.BUTTON_PRIMARY,
+                        actionButton = android.view.MotionEvent.BUTTON_PRIMARY
                     )
                 }
                 "move" -> {
                     if (xiaomiMirrorPointerInjectDownTimeMs != 0L) {
-                        injectXiaomiMirrorMotionEvent(
-                            inputManager, injectMethod, android.view.MotionEvent.ACTION_MOVE, x, y, now
+                        injectXiaomiMirrorMouseEvent(
+                            inputManager, injectMethod, android.view.MotionEvent.ACTION_MOVE,
+                            x, y, now,
+                            buttonState = android.view.MotionEvent.BUTTON_PRIMARY,
+                            actionButton = 0
                         )
                     }
                 }
-                "up", "cancel" -> {
+                "up" -> {
                     if (xiaomiMirrorPointerInjectDownTimeMs != 0L) {
-                        injectXiaomiMirrorMotionEvent(
-                            inputManager, injectMethod, android.view.MotionEvent.ACTION_UP, x, y, now
+                        injectXiaomiMirrorMouseEvent(
+                            inputManager, injectMethod, android.view.MotionEvent.ACTION_UP,
+                            x, y, now,
+                            buttonState = 0,
+                            actionButton = android.view.MotionEvent.BUTTON_PRIMARY
                         )
                         xiaomiMirrorPointerInjectDownTimeMs = 0L
                     }
                 }
+                "cancel" -> {
+                    if (xiaomiMirrorPointerInjectDownTimeMs != 0L) {
+                        injectXiaomiMirrorMouseEvent(
+                            inputManager, injectMethod, android.view.MotionEvent.ACTION_CANCEL,
+                            x, y, now,
+                            buttonState = 0,
+                            actionButton = 0
+                        )
+                        xiaomiMirrorPointerInjectDownTimeMs = 0L
+                    }
+                }
+                "rightUp" -> {
+                    val downTimeMs = now
+                    xiaomiMirrorPointerInjectDownTimeMs = downTimeMs
+                    injectXiaomiMirrorMouseEvent(
+                        inputManager, injectMethod, android.view.MotionEvent.ACTION_DOWN,
+                        x, y, now,
+                        buttonState = android.view.MotionEvent.BUTTON_SECONDARY,
+                        actionButton = android.view.MotionEvent.BUTTON_SECONDARY,
+                        downTimeMs = downTimeMs
+                    )
+                    injectXiaomiMirrorMouseEvent(
+                        inputManager, injectMethod, android.view.MotionEvent.ACTION_BUTTON_PRESS,
+                        x, y, now,
+                        buttonState = android.view.MotionEvent.BUTTON_SECONDARY,
+                        actionButton = android.view.MotionEvent.BUTTON_SECONDARY,
+                        downTimeMs = downTimeMs
+                    )
+                    injectXiaomiMirrorMouseEvent(
+                        inputManager, injectMethod, android.view.MotionEvent.ACTION_BUTTON_RELEASE,
+                        x, y, now,
+                        buttonState = 0,
+                        actionButton = android.view.MotionEvent.BUTTON_SECONDARY,
+                        downTimeMs = downTimeMs
+                    )
+                    injectXiaomiMirrorMouseEvent(
+                        inputManager, injectMethod, android.view.MotionEvent.ACTION_UP,
+                        x, y, now,
+                        buttonState = 0,
+                        actionButton = android.view.MotionEvent.BUTTON_SECONDARY,
+                        downTimeMs = downTimeMs
+                    )
+                    xiaomiMirrorPointerInjectDownTimeMs = 0L
+                }
                 "wheel" -> {
                     if (wheelDy != 0) {
-                        injectXiaomiMirrorScrollEvent(
-                            inputManager, injectMethod, x, y, wheelDy, now
+                        val vscroll = (wheelDy.toFloat() / XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR)
+                            .coerceIn(-XIAOMI_MIRROR_WHEEL_AXIS_MAX, XIAOMI_MIRROR_WHEEL_AXIS_MAX)
+                        injectXiaomiMirrorMouseEvent(
+                            inputManager, injectMethod, android.view.MotionEvent.ACTION_SCROLL,
+                            x, y, now,
+                            buttonState = 0,
+                            actionButton = 0,
+                            vscroll = vscroll
                         )
                     }
                 }
@@ -2700,35 +2759,109 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun injectXiaomiMirrorScrollEvent(
-        inputManager: android.hardware.input.InputManager,
-        injectMethod: java.lang.reflect.Method,
-        x: Int,
-        y: Int,
-        wheelDy: Int,
-        eventTimeMs: Long
-    ) {
-        val pointerProperties = android.view.MotionEvent.PointerProperties().apply {
-            id = 0
-            toolType = android.view.MotionEvent.TOOL_TYPE_MOUSE
+    private var xiaomiMirrorObtain15Method: java.lang.reflect.Method? = null
+    private var xiaomiMirrorObtain15Resolved: Boolean = false
+    private var xiaomiMirrorSetActionButtonMethod: java.lang.reflect.Method? = null
+    private var xiaomiMirrorSetActionButtonResolved: Boolean = false
+
+    private fun resolveXiaomiMirrorObtain15(): java.lang.reflect.Method? {
+        if (!xiaomiMirrorObtain15Resolved) {
+            xiaomiMirrorObtain15Resolved = true
+            xiaomiMirrorObtain15Method = runCatching {
+                android.view.MotionEvent::class.java.getDeclaredMethod(
+                    "obtain",
+                    Long::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Array<android.view.MotionEvent.PointerProperties>::class.java,
+                    Array<android.view.MotionEvent.PointerCoords>::class.java,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Float::class.javaPrimitiveType,
+                    Float::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                )
+            }.getOrNull()
         }
-        val vscroll = (wheelDy.toFloat() / XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR)
-            .coerceIn(-XIAOMI_MIRROR_WHEEL_AXIS_MAX, XIAOMI_MIRROR_WHEEL_AXIS_MAX)
-        val pointerCoords = android.view.MotionEvent.PointerCoords().apply {
-            this.x = x.toFloat()
-            this.y = y.toFloat()
-            setAxisValue(android.view.MotionEvent.AXIS_VSCROLL, vscroll)
+        return xiaomiMirrorObtain15Method
+    }
+
+    private fun resolveXiaomiMirrorSetActionButton(): java.lang.reflect.Method? {
+        if (!xiaomiMirrorSetActionButtonResolved) {
+            xiaomiMirrorSetActionButtonResolved = true
+            xiaomiMirrorSetActionButtonMethod = runCatching {
+                android.view.MotionEvent::class.java.getDeclaredMethod(
+                    "setActionButton",
+                    Int::class.javaPrimitiveType
+                )
+            }.getOrNull()
         }
-        @Suppress("DEPRECATION")
-        val event = android.view.MotionEvent.obtain(
+        return xiaomiMirrorSetActionButtonMethod
+    }
+
+    private fun obtainXiaomiMirrorMouseEvent(
+        downTimeMs: Long,
+        eventTimeMs: Long,
+        action: Int,
+        x: Float,
+        y: Float,
+        buttonState: Int,
+        actionButton: Int,
+        vscroll: Float
+    ): android.view.MotionEvent {
+        val pointerProperties = arrayOf(
+            android.view.MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = android.view.MotionEvent.TOOL_TYPE_MOUSE
+            }
+        )
+        val pointerCoords = arrayOf(
+            android.view.MotionEvent.PointerCoords().apply {
+                this.x = x
+                this.y = y
+                orientation = 0f
+                size = 1f
+                if (vscroll != 0f) {
+                    setAxisValue(android.view.MotionEvent.AXIS_VSCROLL, vscroll)
+                }
+            }
+        )
+        val officialEvent = resolveXiaomiMirrorObtain15()?.let { obtain15 ->
+            runCatching {
+                obtain15.invoke(
+                    null,
+                    downTimeMs,
+                    eventTimeMs,
+                    action,
+                    1,
+                    pointerProperties,
+                    pointerCoords,
+                    0,
+                    buttonState,
+                    1f,
+                    1f,
+                    XIAOMI_MIRROR_INPUT_DEVICE_ID,
+                    0,
+                    android.view.InputDevice.SOURCE_MOUSE,
+                    0,
+                    XIAOMI_MIRROR_INPUT_EVENT_FLAGS
+                ) as? android.view.MotionEvent
+            }.getOrNull()
+        }
+        val event = officialEvent ?: @Suppress("DEPRECATION") android.view.MotionEvent.obtain(
+            downTimeMs,
             eventTimeMs,
-            eventTimeMs,
-            android.view.MotionEvent.ACTION_SCROLL,
+            action,
             1,
-            arrayOf(pointerProperties),
-            arrayOf(pointerCoords),
+            pointerProperties,
+            pointerCoords,
             0,
-            0,
+            buttonState,
             1f,
             1f,
             0,
@@ -2736,30 +2869,36 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             android.view.InputDevice.SOURCE_MOUSE,
             0
         )
-        try {
-            injectMethod.invoke(inputManager, event, XIAOMI_MIRROR_INJECT_MODE_ASYNC)
-        } finally {
-            event.recycle()
+        if (actionButton != 0) {
+            resolveXiaomiMirrorSetActionButton()?.let { setActionButton ->
+                runCatching { setActionButton.invoke(event, actionButton) }
+            }
         }
+        return event
     }
 
-    private fun injectXiaomiMirrorMotionEvent(
+    private fun injectXiaomiMirrorMouseEvent(
         inputManager: android.hardware.input.InputManager,
         injectMethod: java.lang.reflect.Method,
         action: Int,
         x: Int,
         y: Int,
-        eventTimeMs: Long
+        eventTimeMs: Long,
+        buttonState: Int,
+        actionButton: Int,
+        vscroll: Float = 0f,
+        downTimeMs: Long = xiaomiMirrorPointerInjectDownTimeMs
     ) {
-        val event = android.view.MotionEvent.obtain(
-            xiaomiMirrorPointerInjectDownTimeMs,
-            eventTimeMs,
-            action,
-            x.toFloat(),
-            y.toFloat(),
-            0
+        val event = obtainXiaomiMirrorMouseEvent(
+            downTimeMs = downTimeMs,
+            eventTimeMs = eventTimeMs,
+            action = action,
+            x = x.toFloat(),
+            y = y.toFloat(),
+            buttonState = buttonState,
+            actionButton = actionButton,
+            vscroll = vscroll
         )
-        event.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
         try {
             injectMethod.invoke(inputManager, event, XIAOMI_MIRROR_INJECT_MODE_ASYNC)
         } finally {
@@ -7556,6 +7695,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_GLOBAL_REPORT_ID = 3
         private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
         private const val XIAOMI_MIRROR_WHEEL_AXIS_MAX = 8f
+        private const val XIAOMI_MIRROR_INPUT_DEVICE_ID = -100
+        private const val XIAOMI_MIRROR_INPUT_EVENT_FLAGS = 0x800000
         private const val XIAOMI_MIRROR_INJECT_MODE_ASYNC = 0
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_MAX = 0x03ff
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_HOME = 0x0223
