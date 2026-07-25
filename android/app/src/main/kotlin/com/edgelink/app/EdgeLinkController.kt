@@ -308,6 +308,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onClipboardBlobChunk = { chunk ->
             handleClipboardBlobChunk(chunk)
+        },
+        onClipboardSetApplied = {
+            refreshClipboardHistory()
         }
     )
 
@@ -2011,6 +2014,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     )
                 )
                 clipboardHistoryStore.prune()
+                refreshClipboardHistory()
 
                 val shouldSend: Boolean
                 val thumbnailForWire: String?
@@ -2052,6 +2056,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         peerCapabilityHistory = caps.clipboardHistory
         peerCapabilityThumbnail = caps.clipboardThumbnail
         peerCapabilityBlob = caps.clipboardBlob
+        stateFlow.update { it.copy(peerClipboardBlob = caps.clipboardBlob) }
         EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail} blob=${caps.clipboardBlob}")
     }
 
@@ -2062,6 +2067,63 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             EdgeLinkLog.info(
                 "clipboard.android.history_imported count=${response.items.size} inserted=$inserted"
             )
+            refreshClipboardHistory()
+        }
+    }
+
+    override fun onClipboardHistoryRefresh() {
+        refreshClipboardHistory()
+    }
+
+    override fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody) {
+        scope.launch(Dispatchers.IO) {
+            when (ClipboardKind.fromWire(item.kind) ?: ClipboardKind.TEXT) {
+                ClipboardKind.TEXT, ClipboardKind.HTML -> {
+                    val text = item.text ?: return@launch
+                    if (text.isEmpty()) return@launch
+                    clipboardSync.applyRemoteText(text, item.hash)
+                    stateFlow.update {
+                        it.copy(clipboardBlobStatus = appContext.getString(R.string.clipboard_copied))
+                    }
+                }
+                ClipboardKind.IMAGE -> {
+                    val blob = clipboardHistoryStore.loadBlob(item.id)
+                    if (blob != null && blob.data.isNotEmpty()) {
+                        clipboardSync.applyRemoteImage(blob.data, blob.mime)
+                        stateFlow.update {
+                            it.copy(clipboardBlobStatus = appContext.getString(R.string.clipboard_blob_applied))
+                        }
+                    } else {
+                        if (!peerCapabilityBlob) {
+                            stateFlow.update {
+                                it.copy(clipboardBlobStatus = appContext.getString(R.string.clipboard_blob_unsupported))
+                            }
+                            return@launch
+                        }
+                        stateFlow.update {
+                            it.copy(clipboardBlobStatus = appContext.getString(R.string.clipboard_blob_fetching))
+                        }
+                        requestClipboardBlob(item.id) { success ->
+                            stateFlow.update { state ->
+                                state.copy(
+                                    clipboardBlobStatus = appContext.getString(
+                                        if (success) R.string.clipboard_blob_applied
+                                        else R.string.clipboard_blob_failed
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+                ClipboardKind.FILE -> Unit
+            }
+        }
+    }
+
+    private fun refreshClipboardHistory() {
+        scope.launch(Dispatchers.IO) {
+            val items = clipboardHistoryStore.recent(limit = 50)
+            stateFlow.update { it.copy(clipboardHistoryItems = items) }
         }
     }
 
@@ -2171,6 +2233,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         peerCapabilityHistory = false
         peerCapabilityThumbnail = false
         peerCapabilityBlob = false
+        stateFlow.update { it.copy(peerClipboardBlob = false) }
         cancelPendingClipboardBlob(success = false, reason = "new_session")
         sendEnvelope(EnvelopeTypes.STATUS_CAPS, StatusCapsBody(clipboardBlob = true))
         sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
@@ -2440,7 +2503,8 @@ private class AndroidCommandDispatcher(
     private val onStatusCaps: (StatusCapsBody) -> Unit = {},
     private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {},
     private val onClipboardBlobRequest: (ClipboardBlobRequestBody) -> Unit = {},
-    private val onClipboardBlobChunk: (ClipboardBlobChunkBody) -> Unit = {}
+    private val onClipboardBlobChunk: (ClipboardBlobChunkBody) -> Unit = {},
+    private val onClipboardSetApplied: () -> Unit = {}
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2484,6 +2548,7 @@ private class AndroidCommandDispatcher(
                     )
                     clipboardHistoryStore.prune()
                 }
+                onClipboardSetApplied()
                 null
             }
             EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST -> {

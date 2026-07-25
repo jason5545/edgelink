@@ -85,6 +85,10 @@ final class EdgeLinkRuntime: ObservableObject {
     private var pendingClipboardBlobId: String?
     private var pendingClipboardBlobCompletion: ((Bool) -> Void)?
     private var pendingClipboardBlobTimeout: Task<Void, Never>?
+    @Published private(set) var clipboardHistoryItems: [ClipboardHistoryItemBody] = []
+    @Published private(set) var clipboardHistoryStatus = ""
+    @Published private(set) var fetchingClipboardBlobId: String?
+    @Published private(set) var peerClipboardBlobSupported = false
     private let notificationPresenter = MacNotificationPresenter()
     private let incomingCallPresenter = MacIncomingCallPresenter()
     private let verificationCodeBridge = MacVerificationCodeBridge()
@@ -2968,6 +2972,11 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.handleClipboardBlobChunk(chunk)
                         }
+                    },
+                    onClipboardSetApplied: { [weak self] in
+                        Task { @MainActor in
+                            self?.refreshClipboardHistory()
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -3031,6 +3040,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 peerCapabilityHistory = false
                 peerCapabilityThumbnail = false
                 peerCapabilityBlob = false
+                peerClipboardBlobSupported = false
                 cancelPendingClipboardBlob(success: false, reason: "new_session")
                 if let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody())) {
                     try? await session.sendPlaintext(capsData)
@@ -3291,6 +3301,7 @@ final class EdgeLinkRuntime: ObservableObject {
                     )
                 )
                 clipboardHistoryStore?.prune()
+                refreshClipboardHistory()
 
                 let shouldSend: Bool
                 var thumbnailForWire: String? = nil
@@ -3338,6 +3349,7 @@ final class EdgeLinkRuntime: ObservableObject {
         peerCapabilityHistory = caps.clipboardHistory
         peerCapabilityThumbnail = caps.clipboardThumbnail
         peerCapabilityBlob = caps.clipboardBlob
+        peerClipboardBlobSupported = caps.clipboardBlob
         DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail) blob=\(caps.clipboardBlob)")
     }
 
@@ -3345,6 +3357,39 @@ final class EdgeLinkRuntime: ObservableObject {
         let inserted = clipboardHistoryStore?.importRemote(response.items) ?? 0
         clipboardHistoryStore?.prune()
         DiagnosticsLog.info("clipboard.mac.history_imported count=\(response.items.count) inserted=\(inserted)")
+        refreshClipboardHistory()
+    }
+
+    func refreshClipboardHistory() {
+        clipboardHistoryItems = clipboardHistoryStore?.recent(limit: 50) ?? []
+    }
+
+    func handleClipboardHistoryItemClick(_ item: ClipboardHistoryItemBody) {
+        let kind = ClipboardKind(rawValue: item.kind) ?? .text
+        switch kind {
+        case .text, .html:
+            guard let text = item.text, !text.isEmpty else { return }
+            clipboardSync.setLocalTextWithoutPublishing(text)
+            clipboardHistoryStatus = String(localized: "已複製到剪貼簿")
+        case .image:
+            if let blob = clipboardHistoryStore?.loadBlob(id: item.id), !blob.data.isEmpty {
+                clipboardSync.applyRemoteImage(blob.data, mime: blob.mime)
+                clipboardHistoryStatus = String(localized: "已貼上原圖")
+            } else {
+                guard peerCapabilityBlob else {
+                    clipboardHistoryStatus = String(localized: "對端不支援原圖拉取")
+                    return
+                }
+                clipboardHistoryStatus = String(localized: "正在從對端拉取原圖…")
+                requestClipboardBlob(id: item.id) { [weak self] success in
+                    self?.clipboardHistoryStatus = success
+                        ? String(localized: "已貼上原圖")
+                        : String(localized: "原圖拉取失敗")
+                }
+            }
+        case .file:
+            break
+        }
     }
 
     func requestClipboardBlob(id: String, completion: @escaping (Bool) -> Void) {
@@ -3356,6 +3401,7 @@ final class EdgeLinkRuntime: ObservableObject {
         cancelPendingClipboardBlob(success: false, reason: "superseded")
         clipboardBlobReassembler.reset()
         pendingClipboardBlobId = id
+        fetchingClipboardBlobId = id
         pendingClipboardBlobCompletion = completion
         let body = ClipboardBlobRequestBody(id: id)
         guard let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardBlobRequest, b: body)) else {
@@ -3451,6 +3497,7 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.info("clipboard.mac.blob_request_failed reason=\(reason)")
         }
         pendingClipboardBlobId = nil
+        fetchingClipboardBlobId = nil
         clipboardBlobReassembler.reset()
         let completion = pendingClipboardBlobCompletion
         pendingClipboardBlobCompletion = nil

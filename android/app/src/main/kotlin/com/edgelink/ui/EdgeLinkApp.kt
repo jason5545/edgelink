@@ -2,14 +2,18 @@ package com.edgelink.ui
 
 import android.os.Build
 import android.os.Bundle
+import android.util.Base64
+import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -56,6 +60,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -66,6 +71,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -77,6 +83,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.edgelink.app.R
+import com.edgelink.core.ClipboardHistoryItemBody
 import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
@@ -213,7 +220,10 @@ data class EdgeLinkUiState(
     val shizukuPermissionGranted: Boolean = false,
     val shizukuPermissionRequestBlocked: Boolean = false,
     val shizukuUid: Int? = null,
-    val xiaomiMiLinkProbeStatus: String? = null
+    val xiaomiMiLinkProbeStatus: String? = null,
+    val clipboardHistoryItems: List<ClipboardHistoryItemBody> = emptyList(),
+    val clipboardBlobStatus: String = "",
+    val peerClipboardBlob: Boolean = false
 )
 
 interface EdgeLinkActions {
@@ -236,6 +246,8 @@ interface EdgeLinkActions {
     fun onOpenSmsSettings()
     fun onRequestShizukuPermission()
     fun onProbeMiLink()
+    fun onClipboardHistoryRefresh()
+    fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody)
 
     object Noop : EdgeLinkActions {
         override fun onPointer(body: InputPointerBody) = Unit
@@ -257,12 +269,15 @@ interface EdgeLinkActions {
         override fun onOpenSmsSettings() = Unit
         override fun onRequestShizukuPermission() = Unit
         override fun onProbeMiLink() = Unit
+        override fun onClipboardHistoryRefresh() = Unit
+        override fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody) = Unit
     }
 }
 
 private enum class EdgeLinkScreen {
     Dashboard,
     RemoteControl,
+    Clipboard,
     Settings
 }
 
@@ -285,9 +300,15 @@ fun DeviceControlScreen(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             state = state,
             actions = actions,
             onOpenRemoteControl = { screenName = EdgeLinkScreen.RemoteControl.name },
+            onOpenClipboard = { screenName = EdgeLinkScreen.Clipboard.name },
             onOpenSettings = { screenName = EdgeLinkScreen.Settings.name }
         )
         EdgeLinkScreen.RemoteControl -> RemoteControlScreen(
+            state = state,
+            actions = actions,
+            onBack = { screenName = EdgeLinkScreen.Dashboard.name }
+        )
+        EdgeLinkScreen.Clipboard -> ClipboardHistoryScreen(
             state = state,
             actions = actions,
             onBack = { screenName = EdgeLinkScreen.Dashboard.name }
@@ -306,6 +327,7 @@ private fun DashboardScreen(
     state: EdgeLinkUiState,
     actions: EdgeLinkActions,
     onOpenRemoteControl: () -> Unit,
+    onOpenClipboard: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     Scaffold(
@@ -330,6 +352,7 @@ private fun DashboardScreen(
             item { ConnectionStatusCard(state = state, actions = actions) }
             item { PermissionHealthCard(state = state, actions = actions) }
             item { RemoteControlEntry(onOpenRemoteControl = onOpenRemoteControl) }
+            item { ClipboardHistoryEntry(onOpenClipboard = onOpenClipboard) }
         }
     }
 }
@@ -486,6 +509,151 @@ private fun RemoteControlEntry(onOpenRemoteControl: () -> Unit) {
             .height(64.dp)
     ) {
         Text(stringResource(R.string.remote_control_title))
+    }
+}
+
+@Composable
+private fun ClipboardHistoryEntry(onOpenClipboard: () -> Unit) {
+    FilledTonalButton(
+        onClick = onOpenClipboard,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(64.dp)
+    ) {
+        Text(stringResource(R.string.clipboard_history_title))
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ClipboardHistoryScreen(
+    state: EdgeLinkUiState,
+    actions: EdgeLinkActions,
+    onBack: () -> Unit
+) {
+    LaunchedEffect(Unit) {
+        actions.onClipboardHistoryRefresh()
+    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.clipboard_history_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Text("←", style = MaterialTheme.typography.titleLarge)
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(state.clipboardHistoryItems.size) { index ->
+                    val item = state.clipboardHistoryItems[index]
+                    ClipboardHistoryRow(
+                        item = item,
+                        onClick = { actions.onClipboardHistoryItemClick(item) }
+                    )
+                }
+                if (state.clipboardHistoryItems.isEmpty()) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.clipboard_history_empty),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 40.dp)
+                        )
+                    }
+                }
+            }
+            if (state.clipboardBlobStatus.isNotEmpty()) {
+                Text(
+                    text = state.clipboardBlobStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ClipboardHistoryRow(
+    item: ClipboardHistoryItemBody,
+    onClick: () -> Unit
+) {
+    val thumbnail = remember(item.id) {
+        item.thumbnailBase64?.let { base64 ->
+            runCatching {
+                val bytes = Base64.decode(base64, Base64.DEFAULT)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            }.getOrNull()
+        }
+    }
+    val primaryLine = when {
+        !item.text.isNullOrEmpty() -> item.text
+        item.kind == "image" -> stringResource(R.string.clipboard_history_image)
+        item.kind == "file" -> stringResource(R.string.clipboard_history_file)
+        else -> stringResource(R.string.clipboard_history_no_text)
+    }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (thumbnail != null) {
+                    Image(
+                        bitmap = thumbnail,
+                        contentDescription = null,
+                        modifier = Modifier.size(40.dp)
+                    )
+                } else {
+                    Text(
+                        text = if (item.kind == "image") "圖" else "文",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = primaryLine,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                        .format(java.util.Date(item.ts * 1000)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 

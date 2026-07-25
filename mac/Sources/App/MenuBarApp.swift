@@ -32,6 +32,12 @@ struct EdgeLinkMacApp: App {
                 .background(WindowFrameAutosaver(name: "EdgeLinkMessagesWindow"))
         }
         .defaultSize(width: 360, height: 480)
+
+        Window("剪貼簿歷史", id: "clipboard") {
+            ClipboardHistoryWindow(runtime: runtime)
+                .background(WindowFrameAutosaver(name: "EdgeLinkClipboardWindow"))
+        }
+        .defaultSize(width: 400, height: 480)
     }
 }
 
@@ -178,6 +184,13 @@ private struct PhoneSection: View {
                 openWindow(id: "sms")
             } label: {
                 Label("訊息…", systemImage: "message")
+            }
+
+            Button {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "clipboard")
+            } label: {
+                Label("剪貼簿歷史…", systemImage: "list.clipboard")
             }
         }
     }

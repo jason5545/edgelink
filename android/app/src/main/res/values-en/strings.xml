@@ -85,4 +85,14 @@
 
   <string name="pairing_prompt_enter_id">Enter the 9-digit ID shown on your Mac</string>
   <string name="pairing_prompt_confirm">Make sure both numbers match, then tap Confirm</string>
+  <string name="clipboard_history_title">Clipboard history</string>
+  <string name="clipboard_history_empty">No clipboard history yet</string>
+  <string name="clipboard_history_image">Image</string>
+  <string name="clipboard_history_file">File</string>
+  <string name="clipboard_history_no_text">(no text)</string>
+  <string name="clipboard_copied">Copied to clipboard</string>
+  <string name="clipboard_blob_fetching">Fetching original image…</string>
+  <string name="clipboard_blob_applied">Original image pasted</string>
+  <string name="clipboard_blob_failed">Failed to fetch original image</string>
+  <string name="clipboard_blob_unsupported">Peer does not support blob fetch</string>
 </resources>

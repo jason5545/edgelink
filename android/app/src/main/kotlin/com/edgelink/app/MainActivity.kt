@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import com.edgelink.core.ClipboardHistoryItemBody
 import com.edgelink.core.InputKeyBody
 import com.edgelink.core.InputPointerBody
 import com.edgelink.core.InputTextBody
@@ -162,4 +163,7 @@ private class EdgeLinkActivityActions(
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
     override fun onRequestShizukuPermission() = delegate.onRequestShizukuPermission()
     override fun onProbeMiLink() = delegate.onProbeMiLink()
+    override fun onClipboardHistoryRefresh() = delegate.onClipboardHistoryRefresh()
+    override fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody) =
+        delegate.onClipboardHistoryItemClick(item)
 }

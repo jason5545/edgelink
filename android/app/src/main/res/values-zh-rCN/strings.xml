@@ -85,4 +85,14 @@
 
   <string name="pairing_prompt_enter_id">输入 Mac 上显示的 9 位 ID</string>
   <string name="pairing_prompt_confirm">确认两边数字相同后按 Confirm</string>
+  <string name="clipboard_history_title">剪贴板历史</string>
+  <string name="clipboard_history_empty">暂无剪贴板历史</string>
+  <string name="clipboard_history_image">图片</string>
+  <string name="clipboard_history_file">文件</string>
+  <string name="clipboard_history_no_text">（无文字）</string>
+  <string name="clipboard_copied">已复制到剪贴板</string>
+  <string name="clipboard_blob_fetching">正在从对端拉取原图…</string>
+  <string name="clipboard_blob_applied">已贴上原图</string>
+  <string name="clipboard_blob_failed">原图拉取失败</string>
+  <string name="clipboard_blob_unsupported">对端不支持原图拉取</string>
 </resources>

@@ -85,4 +85,14 @@
 
   <string name="pairing_prompt_enter_id">Mac に表示されている 9 桁の ID を入力してください</string>
   <string name="pairing_prompt_confirm">両方の数字が同じことを確認して Confirm を押してください</string>
+  <string name="clipboard_history_title">クリップボード履歴</string>
+  <string name="clipboard_history_empty">クリップボード履歴はまだありません</string>
+  <string name="clipboard_history_image">画像</string>
+  <string name="clipboard_history_file">ファイル</string>
+  <string name="clipboard_history_no_text">（テキストなし）</string>
+  <string name="clipboard_copied">クリップボードにコピーしました</string>
+  <string name="clipboard_blob_fetching">元画像を取得中…</string>
+  <string name="clipboard_blob_applied">元画像を貼り付けました</string>
+  <string name="clipboard_blob_failed">元画像の取得に失敗しました</string>
+  <string name="clipboard_blob_unsupported">相手側は blob 取得に対応していません</string>
 </resources>

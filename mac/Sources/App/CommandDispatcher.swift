@@ -25,6 +25,7 @@ final class CommandDispatcher {
     private let onClipboardHistoryResponse: @Sendable (ClipboardHistoryResponseBody) -> Void
     private let onClipboardBlobRequest: @Sendable (ClipboardBlobRequestBody) -> Void
     private let onClipboardBlobChunk: @Sendable (ClipboardBlobChunkBody) -> Void
+    private let onClipboardSetApplied: @Sendable () -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -51,7 +52,8 @@ final class CommandDispatcher {
         onStatusCaps: @escaping @Sendable (StatusCapsBody) -> Void = { _ in },
         onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in },
         onClipboardBlobRequest: @escaping @Sendable (ClipboardBlobRequestBody) -> Void = { _ in },
-        onClipboardBlobChunk: @escaping @Sendable (ClipboardBlobChunkBody) -> Void = { _ in }
+        onClipboardBlobChunk: @escaping @Sendable (ClipboardBlobChunkBody) -> Void = { _ in },
+        onClipboardSetApplied: @escaping @Sendable () -> Void = {}
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
@@ -76,6 +78,7 @@ final class CommandDispatcher {
         self.onClipboardHistoryResponse = onClipboardHistoryResponse
         self.onClipboardBlobRequest = onClipboardBlobRequest
         self.onClipboardBlobChunk = onClipboardBlobChunk
+        self.onClipboardSetApplied = onClipboardSetApplied
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -119,6 +122,7 @@ final class CommandDispatcher {
                 store.append(item)
                 store.prune()
             }
+            onClipboardSetApplied()
             return nil
         case EnvelopeType.statusCaps:
             let envelope = try decoder.decode(Envelope<StatusCapsBody>.self, from: plaintext)
