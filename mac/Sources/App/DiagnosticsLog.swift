@@ -5,6 +5,8 @@ import OSLog
 enum DiagnosticsLog {
     private static let logger = Logger(subsystem: "com.edgelink.mac", category: "diagnostics")
     private static let fileQueue = DispatchQueue(label: "EdgeLink.DiagnosticsLogFile")
+    private static let maxFileBytes: UInt64 = 2 * 1024 * 1024
+    private static let maxBackupCount = 3
 
     static func info(_ message: String) {
         logger.info("\(message, privacy: .public)")
@@ -31,6 +33,7 @@ enum DiagnosticsLog {
         fileQueue.async {
             do {
                 let url = try logURL()
+                try rotateIfNeeded(url)
                 let line = "\(timestamp()) \(level) \(message)\n"
                 let data = Data(line.utf8)
                 if FileManager.default.fileExists(atPath: url.path) {
@@ -54,6 +57,26 @@ enum DiagnosticsLog {
         let directory = base.appendingPathComponent("EdgeLink", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory.appendingPathComponent("diagnostics.log")
+    }
+
+    private static func rotateIfNeeded(_ url: URL) throws {
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: url.path) else { return }
+        let size = (try manager.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
+        guard size >= maxFileBytes else { return }
+        let oldest = url.appendingPathExtension("\(maxBackupCount)")
+        if manager.fileExists(atPath: oldest.path) {
+            try manager.removeItem(at: oldest)
+        }
+        if maxBackupCount > 1 {
+            for index in stride(from: maxBackupCount - 1, through: 1, by: -1) {
+                let source = url.appendingPathExtension("\(index)")
+                if manager.fileExists(atPath: source.path) {
+                    try manager.moveItem(at: source, to: url.appendingPathExtension("\(index + 1)"))
+                }
+            }
+        }
+        try manager.moveItem(at: url, to: url.appendingPathExtension("1"))
     }
 
     private static func timestamp() -> String {

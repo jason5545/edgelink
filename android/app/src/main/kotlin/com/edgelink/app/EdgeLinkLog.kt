@@ -12,6 +12,8 @@ import java.time.Instant
 
 object EdgeLinkLog {
     private const val TAG = "EdgeLink"
+    private const val MAX_FILE_BYTES = 2L * 1024 * 1024
+    private const val MAX_BACKUP_COUNT = 3
     private val writerThread = HandlerThread("EdgeLinkDiagnosticsLog").apply { start() }
     private val writerHandler = Handler(writerThread.looper)
     @Volatile
@@ -49,11 +51,26 @@ object EdgeLinkLog {
         val line = "${Instant.now()} $level $message\n"
         writerHandler.post {
             runCatching {
+                rotateIfNeeded(target)
                 val activeWriter = writerFor(target)
                 activeWriter.write(line)
                 activeWriter.flush()
             }
         }
+    }
+
+    private fun rotateIfNeeded(target: File) {
+        if (!target.exists() || target.length() < MAX_FILE_BYTES) return
+        writer?.close()
+        writer = null
+        writerFile = null
+        val oldest = File(target.path + "." + MAX_BACKUP_COUNT)
+        if (oldest.exists()) oldest.delete()
+        for (index in MAX_BACKUP_COUNT - 1 downTo 1) {
+            val source = File(target.path + "." + index)
+            if (source.exists()) source.renameTo(File(target.path + "." + (index + 1)))
+        }
+        target.renameTo(File(target.path + ".1"))
     }
 
     private fun writerFor(target: File): BufferedWriter {
