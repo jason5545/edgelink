@@ -386,7 +386,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var telecomRelayFeaturesInstalled: Boolean = false
     private val xiaomiMirrorKeyboardPressedUsages = LinkedHashSet<Int>()
     private var xiaomiMirrorKeyboardModifierMask: Int = 0
-    private var xiaomiMirrorPointerButtonMask: Int = 0
     private val xiaomiMirrorKeyboardShareLock = Any()
     private var xiaomiMirrorKeyboardShareManagerPrepared: Boolean = false
     private var xiaomiMirrorKeyboardShareSocket: Any? = null
@@ -394,7 +393,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var xiaomiMirrorAcceptInputCallback: Any? = null
     private var xiaomiMirrorKeyboardEdgeLinkHidDevice: Any? = null
     private var xiaomiMirrorKeyboardSessionArmed: Boolean = false
-    private var xiaomiMirrorPointerMarkLastMs: Long = 0L
     private var xiaomiMirrorSavedShowImeWithHardKeyboard: Int? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -2275,7 +2273,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         val screenWidth = extras.intCompat("screenWidth", 0)
         val screenHeight = extras.intCompat("screenHeight", 0)
         val wheelDy = extras.intCompat("wheelDy", 0)
-        val inputManagerInjection = injectXiaomiMirrorPointerViaInputManager(
+        val injection = injectXiaomiMirrorPointerViaInputManager(
             classLoader = classLoader,
             action = action,
             x = x,
@@ -2283,36 +2281,15 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             screenWidth = screenWidth,
             screenHeight = screenHeight,
             wheelDy = wheelDy
+        ) ?: XiaomiMirrorKeyboardInjectionResult(
+            accepted = false,
+            route = "edgelink.inputmanager.pointer",
+            message = "unsupported pointer action=$action wheelDy=$wheelDy"
         )
-        val reports: List<ByteArray>
-        val injection: XiaomiMirrorKeyboardInjectionResult
-        if (inputManagerInjection != null) {
-            reports = emptyList()
-            injection = inputManagerInjection
-        } else {
-            reports = buildXiaomiMirrorPointerReports(
-                action = action,
-                x = x,
-                y = y,
-                screenWidth = screenWidth,
-                screenHeight = screenHeight,
-                wheelDy = wheelDy
-            )
-            injection = if (reports.isNotEmpty()) {
-                injectXiaomiMirrorPointerReports(classLoader, reports)
-            } else {
-                XiaomiMirrorKeyboardInjectionResult(
-                    accepted = false,
-                    route = "xiaomi.mirror.hid.pointer",
-                    message = "unsupported pointer action=$action wheelDy=$wheelDy"
-                )
-            }
-        }
         log(
             "mirror pointer provider requestId=$requestId action=$action x=$x y=$y " +
-                "screen=${screenWidth}x$screenHeight wheelDy=$wheelDy reports=${reports.size} " +
-                "accepted=${injection.accepted} route=${injection.route} message=${injection.message} " +
-                "report=${reports.firstOrNull()?.hexSummary().orEmpty()}"
+                "screen=${screenWidth}x$screenHeight wheelDy=$wheelDy " +
+                "accepted=${injection.accepted} route=${injection.route} message=${injection.message}"
         )
         return Bundle().apply {
             putBoolean("edgelinkPointerAccepted", injection.accepted)
@@ -2327,8 +2304,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             putInt("screenWidth", screenWidth)
             putInt("screenHeight", screenHeight)
             putInt("wheelDy", wheelDy)
-            putInt("reports", reports.size)
-            putString("reportHex", reports.firstOrNull()?.hexSummary().orEmpty())
+            putInt("reports", 0)
+            putString("reportHex", "")
         }
     }
 
@@ -2441,9 +2418,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             synchronized(xiaomiMirrorKeyboardPressedUsages) {
                 xiaomiMirrorKeyboardPressedUsages.clear()
                 xiaomiMirrorKeyboardModifierMask = 0
-            }
-            synchronized(xiaomiMirrorKeyboardShareLock) {
-                xiaomiMirrorPointerButtonMask = 0
             }
             XiaomiMirrorKeyboardInjectionResult(
                 accepted = true,
@@ -2627,102 +2601,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun buildXiaomiMirrorPointerReports(
-        action: String,
-        x: Int,
-        y: Int,
-        screenWidth: Int,
-        screenHeight: Int,
-        wheelDy: Int
-    ): List<ByteArray> = synchronized(xiaomiMirrorKeyboardShareLock) {
-        val pointerX = xiaomiMirrorPointerAxis(x, screenWidth)
-        val pointerY = xiaomiMirrorPointerAxis(y, screenHeight)
-        when (action) {
-            "down" -> {
-                xiaomiMirrorPointerButtonMask = 0x01
-                listOf(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
-            }
-            "up" -> {
-                xiaomiMirrorPointerButtonMask = 0x00
-                listOf(xiaomiMirrorTouchReport(touching = false, pointerX, pointerY))
-            }
-            "move" -> if (xiaomiMirrorPointerButtonMask != 0) {
-                listOf(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
-            } else {
-                emptyList()
-            }
-            "rightUp" -> emptyList()
-            "wheel" -> buildXiaomiMirrorWheelReports(
-                wheelDy = wheelDy,
-                x = x,
-                y = y,
-                screenWidth = screenWidth,
-                screenHeight = screenHeight,
-                pointerX = pointerX,
-                pointerY = pointerY
-            )
-            else -> emptyList()
-        }
-    }
-
-    private fun buildXiaomiMirrorWheelReports(
-        wheelDy: Int,
-        x: Int,
-        y: Int,
-        screenWidth: Int,
-        screenHeight: Int,
-        pointerX: Int,
-        pointerY: Int
-    ): List<ByteArray> {
-        if (wheelDy == 0 || screenWidth <= 1 || screenHeight <= 1) {
-            return emptyList()
-        }
-        xiaomiMirrorPointerButtonMask = 0x00
-        val distance = min(160f, max(8f, abs(wheelDy).toFloat() * 0.3f))
-        val direction = if (wheelDy > 0) 1f else -1f
-        val startX = x.coerceIn(0, screenWidth - 1)
-        val startY = y.coerceIn(0, screenHeight - 1)
-        val endY = (startY + distance * direction).coerceIn(0f, (screenHeight - 1).toFloat())
-        val reports = ArrayList<ByteArray>(XIAOMI_MIRROR_WHEEL_STEPS + 2)
-        reports.add(xiaomiMirrorTouchReport(touching = true, pointerX, pointerY))
-        for (step in 1..XIAOMI_MIRROR_WHEEL_STEPS) {
-            val stepY = (startY + (endY - startY) * step / XIAOMI_MIRROR_WHEEL_STEPS).roundToInt()
-            reports.add(
-                xiaomiMirrorTouchReport(
-                    touching = true,
-                    xiaomiMirrorPointerAxis(startX, screenWidth),
-                    xiaomiMirrorPointerAxis(stepY, screenHeight)
-                )
-            )
-        }
-        reports.add(
-            xiaomiMirrorTouchReport(
-                touching = false,
-                pointerX,
-                xiaomiMirrorPointerAxis(endY.roundToInt(), screenHeight)
-            )
-        )
-        return reports
-    }
-
-    private fun xiaomiMirrorPointerAxis(value: Int, size: Int): Int {
-        if (size <= 1) {
-            return value.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX)
-        }
-        val clamped = value.coerceIn(0, size - 1)
-        return ((clamped.toLong() * XIAOMI_MIRROR_POINTER_AXIS_MAX) / (size - 1)).toInt()
-    }
-
-    private fun xiaomiMirrorTouchReport(touching: Boolean, x: Int, y: Int): ByteArray =
-        ByteArray(8).also { report ->
-            report[0] = XIAOMI_MIRROR_POINTER_REPORT_ID.toByte()
-            report[1] = (if (touching) 0x03 else 0x00).toByte()
-            report[2] = 0x01.toByte()
-            writeLittleEndianUInt16(report, 3, x.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX))
-            writeLittleEndianUInt16(report, 5, y.coerceIn(0, XIAOMI_MIRROR_POINTER_AXIS_MAX))
-            report[7] = (if (touching) 0x01 else 0x00).toByte()
-        }
-
     private fun buildXiaomiMirrorGlobalReports(action: String): List<ByteArray> {
         val usage = when (action) {
             "back" -> XIAOMI_MIRROR_GLOBAL_USAGE_BACK
@@ -2799,30 +2677,10 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                     }
                 }
                 "wheel" -> {
-                    if (wheelDy != 0 && screenWidth > 1 && screenHeight > 1) {
-                        val distance = min(160f, max(8f, abs(wheelDy).toFloat() * 0.3f))
-                        val direction = if (wheelDy > 0) 1f else -1f
-                        val startY = y.toFloat().coerceIn(0f, (screenHeight - 1).toFloat())
-                        val endY = (startY + distance * direction)
-                            .coerceIn(0f, (screenHeight - 1).toFloat())
-                        xiaomiMirrorPointerInjectDownTimeMs = now
-                        injectXiaomiMirrorMotionEvent(
-                            inputManager, injectMethod, android.view.MotionEvent.ACTION_DOWN,
-                            x, startY.roundToInt(), now
+                    if (wheelDy != 0) {
+                        injectXiaomiMirrorScrollEvent(
+                            inputManager, injectMethod, x, y, wheelDy, now
                         )
-                        for (step in 1..XIAOMI_MIRROR_WHEEL_STEPS) {
-                            val stepY = (startY + (endY - startY) * step / XIAOMI_MIRROR_WHEEL_STEPS)
-                                .roundToInt()
-                            injectXiaomiMirrorMotionEvent(
-                                inputManager, injectMethod, android.view.MotionEvent.ACTION_MOVE,
-                                x, stepY, now + step * 16L
-                            )
-                        }
-                        injectXiaomiMirrorMotionEvent(
-                            inputManager, injectMethod, android.view.MotionEvent.ACTION_UP,
-                            x, endY.roundToInt(), now + (XIAOMI_MIRROR_WHEEL_STEPS + 1) * 16L
-                        )
-                        xiaomiMirrorPointerInjectDownTimeMs = 0L
                     }
                 }
             }
@@ -2835,10 +2693,53 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             val cause = error.cause ?: error
             log(
                 "mirror pointer inputmanager injection failed action=$action " +
-                    "falling back to hid: ${cause.javaClass.simpleName}: ${cause.message}"
+                    "${cause.javaClass.simpleName}: ${cause.message}"
             )
             xiaomiMirrorPointerInjectDownTimeMs = 0L
             null
+        }
+    }
+
+    private fun injectXiaomiMirrorScrollEvent(
+        inputManager: android.hardware.input.InputManager,
+        injectMethod: java.lang.reflect.Method,
+        x: Int,
+        y: Int,
+        wheelDy: Int,
+        eventTimeMs: Long
+    ) {
+        val pointerProperties = android.view.MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = android.view.MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val vscroll = (wheelDy.toFloat() / XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR)
+            .coerceIn(-XIAOMI_MIRROR_WHEEL_AXIS_MAX, XIAOMI_MIRROR_WHEEL_AXIS_MAX)
+        val pointerCoords = android.view.MotionEvent.PointerCoords().apply {
+            this.x = x.toFloat()
+            this.y = y.toFloat()
+            setAxisValue(android.view.MotionEvent.AXIS_VSCROLL, vscroll)
+        }
+        @Suppress("DEPRECATION")
+        val event = android.view.MotionEvent.obtain(
+            eventTimeMs,
+            eventTimeMs,
+            android.view.MotionEvent.ACTION_SCROLL,
+            1,
+            arrayOf(pointerProperties),
+            arrayOf(pointerCoords),
+            0,
+            0,
+            1f,
+            1f,
+            0,
+            0,
+            android.view.InputDevice.SOURCE_MOUSE,
+            0
+        )
+        try {
+            injectMethod.invoke(inputManager, event, XIAOMI_MIRROR_INJECT_MODE_ASYNC)
+        } finally {
+            event.recycle()
         }
     }
 
@@ -2863,64 +2764,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
             injectMethod.invoke(inputManager, event, XIAOMI_MIRROR_INJECT_MODE_ASYNC)
         } finally {
             event.recycle()
-        }
-    }
-
-    private fun injectXiaomiMirrorPointerReports(
-        classLoader: ClassLoader,
-        reports: List<ByteArray>
-    ): XiaomiMirrorKeyboardInjectionResult {
-        return runCatching {
-            val shareSession = ensureXiaomiMirrorOfficialKeyboardShareSession(classLoader, "pointer")
-            val device = ensureXiaomiMirrorKeyboardDevice(classLoader)
-            if (device == null) {
-                return XiaomiMirrorKeyboardInjectionResult(
-                    accepted = false,
-                    route = "xiaomi.mirror.hid.pointer",
-                    message = "device unavailable $shareSession"
-                )
-            }
-            if (!waitForXiaomiMirrorHidDeviceOpen(device.first, XIAOMI_MIRROR_HID_OPEN_TIMEOUT_MS)) {
-                return XiaomiMirrorKeyboardInjectionResult(
-                    accepted = false,
-                    route = device.second,
-                    message = "pointer device not open ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
-                        "${xiaomiMirrorUhidAccessSummary()} $shareSession"
-                )
-            }
-            val markNowMs = android.os.SystemClock.uptimeMillis()
-            if (!xiaomiMirrorKeyboardSessionArmed ||
-                markNowMs - xiaomiMirrorPointerMarkLastMs > XIAOMI_MIRROR_POINTER_MARK_INTERVAL_MS
-            ) {
-                xiaomiMirrorPointerMarkLastMs = markNowMs
-                markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "pointer")
-            }
-            var sentCount = 0
-            for (report in reports) {
-                if (!sendXiaomiMirrorHidReport(classLoader, device.first, report)) {
-                    return XiaomiMirrorKeyboardInjectionResult(
-                        accepted = false,
-                        route = device.second,
-                        message = "pointer sendReport timeout sent=$sentCount/${reports.size} " +
-                            "ptr=${xiaomiMirrorHidDevicePtr(device.first)}"
-                    )
-                }
-                sentCount += 1
-            }
-            val afterInputState = "markBeforeSend=true"
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = true,
-                route = "xiaomi.mirror.hid.pointer",
-                message = "sendReport count=$sentCount ptr=${xiaomiMirrorHidDevicePtr(device.first)} " +
-                    "$afterInputState $shareSession"
-            )
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "xiaomi.mirror.hid.pointer",
-                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-            )
         }
     }
 
@@ -7711,8 +7554,8 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID = -100
         private const val XIAOMI_MIRROR_POINTER_REPORT_ID = 2
         private const val XIAOMI_MIRROR_GLOBAL_REPORT_ID = 3
-        private const val XIAOMI_MIRROR_POINTER_AXIS_MAX = 32_767
-        private const val XIAOMI_MIRROR_WHEEL_STEPS = 6
+        private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
+        private const val XIAOMI_MIRROR_WHEEL_AXIS_MAX = 8f
         private const val XIAOMI_MIRROR_INJECT_MODE_ASYNC = 0
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_MAX = 0x03ff
         private const val XIAOMI_MIRROR_GLOBAL_USAGE_HOME = 0x0223
@@ -7763,7 +7606,6 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_HID_EXISTING_OPEN_WAIT_MS = 50L
         private const val XIAOMI_MIRROR_HID_OPEN_POLL_MS = 20L
         private const val XIAOMI_MIRROR_HID_SEND_TIMEOUT_MS = 300L
-        private const val XIAOMI_MIRROR_POINTER_MARK_INTERVAL_MS = 1_000L
         private const val XIAOMI_MIRROR_HID_RECREATE_THROTTLE_MS = 5_000L
         private const val FAKE_MIRROR_SOURCE_ROUTE_WINDOW_MS = 30_000L
         private const val FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS = 120_000L
