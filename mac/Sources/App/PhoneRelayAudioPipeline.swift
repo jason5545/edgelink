@@ -27,6 +27,10 @@ final class PhoneRelayAudioController {
     private var uplinkMuted = false
     private var pcmFramesCaptured: UInt64 = 0
     private var uplinkPacketsEmitted = 0
+    private var uplinkLevelSamples = 0
+    private var uplinkLevelNonzero = 0
+    private var uplinkLevelMaxAbs = 0
+    private var uplinkLevelAbsTotal: Int64 = 0
     private var downlinkActive = false
     private(set) var state = State.idle
 
@@ -155,6 +159,10 @@ final class PhoneRelayAudioController {
         uplinkPacketHandler = packetHandler
         pcmFramesCaptured = 0
         uplinkPacketsEmitted = 0
+        uplinkLevelSamples = 0
+        uplinkLevelNonzero = 0
+        uplinkLevelMaxAbs = 0
+        uplinkLevelAbsTotal = 0
 
         inputNode.installTap(onBus: 0, bufferSize: Self.uplinkFramesPerBuffer, format: inputFormat) { [weak self] buffer, _ in
             guard let self else {
@@ -198,6 +206,11 @@ final class PhoneRelayAudioController {
             return
         }
         pcmFramesCaptured += UInt64(buffer.frameLength)
+        let levelStats = PhoneRelayPCMStats.s16le(pcm)
+        uplinkLevelSamples += levelStats.samples
+        uplinkLevelNonzero += levelStats.nonzero
+        uplinkLevelMaxAbs = max(uplinkLevelMaxAbs, levelStats.maxAbs)
+        uplinkLevelAbsTotal += Int64(levelStats.averageAbs) * Int64(levelStats.samples)
         if uplinkMuted {
             pcm.replaceSubrange(pcm.startIndex..<pcm.endIndex, with: repeatElement(0, count: pcm.count))
         }
@@ -216,10 +229,17 @@ final class PhoneRelayAudioController {
             handler(packet)
         }
         if uplinkPacketsEmitted > 0, uplinkPacketsEmitted % 250 < rtpPackets.count {
+            let avgAbs = uplinkLevelSamples > 0 ? Int(uplinkLevelAbsTotal / Int64(uplinkLevelSamples)) : 0
             DiagnosticsLog.info(
                 "phonerelay.mac.audio_uplink_progress packets=\(uplinkPacketsEmitted) " +
-                    "accessUnits=\(encoder.accessUnitsEncoded) pes=\(muxer.pesPacketsMuxed)"
+                    "accessUnits=\(encoder.accessUnitsEncoded) pes=\(muxer.pesPacketsMuxed) " +
+                    "samples=\(uplinkLevelSamples) nonzero=\(uplinkLevelNonzero) " +
+                    "maxAbs=\(uplinkLevelMaxAbs) avgAbs=\(avgAbs)"
             )
+            uplinkLevelSamples = 0
+            uplinkLevelNonzero = 0
+            uplinkLevelMaxAbs = 0
+            uplinkLevelAbsTotal = 0
         }
     }
 
@@ -261,8 +281,11 @@ final class PhoneRelayAudioController {
         rtpPacketizer = nil
         uplinkPacketHandler = nil
         if wasActive {
+            let avgAbs = uplinkLevelSamples > 0 ? Int(uplinkLevelAbsTotal / Int64(uplinkLevelSamples)) : 0
             DiagnosticsLog.info(
-                "phonerelay.mac.audio_uplink_stop reason=\(reason) packets=\(uplinkPacketsEmitted)"
+                "phonerelay.mac.audio_uplink_stop reason=\(reason) packets=\(uplinkPacketsEmitted) " +
+                    "tailSamples=\(uplinkLevelSamples) tailNonzero=\(uplinkLevelNonzero) " +
+                    "tailMaxAbs=\(uplinkLevelMaxAbs) tailAvgAbs=\(avgAbs)"
             )
             if state == .active {
                 state = downlinkActive ? .downlinkOnly : .idle
