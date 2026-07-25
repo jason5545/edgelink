@@ -180,9 +180,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
-    private val miLinkCommandBridge = AndroidMiLinkCommandBridge(appContext) { request ->
-        startMiLinkMirrorCloudBridge(request)
-    }
+    private val miLinkCommandBridge = AndroidMiLinkCommandBridge(
+        appContext,
+        onMirrorCloudBridgeRequested = { request ->
+            startMiLinkMirrorCloudBridge(request)
+        },
+        onMirrorCloudBridgeStopRequested = { reason ->
+            AndroidMiLinkMirrorMediaBridge.stop(reason)
+        }
+    )
     private val miLinkScreenPowerGuard = AndroidScreenPowerGuard(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)

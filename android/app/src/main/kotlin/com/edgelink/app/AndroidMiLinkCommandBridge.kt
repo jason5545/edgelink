@@ -32,11 +32,21 @@ data class AndroidMiLinkMirrorCloudBridgeRequest(
     val reason: String
 )
 
+enum class MirrorMediaTransport { CLOUDFLARE, LAN_DIRECT, LEGACY_DIRECT }
+
+data class MirrorMediaRouteSelection(
+    val transport: MirrorMediaTransport,
+    val cloudSessionId: String?
+)
+
 class AndroidMiLinkCommandBridge(
     context: Context,
-    private val onMirrorCloudBridgeRequested: (AndroidMiLinkMirrorCloudBridgeRequest) -> Unit = {}
+    private val onMirrorCloudBridgeRequested: (AndroidMiLinkMirrorCloudBridgeRequest) -> Unit = {},
+    private val onMirrorCloudBridgeStopRequested: (String) -> Unit = {}
 ) {
     private val appContext = context.applicationContext
+    @Volatile
+    private var activeMirrorMediaTransport: MirrorMediaTransport? = null
 
     suspend fun handle(body: MiLinkCommandBody): MiLinkCommandResultBody =
         withContext(Dispatchers.IO) {
@@ -373,8 +383,13 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun requestMirrorSourceRecovery(body: MiLinkCommandBody): CommandResult {
-        val cloudMirrorSessionId = selectCloudMirrorSessionId(body, reason = "source_recovery")
-        val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
+        // Transport is sticky per session: a mid-session switch would strand
+        // the Mac (its renderer binds to the transport chosen at start). Only
+        // probe when no session transport is known.
+        val transport = activeMirrorMediaTransport
+            ?: selectMirrorMediaRoute(body, reason = "source_recovery").transport
+                .also { activeMirrorMediaTransport = it }
+        val armPeerHost = if (transport == MirrorMediaTransport.CLOUDFLARE) "127.0.0.1" else body.args["peerHost"]
         val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
@@ -418,6 +433,7 @@ class AndroidMiLinkCommandBridge(
                     "accepted" to accepted.toString(),
                     "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
                     "arm" to armResult.success.toString(),
+                    "mediaTransport" to transport.name.lowercase(),
                     "recoveryAttempt" to body.args["recoveryAttempt"].orEmpty(),
                     "recoveryReason" to body.args["recoveryReason"].orEmpty()
                 )
@@ -433,6 +449,7 @@ class AndroidMiLinkCommandBridge(
                     "accepted" to "false",
                     "providerValue" to "pending",
                     "arm" to armResult.success.toString(),
+                    "mediaTransport" to transport.name.lowercase(),
                     "pending" to "true",
                     "pendingDeadlineMs" to result.deadlineMs.toString(),
                     "recoveryAttempt" to body.args["recoveryAttempt"].orEmpty(),
@@ -923,8 +940,14 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun startFakeMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
-        val cloudMirrorSessionId = selectCloudMirrorSessionId(body, reason = "start_main_display")
-        val armPeerHost = if (cloudMirrorSessionId != null) "127.0.0.1" else body.args["peerHost"]
+        val routeSelection = selectMirrorMediaRoute(body, reason = "start_main_display")
+        val transport = routeSelection.transport
+        val cloudMirrorSessionId = routeSelection.cloudSessionId
+        activeMirrorMediaTransport = transport
+        if (transport != MirrorMediaTransport.CLOUDFLARE) {
+            onMirrorCloudBridgeStopRequested("transport_${transport.name.lowercase()}")
+        }
+        val armPeerHost = if (transport == MirrorMediaTransport.CLOUDFLARE) "127.0.0.1" else body.args["peerHost"]
         val armPeerPort = body.args["peerPort"]?.toIntOrNull()
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
@@ -982,6 +1005,7 @@ class AndroidMiLinkCommandBridge(
                 armResult = armResult,
                 sourceListenHost = sourceListenHost,
                 sourceListenPort = sourceListenPort,
+                transport = transport,
                 cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
@@ -994,6 +1018,7 @@ class AndroidMiLinkCommandBridge(
                     "arm" to armResult.success.toString(),
                     "debugFakeRemote" to "true"
                 ) + mirrorMediaTransportData(
+                    transport = transport,
                     cloudMirrorSessionId = cloudMirrorSessionId,
                     sourceListenHost = sourceListenHost,
                     sourceListenPort = sourceListenPort
@@ -1016,6 +1041,7 @@ class AndroidMiLinkCommandBridge(
                 sourceShareResult = sourceShareResult,
                 sourceListenHost = sourceListenHost,
                 sourceListenPort = sourceListenPort,
+                transport = transport,
                 cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
@@ -1030,6 +1056,7 @@ class AndroidMiLinkCommandBridge(
                     "arm" to armResult.success.toString(),
                     "debugFakeRemote" to "true"
                 ) + mirrorMediaTransportData(
+                    transport = transport,
                     cloudMirrorSessionId = cloudMirrorSessionId,
                     sourceListenHost = sourceListenHost,
                     sourceListenPort = sourceListenPort
@@ -1053,6 +1080,7 @@ class AndroidMiLinkCommandBridge(
                 sourceShareResult = sourceShareResult,
                 sourceListenHost = sourceListenHost,
                 sourceListenPort = sourceListenPort,
+                transport = transport,
                 cloudMirrorSessionId = cloudMirrorSessionId
             )
         }
@@ -1071,6 +1099,7 @@ class AndroidMiLinkCommandBridge(
                 "arm" to armResult.success.toString(),
                 "debugFakeRemote" to "true"
             ) + mirrorMediaTransportData(
+                transport = transport,
                 cloudMirrorSessionId = cloudMirrorSessionId,
                 sourceListenHost = sourceListenHost,
                 sourceListenPort = sourceListenPort
@@ -1088,6 +1117,7 @@ class AndroidMiLinkCommandBridge(
         sourceShareResult: CommandResult? = null,
         sourceListenHost: String? = null,
         sourceListenPort: Int? = null,
+        transport: MirrorMediaTransport,
         cloudMirrorSessionId: String? = null
     ): CommandResult {
         val queryCount = queryResult.data["count"]?.toIntOrNull() ?: 0
@@ -1097,6 +1127,7 @@ class AndroidMiLinkCommandBridge(
         val sourceEndpointData =
             if (accepted) {
                 mirrorMediaTransportData(
+                    transport = transport,
                     cloudMirrorSessionId = cloudMirrorSessionId,
                     sourceListenHost = sourceListenHost,
                     sourceListenPort = sourceListenPort
@@ -1135,16 +1166,27 @@ class AndroidMiLinkCommandBridge(
     }
 
     private fun mirrorMediaTransportData(
+        transport: MirrorMediaTransport,
         cloudMirrorSessionId: String?,
         sourceListenHost: String?,
         sourceListenPort: Int?
     ): Map<String, String> {
-        if (!cloudMirrorSessionId.isNullOrBlank()) {
+        if (transport == MirrorMediaTransport.CLOUDFLARE && !cloudMirrorSessionId.isNullOrBlank()) {
             return mapOf(
                 "sourceRole" to "android_cloud_bridge",
                 "cloudBridge" to "true",
                 "mediaTransport" to "cloudflare",
                 "mirrorSessionId" to cloudMirrorSessionId,
+                "sourceListenHost" to sourceListenHost.orEmpty(),
+                "sourceListenPort" to (sourceListenPort?.toString() ?: "")
+            )
+        }
+        if (transport == MirrorMediaTransport.LAN_DIRECT) {
+            // MirrorControl listens on the source device (like the official
+            // WFD source), so the Mac must dial it as the RTSP client.
+            return mapOf(
+                "mediaTransport" to "lan_direct",
+                "sourceRole" to "android_server",
                 "sourceListenHost" to sourceListenHost.orEmpty(),
                 "sourceListenPort" to (sourceListenPort?.toString() ?: "")
             )
@@ -1159,26 +1201,41 @@ class AndroidMiLinkCommandBridge(
         return emptyMap()
     }
 
-    private suspend fun selectCloudMirrorSessionId(
+    private suspend fun selectMirrorMediaRoute(
         body: MiLinkCommandBody,
         reason: String
-    ): String? {
+    ): MirrorMediaRouteSelection {
         val cloudSessionId = body.args["mirrorSessionId"]
             ?.trim()
             ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
-            ?: return null
-        // The Mac commits to the cloud session it creates (its renderer binds
-        // to that sessionId), so the phone must not veto it in favor of LAN —
-        // doing so strands the Mac with an empty session while the phone
-        // keeps streaming a stale one.
         val peerHost = body.args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() }
         val peerPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
         val probePort = body.args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
+        // LAN-first: the Mac announces its probe endpoint; when it answers, the
+        // source can dial the Mac's own RTSP listener directly (the official
+        // path) instead of bridging through the cloud. The Mac stands down its
+        // cloud receiver when the result carries mediaTransport=lan_direct.
+        if (cloudSessionId != null && peerHost != null && probePort != null &&
+            LANTransport.isReachable(peerHost, probePort)
+        ) {
+            EdgeLinkLog.info(
+                "xiaomi.mirror.android.media_route reason=$reason " +
+                    "transport=lan_direct peer=$peerHost:$peerPort probePort=$probePort"
+            )
+            return MirrorMediaRouteSelection(MirrorMediaTransport.LAN_DIRECT, cloudSessionId = null)
+        }
+        if (cloudSessionId != null) {
+            EdgeLinkLog.info(
+                "xiaomi.mirror.android.media_route reason=$reason " +
+                    "transport=cloudflare peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+            )
+            return MirrorMediaRouteSelection(MirrorMediaTransport.CLOUDFLARE, cloudSessionId)
+        }
         EdgeLinkLog.info(
             "xiaomi.mirror.android.media_route reason=$reason " +
-                "transport=cloudflare peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+                "transport=direct peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
         )
-        return cloudSessionId
+        return MirrorMediaRouteSelection(MirrorMediaTransport.LEGACY_DIRECT, cloudSessionId = null)
     }
 
     private fun callMirrorDeviceProviderWithDeadline(

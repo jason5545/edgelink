@@ -146,6 +146,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastSourceRecoverySessionID: UUID?
     private var xiaomiScreenLastSourceRecoveryRequestID: String?
     private var xiaomiScreenLastSourceRecoveryDecodedFrames: UInt64?
+    private var xiaomiScreenIneffectiveSourceRecoveryStreak = 0
+    private var xiaomiScreenLastIneffectiveRecoveryEvaluationAt = Date.distantPast
     private var xiaomiScreenUserStopped = false
     private var orphanXiaomiMirrorStopPending = false
     private var activeXiaomiMirrorCloudflareSessionId: String?
@@ -1493,7 +1495,38 @@ final class EdgeLinkRuntime: ObservableObject {
 
         let peerHost = Self.xiaomiMirrorAdvertisedHost()
         let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
-        let shouldRebuildSession = Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt)
+        var forceRebuildForIneffectiveRecovery = false
+        if event.reason == "no_packets_beyond_6s",
+           xiaomiScreenLastSourceRecoverySessionID == event.sessionID,
+           let lastSourceDecodedFrames = xiaomiScreenLastSourceRecoveryDecodedFrames,
+           xiaomiScreenLastSourceRecoveryAt > xiaomiScreenLastIneffectiveRecoveryEvaluationAt {
+            xiaomiScreenLastIneffectiveRecoveryEvaluationAt = Date()
+            let decodedProgress = event.decodedFrames >= lastSourceDecodedFrames
+                ? event.decodedFrames - lastSourceDecodedFrames
+                : 0
+            if decodedProgress >= Self.xiaomiScreenSourceRecoveryMinDecodedFrameProgress {
+                xiaomiScreenIneffectiveSourceRecoveryStreak = 0
+            } else {
+                xiaomiScreenIneffectiveSourceRecoveryStreak += 1
+                DiagnosticsLog.warn(
+                    "xiaomi.mac.screen_recovery_source_ineffective rtspSession=\(event.sessionID.uuidString) " +
+                        "streak=\(xiaomiScreenIneffectiveSourceRecoveryStreak) " +
+                        "decodedProgress=\(decodedProgress) decodedFrames=\(event.decodedFrames) " +
+                        "lastSourceDecodedFrames=\(lastSourceDecodedFrames) " +
+                        "lastSourceRequestId=\(xiaomiScreenLastSourceRecoveryRequestID ?? "none")"
+                )
+                if xiaomiScreenIneffectiveSourceRecoveryStreak >= Self.xiaomiScreenIneffectiveSourceRecoveryMaxStreak {
+                    forceRebuildForIneffectiveRecovery = true
+                    xiaomiScreenIneffectiveSourceRecoveryStreak = 0
+                    DiagnosticsLog.warn(
+                        "xiaomi.mac.screen_recovery_escalated reason=ineffective_source_recovery " +
+                            "rtspSession=\(event.sessionID.uuidString) attempt=\(attempt) action=session_rebuild"
+                    )
+                }
+            }
+        }
+        let shouldRebuildSession = forceRebuildForIneffectiveRecovery ||
+            Self.shouldRebuildXiaomiScreenSession(event: event, attempt: attempt)
         let cloudflareMirrorSessionId = xiaomiMirrorCloudflareSessionIdForRecovery(
             rebuildSession: shouldRebuildSession,
             reason: shouldRebuildSession ? "session_rebuild" : "source_recovery"
@@ -1686,6 +1719,8 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenLastSourceRecoverySessionID = nil
         xiaomiScreenLastSourceRecoveryRequestID = nil
         xiaomiScreenLastSourceRecoveryDecodedFrames = nil
+        xiaomiScreenIneffectiveSourceRecoveryStreak = 0
+        xiaomiScreenLastIneffectiveRecoveryEvaluationAt = .distantPast
         DiagnosticsLog.info("xiaomi.mac.screen_recovery_state_reset reason=\(reason)")
     }
 
@@ -3651,6 +3686,27 @@ final class EdgeLinkRuntime: ObservableObject {
             }
         }
 
+        if Self.xiaomiMirrorLanDirectSelected(from: result) {
+            activeXiaomiMirrorCloudflareSessionId = nil
+            xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "lan_direct_selected")
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像連線中")
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_transport_selected transport=lan_direct requestId=\(result.requestId) " +
+                    "command=\(pending.command) route=\(pending.route) elapsedMs=\(pending.elapsedMs) " +
+                    "data=\(Self.formatDiagnosticsData(result.data))"
+            )
+            if let sourceEndpoint = Self.xiaomiMirrorLanDirectSourceEndpoint(from: result) {
+                connectXiaomiMirrorRTSPDiagnosticSource(
+                    host: sourceEndpoint.host,
+                    port: sourceEndpoint.port,
+                    reason: "lan_direct"
+                )
+            }
+            if isMirrorPending {
+                return
+            }
+        }
+
         if isMirrorPending, let sourceEndpoint = Self.xiaomiMirrorAndroidSourceEndpoint(from: result) {
             xiaomiMiLinkCommandStatus = String(localized: "小米鏡像連線中")
             DiagnosticsLog.info(
@@ -3740,6 +3796,26 @@ final class EdgeLinkRuntime: ObservableObject {
             return nil
         }
         return sessionId
+    }
+
+    private static func xiaomiMirrorLanDirectSelected(from result: MiLinkCommandResultBody) -> Bool {
+        result.command == "xiaomi.mirror.startMainDisplay" &&
+            result.data["mediaTransport"] == "lan_direct"
+    }
+
+    private static func xiaomiMirrorLanDirectSourceEndpoint(
+        from result: MiLinkCommandResultBody
+    ) -> (host: String, port: UInt16)? {
+        guard xiaomiMirrorLanDirectSelected(from: result),
+              result.data["sourceRole"] == "android_server",
+              let rawHost = result.data["sourceListenHost"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawHost.isEmpty,
+              rawHost != "0.0.0.0",
+              let rawPort = result.data["sourceListenPort"],
+              let portValue = UInt16(rawPort) else {
+            return nil
+        }
+        return (rawHost, portValue)
     }
 
     private static func xiaomiScreenRouteCandidate(
@@ -4137,6 +4213,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSessionRebuildStartupNoPacketSeconds: Double = 10
     private static let xiaomiScreenSourceRecoveryCooldownSeconds: TimeInterval = 10
     private static let xiaomiScreenSourceRecoveryStartupCooldownSeconds: TimeInterval = 3
+    private static let xiaomiScreenSourceRecoveryMinDecodedFrameProgress: UInt64 = 30
+    private static let xiaomiScreenIneffectiveSourceRecoveryMaxStreak = 3
     private static let xiaomiScreenStartupDecodedFrameThreshold: UInt64 = 300
     private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 45
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000

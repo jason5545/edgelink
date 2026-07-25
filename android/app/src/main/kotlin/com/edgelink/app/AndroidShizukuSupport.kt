@@ -26,7 +26,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 7
+private const val SHIZUKU_USER_SERVICE_VERSION = 8
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val ANDROID_UIDS_PER_USER = 100_000
@@ -704,7 +704,7 @@ object AndroidShizukuSupport {
         Shizuku.UserServiceArgs(
             ComponentName(context.packageName, EdgeLinkShizukuService::class.java.name)
         )
-            .daemon(false)
+            .daemon(true)
             .processNameSuffix("shizuku")
             .tag("edgelink-shizuku")
             .version(SHIZUKU_USER_SERVICE_VERSION)

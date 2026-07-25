@@ -13,6 +13,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 private const val SCREEN_DIM_DELAY_MS = 5_000L
+private const val DIMMED_SCREEN_BRIGHTNESS = 1
 private const val SCREEN_POWER_PREFS = "edgelink_screen_power"
 private const val KEY_LEGACY_HAS_SNAPSHOT = "hasSnapshot"
 private const val KEY_HAS_BRIGHTNESS_SNAPSHOT = "hasBrightnessSnapshot"
@@ -75,9 +76,9 @@ class AndroidScreenPowerGuard(context: Context) {
                 Settings.System.SCREEN_BRIGHTNESS_MODE,
                 Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
             )
-            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, 0)
+            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, DIMMED_SCREEN_BRIGHTNESS)
         }.onSuccess {
-            EdgeLinkLog.info("screen.android.brightness_dimmed delayMs=$SCREEN_DIM_DELAY_MS")
+            EdgeLinkLog.info("screen.android.brightness_dimmed delayMs=$SCREEN_DIM_DELAY_MS value=$DIMMED_SCREEN_BRIGHTNESS")
         }.onFailure { error ->
             EdgeLinkLog.warn("screen.android.brightness_dim_failed", error)
         }

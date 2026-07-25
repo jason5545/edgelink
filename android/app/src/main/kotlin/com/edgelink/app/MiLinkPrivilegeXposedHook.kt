@@ -2217,6 +2217,35 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                             }
                         }
                     }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val method = param.args.getOrNull(2) as? String
+                        val extras = param.args.getOrNull(4) as? Bundle ?: return
+                        if (method != "startShare" || !extras.booleanCompat("isStart")) {
+                            return
+                        }
+                        if (!MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(extras.getString("deviceId")) ||
+                            !shouldForceMirrorScreenTerminalPresent()
+                        ) {
+                            return
+                        }
+                        val result = param.result as? Bundle ?: return
+                        if (result.booleanCompat("edgelinkRecoveryAccepted") ||
+                            result.getBoolean("enable", false)
+                        ) {
+                            return
+                        }
+                        // Stock startShare (used when no live source exists yet)
+                        // can return enable=false after hanging ~15s; without a
+                        // corrective kick the fresh session is dead on arrival.
+                        val kickSourceResult = requestFakeMirrorSourceIDR("provider_start_share_stock_failure")
+                        val kickCodecResult = requestLiveMirrorHEVCEncoderSync("provider_start_share_stock_failure")
+                        scheduleFakeMirrorSourceIDRBurst("provider_start_share_stock_failure")
+                        log(
+                            "mirror startShare stock failure corrective kick " +
+                                "$kickSourceResult $kickCodecResult"
+                        )
+                    }
                 }
             )
             log("mirror source recovery provider hook installed")
