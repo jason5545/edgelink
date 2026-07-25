@@ -704,7 +704,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     private fun handleMiLinkCommandResult(body: MiLinkCommandBody, result: MiLinkCommandResultBody) {
-        if (!result.success) {
+        val startPending = (body.command == MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY ||
+            body.command == MILINK_COMMAND_MIRROR_SOURCE_RECOVERY) &&
+            result.route == "xiaomi.mirror.pending"
+        if (!result.success && !startPending) {
             return
         }
         when (body.command) {
