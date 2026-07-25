@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 import java.net.Inet4Address
@@ -29,6 +30,7 @@ private const val SHIZUKU_REQUEST_CODE = 61_240
 private const val SHIZUKU_USER_SERVICE_VERSION = 8
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
+private const val SHIZUKU_USER_SERVICE_BIND_TIMEOUT_MS = 5_000L
 private const val ANDROID_UIDS_PER_USER = 100_000
 private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
 private const val PHONE_RELAY_DEFAULT_PORT = 7_102
@@ -76,6 +78,7 @@ data class MirrorBluetoothMacResult(
 object AndroidShizukuSupport {
     val requestCode: Int = SHIZUKU_REQUEST_CODE
     private val serviceMutex = Mutex()
+    private var cachedService: BoundShizukuService? = null
 
     fun currentState(): AndroidShizukuState {
         val available = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
@@ -652,13 +655,44 @@ object AndroidShizukuSupport {
     ): T = withContext(Dispatchers.IO) {
         serviceMutex.withLock {
             ensureUsable()
-            val boundService = bindService(context.applicationContext)
+            val boundService = acquireServiceLocked(context.applicationContext)
             try {
                 block(boundService.service)
-            } finally {
-                boundService.close()
+            } catch (error: Throwable) {
+                if (error.isTransientShizukuServiceError()) {
+                    dropCachedServiceLocked()
+                }
+                throw error
             }
         }
+    }
+
+    private suspend fun acquireServiceLocked(context: Context): BoundShizukuService {
+        cachedService?.takeIf { it.service.asBinder().isBinderAlive }?.let { return it }
+        dropCachedServiceLocked()
+        val bound = withTimeout(SHIZUKU_USER_SERVICE_BIND_TIMEOUT_MS) {
+            bindService(context)
+        }
+        bound.service.asBinder().linkToDeath({
+            serviceMutex.tryLock().also { locked ->
+                if (locked) {
+                    try {
+                        if (cachedService === bound) {
+                            cachedService = null
+                        }
+                    } finally {
+                        serviceMutex.unlock()
+                    }
+                }
+            }
+        }, 0)
+        cachedService = bound
+        return bound
+    }
+
+    private fun dropCachedServiceLocked() {
+        cachedService?.close()
+        cachedService = null
     }
 
     private fun ensureUsable() {
@@ -838,6 +872,7 @@ object AndroidShizukuSupport {
     private fun Throwable.isTransientShizukuServiceError(): Boolean =
         this is ShizukuUserServiceDisconnectedException ||
             this is DeadObjectException ||
+            this is kotlinx.coroutines.TimeoutCancellationException ||
             this is RemoteException && message.orEmpty().contains("disconnected", ignoreCase = true)
 
     private class ShizukuUserServiceDisconnectedException :
