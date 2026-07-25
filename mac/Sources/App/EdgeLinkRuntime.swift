@@ -80,6 +80,11 @@ final class EdgeLinkRuntime: ObservableObject {
     }()
     private var peerCapabilityHistory = false
     private var peerCapabilityThumbnail = false
+    private var peerCapabilityBlob = false
+    private var clipboardBlobReassembler = ClipboardBlobReassembler()
+    private var pendingClipboardBlobId: String?
+    private var pendingClipboardBlobCompletion: ((Bool) -> Void)?
+    private var pendingClipboardBlobTimeout: Task<Void, Never>?
     private let notificationPresenter = MacNotificationPresenter()
     private let incomingCallPresenter = MacIncomingCallPresenter()
     private let verificationCodeBridge = MacVerificationCodeBridge()
@@ -2953,6 +2958,16 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.handleClipboardHistoryResponse(response)
                         }
+                    },
+                    onClipboardBlobRequest: { [weak self] request in
+                        Task { @MainActor in
+                            self?.handleClipboardBlobRequest(request)
+                        }
+                    },
+                    onClipboardBlobChunk: { [weak self] chunk in
+                        Task { @MainActor in
+                            self?.handleClipboardBlobChunk(chunk)
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -3015,6 +3030,8 @@ final class EdgeLinkRuntime: ObservableObject {
 
                 peerCapabilityHistory = false
                 peerCapabilityThumbnail = false
+                peerCapabilityBlob = false
+                cancelPendingClipboardBlob(success: false, reason: "new_session")
                 if let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody())) {
                     try? await session.sendPlaintext(capsData)
                     DiagnosticsLog.info("clipboard.mac.caps_sent hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
@@ -3259,6 +3276,9 @@ final class EdgeLinkRuntime: ObservableObject {
             if let snapshot = clipboardSync.pollLocalClip() {
                 let deviceId = identity.deviceId
                 let historyId = "\(deviceId)#\(snapshot.timestampSeconds)-0"
+                if let blobData = snapshot.blobData {
+                    clipboardHistoryStore?.saveBlob(id: historyId, mime: snapshot.blobMime, data: blobData)
+                }
                 clipboardHistoryStore?.append(
                     ClipboardHistoryItemBody(
                         id: historyId,
@@ -3317,13 +3337,124 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleStatusCaps(_ caps: StatusCapsBody) {
         peerCapabilityHistory = caps.clipboardHistory
         peerCapabilityThumbnail = caps.clipboardThumbnail
-        DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail)")
+        peerCapabilityBlob = caps.clipboardBlob
+        DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail) blob=\(caps.clipboardBlob)")
     }
 
     private func handleClipboardHistoryResponse(_ response: ClipboardHistoryResponseBody) {
         let inserted = clipboardHistoryStore?.importRemote(response.items) ?? 0
         clipboardHistoryStore?.prune()
         DiagnosticsLog.info("clipboard.mac.history_imported count=\(response.items.count) inserted=\(inserted)")
+    }
+
+    func requestClipboardBlob(id: String, completion: @escaping (Bool) -> Void) {
+        guard peerCapabilityBlob, let session = currentSession else {
+            DiagnosticsLog.info("clipboard.mac.blob_request_unsupported id=\(id)")
+            completion(false)
+            return
+        }
+        cancelPendingClipboardBlob(success: false, reason: "superseded")
+        clipboardBlobReassembler.reset()
+        pendingClipboardBlobId = id
+        pendingClipboardBlobCompletion = completion
+        let body = ClipboardBlobRequestBody(id: id)
+        guard let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardBlobRequest, b: body)) else {
+            cancelPendingClipboardBlob(success: false, reason: "encode_failed")
+            return
+        }
+        Task {
+            do {
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info("clipboard.mac.blob_request_sent id=\(id)")
+            } catch {
+                DiagnosticsLog.warn("clipboard.mac.blob_request_send_failed id=\(id)")
+                cancelPendingClipboardBlob(success: false, reason: "send_failed")
+            }
+        }
+        pendingClipboardBlobTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(ClipboardBlobTransfer.receiveTimeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.cancelPendingClipboardBlob(success: false, reason: "timeout")
+        }
+    }
+
+    private func handleClipboardBlobRequest(_ request: ClipboardBlobRequestBody) {
+        guard let session = currentSession else { return }
+        let blob = clipboardHistoryStore?.loadBlob(id: request.id)
+        Task {
+            if let blob, blob.data.count <= ClipboardBlobTransfer.maxBlobBytes {
+                let chunks = ClipboardBlobTransfer.chunk(blob.data)
+                for chunk in chunks {
+                    let body = ClipboardBlobChunkBody(
+                        id: request.id,
+                        seq: chunk.seq,
+                        fin: chunk.fin,
+                        hash: chunk.seq == 0 ? blob.hash : nil,
+                        mime: chunk.seq == 0 ? blob.mime : nil,
+                        payloadBase64: chunk.payloadBase64
+                    )
+                    guard let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardBlobChunk, b: body)) else {
+                        return
+                    }
+                    try? await session.sendPlaintext(data)
+                }
+                DiagnosticsLog.info("clipboard.mac.blob_served id=\(request.id) chunks=\(chunks.count) bytes=\(blob.data.count)")
+            } else {
+                let body = ClipboardBlobChunkBody(id: request.id, seq: 0, fin: true, payloadBase64: "")
+                if let data = try? encoder.encode(Envelope(t: EnvelopeType.clipboardBlobChunk, b: body)) {
+                    try? await session.sendPlaintext(data)
+                }
+                DiagnosticsLog.info("clipboard.mac.blob_not_available id=\(request.id)")
+            }
+        }
+    }
+
+    private func handleClipboardBlobChunk(_ chunk: ClipboardBlobChunkBody) {
+        guard chunk.id == pendingClipboardBlobId else { return }
+        let outcome = clipboardBlobReassembler.append(
+            id: chunk.id,
+            seq: chunk.seq,
+            fin: chunk.fin,
+            hash: chunk.hash,
+            mime: chunk.mime,
+            payloadBase64: chunk.payloadBase64
+        )
+        switch outcome {
+        case .pending:
+            return
+        case .complete(let result):
+            clipboardHistoryStore?.saveBlob(id: chunk.id, mime: result.mime, data: result.data)
+            if let mime = result.mime, mime.hasPrefix("image/") {
+                clipboardSync.applyRemoteImage(result.data, mime: mime)
+            } else if let text = String(data: result.data, encoding: .utf8) {
+                clipboardSync.applyRemoteText(text, hash: ClipboardBlobTransfer.sha256Hex(result.data))
+            }
+            DiagnosticsLog.info("clipboard.mac.blob_received id=\(chunk.id) bytes=\(result.data.count)")
+            cancelPendingClipboardBlob(success: true, reason: "complete")
+        case .notAvailable:
+            DiagnosticsLog.info("clipboard.mac.blob_not_available id=\(chunk.id)")
+            cancelPendingClipboardBlob(success: false, reason: "not_available")
+        case .hashMismatch:
+            DiagnosticsLog.warn("clipboard.mac.blob_hash_mismatch id=\(chunk.id)")
+            cancelPendingClipboardBlob(success: false, reason: "hash_mismatch")
+        case .invalidChunk:
+            DiagnosticsLog.warn("clipboard.mac.blob_invalid_chunk id=\(chunk.id)")
+            cancelPendingClipboardBlob(success: false, reason: "invalid_chunk")
+        }
+    }
+
+    private func cancelPendingClipboardBlob(success: Bool, reason: String) {
+        pendingClipboardBlobTimeout?.cancel()
+        pendingClipboardBlobTimeout = nil
+        guard pendingClipboardBlobId != nil else { return }
+        if !success {
+            DiagnosticsLog.info("clipboard.mac.blob_request_failed reason=\(reason)")
+        }
+        pendingClipboardBlobId = nil
+        clipboardBlobReassembler.reset()
+        let completion = pendingClipboardBlobCompletion
+        pendingClipboardBlobCompletion = nil
+        completion?(success)
     }
 
     private func macNotificationLoop(identity: LocalIdentity, session: SecureSessionHost) async {

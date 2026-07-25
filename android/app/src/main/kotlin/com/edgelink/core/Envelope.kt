@@ -34,6 +34,8 @@ object EnvelopeTypes {
     const val CLIPBOARD_SET = "clipboard.set"
     const val CLIPBOARD_HISTORY_REQUEST = "clipboard.history.request"
     const val CLIPBOARD_HISTORY_RESPONSE = "clipboard.history.response"
+    const val CLIPBOARD_BLOB_REQUEST = "clipboard.blob.request"
+    const val CLIPBOARD_BLOB_CHUNK = "clipboard.blob.chunk"
     const val NOTIFICATION_POST = "notification.post"
     const val NOTIFICATION_REMOVE = "notification.remove"
     const val SMS_MESSAGE = "sms.message"
@@ -178,7 +180,8 @@ enum class ClipboardKind(val intValue: Int) {
 @Serializable
 data class StatusCapsBody(
     val clipboardHistory: Boolean = true,
-    val clipboardThumbnail: Boolean = true
+    val clipboardThumbnail: Boolean = true,
+    val clipboardBlob: Boolean = false
 )
 
 @Serializable
@@ -201,6 +204,21 @@ data class ClipboardHistoryItemBody(
 @Serializable
 data class ClipboardHistoryResponseBody(
     val items: List<ClipboardHistoryItemBody> = emptyList()
+)
+
+@Serializable
+data class ClipboardBlobRequestBody(
+    val id: String
+)
+
+@Serializable
+data class ClipboardBlobChunkBody(
+    val id: String,
+    val seq: Int,
+    val fin: Boolean,
+    val hash: String? = null,
+    val mime: String? = null,
+    val payloadBase64: String
 )
 
 @Serializable

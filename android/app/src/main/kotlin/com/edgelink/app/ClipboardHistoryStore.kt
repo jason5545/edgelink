@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.edgelink.core.ClipboardBlobTransfer
 import com.edgelink.core.ClipboardHistoryItemBody
 import com.edgelink.core.ClipboardHistoryResponseBody
 import com.edgelink.core.ClipboardKind
@@ -18,16 +19,30 @@ class ClipboardHistoryStore(context: Context) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL(CREATE_TABLE_SQL)
             db.execSQL(CREATE_INDEX_SQL)
+            db.execSQL(CREATE_BLOB_TABLE_SQL)
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            db.execSQL(DROP_SQL)
-            onCreate(db)
+            if (oldVersion < 2) {
+                db.execSQL(CREATE_BLOB_TABLE_SQL)
+                db.execSQL(PURGE_OVERSIZED_TEXT_SQL)
+            }
         }
     }
 
+    data class Blob(
+        val id: String,
+        val mime: String?,
+        val hash: String,
+        val data: ByteArray
+    )
+
     fun append(item: ClipboardHistoryItemBody, itemIndex: Int = 0) {
         submit(Unit) {
+            if (isOversizedText(item.text)) {
+                EdgeLinkLog.info("clipboard.android.history_text_too_large_dropped id=${item.id}")
+                return@submit
+            }
             val db = helper.writableDatabase
             val values = ContentValues().apply {
                 put(COL_EVENT_ID, item.id)
@@ -54,6 +69,9 @@ class ClipboardHistoryStore(context: Context) {
             val db = helper.writableDatabase
             var inserted = 0
             items.forEach { item ->
+                if (isOversizedText(item.text)) {
+                    return@forEach
+                }
                 val values = ContentValues().apply {
                     put(COL_EVENT_ID, item.id)
                     put(COL_ITEM_INDEX, 0)
@@ -137,7 +155,92 @@ class ClipboardHistoryStore(context: Context) {
         submit(Unit) {
             val db = helper.writableDatabase
             db.execSQL(DELETE_ALL_SQL)
+            db.execSQL(DELETE_ALL_BLOBS_SQL)
         }
+    }
+
+    fun saveBlob(id: String, mime: String?, data: ByteArray) {
+        submit(Unit) {
+            if (data.isEmpty() || data.size > ClipboardBlobTransfer.MAX_BLOB_BYTES) {
+                EdgeLinkLog.info("clipboard.android.blob_rejected id=$id bytes=${data.size}")
+                return@submit
+            }
+            val db = helper.writableDatabase
+            val values = ContentValues().apply {
+                put(COL_BLOB_EVENT_ID, id)
+                put(COL_BLOB_MIME, mime)
+                put(COL_BLOB_HASH, ClipboardBlobTransfer.sha256Hex(data))
+                put(COL_BLOB_DATA, data)
+                put(COL_BLOB_LAST_ACCESS, System.currentTimeMillis() / 1000)
+                put(COL_BLOB_BYTES, data.size)
+            }
+            db.insertWithOnConflict(
+                BLOB_TABLE_NAME,
+                null,
+                values,
+                SQLiteDatabase.CONFLICT_REPLACE
+            )
+            pruneBlobsLocked(db)
+        }
+    }
+
+    fun loadBlob(id: String): Blob? =
+        submit(null) {
+            val db = helper.writableDatabase
+            val cursor = db.rawQuery(SELECT_BLOB_SQL, arrayOf(id))
+            val blob = cursor.use {
+                if (!it.moveToFirst()) {
+                    null
+                } else {
+                    Blob(
+                        id = it.getString(0),
+                        mime = if (it.isNull(1)) null else it.getString(1),
+                        hash = it.getString(2),
+                        data = it.getBlob(3)
+                    )
+                }
+            }
+            if (blob != null) {
+                val values = ContentValues().apply {
+                    put(COL_BLOB_LAST_ACCESS, System.currentTimeMillis() / 1000)
+                }
+                db.update(BLOB_TABLE_NAME, values, "$COL_BLOB_EVENT_ID = ?", arrayOf(id))
+            }
+            blob
+        }
+
+    fun deleteBlob(id: String) {
+        submit(Unit) {
+            val db = helper.writableDatabase
+            db.delete(BLOB_TABLE_NAME, "$COL_BLOB_EVENT_ID = ?", arrayOf(id))
+        }
+    }
+
+    private fun pruneBlobsLocked(db: SQLiteDatabase) {
+        var total = 0L
+        db.rawQuery(SUM_BLOBS_SQL, null).use {
+            if (it.moveToFirst() && !it.isNull(0)) total = it.getLong(0)
+        }
+        if (total <= BLOB_QUOTA_BYTES) return
+        val cursor = db.rawQuery(SELECT_BLOBS_BY_ACCESS_SQL, null)
+        val toDelete = mutableListOf<String>()
+        cursor.use {
+            while (it.moveToNext() && total > BLOB_QUOTA_BYTES) {
+                toDelete += it.getString(0)
+                total -= it.getLong(1)
+            }
+        }
+        toDelete.forEach { id ->
+            db.delete(BLOB_TABLE_NAME, "$COL_BLOB_EVENT_ID = ?", arrayOf(id))
+        }
+        if (toDelete.isNotEmpty()) {
+            EdgeLinkLog.info("clipboard.android.blob_lru_evicted count=${toDelete.size}")
+        }
+    }
+
+    private fun isOversizedText(text: String?): Boolean {
+        val bytes = text?.toByteArray(Charsets.UTF_8)?.size ?: return false
+        return bytes > TEXT_STORE_MAX_BYTES
     }
 
     val count: Int
@@ -166,9 +269,11 @@ class ClipboardHistoryStore(context: Context) {
 
     companion object {
         private const val DB_NAME = "clipboard_history.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
         private const val WIRE_ITEM_MAX_BYTES = 24 * 1024
         private const val WIRE_TOTAL_MAX_BYTES = 48 * 1024
+        private const val TEXT_STORE_MAX_BYTES = 256 * 1024
+        private const val BLOB_QUOTA_BYTES = 50L * 1024 * 1024
         private const val TABLE_NAME = "clipboard_history"
         private const val COL_EVENT_ID = "event_id"
         private const val COL_ITEM_INDEX = "item_index"
@@ -197,8 +302,6 @@ class ClipboardHistoryStore(context: Context) {
         private const val CREATE_INDEX_SQL =
             "CREATE INDEX IF NOT EXISTS idx_clip_hist_ts ON $TABLE_NAME($COL_TIMESTAMP DESC);"
 
-        private const val DROP_SQL = "DROP TABLE IF EXISTS $TABLE_NAME;"
-
         private val SELECT_SQL =
             """SELECT $COL_EVENT_ID, $COL_TIMESTAMP, $COL_CLIPBOARD_TYPE, $COL_TEXT_DATA,
        $COL_THUMBNAIL_BASE64, $COL_HASH, $COL_SOURCE_DEVICE_ID
@@ -226,5 +329,36 @@ class ClipboardHistoryStore(context: Context) {
         private const val DELETE_ALL_SQL = "DELETE FROM $TABLE_NAME;"
 
         private const val COUNT_SQL = "SELECT COUNT(*) FROM $TABLE_NAME;"
+
+        private const val BLOB_TABLE_NAME = "clipboard_blobs"
+        private const val COL_BLOB_EVENT_ID = "event_id"
+        private const val COL_BLOB_MIME = "mime"
+        private const val COL_BLOB_HASH = "hash"
+        private const val COL_BLOB_DATA = "data"
+        private const val COL_BLOB_LAST_ACCESS = "last_access"
+        private const val COL_BLOB_BYTES = "bytes"
+
+        private val CREATE_BLOB_TABLE_SQL =
+            """CREATE TABLE IF NOT EXISTS $BLOB_TABLE_NAME (
+    $COL_BLOB_EVENT_ID TEXT PRIMARY KEY,
+    $COL_BLOB_MIME TEXT,
+    $COL_BLOB_HASH TEXT NOT NULL,
+    $COL_BLOB_DATA BLOB NOT NULL,
+    $COL_BLOB_LAST_ACCESS INTEGER NOT NULL,
+    $COL_BLOB_BYTES INTEGER NOT NULL
+);""".trimIndent()
+
+        private const val PURGE_OVERSIZED_TEXT_SQL =
+            "DELETE FROM $TABLE_NAME WHERE LENGTH(CAST($COL_TEXT_DATA AS BLOB)) > $TEXT_STORE_MAX_BYTES;"
+
+        private const val SELECT_BLOB_SQL =
+            "SELECT $COL_BLOB_EVENT_ID, $COL_BLOB_MIME, $COL_BLOB_HASH, $COL_BLOB_DATA FROM $BLOB_TABLE_NAME WHERE $COL_BLOB_EVENT_ID = ?;"
+
+        private const val SUM_BLOBS_SQL = "SELECT SUM($COL_BLOB_BYTES) FROM $BLOB_TABLE_NAME;"
+
+        private const val SELECT_BLOBS_BY_ACCESS_SQL =
+            "SELECT $COL_BLOB_EVENT_ID, $COL_BLOB_BYTES FROM $BLOB_TABLE_NAME ORDER BY $COL_BLOB_LAST_ACCESS ASC;"
+
+        private const val DELETE_ALL_BLOBS_SQL = "DELETE FROM $BLOB_TABLE_NAME;"
     }
 }

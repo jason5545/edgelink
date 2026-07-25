@@ -9,6 +9,8 @@ struct ClipboardSnapshot: Equatable {
     let hash: String
     let kind: ClipboardKind
     let thumbnailBase64: String?
+    let blobData: Data?
+    let blobMime: String?
 }
 
 final class ClipboardSync {
@@ -16,6 +18,8 @@ final class ClipboardSync {
     private static let imageTextMaxChars = 2_048
     private static let wireImageMaxBytes = 24 * 1024
     private static let textWireMaxBytes = 48 * 1024
+    private static let textStoreMaxBytes = 256 * 1024
+    private static let textPreviewMaxBytes = 16 * 1024
 
     private var lastChangeCount = NSPasteboard.general.changeCount
     private var suppressedHash: String?
@@ -34,6 +38,8 @@ final class ClipboardSync {
         var kind: ClipboardKind = .text
         var text = ""
         var thumbnailBase64: String?
+        var blobData: Data?
+        var blobMime: String?
         if hasImage {
             kind = .image
             thumbnailBase64 = ClipboardThumbnailGenerator.thumbnailBase64(forImageIn: pasteboard)
@@ -43,13 +49,34 @@ final class ClipboardSync {
                 DiagnosticsLog.info("clipboard.mac.image_thumbnail_dropped bytes=\(thumbnail.utf8.count)")
                 thumbnailBase64 = nil
             }
+            if let png = pasteboard.data(forType: .png) {
+                blobData = png
+                blobMime = "image/png"
+            } else if let tiff = pasteboard.data(forType: .tiff),
+                      let rep = NSBitmapImageRep(data: tiff),
+                      let png = rep.representation(using: .png, properties: [:]) {
+                blobData = png
+                blobMime = "image/png"
+            }
+            if let data = blobData, data.count > ClipboardBlobTransfer.maxBlobBytes {
+                DiagnosticsLog.info("clipboard.mac.image_blob_too_large bytes=\(data.count)")
+                blobData = nil
+                blobMime = nil
+            }
         } else if !stringText.isEmpty {
-            guard stringText.utf8.count <= Self.textWireMaxBytes else {
-                DiagnosticsLog.info("clipboard.mac.text_too_large_skipped bytes=\(stringText.utf8.count)")
+            let textBytes = stringText.utf8.count
+            guard textBytes <= Self.textStoreMaxBytes else {
+                DiagnosticsLog.info("clipboard.mac.text_too_large_skipped bytes=\(textBytes)")
                 return nil
             }
             kind = .text
-            text = stringText
+            if textBytes > Self.textWireMaxBytes {
+                blobData = Data(stringText.utf8)
+                blobMime = "text/plain"
+                text = Self.utf8Preview(stringText, maxBytes: Self.textPreviewMaxBytes)
+            } else {
+                text = stringText
+            }
         } else {
             return nil
         }
@@ -57,6 +84,8 @@ final class ClipboardSync {
         let hash: String
         if kind == .image {
             hash = Self.hash("\u{1}" + (thumbnailBase64 ?? ""))
+        } else if blobData != nil {
+            hash = Self.hash(stringText)
         } else {
             hash = Self.hash(text)
         }
@@ -75,8 +104,43 @@ final class ClipboardSync {
             timestampSeconds: Int64(Date().timeIntervalSince1970),
             hash: hash,
             kind: kind,
-            thumbnailBase64: thumbnailBase64
+            thumbnailBase64: thumbnailBase64,
+            blobData: blobData,
+            blobMime: blobMime
         )
+    }
+
+    func applyRemoteImage(_ data: Data, mime: String?) {
+        guard let thumbnail = ClipboardThumbnailGenerator.thumbnailBase64(for: data) else {
+            DiagnosticsLog.info("clipboard.mac.remote_image_undecodable bytes=\(data.count)")
+            return
+        }
+        let hash = Self.hash("\u{1}" + thumbnail)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if mime == "image/png" {
+            pasteboard.setData(data, forType: .png)
+        } else if let image = NSImage(data: data),
+                  let tiff = image.tiffRepresentation {
+            pasteboard.setData(tiff, forType: .tiff)
+        } else {
+            pasteboard.setData(data, forType: .png)
+        }
+        suppressedHash = hash
+        lastChangeCount = pasteboard.changeCount
+    }
+
+    static func utf8Preview(_ text: String, maxBytes: Int) -> String {
+        guard text.utf8.count > maxBytes else { return text }
+        let prefix = text.utf8.prefix(maxBytes)
+        var endIndex = prefix.endIndex
+        while endIndex > prefix.startIndex {
+            if String(prefix[..<endIndex]) != nil {
+                break
+            }
+            endIndex = prefix.index(before: endIndex)
+        }
+        return String(prefix[..<endIndex]) ?? ""
     }
 
     func applyRemoteText(_ text: String, hash remoteHash: String) {

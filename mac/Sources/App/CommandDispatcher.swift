@@ -23,6 +23,8 @@ final class CommandDispatcher {
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
     private let onStatusCaps: @Sendable (StatusCapsBody) -> Void
     private let onClipboardHistoryResponse: @Sendable (ClipboardHistoryResponseBody) -> Void
+    private let onClipboardBlobRequest: @Sendable (ClipboardBlobRequestBody) -> Void
+    private let onClipboardBlobChunk: @Sendable (ClipboardBlobChunkBody) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -47,7 +49,9 @@ final class CommandDispatcher {
         onBatteryStatus: @escaping @Sendable (BatteryStatusBody) -> Void = { _ in },
         onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
         onStatusCaps: @escaping @Sendable (StatusCapsBody) -> Void = { _ in },
-        onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in }
+        onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in },
+        onClipboardBlobRequest: @escaping @Sendable (ClipboardBlobRequestBody) -> Void = { _ in },
+        onClipboardBlobChunk: @escaping @Sendable (ClipboardBlobChunkBody) -> Void = { _ in }
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
@@ -70,6 +74,8 @@ final class CommandDispatcher {
         self.onTunnelEnvelope = onTunnelEnvelope
         self.onStatusCaps = onStatusCaps
         self.onClipboardHistoryResponse = onClipboardHistoryResponse
+        self.onClipboardBlobRequest = onClipboardBlobRequest
+        self.onClipboardBlobChunk = onClipboardBlobChunk
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -132,6 +138,14 @@ final class CommandDispatcher {
         case EnvelopeType.clipboardHistoryResponse:
             let envelope = try decoder.decode(Envelope<ClipboardHistoryResponseBody>.self, from: plaintext)
             onClipboardHistoryResponse(envelope.b)
+            return nil
+        case EnvelopeType.clipboardBlobRequest:
+            let envelope = try decoder.decode(Envelope<ClipboardBlobRequestBody>.self, from: plaintext)
+            onClipboardBlobRequest(envelope.b)
+            return nil
+        case EnvelopeType.clipboardBlobChunk:
+            let envelope = try decoder.decode(Envelope<ClipboardBlobChunkBody>.self, from: plaintext)
+            onClipboardBlobChunk(envelope.b)
             return nil
         case EnvelopeType.notificationPost:
             let envelope = try decoder.decode(Envelope<NotificationPostBody>.self, from: plaintext)

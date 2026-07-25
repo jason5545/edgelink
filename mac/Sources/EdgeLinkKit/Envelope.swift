@@ -35,6 +35,8 @@ public enum EnvelopeType {
     public static let clipboardSet = "clipboard.set"
     public static let clipboardHistoryRequest = "clipboard.history.request"
     public static let clipboardHistoryResponse = "clipboard.history.response"
+    public static let clipboardBlobRequest = "clipboard.blob.request"
+    public static let clipboardBlobChunk = "clipboard.blob.chunk"
     public static let notificationPost = "notification.post"
     public static let notificationRemove = "notification.remove"
     public static let smsMessage = "sms.message"
@@ -228,10 +230,19 @@ public enum ClipboardKind: String, Codable, Equatable, Sendable {
 public struct StatusCapsBody: Codable, Equatable, Sendable {
     public let clipboardHistory: Bool
     public let clipboardThumbnail: Bool
+    public let clipboardBlob: Bool
 
-    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true) {
+    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true) {
         self.clipboardHistory = clipboardHistory
         self.clipboardThumbnail = clipboardThumbnail
+        self.clipboardBlob = clipboardBlob
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clipboardHistory = try container.decodeIfPresent(Bool.self, forKey: .clipboardHistory) ?? false
+        clipboardThumbnail = try container.decodeIfPresent(Bool.self, forKey: .clipboardThumbnail) ?? false
+        clipboardBlob = try container.decodeIfPresent(Bool.self, forKey: .clipboardBlob) ?? false
     }
 }
 
@@ -278,6 +289,32 @@ public struct ClipboardHistoryResponseBody: Codable, Equatable, Sendable {
 
     public init(items: [ClipboardHistoryItemBody]) {
         self.items = items
+    }
+}
+
+public struct ClipboardBlobRequestBody: Codable, Equatable, Sendable {
+    public let id: String
+
+    public init(id: String) {
+        self.id = id
+    }
+}
+
+public struct ClipboardBlobChunkBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let seq: Int
+    public let fin: Bool
+    public let hash: String?
+    public let mime: String?
+    public let payloadBase64: String
+
+    public init(id: String, seq: Int, fin: Bool, hash: String? = nil, mime: String? = nil, payloadBase64: String) {
+        self.id = id
+        self.seq = seq
+        self.fin = fin
+        self.hash = hash
+        self.mime = mime
+        self.payloadBase64 = payloadBase64
     }
 }
 

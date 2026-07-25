@@ -335,7 +335,13 @@ AEAD：
   - initiator -> responder: `utf8("EdgeLink frame v1 i2r")`
   - responder -> initiator: `utf8("EdgeLink frame v1 r2i")`
 
-單一 frame 上限：64 KB。超過上限的資料走未來的 side channel，不塞控制通道。
+單一 frame 上限：64 KB，此上限不改動。超過上限的資料有兩條路：
+
+- 即時媒體（螢幕、音訊）：走 WebRTC side channel，不進控制通道。
+- 偶發大 payload（剪貼簿原圖等）：**application layer chunked envelope**。
+  見 §6「Clipboard Blob Transfer」。secure frame 層永遠不做分片——nonce 由
+  counter 單向導出、接收 counter 隱含遞增，frame 層分片會與 replay/計數器
+  糾纏，且每個 chunk 本來就要各吃一個 counter，frame 層分片省不到任何東西。
 
 ## 6. Envelope
 
@@ -359,6 +365,8 @@ AEAD：
 {"t":"status.caps","b":{"clipboardHistory":true,"clipboardThumbnail":true}}
 {"t":"clipboard.history.request","b":{"sinceTs":1751940600,"limit":20}}
 {"t":"clipboard.history.response","b":{"items":[{"id":"137245816#1751941001","kind":"image","ts":1751941001,"hash":"...","thumbnailBase64":"iVBORw0KGgo...","sourceDeviceId":"137245816"}]}}
+{"t":"clipboard.blob.request","b":{"id":"137245816#1751941001-0"}}
+{"t":"clipboard.blob.chunk","b":{"id":"137245816#1751941001-0","seq":0,"fin":false,"hash":"...","mime":"image/png","payloadBase64":"..."}}
 {"t":"notification.post","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816","sourcePlatform":"android","app":"Chat","bundle":"com.chat","iconPngBase64":"iVBORw0KGgo...","title":"Alice","text":"晚上吃什麼","subtitle":null,"ts":1751941000}}
 {"t":"notification.remove","b":{"id":"android:0|com.chat|42","sourceDeviceId":"137245816"}}
 {"t":"status.ping","b":{}}
@@ -656,14 +664,17 @@ Xiaomi 裝置另有相容路線：Mac 在 `milink.command.result` 處理路徑�
 自己支援的 feature：
 
 ```json
-{"t":"status.caps","b":{"clipboardHistory":true,"clipboardThumbnail":true}}
+{"t":"status.caps","b":{"clipboardHistory":true,"clipboardThumbnail":true,"clipboardBlob":true}}
 ```
 
 - `clipboardHistory`：是否支援 clipboard history（`clipboard.history.request` / `.response`）。
 - `clipboardThumbnail`：是否能在 history item / `clipboard.set` 帶 capped thumbnail。
+- `clipboardBlob`：是否支援 `clipboard.blob.request` / `.chunk` 按需拉取原始 blob
+  （見「Clipboard Blob Transfer」）。省略視為 false。
 
 未知欄位一律忽略（前向相容）。舊版 peer 收到 `status.caps` 直接丟掉；新版 peer 收到沒帶
-caps（或舊版）視為 `clipboardHistory=false, clipboardThumbnail=false`，只走單筆文字 sync。
+caps（或舊版）視為 `clipboardHistory=false, clipboardThumbnail=false, clipboardBlob=false`，
+只走單筆文字 sync。
 
 > 設計參考：小米 `dist_clipboard` 在 service discovery 時以
 > `protocol=0x%02X v2.0: clipboard_history=%d thumbnail=%d` 協商同類旗標。EdgeLink 不抄其
@@ -714,16 +725,91 @@ caps（或舊版）視為 `clipboardHistory=false, clipboardThumbnail=false`，�
 規則：
 
 - history 只存近 N 筆（先試 200），超過 prune by timestamp desc。
+- **寫入時設限，不是上線時才過濾**：單筆 text 寫入上限 256 KB，超過整筆不收；
+  圖片原圖不進 `clipboard_history` 表，改存 blob table（見下節），history row 只留
+  thumbnail + metadata。舊版資料庫升級時一次性 purge text 超過上限的 row。
 - thumbnail 固定 capped（96×96、PNG），不進控制通道原始大圖。
+- `clipboard.history.response` 的 item 永遠只帶 thumbnail，不帶原圖；原圖走
+  `clipboard.blob.request` 按需拉取。
 - 收到 `clipboard.history.response` 的 item 入本機 store（去重 by id），不回環給對端。
 - 收到 `clipboard.history.request` 時送回本機 store 的 recent items；對不支援 history 的
   peer 不回應。
 - 螢幕鎖定 / clipboard 功能關閉時暫停寫入 history（與既有鎖屏閘一致）。
+- Wire filter（單筆 24 KB / 整包 48 KB）保留為 defense-in-depth，不再是主要防線。
 
 > 設計參考：小米 `dist_clipboard` 的 `ClipboardHistory` SQLite schema 與
 > `RequestRemoteClipboardHistory(deviceId)`；其內部字串
 > `Clipboard history feature not yet implemented` 顯示連原廠都只搭好骨架。EdgeLink 在自家
 > protocol 上把同等概念做完。
+
+### Clipboard Blob Transfer
+
+背景：2026-07-25 事故——手機剪貼簿一張圖片 clip 的 coerceToText 產生 ~1 MB text 進
+history DB，之後每次重連的 `clipboard.history.response` 高達 4 MB，超過 secure frame
+64 KB 上限，seal() 丟 frameTooLarge，session 斷線重連無限循環。治本方式：大 blob
+不進單一 envelope，改走 application layer chunked transfer。
+
+設計原則：
+
+- **分片做在 envelope 層，不動 secure frame 層**（理由見 §5）。
+- 沿用 `TunnelChunker` 已驗證的 pattern：32 KB raw chunk → base64 → JSON，一個 chunk
+  一個 secure frame，流量約 42.7 KB base64 + JSON overhead，穩穩落在 64 KB 以內。
+- transport（WebSocket / TCP）保證有序無遺失，chunk 只依賴 `seq` 去重與 `fin` 收尾，
+  不需要重傳；session 斷線則整個 transfer 作廢，由 requester 重發 `blob.request`。
+- 雙端同時只各有一個 in-flight blob transfer；收到新 `blob.request` 時丟棄舊的
+  reassembly 狀態。blob 大小上限 8 MB，超過拒絕（見下）。
+
+流程：
+
+```json
+{"t":"clipboard.blob.request","b":{"id":"137245816#1751941001-0"}}
+```
+
+- `id`：history item 的穩定 key（`"{sourceDeviceId}#{ts}-{itemIndex}"`）。
+
+回應方查本機 blob table：
+
+- 有 blob：切成 N 個 `clipboard.blob.chunk` 依序送出。
+- 沒有（已被 LRU 淘汰或從未保存）：送一個 `fin=true, seq=0, payloadBase64=""` 的
+  空 chunk 表示 `not_available`；requester 收到後視同拉取失敗，不寫入剪貼簿。
+- blob 超過 8 MB 上限：同上回空 chunk（requester 端 log `clipboard.blob.too_large`）。
+
+```json
+{"t":"clipboard.blob.chunk","b":{"id":"137245816#1751941001-0","seq":0,"fin":false,"hash":"<sha256 hex of full blob>","mime":"image/png","payloadBase64":"..."}}
+```
+
+- `seq`：從 0 遞增。
+- `fin`：最後一個 chunk 為 true；單 chunk 的 blob 直接 `seq=0, fin=true`。
+- `hash` / `mime`：只在 `seq=0` 帶。`hash` 是完整 blob 的 SHA-256 hex，receiver
+  重組後校驗，不符則丟棄。`mime` 例如 `image/png`、`image/jpeg`。
+- 每個 chunk 的 `payloadBase64` 解碼後 ≤ 32 KB。
+
+Requester 行為：
+
+- 使用者在 history UI 點選 image item 才發 `blob.request`；不主動預拉。
+- 收齊 `fin` 且 hash 校驗通過後：寫入本機 pasteboard（圖片），並把 blob 存入本機
+  blob table（之後本機其他裝置再要就不用回源頭拉）。
+- 逾時（建議 10 秒未收齊）丟棄 reassembly 狀態，UI 顯示拉取失敗，可手動重試。
+- 對端 `status.caps` 沒有 `clipboardBlob=true`：不發 request，UI 把原圖拉取入口
+  隱藏（退化成只看 thumbnail）。
+
+Blob table（本機，不進 wire）：
+
+- key 同 history item `id`；value 是原始 blob bytes + mime + hash。
+- 來源有二：本機剪貼簿產生 image clip 時存入；或從 peer 拉取成功後存入。
+- 容量配額 50 MB，LRU 淘汰；被淘汰的 item history row 仍在，但之後的
+  `blob.request` 只能回 `not_available`。
+
+`clipboard.set` 的降級規則（有 blob transfer 後）：
+
+- 圖片 clip：永遠只送 thumbnail（≤ 24 KB），原圖不主動推；這是正常行為，不是降級，
+  不提示使用者。
+- 純文字 ≤ 48 KB（wire limit）：照舊整段放在 `clipboard.set.text`。
+- 純文字 > 48 KB 且 ≤ 256 KB：`clipboard.set.text` 放前 48 KB 預覽，完整文字存入
+  本機 blob table（mime `text/plain`）；peer 端使用者點選時同樣走 `blob.request`
+  拉全文。超過 256 KB 的 text 寫入端整筆拒收，log 記錄，不提示使用者（病態 payload）。
+- 對端沒有 `clipboardBlob=true`：退回舊行為——> 48 KB 的 text 截斷送出、圖片只有
+  thumbnail。
 
 ## 7. Transports
 

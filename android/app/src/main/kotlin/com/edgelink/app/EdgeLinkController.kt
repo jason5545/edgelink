@@ -11,6 +11,10 @@ import android.os.SystemClock
 import android.provider.Settings
 import com.edgelink.core.AndroidMicStatusBody
 import com.edgelink.core.BatteryStatusBody
+import com.edgelink.core.ClipboardBlobChunkBody
+import com.edgelink.core.ClipboardBlobReassembler
+import com.edgelink.core.ClipboardBlobRequestBody
+import com.edgelink.core.ClipboardBlobTransfer
 import com.edgelink.core.ClipboardHistoryItemBody
 import com.edgelink.core.ClipboardHistoryRequestBody
 import com.edgelink.core.ClipboardHistoryResponseBody
@@ -177,6 +181,11 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var peerCapabilityHistory = false
     @Volatile
     private var peerCapabilityThumbnail = false
+    private var peerCapabilityBlob = false
+    private val clipboardBlobReassembler = ClipboardBlobReassembler()
+    private var pendingClipboardBlobId: String? = null
+    private var pendingClipboardBlobCallback: ((Boolean) -> Unit)? = null
+    private var pendingClipboardBlobTimeoutJob: Job? = null
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
@@ -293,6 +302,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onClipboardHistoryResponse = { response ->
             handleClipboardHistoryResponse(response)
+        },
+        onClipboardBlobRequest = { request ->
+            handleClipboardBlobRequest(request)
+        },
+        onClipboardBlobChunk = { chunk ->
+            handleClipboardBlobChunk(chunk)
         }
     )
 
@@ -1978,6 +1993,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             if (snapshot != null) {
                 val deviceId = identity.deviceId
                 val historyId = "$deviceId#${snapshot.timestampSeconds}-0"
+                snapshot.blobData?.let { blobData ->
+                    clipboardHistoryStore.saveBlob(historyId, snapshot.blobMime, blobData)
+                }
                 clipboardHistoryStore.append(
                     ClipboardHistoryItemBody(
                         id = historyId,
@@ -2030,7 +2048,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun handleStatusCaps(caps: StatusCapsBody) {
         peerCapabilityHistory = caps.clipboardHistory
         peerCapabilityThumbnail = caps.clipboardThumbnail
-        EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail}")
+        peerCapabilityBlob = caps.clipboardBlob
+        EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail} blob=${caps.clipboardBlob}")
     }
 
     private fun handleClipboardHistoryResponse(response: ClipboardHistoryResponseBody) {
@@ -2043,10 +2062,114 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    fun requestClipboardBlob(id: String, onComplete: (Boolean) -> Unit) {
+        if (!peerCapabilityBlob || session == null) {
+            EdgeLinkLog.info("clipboard.android.blob_request_unsupported id=$id")
+            onComplete(false)
+            return
+        }
+        cancelPendingClipboardBlob(success = false, reason = "superseded")
+        clipboardBlobReassembler.reset()
+        pendingClipboardBlobId = id
+        pendingClipboardBlobCallback = onComplete
+        sendEnvelope(EnvelopeTypes.CLIPBOARD_BLOB_REQUEST, ClipboardBlobRequestBody(id = id))
+        EdgeLinkLog.info("clipboard.android.blob_request_sent id=$id")
+        pendingClipboardBlobTimeoutJob = scope.launch {
+            delay(ClipboardBlobTransfer.RECEIVE_TIMEOUT_MS)
+            cancelPendingClipboardBlob(success = false, reason = "timeout")
+        }
+    }
+
+    private fun handleClipboardBlobRequest(request: ClipboardBlobRequestBody) {
+        scope.launch(Dispatchers.IO) {
+            val blob = clipboardHistoryStore.loadBlob(request.id)
+            if (blob != null && blob.data.size <= ClipboardBlobTransfer.MAX_BLOB_BYTES) {
+                val chunks = ClipboardBlobTransfer.chunk(blob.data)
+                for (chunk in chunks) {
+                    sendEnvelope(
+                        EnvelopeTypes.CLIPBOARD_BLOB_CHUNK,
+                        ClipboardBlobChunkBody(
+                            id = request.id,
+                            seq = chunk.seq,
+                            fin = chunk.fin,
+                            hash = if (chunk.seq == 0) blob.hash else null,
+                            mime = if (chunk.seq == 0) blob.mime else null,
+                            payloadBase64 = chunk.payloadBase64
+                        )
+                    )
+                }
+                EdgeLinkLog.info(
+                    "clipboard.android.blob_served id=${request.id} chunks=${chunks.size} bytes=${blob.data.size}"
+                )
+            } else {
+                sendEnvelope(
+                    EnvelopeTypes.CLIPBOARD_BLOB_CHUNK,
+                    ClipboardBlobChunkBody(id = request.id, seq = 0, fin = true, payloadBase64 = "")
+                )
+                EdgeLinkLog.info("clipboard.android.blob_not_available id=${request.id}")
+            }
+        }
+    }
+
+    private fun handleClipboardBlobChunk(chunk: ClipboardBlobChunkBody) {
+        if (chunk.id != pendingClipboardBlobId) return
+        when (val outcome = clipboardBlobReassembler.append(
+            id = chunk.id,
+            seq = chunk.seq,
+            fin = chunk.fin,
+            hash = chunk.hash,
+            mime = chunk.mime,
+            payloadBase64 = chunk.payloadBase64
+        )) {
+            is ClipboardBlobReassembler.AppendOutcome.Pending -> Unit
+            is ClipboardBlobReassembler.AppendOutcome.Complete -> {
+                val result = outcome.result
+                clipboardHistoryStore.saveBlob(chunk.id, result.mime, result.data)
+                if (result.mime?.startsWith("image/") == true) {
+                    clipboardSync.applyRemoteImage(result.data, result.mime)
+                } else {
+                    result.data.decodeToString().let { text ->
+                        clipboardSync.applyRemoteText(text, ClipboardBlobTransfer.sha256Hex(result.data))
+                    }
+                }
+                EdgeLinkLog.info("clipboard.android.blob_received id=${chunk.id} bytes=${result.data.size}")
+                cancelPendingClipboardBlob(success = true, reason = "complete")
+            }
+            is ClipboardBlobReassembler.AppendOutcome.NotAvailable -> {
+                EdgeLinkLog.info("clipboard.android.blob_not_available id=${chunk.id}")
+                cancelPendingClipboardBlob(success = false, reason = "not_available")
+            }
+            is ClipboardBlobReassembler.AppendOutcome.HashMismatch -> {
+                EdgeLinkLog.warn("clipboard.android.blob_hash_mismatch id=${chunk.id}")
+                cancelPendingClipboardBlob(success = false, reason = "hash_mismatch")
+            }
+            is ClipboardBlobReassembler.AppendOutcome.InvalidChunk -> {
+                EdgeLinkLog.warn("clipboard.android.blob_invalid_chunk id=${chunk.id}")
+                cancelPendingClipboardBlob(success = false, reason = "invalid_chunk")
+            }
+        }
+    }
+
+    private fun cancelPendingClipboardBlob(success: Boolean, reason: String) {
+        pendingClipboardBlobTimeoutJob?.cancel()
+        pendingClipboardBlobTimeoutJob = null
+        if (pendingClipboardBlobId == null) return
+        if (!success) {
+            EdgeLinkLog.info("clipboard.android.blob_request_failed reason=$reason")
+        }
+        pendingClipboardBlobId = null
+        clipboardBlobReassembler.reset()
+        val callback = pendingClipboardBlobCallback
+        pendingClipboardBlobCallback = null
+        callback?.invoke(success)
+    }
+
     private fun sendStatusCapsAndRequestHistory(identity: LocalIdentity) {
         peerCapabilityHistory = false
         peerCapabilityThumbnail = false
-        sendEnvelope(EnvelopeTypes.STATUS_CAPS, StatusCapsBody())
+        peerCapabilityBlob = false
+        cancelPendingClipboardBlob(success = false, reason = "new_session")
+        sendEnvelope(EnvelopeTypes.STATUS_CAPS, StatusCapsBody(clipboardBlob = true))
         sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
         EdgeLinkLog.info("clipboard.android.caps_sent hostId=${identity.deviceId}")
     }
@@ -2312,7 +2435,9 @@ private class AndroidCommandDispatcher(
     private val onMacAwake: () -> Unit,
     private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> },
     private val onStatusCaps: (StatusCapsBody) -> Unit = {},
-    private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {}
+    private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {},
+    private val onClipboardBlobRequest: (ClipboardBlobRequestBody) -> Unit = {},
+    private val onClipboardBlobChunk: (ClipboardBlobChunkBody) -> Unit = {}
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2376,6 +2501,16 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.CLIPBOARD_HISTORY_RESPONSE -> {
                 val envelope = EnvelopeCodec.decode<ClipboardHistoryResponseBody>(plaintext)
                 onClipboardHistoryResponse(envelope.b)
+                null
+            }
+            EnvelopeTypes.CLIPBOARD_BLOB_REQUEST -> {
+                val envelope = EnvelopeCodec.decode<ClipboardBlobRequestBody>(plaintext)
+                onClipboardBlobRequest(envelope.b)
+                null
+            }
+            EnvelopeTypes.CLIPBOARD_BLOB_CHUNK -> {
+                val envelope = EnvelopeCodec.decode<ClipboardBlobChunkBody>(plaintext)
+                onClipboardBlobChunk(envelope.b)
                 null
             }
             EnvelopeTypes.NOTIFICATION_POST -> {
