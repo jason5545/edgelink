@@ -45,7 +45,6 @@ class AndroidScreenPowerGuard(context: Context) {
     fun onSharingStarted() {
         sharingActive = true
         acquireWakeLock()
-        setRootScreenWakeLock(hold = true)
         keepScreenOnWindow.show()
         ScreenPowerForegroundService.start(appContext)
         disableScreensaver()
@@ -57,7 +56,6 @@ class AndroidScreenPowerGuard(context: Context) {
     fun onSharingStopped() {
         sharingActive = false
         mainHandler.removeCallbacks(dimRunnable)
-        setRootScreenWakeLock(hold = false)
         restoreBrightnessIfNeeded(reason = "sharing_stopped")
         restoreScreensaverIfNeeded(reason = "sharing_stopped")
         keepScreenOnWindow.hide()
@@ -204,25 +202,6 @@ class AndroidScreenPowerGuard(context: Context) {
             runCatching { lock.release() }
                 .onFailure { error -> EdgeLinkLog.warn("screen.android.wake_lock_release_failed", error) }
             EdgeLinkLog.info("screen.android.wake_lock_released")
-        }
-    }
-
-    private fun setRootScreenWakeLock(hold: Boolean) {
-        if (!AndroidShizukuSupport.hasPermission()) {
-            EdgeLinkLog.info("screen.android.root_wakelock_skipped hold=$hold no_shizuku_permission")
-            return
-        }
-        secureSettingsScope.launch {
-            val result = runCatching {
-                AndroidShizukuSupport.setRootScreenWakeLock(appContext, hold)
-            }.getOrElse { error ->
-                ShizukuOperationResult(success = false, message = error.message.orEmpty())
-            }
-            if (result.success) {
-                EdgeLinkLog.info("screen.android.root_wakelock_ok hold=$hold message=${result.message}")
-            } else {
-                EdgeLinkLog.warn("screen.android.root_wakelock_failed hold=$hold message=${result.message}")
-            }
         }
     }
 

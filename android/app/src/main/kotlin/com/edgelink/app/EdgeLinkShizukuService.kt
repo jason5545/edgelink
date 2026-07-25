@@ -26,49 +26,8 @@ private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
 )
 
 class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
-    private var screenWakeLock: android.os.PowerManager.WakeLock? = null
-
     override fun destroy() {
         System.exit(0)
-    }
-
-    override fun acquireScreenWakeLock(): String = runCatching {
-        val existing = screenWakeLock
-        if (existing?.isHeld == true) {
-            return@runCatching "already_held"
-        }
-        val powerManager = rootSystemContext().getSystemService(android.os.PowerManager::class.java)
-        @Suppress("DEPRECATION")
-        screenWakeLock = powerManager.newWakeLock(
-            android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
-                android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
-            "EdgeLink:MirrorShareRoot"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        "acquired"
-    }.getOrElse { error ->
-        "error:${error.javaClass.simpleName}:${error.message.orEmpty()}"
-    }
-
-    override fun releaseScreenWakeLock(): String = runCatching {
-        val lock = screenWakeLock
-        screenWakeLock = null
-        if (lock?.isHeld == true) {
-            lock.release()
-        }
-        "released"
-    }.getOrElse { error ->
-        "error:${error.javaClass.simpleName}:${error.message.orEmpty()}"
-    }
-
-    private fun rootSystemContext(): android.content.Context {
-        val activityThreadClass = Class.forName("android.app.ActivityThread")
-        val activityThread = activityThreadClass.getMethod("currentActivityThread").invoke(null)
-            ?: activityThreadClass.getMethod("systemMain").invoke(null)
-        return activityThreadClass.getMethod("getSystemContext").invoke(activityThread)
-            as android.content.Context
     }
 
     override fun runCommand(command: Array<String>): String {
