@@ -1,6 +1,7 @@
 package com.edgelink.transport
 
 import com.edgelink.app.EdgeLinkLog
+import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.EstablishedHandshake
 import com.edgelink.core.HandshakeSession
 import com.edgelink.core.HandshakeTypes
@@ -62,6 +63,12 @@ class SecureSessionClient(
     suspend fun sendPlaintext(plaintext: ByteArray) {
         secureMutex.withLock {
             val session = established ?: error("Secure session is not established.")
+            if (plaintext.size > LARGE_FRAME_WARN_BYTES) {
+                EdgeLinkLog.warn(
+                    "secure.android.large_frame_out bytes=${plaintext.size} " +
+                        "type=${runCatching { EnvelopeCodec.type(plaintext) }.getOrDefault("unknown")}"
+                )
+            }
             val frame = session.channel.seal(plaintext)
             framesSent += 1
             if (framesSent <= 3 || framesSent % 100L == 0L) {
@@ -102,4 +109,8 @@ class SecureSessionClient(
     }
 
     private fun monotonicMilliseconds(): Long = System.nanoTime() / 1_000_000L
+
+    private companion object {
+        const val LARGE_FRAME_WARN_BYTES = 32 * 1024
+    }
 }

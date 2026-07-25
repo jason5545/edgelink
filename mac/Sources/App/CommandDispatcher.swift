@@ -121,7 +121,9 @@ final class CommandDispatcher {
         case EnvelopeType.clipboardHistoryRequest:
             let envelope = try decoder.decode(Envelope<ClipboardHistoryRequestBody>.self, from: plaintext)
             if let store = clipboardHistoryStore {
-                let items = store.recent(sinceTs: envelope.b.sinceTs, limit: envelope.b.limit ?? 50)
+                let items = Self.filterForWire(
+                    store.recent(sinceTs: envelope.b.sinceTs, limit: envelope.b.limit ?? 50)
+                )
                 return try encoder.encode(
                     Envelope(t: EnvelopeType.clipboardHistoryResponse, b: ClipboardHistoryResponseBody(items: items))
                 )
@@ -237,6 +239,26 @@ final class CommandDispatcher {
     private func handleKey(_ body: InputKeyBody) {
         let modifiers = Set(body.mods.compactMap(InputInjector.KeyModifier.init(rawValue:)))
         inputInjector.pressKey(body.key, modifiers: modifiers)
+    }
+
+    private static let wireItemMaxBytes = 24 * 1024
+    private static let wireTotalMaxBytes = 48 * 1024
+
+    private static func filterForWire(_ items: [ClipboardHistoryItemBody]) -> [ClipboardHistoryItemBody] {
+        var totalBytes = 0
+        var out: [ClipboardHistoryItemBody] = []
+        for item in items {
+            let itemBytes = (item.text?.utf8.count ?? 0) + (item.thumbnailBase64?.utf8.count ?? 0)
+            if itemBytes > wireItemMaxBytes {
+                continue
+            }
+            if totalBytes + itemBytes > wireTotalMaxBytes {
+                break
+            }
+            totalBytes += itemBytes
+            out.append(item)
+        }
+        return out
     }
 }
 

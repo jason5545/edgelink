@@ -45,10 +45,24 @@ class AndroidClipboardSync(context: Context) {
         if (isImage) {
             kind = ClipboardKind.IMAGE
             thumbnailBase64 = ClipboardThumbnailGenerator.thumbnailBase64(clip, appContext)
-            text = clip.getItemAt(0).coerceToText(appContext)?.toString() ?: ""
+            text = clip.getItemAt(0).coerceToText(appContext)?.toString()
+                ?.take(IMAGE_TEXT_MAX_CHARS) ?: ""
+            if (thumbnailBase64 != null &&
+                thumbnailBase64.length + text.length > WIRE_IMAGE_MAX_CHARS
+            ) {
+                EdgeLinkLog.info(
+                    "clipboard.android.image_thumbnail_dropped bytes=${thumbnailBase64.length}"
+                )
+                thumbnailBase64 = null
+            }
         } else {
             val t = clip.getItemAt(0).coerceToText(appContext)?.toString() ?: ""
             if (t.isEmpty()) {
+                return null
+            }
+            val textBytes = t.toByteArray(Charsets.UTF_8).size
+            if (textBytes > TEXT_WIRE_MAX_BYTES) {
+                EdgeLinkLog.info("clipboard.android.text_too_large_skipped bytes=$textBytes")
                 return null
             }
             kind = ClipboardKind.TEXT
@@ -97,6 +111,10 @@ class AndroidClipboardSync(context: Context) {
     }
 
     companion object {
+        private const val IMAGE_TEXT_MAX_CHARS = 2_048
+        private const val WIRE_IMAGE_MAX_CHARS = 24 * 1024
+        private const val TEXT_WIRE_MAX_BYTES = 48 * 1024
+
         fun hash(text: String): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(text.encodeToByteArray())
             return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }

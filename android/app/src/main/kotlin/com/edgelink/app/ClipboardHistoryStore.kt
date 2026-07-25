@@ -99,14 +99,26 @@ class ClipboardHistoryStore(context: Context) {
                 val idxHash = it.getColumnIndexOrThrow(COL_HASH)
                 val idxSrc = it.getColumnIndexOrThrow(COL_SOURCE_DEVICE_ID)
                 val out = mutableListOf<ClipboardHistoryItemBody>()
+                var totalBytes = 0
                 while (it.moveToNext()) {
+                    val text = if (it.isNull(idxText)) null else it.getString(idxText)
+                    val thumb = if (it.isNull(idxThumb)) null else it.getString(idxThumb)
+                    val itemBytes = (text?.toByteArray(Charsets.UTF_8)?.size ?: 0) +
+                        (thumb?.toByteArray(Charsets.UTF_8)?.size ?: 0)
+                    if (itemBytes > WIRE_ITEM_MAX_BYTES) {
+                        continue
+                    }
+                    if (totalBytes + itemBytes > WIRE_TOTAL_MAX_BYTES) {
+                        break
+                    }
+                    totalBytes += itemBytes
                     out += ClipboardHistoryItemBody(
                         id = it.getString(idxId),
                         kind = ClipboardKind.fromInt(it.getInt(idxType))?.wireName ?: "text",
                         ts = it.getLong(idxTs),
                         hash = if (it.isNull(idxHash)) "" else it.getString(idxHash),
-                        text = if (it.isNull(idxText)) null else it.getString(idxText),
-                        thumbnailBase64 = if (it.isNull(idxThumb)) null else it.getString(idxThumb),
+                        text = text,
+                        thumbnailBase64 = thumb,
                         sourceDeviceId = if (it.isNull(idxSrc)) null else it.getString(idxSrc)
                     )
                 }
@@ -155,6 +167,8 @@ class ClipboardHistoryStore(context: Context) {
     companion object {
         private const val DB_NAME = "clipboard_history.db"
         private const val DB_VERSION = 1
+        private const val WIRE_ITEM_MAX_BYTES = 24 * 1024
+        private const val WIRE_TOTAL_MAX_BYTES = 48 * 1024
         private const val TABLE_NAME = "clipboard_history"
         private const val COL_EVENT_ID = "event_id"
         private const val COL_ITEM_INDEX = "item_index"

@@ -13,6 +13,9 @@ struct ClipboardSnapshot: Equatable {
 
 final class ClipboardSync {
     private static let protectedOutboundInterval: TimeInterval = 10 * 60
+    private static let imageTextMaxChars = 2_048
+    private static let wireImageMaxBytes = 24 * 1024
+    private static let textWireMaxBytes = 48 * 1024
 
     private var lastChangeCount = NSPasteboard.general.changeCount
     private var suppressedHash: String?
@@ -34,8 +37,17 @@ final class ClipboardSync {
         if hasImage {
             kind = .image
             thumbnailBase64 = ClipboardThumbnailGenerator.thumbnailBase64(forImageIn: pasteboard)
-            text = stringText
+            text = String(stringText.prefix(Self.imageTextMaxChars))
+            if let thumbnail = thumbnailBase64,
+               thumbnail.utf8.count + text.utf8.count > Self.wireImageMaxBytes {
+                DiagnosticsLog.info("clipboard.mac.image_thumbnail_dropped bytes=\(thumbnail.utf8.count)")
+                thumbnailBase64 = nil
+            }
         } else if !stringText.isEmpty {
+            guard stringText.utf8.count <= Self.textWireMaxBytes else {
+                DiagnosticsLog.info("clipboard.mac.text_too_large_skipped bytes=\(stringText.utf8.count)")
+                return nil
+            }
             kind = .text
             text = stringText
         } else {
