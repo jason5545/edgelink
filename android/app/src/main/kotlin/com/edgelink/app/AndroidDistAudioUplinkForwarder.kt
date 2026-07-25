@@ -30,6 +30,10 @@ object AndroidDistAudioUplinkForwarder {
     @Volatile private var aacFramesDecoded = 0L
     @Volatile private var pcmBytesDecoded = 0L
     @Volatile private var pcmBytesSent = 0L
+    private var pcmSentSamples = 0L
+    private var pcmSentNonzero = 0L
+    private var pcmSentMaxAbs = 0
+    private var pcmSentAbsTotal = 0L
 
     fun start(reason: String) {
         if (!running.compareAndSet(false, true)) {
@@ -40,6 +44,10 @@ object AndroidDistAudioUplinkForwarder {
         aacFramesDecoded = 0
         pcmBytesDecoded = 0
         pcmBytesSent = 0
+        pcmSentSamples = 0
+        pcmSentNonzero = 0
+        pcmSentMaxAbs = 0
+        pcmSentAbsTotal = 0
         workerThread = Thread({ runWorker() }, "EdgeLinkDistAudioUplink").apply { start() }
         EdgeLinkLog.info("callrelay.android.dist_uplink_start reason=$reason")
     }
@@ -55,7 +63,9 @@ object AndroidDistAudioUplinkForwarder {
         }
         EdgeLinkLog.info(
             "callrelay.android.dist_uplink_stop reason=$reason packets=$packetsReceived " +
-                "aacFrames=$aacFramesDecoded pcmDecoded=$pcmBytesDecoded pcmBytesSent=$pcmBytesSent"
+                "aacFrames=$aacFramesDecoded pcmDecoded=$pcmBytesDecoded pcmBytesSent=$pcmBytesSent " +
+                "tailSamples=$pcmSentSamples tailNonzero=$pcmSentNonzero " +
+                "tailMaxAbs=$pcmSentMaxAbs tailAvgAbs=${averageSentAbs()}"
         )
     }
 
@@ -239,11 +249,20 @@ object AndroidDistAudioUplinkForwarder {
 
     private fun writeToSocket(socket: Socket, pcm: ByteArray) {
         runCatching {
+            accumulateSentStats(pcm)
             socket.outputStream.write(pcm)
             socket.outputStream.flush()
             pcmBytesSent += pcm.size
             if (pcmBytesSent == pcm.size.toLong() || pcmBytesSent % 320_000L < pcm.size) {
-                EdgeLinkLog.info("callrelay.android.dist_uplink_pcm_sent bytes=$pcmBytesSent")
+                EdgeLinkLog.info(
+                    "callrelay.android.dist_uplink_pcm_sent bytes=$pcmBytesSent " +
+                        "samples=$pcmSentSamples nonzero=$pcmSentNonzero " +
+                        "maxAbs=$pcmSentMaxAbs avgAbs=${averageSentAbs()}"
+                )
+                pcmSentSamples = 0
+                pcmSentNonzero = 0
+                pcmSentMaxAbs = 0
+                pcmSentAbsTotal = 0
             }
         }.onFailure { error ->
             EdgeLinkLog.warn(
@@ -253,6 +272,26 @@ object AndroidDistAudioUplinkForwarder {
             throw error
         }
     }
+
+    private fun accumulateSentStats(pcm: ByteArray) {
+        var index = 0
+        while (index + 1 < pcm.size) {
+            val sample = (pcm[index].toInt() and 0xff) or (pcm[index + 1].toInt() shl 8)
+            val absolute = kotlin.math.abs(sample)
+            pcmSentSamples += 1
+            if (absolute > 0) {
+                pcmSentNonzero += 1
+            }
+            if (absolute > pcmSentMaxAbs) {
+                pcmSentMaxAbs = absolute
+            }
+            pcmSentAbsTotal += absolute
+            index += 2
+        }
+    }
+
+    private fun averageSentAbs(): Long =
+        if (pcmSentSamples > 0) pcmSentAbsTotal / pcmSentSamples else 0L
 
     private fun extractRtpPayload(packet: ByteArray): ByteArray? {
         if (packet.size < 12) {
