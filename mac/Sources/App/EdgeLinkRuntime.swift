@@ -3126,6 +3126,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleSystemWake() {
         DiagnosticsLog.info("runtime.mac.system_wake")
         currentChannel?.close()
+        reportPresence(.awake, reason: "system_wake")
         guard resumeConnectionAfterWake else {
             return
         }

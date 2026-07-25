@@ -1546,6 +1546,31 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private suspend fun connectLoop(identity: LocalIdentity, peer: PinnedPeer, generation: Int) {
         var retryDelayMs = 1_000L
 
+        if (stateFlow.value.autoReconnectEnabled && !macSleepSuppressed &&
+            fetchMacPresence(identity, peer) == MacPresenceState.Sleeping
+        ) {
+            EdgeLinkLog.info("relay.android.mac_sleep_presence_startup hostId=${peer.deviceId}")
+            macSleepSuppressed = true
+            stateFlow.update {
+                it.copy(
+                    connectionStatus = "Mac sleeping",
+                    connectionPhase = ConnectionPhase.Disconnected,
+                    isConnected = false
+                )
+            }
+            if (!waitForMacAwake(identity, peer, generation)) {
+                EdgeLinkLog.info("relay.android.mac_sleep_wait_stopped hostId=${peer.deviceId} clientId=${identity.deviceId}")
+                stateFlow.update {
+                    it.copy(
+                        connectionStatus = "Disconnected",
+                        connectionPhase = ConnectionPhase.Disconnected,
+                        isConnected = false
+                    )
+                }
+                return
+            }
+        }
+
         while (coroutineContext.isActive && connectionGeneration.get() == generation) {
             var channel: ByteChannel? = null
             try {
@@ -1687,6 +1712,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 stopMiLinkScreenPowerGuard()
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
+                if (autoReconnect && !macSleepSuppressed &&
+                    fetchMacPresence(identity, peer) == MacPresenceState.Sleeping
+                ) {
+                    EdgeLinkLog.info("relay.android.mac_sleep_presence_reconcile hostId=${peer.deviceId}")
+                    macSleepSuppressed = true
+                }
                 val sleepSuppressed = macSleepSuppressed && autoReconnect
                 stateFlow.update {
                     it.copy(
