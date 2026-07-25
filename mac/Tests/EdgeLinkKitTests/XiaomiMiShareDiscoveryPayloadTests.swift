@@ -74,6 +74,22 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         XCTAssertEqual(Array(data)[19...20], [0xE8, 0x97])
     }
 
+    func testBuildsAppDataWithMiShareServiceTLV() throws {
+        let data = Array(
+            try XiaomiMiShareDiscoveryAppData.build(
+                deviceIdHex: "A1B2C3D4",
+                displayName: "EdgeLink Mac",
+                meshPort: 0xE897
+            )
+        )
+
+        let nameCount = Int(data[34])
+        let serviceTLV = Array(data[30...32])
+        XCTAssertEqual(serviceTLV, [0x25, 0x01, 0x00])
+        XCTAssertEqual(data[33], 0x02)
+        XCTAssertEqual(data.count, 35 + nameCount)
+    }
+
     func testParsesCapturedPhoneAppDataMeshPort() throws {
         let phone = try XCTUnwrap(
             XiaomiMiShareDiscoveryAppData(
@@ -113,6 +129,6 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
 
         XCTAssertEqual(txt.first, UInt8(entry.utf8.count))
         XCTAssertEqual(String(data: txt.dropFirst(), encoding: .utf8), entry)
-        XCTAssertEqual(entry.utf8.count, 68)
+        XCTAssertEqual(entry.utf8.count, 72)
     }
 }
