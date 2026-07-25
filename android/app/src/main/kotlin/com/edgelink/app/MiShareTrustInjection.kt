@@ -1,6 +1,5 @@
 package com.edgelink.app
 
-import de.robv.android.xposed.XposedHelpers
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -55,6 +54,15 @@ object MiShareTrustInjection {
                 TimeUnit.SECONDS
             )
         }
+    }
+
+    fun shutdown() {
+        scheduler.shutdownNow()
+        synchronized(lock) {
+            listenersByService.clear()
+        }
+        injectorStarted.set(false)
+        lastLoggedConfig = null
     }
 
     private data class ServiceSpec(val name: String, val packageName: String, val data: ByteArray?)
@@ -143,7 +151,7 @@ object MiShareTrustInjection {
             ) ?: return
             for (listener in serviceListeners) {
                 runCatching {
-                    XposedHelpers.callMethod(listener, "onServiceOnline", businessServiceInfo, trustedDeviceInfo)
+                    callBestMatch(listener, "onServiceOnline", businessServiceInfo, trustedDeviceInfo)
                 }.onFailure {
                     logger("onServiceOnline call failed service=$serviceName listener=$listener error=${it.message}")
                 }
@@ -160,14 +168,14 @@ object MiShareTrustInjection {
         trustedTypes: Int
     ): Any? {
         val clazz = runCatching {
-            XposedHelpers.findClass("com.xiaomi.continuity.networking.TrustedDeviceInfo", classLoader)
+            Class.forName("com.xiaomi.continuity.networking.TrustedDeviceInfo", false, classLoader)
         }.getOrNull() ?: return null
         val instance = runCatching { clazz.getDeclaredConstructor().newInstance() }.getOrNull() ?: return null
-        XposedHelpers.callMethod(instance, "setDeviceId", deviceId)
-        XposedHelpers.callMethod(instance, "setDeviceName", deviceName)
-        XposedHelpers.callMethod(instance, "setDeviceType", deviceType)
-        XposedHelpers.callMethod(instance, "setMediumTypes", mediumTypes)
-        XposedHelpers.callMethod(instance, "setTrustedTypes", trustedTypes)
+        callBestMatch(instance, "setDeviceId", deviceId)
+        callBestMatch(instance, "setDeviceName", deviceName)
+        callBestMatch(instance, "setDeviceType", deviceType)
+        callBestMatch(instance, "setMediumTypes", mediumTypes)
+        callBestMatch(instance, "setTrustedTypes", trustedTypes)
         return instance
     }
 
@@ -178,16 +186,49 @@ object MiShareTrustInjection {
         serviceData: ByteArray?
     ): Any? {
         val clazz = runCatching {
-            XposedHelpers.findClass("com.xiaomi.continuity.networking.BusinessServiceInfo", classLoader)
+            Class.forName("com.xiaomi.continuity.networking.BusinessServiceInfo", false, classLoader)
         }.getOrNull() ?: return null
         val instance = runCatching { clazz.getDeclaredConstructor().newInstance() }.getOrNull() ?: return null
-        XposedHelpers.callMethod(instance, "setServiceName", serviceName)
-        XposedHelpers.callMethod(instance, "setPackageName", servicePackage)
+        callBestMatch(instance, "setServiceName", serviceName)
+        callBestMatch(instance, "setPackageName", servicePackage)
         if (serviceData != null) {
-            XposedHelpers.callMethod(instance, "setServiceData", serviceData)
+            callBestMatch(instance, "setServiceData", serviceData)
         }
         return instance
     }
+
+    private fun callBestMatch(target: Any, name: String, vararg args: Any?): Any? {
+        val argTypes = args.map { it?.javaClass }
+        val method = generateSequence(target.javaClass) { it.superclass }
+            .flatMap { it.declaredMethods.asSequence() }
+            .firstOrNull { candidate ->
+                candidate.name == name &&
+                    candidate.parameterTypes.size == args.size &&
+                    candidate.parameterTypes.indices.all { index ->
+                        val argType = argTypes[index] ?: return@all true
+                        val parameterType = candidate.parameterTypes[index]
+                        if (parameterType.isPrimitive) {
+                            PRIMITIVE_WRAPPERS[parameterType]?.isAssignableFrom(argType) == true
+                        } else {
+                            parameterType.isAssignableFrom(argType)
+                        }
+                    }
+            }
+            ?: throw NoSuchMethodException("${target.javaClass.name}#$name(${args.size} args)")
+        method.isAccessible = true
+        return method.invoke(target, *args)
+    }
+
+    private val PRIMITIVE_WRAPPERS: Map<Class<*>, Class<*>> = mapOf(
+        java.lang.Boolean.TYPE to java.lang.Boolean::class.java,
+        java.lang.Byte.TYPE to java.lang.Byte::class.java,
+        java.lang.Character.TYPE to java.lang.Character::class.java,
+        java.lang.Short.TYPE to java.lang.Short::class.java,
+        java.lang.Integer.TYPE to java.lang.Integer::class.java,
+        java.lang.Long.TYPE to java.lang.Long::class.java,
+        java.lang.Float.TYPE to java.lang.Float::class.java,
+        java.lang.Double.TYPE to java.lang.Double::class.java
+    )
 
     private fun logOnce(logger: (String) -> Unit, key: String, message: () -> String) {
         if (lastLoggedConfig == key) {

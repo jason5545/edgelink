@@ -44,7 +44,7 @@ class SharedPreferencesIdentityStore(context: Context) : IdentityStore {
             .putString("name", identity.name)
             .putBase64("publicKey", identity.publicKey)
             .putBase64("privateKeySeed", identity.privateKeySeed)
-            .apply()
+            .commit()
     }
 }
 
@@ -71,7 +71,7 @@ class SharedPreferencesPairingStore(context: Context) : PairingStore {
             .putString(prefix + "name", peer.name)
             .putBase64(prefix + "publicKey", peer.publicKey)
             .putString(prefix + "pairedAt", peer.pairedAt.toString())
-            .apply()
+            .commit()
     }
 }
 

@@ -266,7 +266,7 @@ MiLink's signature/internal/whitelist rules. The Messenger service path similarl
 
 EdgeLink now ships an opt-in legacy Xposed module entry point:
 
-- `assets/xposed_init` -> `com.edgelink.app.MiLinkPrivilegeXposedHook`
+- `META-INF/xposed/java_init.list` -> `com.edgelink.app.EdgeLinkXposedModule` (libxposed API 102)
 - Scope target: `com.milink.service`
 - Runtime process guard: `com.milink.runtime` for `provider.milink.mi.com/messenger`
 - Main process guard: `com.milink.service` for `ClientV2PublicService`
