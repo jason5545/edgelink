@@ -192,14 +192,6 @@ object AndroidShizukuSupport {
             results.toOperationResult("screen", allowPartial = true)
         }
 
-    suspend fun grantOverlayPermission(context: Context): ShizukuOperationResult =
-        withService(context) { service ->
-            val result = service.runCommandResult(
-                arrayOf("cmd", "appops", "set", context.packageName, "SYSTEM_ALERT_WINDOW", "allow")
-            )
-            listOf(result).toOperationResult("overlay_permission")
-        }
-
     suspend fun putSecureInt(context: Context, key: String, value: Int): ShizukuOperationResult =
         withService(context) { service ->
             val result = service.runCommandResult(

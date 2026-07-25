@@ -6,7 +6,6 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.provider.Settings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,12 +27,9 @@ class AndroidScreenPowerGuard(context: Context) {
     private val resolver = appContext.contentResolver
     private val prefs = appContext.getSharedPreferences(SCREEN_POWER_PREFS, Context.MODE_PRIVATE)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val powerManager = appContext.getSystemService(PowerManager::class.java)
-    private var wakeLock: PowerManager.WakeLock? = null
     private val secureSettingsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var originalBrightnessSettings: BrightnessSnapshot? = null
     private var originalScreensaverSettings: ScreensaverSnapshot? = null
-    private val keepScreenOnWindow = AndroidKeepScreenOnWindow(appContext)
     private var sharingActive = false
     private val dimRunnable = Runnable { dimIfSharingActive() }
 
@@ -44,8 +40,6 @@ class AndroidScreenPowerGuard(context: Context) {
 
     fun onSharingStarted() {
         sharingActive = true
-        acquireWakeLock()
-        keepScreenOnWindow.show()
         ScreenPowerForegroundService.start(appContext)
         disableScreensaver()
         mainHandler.removeCallbacks(dimRunnable)
@@ -58,8 +52,6 @@ class AndroidScreenPowerGuard(context: Context) {
         mainHandler.removeCallbacks(dimRunnable)
         restoreBrightnessIfNeeded(reason = "sharing_stopped")
         restoreScreensaverIfNeeded(reason = "sharing_stopped")
-        keepScreenOnWindow.hide()
-        releaseWakeLock()
         ScreenPowerForegroundService.stop(appContext)
     }
 
@@ -180,31 +172,6 @@ class AndroidScreenPowerGuard(context: Context) {
         }
     }
 
-    private fun acquireWakeLock() {
-        val existing = wakeLock
-        if (existing?.isHeld == true) {
-            return
-        }
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.SCREEN_DIM_WAKE_LOCK,
-            "EdgeLink:ScreenShare"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        EdgeLinkLog.info("screen.android.wake_lock_acquired")
-    }
-
-    private fun releaseWakeLock() {
-        val lock = wakeLock
-        wakeLock = null
-        if (lock?.isHeld == true) {
-            runCatching { lock.release() }
-                .onFailure { error -> EdgeLinkLog.warn("screen.android.wake_lock_release_failed", error) }
-            EdgeLinkLog.info("screen.android.wake_lock_released")
-        }
-    }
-
     private fun readCurrentBrightnessSnapshot(): BrightnessSnapshot =
         BrightnessSnapshot(
             mode = Settings.System.getInt(
@@ -290,6 +257,6 @@ class AndroidScreenPowerGuard(context: Context) {
             Build.VERSION.SDK_INT < 23 || Settings.System.canWrite(context.applicationContext)
 
         fun hasRequiredScreenPowerAccess(context: Context): Boolean =
-            canWriteSettings(context) && AndroidKeepScreenOnWindow.canDrawOverlays(context)
+            canWriteSettings(context)
     }
 }
