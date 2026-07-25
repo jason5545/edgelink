@@ -18,7 +18,11 @@ object AndroidMirrorScreenRemoteKeeper {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lifecycleMutex = Mutex()
     private var refreshJob: Job? = null
+
+    @Volatile
     private var activeKey: String? = null
+
+    fun isArmed(): Boolean = activeKey != null
 
     fun noteSessionArmed(context: Context, peerHost: String?, peerPort: Int?) {
         val appContext = context.applicationContext

@@ -676,6 +676,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let phoneMediaRelayCandidateCount: Int?
     public let services: [MiLinkServiceCapabilityBody]?
     public let preferredRoutes: [String: String]?
+    public let mirrorScreenRemoteActive: Bool?
     public let summary: String
     public let ts: Int64
 
@@ -696,6 +697,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         phoneMediaRelayCandidateCount: Int? = nil,
         services: [MiLinkServiceCapabilityBody]? = nil,
         preferredRoutes: [String: String]? = nil,
+        mirrorScreenRemoteActive: Bool? = nil,
         summary: String,
         ts: Int64
     ) {
@@ -715,6 +717,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         self.phoneMediaRelayCandidateCount = phoneMediaRelayCandidateCount
         self.services = services
         self.preferredRoutes = preferredRoutes
+        self.mirrorScreenRemoteActive = mirrorScreenRemoteActive
         self.summary = summary
         self.ts = ts
     }

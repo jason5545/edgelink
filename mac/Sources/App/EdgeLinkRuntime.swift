@@ -8,6 +8,7 @@ import Foundation
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
+    private static let disconnectStopFlushTimeoutNanoseconds: UInt64 = 1_500_000_000
     private static let xiaomiMirrorKeyboardCommand = "xiaomi.mirror.keyboard"
     private static let xiaomiMirrorKeyboardReadyCommand = "xiaomi.mirror.keyboardReady"
     private static let xiaomiMirrorKeyboardReleaseCommand = "xiaomi.mirror.keyboardRelease"
@@ -146,6 +147,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastSourceRecoveryRequestID: String?
     private var xiaomiScreenLastSourceRecoveryDecodedFrames: UInt64?
     private var xiaomiScreenUserStopped = false
+    private var orphanXiaomiMirrorStopPending = false
     private var activeXiaomiMirrorCloudflareSessionId: String?
     private var xiaomiMirrorCloudflareDatagramsSent: UInt64 = 0
     private var didAutoBindXiaomiDistAudio = false
@@ -647,13 +649,18 @@ final class EdgeLinkRuntime: ObservableObject {
         isPhoneScreenViewerVisible = false
     }
 
-    func disconnect() {
+    func disconnect(completion: (() -> Void)? = nil) {
         DiagnosticsLog.info("relay.mac.disconnect_requested")
+        let session = currentSession
+        let wasConnected = isConnected
+        let shouldSendRemoteStop = wasConnected && isPhoneScreenSessionActive
+        let connectionTaskToCancel = connectionTask
+        let lanSessionTaskToCancel = lanSessionTask
+        let channelToClose = currentChannel
+
         currentConnectionGeneration = nil
         canDisconnect = false
-        connectionTask?.cancel()
         connectionTask = nil
-        lanSessionTask?.cancel()
         lanSessionTask = nil
         turnCredentialTask?.cancel()
         turnCredentialTask = nil
@@ -666,15 +673,15 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenRecoveryAttempt = 0
         resetXiaomiScreenRecoveryState(reason: "disconnect")
         xiaomiScreenUserStopped = false
+        orphanXiaomiMirrorStopPending = false
         activeXiaomiMirrorCloudflareSessionId = nil
-        releaseXiaomiMirrorKeyboard(reason: "disconnect")
+        didPrepareXiaomiMirrorKeyboard = false
+        xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
         stopXiaomiMirrorRTSPDiagnosticSource(reason: "disconnect")
         didAutoBindXiaomiDistAudio = false
         didAutoQueryXiaomiMirrorDevices = false
 
-        let shouldSendRemoteStop = isConnected
-        screenSession.hideWindowAndStop(sendRemoteStop: shouldSendRemoteStop)
-        currentChannel?.close()
+        screenSession.hideWindowAndStop(sendRemoteStop: false)
         currentChannel = nil
         currentChannelGeneration = nil
         currentChannelTransport = nil
@@ -694,6 +701,65 @@ final class EdgeLinkRuntime: ObservableObject {
         isPhoneScreenSessionActive = false
         isPhoneScreenViewerVisible = false
         connectionStatus = peerDeviceId.isEmpty ? "No paired Android" : "Disconnected"
+
+        let finishTeardown = {
+            connectionTaskToCancel?.cancel()
+            lanSessionTaskToCancel?.cancel()
+            channelToClose?.close()
+            completion?()
+        }
+
+        guard let session, wasConnected else {
+            finishTeardown()
+            return
+        }
+
+        var stopEnvelopes: [Data] = []
+        if shouldSendRemoteStop,
+           let data = try? encoder.encode(Envelope(t: EnvelopeType.screenStop, b: EmptyBody())) {
+            stopEnvelopes.append(data)
+        }
+        let keyboardReleaseBody = MiLinkCommandBody(
+            requestId: UUID().uuidString,
+            command: Self.xiaomiMirrorKeyboardReleaseCommand,
+            args: ["source": "disconnect"],
+            ts: Int64(Date().timeIntervalSince1970)
+        )
+        if let data = try? encoder.encode(Envelope(t: EnvelopeType.miLinkCommand, b: keyboardReleaseBody)) {
+            stopEnvelopes.append(data)
+        }
+        DiagnosticsLog.info(
+            "relay.mac.disconnect_stop_flush envelopes=\(stopEnvelopes.count) screenActive=\(shouldSendRemoteStop)"
+        )
+        Task {
+            await Self.flushDisconnectStopEnvelopes(stopEnvelopes, session: session)
+            await MainActor.run {
+                finishTeardown()
+            }
+        }
+    }
+
+    private static func flushDisconnectStopEnvelopes(_ envelopes: [Data], session: SecureSessionHost) async {
+        guard !envelopes.isEmpty else {
+            return
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for (index, data) in envelopes.enumerated() {
+                    do {
+                        try await session.sendPlaintext(data)
+                        DiagnosticsLog.info("relay.mac.disconnect_stop_sent index=\(index) bytes=\(data.count)")
+                    } catch {
+                        DiagnosticsLog.error("relay.mac.disconnect_stop_failed index=\(index)", error)
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: disconnectStopFlushTimeoutNanoseconds)
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     func reconnect() {
@@ -727,8 +793,9 @@ final class EdgeLinkRuntime: ObservableObject {
 
     func quit() {
         DiagnosticsLog.info("runtime.mac.quit_requested")
-        disconnect()
-        NSApplication.shared.terminate(nil)
+        disconnect {
+            NSApplication.shared.terminate(nil)
+        }
     }
 
     func sendSms(to rawRecipient: String, text rawText: String) {
@@ -3327,6 +3394,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleMiLinkStatus(_ status: MiLinkStatusBody) {
         latestMiLinkStatus = status
         autoWarmXiaomiServicesIfNeeded(status)
+        reconcileOrphanXiaomiMirrorIfNeeded(status)
         if deferredViewPhoneScreenTask != nil {
             deferredViewPhoneScreenTask?.cancel()
             deferredViewPhoneScreenTask = nil
@@ -3344,8 +3412,43 @@ final class EdgeLinkRuntime: ObservableObject {
                 "callRelay=\(status.phoneCallRelayServiceOk ?? false) " +
                 "mediaRelayCallback=\(status.phoneMediaRelayCallbackOk ?? false) " +
                 "phoneDevices=\(status.phoneRemoteDeviceCount ?? 0) " +
-                "mediaRelayCandidates=\(status.phoneMediaRelayCandidateCount ?? 0)"
+                "mediaRelayCandidates=\(status.phoneMediaRelayCandidateCount ?? 0) " +
+                "mirrorScreenRemoteActive=\(status.mirrorScreenRemoteActive ?? false)"
         )
+    }
+
+    private func reconcileOrphanXiaomiMirrorIfNeeded(_ status: MiLinkStatusBody) {
+        guard status.mirrorScreenRemoteActive == true else {
+            orphanXiaomiMirrorStopPending = false
+            return
+        }
+        guard isConnected,
+              !isPhoneScreenSessionActive,
+              !xiaomiScreenUserStopped,
+              !orphanXiaomiMirrorStopPending,
+              let session = currentSession else {
+            return
+        }
+        orphanXiaomiMirrorStopPending = true
+        DiagnosticsLog.warn(
+            "xiaomi.mac.screen_orphan_stop preferredRoute=\(status.preferredRoutes?["screen"] ?? "unknown") " +
+                "reason=phone_mirror_active_without_local_session"
+        )
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.screenStop, b: EmptyBody()))
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info("xiaomi.mac.screen_orphan_stop_sent")
+                await MainActor.run {
+                    self.xiaomiMiLinkCommandStatus = String(localized: "小米鏡像已停止")
+                }
+            } catch {
+                DiagnosticsLog.error("xiaomi.mac.screen_orphan_stop_failed", error)
+                await MainActor.run {
+                    self.orphanXiaomiMirrorStopPending = false
+                }
+            }
+        }
     }
 
     private func handleMiLinkFrame(_ frame: MiLinkFrameBody) {

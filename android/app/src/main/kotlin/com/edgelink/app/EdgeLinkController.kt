@@ -2162,7 +2162,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         status: MiLinkStatusBody,
         reason: String
     ) {
-        val sourcedStatus = status.copy(sourceDeviceId = identity.deviceId)
+        val sourcedStatus = status.copy(
+            sourceDeviceId = identity.deviceId,
+            mirrorScreenRemoteActive = AndroidMirrorScreenRemoteKeeper.isArmed()
+        )
         latestMiLinkStatus = sourcedStatus
         runCatching {
             activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.MILINK_STATUS, sourcedStatus))
@@ -2175,7 +2178,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     "callRelay=${sourcedStatus.phoneCallRelayServiceOk} " +
                     "mediaRelayCallback=${sourcedStatus.phoneMediaRelayCallbackOk} " +
                     "phoneDevices=${sourcedStatus.phoneRemoteDeviceCount} " +
-                    "mediaRelayCandidates=${sourcedStatus.phoneMediaRelayCandidateCount}"
+                    "mediaRelayCandidates=${sourcedStatus.phoneMediaRelayCandidateCount} " +
+                    "mirrorScreenRemoteActive=${sourcedStatus.mirrorScreenRemoteActive}"
             )
         }.onFailure { error ->
             EdgeLinkLog.error("milink.android.status_send_failed", error)

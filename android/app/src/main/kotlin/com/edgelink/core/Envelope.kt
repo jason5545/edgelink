@@ -378,6 +378,7 @@ data class MiLinkStatusBody(
     val phoneMediaRelayCandidateCount: Int = 0,
     val services: List<MiLinkServiceCapabilityBody> = emptyList(),
     val preferredRoutes: Map<String, String> = emptyMap(),
+    val mirrorScreenRemoteActive: Boolean = false,
     val summary: String,
     val ts: Long
 )
