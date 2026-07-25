@@ -61,6 +61,15 @@ class LANSessionTransport(context: Context) {
 
     fun currentEndpoint(): Endpoint? = endpoint
 
+    suspend fun awaitEndpoint(timeoutMs: Long): Endpoint? {
+        val deadlineMs = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadlineMs) {
+            endpoint?.let { return it }
+            kotlinx.coroutines.delay(50)
+        }
+        return endpoint
+    }
+
     suspend fun connect(host: String, port: Int): ByteChannel = withContext(Dispatchers.IO) {
         val socket = Socket()
         socket.tcpNoDelay = true

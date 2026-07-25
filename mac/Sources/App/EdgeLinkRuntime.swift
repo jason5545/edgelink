@@ -249,6 +249,11 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.sendXiaomiMirrorCloudflareDatagram(packet, sessionId: sessionId)
             }
         }
+        xiaomiMirrorRTSPDiagnosticSource.onCloudflareMirrorOutboundDatagramBatch = { [weak self] packets, sessionId in
+            Task { @MainActor in
+                self?.sendXiaomiMirrorCloudflareDatagramBatch(packets, sessionId: sessionId)
+            }
+        }
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
             Task { @MainActor in
                 self?.handlePhoneRelayPCMStats(stats)
@@ -3383,6 +3388,49 @@ final class EdgeLinkRuntime: ObservableObject {
                     DiagnosticsLog.info(
                         "xiaomi.mirror.cloudflare.datagram_out sessionId=\(sessionId) " +
                             "count=\(sentCount) bytes=\(packet.count)"
+                    )
+                }
+            } catch {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.cloudflare.datagram_send_failed sessionId=\(sessionId) count=\(sentCount)"
+                )
+            }
+        }
+    }
+
+    private func sendXiaomiMirrorCloudflareDatagramBatch(_ packets: [Data], sessionId: String) {
+        guard let session = currentSession, isConnected, !packets.isEmpty else {
+            return
+        }
+        if packets.count == 1, let packet = packets.first {
+            sendXiaomiMirrorCloudflareDatagram(packet, sessionId: sessionId)
+            return
+        }
+        var packed = Data()
+        packed.reserveCapacity(packets.reduce(0) { $0 + $1.count + 2 })
+        for packet in packets {
+            packed.append(UInt8(packet.count >> 8 & 0xFF))
+            packed.append(UInt8(packet.count & 0xFF))
+            packed.append(packet)
+        }
+        xiaomiMirrorCloudflareDatagramsSent += UInt64(packets.count)
+        let sentCount = xiaomiMirrorCloudflareDatagramsSent
+        let body = MiLinkMirrorMediaBody(
+            sessionId: sessionId,
+            direction: "mac_to_android",
+            kind: "rtp_batch",
+            dataBase64: packed.base64EncodedString(),
+            bytes: packed.count,
+            ts: Int64(Date().timeIntervalSince1970)
+        )
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.miLinkMirrorMedia, b: body))
+                try await session.sendPlaintext(data)
+                if sentCount % 500 < packets.count {
+                    DiagnosticsLog.info(
+                        "xiaomi.mirror.cloudflare.datagram_out sessionId=\(sessionId) " +
+                            "count=\(sentCount) bytes=\(packed.count) batch=\(packets.count)"
                     )
                 }
             } catch {

@@ -100,6 +100,7 @@ import java.util.concurrent.atomic.AtomicInteger
 private const val HANDSHAKE_TIMEOUT_MS = 4_000L
 private const val RELAY_CONNECT_TIMEOUT_MS = 8_000L
 private const val LAN_CONNECT_TIMEOUT_MS = 4_000L
+private const val LAN_DISCOVERY_WAIT_MS = 750L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
@@ -1559,13 +1560,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     }
                 }
                 channel = withTimeoutOrNull(LAN_CONNECT_TIMEOUT_MS) {
-                    lanSessionTransport.currentEndpoint()?.let { endpoint ->
-                        EdgeLinkLog.info("lan.android.connect_start host=${endpoint.host} port=${endpoint.port}")
+                    val endpoint = lanSessionTransport.currentEndpoint()
+                        ?: lanSessionTransport.awaitEndpoint(LAN_DISCOVERY_WAIT_MS)
+                    endpoint?.let {
+                        EdgeLinkLog.info("lan.android.connect_start host=${it.host} port=${it.port}")
                         runCatching {
-                            lanSessionTransport.connect(endpoint.host, endpoint.port)
+                            lanSessionTransport.connect(it.host, it.port)
                         }.onFailure { error ->
                             EdgeLinkLog.warn(
-                                "lan.android.connect_failed host=${endpoint.host} port=${endpoint.port} " +
+                                "lan.android.connect_failed host=${it.host} port=${it.port} " +
                                     "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
                             )
                         }.getOrNull()

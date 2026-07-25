@@ -96,11 +96,15 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     var onRecoveryRequired: ((XiaomiMirrorRTSPRecoveryEvent) -> Void)?
     var onPeerStop: ((String, UUID, UInt64) -> Void)?
     var onCloudflareMirrorOutboundDatagram: ((Data, String) -> Void)?
+    var onCloudflareMirrorOutboundDatagramBatch: (([Data], String) -> Void)?
 
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
     private var listener: NWListener?
     private var listenerReady = false
+    private var listenerRetryWorkItem: DispatchWorkItem?
+    private var listenerRetryAttempt = 0
+    private var listenerLifetime: TimeInterval = 0
     private var connections: [UUID: NWConnection] = [:]
     private var states: [UUID: RTSPConnectionState] = [:]
     private var sessionLifecycle = SessionLifecycleFence<UUID>()
@@ -249,6 +253,14 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     self.onCloudflareMirrorOutboundDatagram?(packet, sessionId)
                 }
             }
+            receiver.onExternalDatagramBatchSend = { [weak self] packets in
+                self?.queue.async {
+                    guard let self, self.cloudflareMirrorSessionId == sessionId else {
+                        return
+                    }
+                    self.onCloudflareMirrorOutboundDatagramBatch?(packets, sessionId)
+                }
+            }
             receiver.startExternalRTPReceiver(reason: reason)
             scheduleAutoStop(lifetime: lifetime)
             DiagnosticsLog.info(
@@ -390,6 +402,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         self.port = port
         self.advertisedHost = host
         self.listener = listener
+        self.listenerLifetime = lifetime
         listenerReady = false
         configure(listener)
         scheduleAutoStop(lifetime: lifetime)
@@ -446,6 +459,9 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         sessionLifecycle.reset()
         stopWorkItem?.cancel()
         stopWorkItem = nil
+        listenerRetryWorkItem?.cancel()
+        listenerRetryWorkItem = nil
+        listenerRetryAttempt = 0
         for workItem in activeClientRetryWorkItems.values {
             workItem.cancel()
         }
@@ -491,17 +507,57 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         switch state {
         case .ready:
             listenerReady = true
+            listenerRetryAttempt = 0
             DiagnosticsLog.info("xiaomi.mirror.rtsp.listener_ready port=\(port)")
         case .failed(let error):
             listenerReady = false
             DiagnosticsLog.error("xiaomi.mirror.rtsp.listener_failed port=\(port)", error)
-            stopOnQueue(reason: "listener_failed")
+            scheduleListenerRetryOnQueue(reason: "listener_failed")
         case .cancelled:
             listenerReady = false
             DiagnosticsLog.info("xiaomi.mirror.rtsp.listener_cancelled port=\(port)")
         default:
             break
         }
+    }
+
+    private func scheduleListenerRetryOnQueue(reason: String) {
+        guard listener != nil else {
+            return
+        }
+        listener?.cancel()
+        listener = nil
+        listenerRetryAttempt += 1
+        let attempt = listenerRetryAttempt
+        guard attempt <= Self.listenerRetryMaxAttempts else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.listener_retry_exhausted port=\(port) attempts=\(attempt) reason=\(reason)"
+            )
+            return
+        }
+        let delaySeconds = min(Double(attempt), 5.0)
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.rtsp.listener_retry_scheduled port=\(port) attempt=\(attempt) " +
+                "delaySeconds=\(Int(delaySeconds)) reason=\(reason)"
+        )
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.listener == nil else {
+                return
+            }
+            do {
+                try self.startOnQueue(
+                    port: self.port,
+                    advertisedHost: self.advertisedHost,
+                    lifetime: self.listenerLifetime
+                )
+            } catch {
+                DiagnosticsLog.error("xiaomi.mirror.rtsp.listener_retry_failed port=\(self.port)", error)
+                self.scheduleListenerRetryOnQueue(reason: "listener_retry_throw")
+            }
+        }
+        listenerRetryWorkItem?.cancel()
+        listenerRetryWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + delaySeconds, execute: workItem)
     }
 
     private func accept(_ connection: NWConnection) {
@@ -2265,6 +2321,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     }
 
     private static let officialRTSPUserAgent = "stagefright/1.1 (Linux;Android 4.1)"
+    private static let listenerRetryMaxAttempts = 8
     private static let officialRTSPLibVersion = "miplaycast_os3_release1.7 3.2.6011403"
     private static let officialRTSPAuthKeyType = "3"
     private static let officialRTSPAuthAlgorithmTypes = "7"
@@ -2839,6 +2896,10 @@ private final class XiaomiMirrorRTPMediaSender {
     private var externalRTPReceiverStarted = false
     private var stopped = false
     var onExternalDatagramSend: ((Data) -> Void)?
+    var onExternalDatagramBatchSend: (([Data]) -> Void)?
+    private var kcpACKBatch: [Data] = []
+    private var kcpACKBatchWorkItem: DispatchWorkItem?
+    private let kcpACKBatchLock = NSLock()
 
     init(
         transportMode: XiaomiMirrorRTSPTransportMode,
@@ -3978,7 +4039,7 @@ private final class XiaomiMirrorRTPMediaSender {
             )
             return
         }
-        if sendMPTDatagram(packet) {
+        if sendKCPACKPacket(packet) {
             kcpACKSent += 1
             if kcpACKSent <= 5 || kcpACKSent % 50 == 0 {
                 DiagnosticsLog.info(
@@ -3990,6 +4051,51 @@ private final class XiaomiMirrorRTPMediaSender {
             DiagnosticsLog.warn(
                 "xiaomi.mirror.mpt.kcp_ack_send_failed session=\(sessionID.uuidString) sn=\(segment.sn) errno=\(errno)"
             )
+        }
+    }
+
+    private func sendKCPACKPacket(_ packet: Data) -> Bool {
+        guard onExternalDatagramBatchSend != nil else {
+            return sendMPTDatagram(packet)
+        }
+        var flushNow = false
+        kcpACKBatchLock.lock()
+        kcpACKBatch.append(packet)
+        if kcpACKBatch.count >= Self.kcpACKBatchMaxCount {
+            flushNow = true
+        } else if kcpACKBatchWorkItem == nil {
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.flushKCPACKBatch()
+            }
+            kcpACKBatchWorkItem = workItem
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(
+                deadline: .now() + Self.kcpACKBatchDelaySeconds,
+                execute: workItem
+            )
+        }
+        kcpACKBatchLock.unlock()
+        if flushNow {
+            flushKCPACKBatch()
+        }
+        return true
+    }
+
+    private func flushKCPACKBatch() {
+        kcpACKBatchLock.lock()
+        kcpACKBatchWorkItem?.cancel()
+        kcpACKBatchWorkItem = nil
+        let packets = kcpACKBatch
+        kcpACKBatch.removeAll(keepingCapacity: true)
+        kcpACKBatchLock.unlock()
+        guard !packets.isEmpty else {
+            return
+        }
+        if let onExternalDatagramBatchSend {
+            onExternalDatagramBatchSend(packets)
+        } else {
+            for packet in packets {
+                _ = sendMPTDatagram(packet)
+            }
         }
     }
 
@@ -4186,11 +4292,13 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let kcpReceiveWindow: UInt16 = 600
     private static let kcpReceiveBufferLimit = 600
     private static let kcpReceiveMaxGap: UInt32 = 1_200
-    private static let kcpReceiveStallResyncDelayNanoseconds: UInt64 = 250_000_000
-    private static let kcpReceiveStallResyncMaxStallNanoseconds: UInt64 = 1_500_000_000
+    private static let kcpReceiveStallResyncDelayNanoseconds: UInt64 = 900_000_000
+    private static let kcpReceiveStallResyncMaxStallNanoseconds: UInt64 = 2_500_000_000
     private static let kcpReceiveStallResyncMinGap: Int64 = 128
     private static let kcpReceiveStallResyncMinBuffered = 48
     private static let officialMPTSocketBufferBytes: Int32 = 6_291_456
+    private static let kcpACKBatchMaxCount = 16
+    private static let kcpACKBatchDelaySeconds: Double = 0.005
     private static let mptSinkNoPacketTimeoutSeconds: Double = 6
     private static let mptSinkNoFrameTimeoutSeconds: Double = 2
     private static let mptSinkFrameStallDecoderResetMinIntervalSeconds: Double = 1.5

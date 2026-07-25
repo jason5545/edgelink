@@ -36,6 +36,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
     private const val RTP_BATCH_MAX_DELAY_MS = 10L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
+    private const val LOCAL_RTP_RECEIVE_BUFFER_BYTES = 8 * 1024 * 1024
     private const val ANDROID_TO_MAC = "android_to_mac"
     private const val MAC_TO_ANDROID = "mac_to_android"
     private const val OFFICIAL_RTSP_USER_AGENT = "stagefright/1.1 (Linux;Android 4.1)"
@@ -115,7 +116,7 @@ object AndroidMiLinkMirrorMediaBridge {
     }
 
     suspend fun handleMedia(body: MiLinkMirrorMediaBody) {
-        if (body.direction != MAC_TO_ANDROID || body.kind != "rtp") {
+        if (body.direction != MAC_TO_ANDROID || (body.kind != "rtp" && body.kind != "rtp_batch")) {
             return
         }
         val session = activeSession
@@ -211,12 +212,13 @@ object AndroidMiLinkMirrorMediaBridge {
             val udp = DatagramSocket(null).apply {
                 reuseAddress = true
                 soTimeout = 2_000
+                receiveBufferSize = LOCAL_RTP_RECEIVE_BUFFER_BYTES
                 bind(InetSocketAddress(0))
             }
             udpSocket = udp
             EdgeLinkLog.info(
                 "xiaomi.mirror.android.cloudflare_local_rtp_ready sessionId=$sessionId " +
-                    "port=${udp.localPort} reason=$startReason"
+                    "port=${udp.localPort} receiveBuffer=${udp.receiveBufferSize} reason=$startReason"
             )
             val udpJob = launch { receiveRTP(udp) }
             val batchJob = launch { flushRTPBatches() }
@@ -490,7 +492,20 @@ object AndroidMiLinkMirrorMediaBridge {
                 )
             }
             withContext(Dispatchers.IO) {
-                udp.send(DatagramPacket(packet, packet.size, target))
+                if (body.kind == "rtp_batch") {
+                    var offset = 0
+                    while (offset + 2 <= packet.size) {
+                        val chunkLength = (packet[offset].toInt() and 0xFF shl 8) or
+                            (packet[offset + 1].toInt() and 0xFF)
+                        if (chunkLength <= 0 || offset + 2 + chunkLength > packet.size) {
+                            break
+                        }
+                        udp.send(DatagramPacket(packet, offset + 2, chunkLength, target))
+                        offset += 2 + chunkLength
+                    }
+                } else {
+                    udp.send(DatagramPacket(packet, packet.size, target))
+                }
             }
         }
 

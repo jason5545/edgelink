@@ -26,7 +26,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 6
+private const val SHIZUKU_USER_SERVICE_VERSION = 7
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val ANDROID_UIDS_PER_USER = 100_000
@@ -191,6 +191,74 @@ object AndroidShizukuSupport {
             }
             results.toOperationResult("screen", allowPartial = true)
         }
+
+    suspend fun grantOverlayPermission(context: Context): ShizukuOperationResult =
+        withService(context) { service ->
+            val result = service.runCommandResult(
+                arrayOf("cmd", "appops", "set", context.packageName, "SYSTEM_ALERT_WINDOW", "allow")
+            )
+            listOf(result).toOperationResult("overlay_permission")
+        }
+
+    fun setRootScreenWakeLock(context: Context, hold: Boolean): ShizukuOperationResult =
+        runCatching {
+            ensureUsable()
+            if (hold) {
+                holdRootScreenWakeLock(context)
+            } else {
+                releaseRootScreenWakeLock()
+            }
+            ShizukuOperationResult(success = true, message = "root_screen_wakelock=$hold")
+        }.getOrElse { error ->
+            ShizukuOperationResult(success = false, message = error.message.orEmpty())
+        }
+
+    private var screenWakeLockConnection: ServiceConnection? = null
+    private var screenWakeLockArgs: Shizuku.UserServiceArgs? = null
+
+    private fun holdRootScreenWakeLock(context: Context) {
+        if (screenWakeLockConnection != null) {
+            return
+        }
+        val args = Shizuku.UserServiceArgs(
+            ComponentName(context.applicationContext.packageName, EdgeLinkShizukuService::class.java.name)
+        )
+            .daemon(false)
+            .processNameSuffix("shizuku_wakelock")
+            .tag("edgelink-shizuku-wakelock")
+            .version(SHIZUKU_USER_SERVICE_VERSION)
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                val service = IEdgeLinkShizukuService.Stub.asInterface(binder)
+                runCatching { service.acquireScreenWakeLock() }
+                    .onSuccess { result ->
+                        EdgeLinkLog.info("screen.android.root_wakelock_service_acquired message=$result")
+                    }
+                    .onFailure { error ->
+                        EdgeLinkLog.warn("screen.android.root_wakelock_service_acquire_failed", error)
+                    }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName) {
+                screenWakeLockConnection = null
+                screenWakeLockArgs = null
+                EdgeLinkLog.warn("screen.android.root_wakelock_service_disconnected")
+            }
+        }
+        Shizuku.bindUserService(args, connection)
+        screenWakeLockConnection = connection
+        screenWakeLockArgs = args
+    }
+
+    private fun releaseRootScreenWakeLock() {
+        val args = screenWakeLockArgs
+        val connection = screenWakeLockConnection
+        screenWakeLockConnection = null
+        screenWakeLockArgs = null
+        if (args != null && connection != null) {
+            runCatching { Shizuku.unbindUserService(args, connection, true) }
+        }
+    }
 
     suspend fun putSecureInt(context: Context, key: String, value: Int): ShizukuOperationResult =
         withService(context) { service ->

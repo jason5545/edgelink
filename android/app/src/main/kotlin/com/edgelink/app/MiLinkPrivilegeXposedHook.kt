@@ -394,6 +394,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
     private var xiaomiMirrorAcceptInputCallback: Any? = null
     private var xiaomiMirrorKeyboardEdgeLinkHidDevice: Any? = null
     private var xiaomiMirrorKeyboardSessionArmed: Boolean = false
+    private var xiaomiMirrorPointerMarkLastMs: Long = 0L
     private var xiaomiMirrorSavedShowImeWithHardKeyboard: Int? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -2752,6 +2753,13 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                         "${xiaomiMirrorUhidAccessSummary()} $shareSession"
                 )
             }
+            val markNowMs = android.os.SystemClock.uptimeMillis()
+            if (!xiaomiMirrorKeyboardSessionArmed ||
+                markNowMs - xiaomiMirrorPointerMarkLastMs > XIAOMI_MIRROR_POINTER_MARK_INTERVAL_MS
+            ) {
+                xiaomiMirrorPointerMarkLastMs = markNowMs
+                markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "pointer")
+            }
             var sentCount = 0
             for (report in reports) {
                 if (!sendXiaomiMirrorHidReport(classLoader, device.first, report)) {
@@ -2764,7 +2772,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
                 }
                 sentCount += 1
             }
-            val afterInputState = markXiaomiMirrorHardwareKeyboardOpen(classLoader, source = "pointer_after")
+            val afterInputState = "markBeforeSend=true"
             XiaomiMirrorKeyboardInjectionResult(
                 accepted = true,
                 route = "xiaomi.mirror.hid.pointer",
@@ -7619,6 +7627,7 @@ class MiLinkPrivilegeXposedHook : IXposedHookLoadPackage {
         private const val XIAOMI_MIRROR_HID_EXISTING_OPEN_WAIT_MS = 50L
         private const val XIAOMI_MIRROR_HID_OPEN_POLL_MS = 20L
         private const val XIAOMI_MIRROR_HID_SEND_TIMEOUT_MS = 300L
+        private const val XIAOMI_MIRROR_POINTER_MARK_INTERVAL_MS = 1_000L
         private const val XIAOMI_MIRROR_HID_RECREATE_THROTTLE_MS = 5_000L
         private const val FAKE_MIRROR_SOURCE_ROUTE_WINDOW_MS = 30_000L
         private const val FAKE_MIRROR_SOURCE_SESSION_WINDOW_MS = 120_000L
