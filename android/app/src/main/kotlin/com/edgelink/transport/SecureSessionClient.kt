@@ -18,7 +18,7 @@ class SecureSessionClient(
     private val peer: PinnedPeer,
     private val crypto: SodiumHandshakeCrypto = SodiumHandshakeCrypto()
 ) {
-    private val secureMutex = Mutex()
+    private val sendMutex = Mutex()
     private var established: EstablishedHandshake? = null
     @Volatile
     private var lastInboundElapsedMs = 0L
@@ -61,7 +61,7 @@ class SecureSessionClient(
     }
 
     suspend fun sendPlaintext(plaintext: ByteArray) {
-        secureMutex.withLock {
+        sendMutex.withLock {
             val session = established ?: error("Secure session is not established.")
             if (plaintext.size > LARGE_FRAME_WARN_BYTES) {
                 EdgeLinkLog.warn(
@@ -81,10 +81,8 @@ class SecureSessionClient(
     suspend fun receiveLoop(handler: suspend (ByteArray) -> ByteArray?) {
         while (true) {
             val frame = channel.receive() ?: return
-            val plaintext = secureMutex.withLock {
-                val session = established ?: error("Secure session is not established.")
-                session.channel.open(frame)
-            }
+            val session = established ?: error("Secure session is not established.")
+            val plaintext = session.channel.open(frame)
             lastInboundElapsedMs = monotonicMilliseconds()
             framesReceived += 1
             if (framesReceived <= 3 || framesReceived % 100L == 0L) {

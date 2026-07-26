@@ -123,14 +123,19 @@ object AndroidCallRelayBridge {
     ) {
         private var bridgeRtpPackets = 0
         private var sourceRtpPackets = 0
+        private var bridgeRtpDropped = 0
         private val sourceRTPQueue = Channel<PhoneRelayMediaBody>(
+            capacity = SOURCE_RTP_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        private val bridgeRTPQueue = Channel<ByteArray>(
             capacity = SOURCE_RTP_QUEUE_CAPACITY,
             onBufferOverflow = BufferOverflow.DROP_OLDEST
         )
         private val localBridge = LocalMiLinkRTSPBridge(
             relaySessionId = relaySessionId,
             localRtspPorts = localRtspPorts,
-            rtpHandler = ::sendBridgeRTP,
+            rtpHandler = ::enqueueBridgeRTP,
             statusHandler = ::sendStatus
         )
 
@@ -138,6 +143,11 @@ object AndroidCallRelayBridge {
             val sourceRTPJob = launch {
                 for (body in sourceRTPQueue) {
                     acceptSourceRTP(body)
+                }
+            }
+            val bridgeRTPJob = launch {
+                for (packet in bridgeRTPQueue) {
+                    sendBridgeRTP(packet)
                 }
             }
             sendStatus("bridge_starting")
@@ -156,9 +166,24 @@ object AndroidCallRelayBridge {
             } finally {
                 AndroidDistAudioUplinkForwarder.stop(reason = "bridge_exit")
                 sourceRTPQueue.close()
+                bridgeRTPQueue.close()
                 sourceRTPJob.cancelAndJoin()
+                bridgeRTPJob.cancelAndJoin()
                 sendStatus("source_stop")
                 sendStatus("bridge_stopped")
+            }
+        }
+
+        private fun enqueueBridgeRTP(packet: ByteArray) {
+            val accepted = bridgeRTPQueue.trySend(packet).isSuccess
+            if (!accepted) {
+                bridgeRtpDropped += 1
+                if (bridgeRtpDropped == 1 || bridgeRtpDropped % 100 == 0) {
+                    EdgeLinkLog.warn(
+                        "callrelay.android.rtp_cloudflare_out_dropped sessionId=$relaySessionId " +
+                            "count=$bridgeRtpDropped"
+                    )
+                }
             }
         }
 

@@ -2,6 +2,7 @@ package com.edgelink.app
 
 import com.edgelink.core.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -20,6 +21,11 @@ class AndroidTunnelManager(
     private val scope: CoroutineScope,
     private val sendEnvelope: suspend (String, Any) -> Unit
 ) {
+    private sealed interface StreamWrite {
+        data class Data(val bytes: ByteArray) : StreamWrite
+        data object Fin : StreamWrite
+    }
+
     private data class StreamState(
         val socket: Socket,
         var state: String = "open",
@@ -28,7 +34,9 @@ class AndroidTunnelManager(
         var bytesIn: Long = 0,
         var bytesOut: Long = 0,
         var lastActivity: Long = System.currentTimeMillis(),
-        val readJob: Job? = null
+        val readJob: Job? = null,
+        val writeChannel: Channel<StreamWrite>? = null,
+        val writeJob: Job? = null
     )
 
     private data class TunnelState(
@@ -46,6 +54,10 @@ class AndroidTunnelManager(
     private val tunnels = ConcurrentHashMap<String, TunnelState>()
     private val allowlist = TunnelAllowlist()
     private val mutex = Mutex()
+
+    private companion object {
+        const val STREAM_WRITE_QUEUE_CAPACITY = 64
+    }
 
     // MARK: - Inbound Envelope Handling
 
@@ -167,7 +179,8 @@ class AndroidTunnelManager(
         val readJob = scope.launch(Dispatchers.IO) {
             readFromSocket(tunnelId, streamId, socket)
         }
-        val stream = StreamState(socket = socket, readJob = readJob)
+        val (writeChannel, writeJob) = launchStreamWriter(tunnelId, streamId, socket)
+        val stream = StreamState(socket = socket, readJob = readJob, writeChannel = writeChannel, writeJob = writeJob)
         tunnel.streams[streamId] = stream
 
         // Notify Mac about the new stream via tunnel.open (reuse as stream notification)
@@ -209,19 +222,15 @@ class AndroidTunnelManager(
         val data = TunnelChunker.payloadFromBase64(body.payload)
         if (data != null && data.isNotEmpty()) {
             stream.bytesIn += data.size
-            try {
-                stream.socket.getOutputStream().write(data)
-                stream.socket.getOutputStream().flush()
-            } catch (_: Exception) {
+            val queued = stream.writeChannel?.trySend(StreamWrite.Data(data))?.isSuccess == true
+            if (!queued) {
                 closeStream(body.tunnelId, body.streamId)
                 return
             }
         }
 
         if (body.fin) {
-            try {
-                stream.socket.shutdownOutput()
-            } catch (_: Exception) {}
+            stream.writeChannel?.trySend(StreamWrite.Fin)
             stream.state = "halfClosedRemote"
         }
 
@@ -245,7 +254,8 @@ class AndroidTunnelManager(
             val readJob = scope.launch(Dispatchers.IO) {
                 readFromSocket(tunnel.tunnelId, streamId, socket)
             }
-            val stream = StreamState(socket = socket, readJob = readJob)
+            val (writeChannel, writeJob) = launchStreamWriter(tunnel.tunnelId, streamId, socket)
+            val stream = StreamState(socket = socket, readJob = readJob, writeChannel = writeChannel, writeJob = writeJob)
             tunnel.streams[streamId] = stream
             EdgeLinkLog.info("tunnel.android.dial_ok tunnelId=${tunnel.tunnelId} stream=$streamId target=${tunnel.targetHost}:${tunnel.targetPort}")
             stream
@@ -253,6 +263,30 @@ class AndroidTunnelManager(
             EdgeLinkLog.warn("tunnel.android.dial_failed tunnelId=${tunnel.tunnelId} stream=$streamId error=${e.message}")
             null
         }
+    }
+
+    private fun launchStreamWriter(tunnelId: String, streamId: Int, socket: Socket): Pair<Channel<StreamWrite>, Job> {
+        val channel = Channel<StreamWrite>(STREAM_WRITE_QUEUE_CAPACITY)
+        val job = scope.launch(Dispatchers.IO) {
+            try {
+                val output = socket.getOutputStream()
+                for (write in channel) {
+                    when (write) {
+                        is StreamWrite.Data -> {
+                            output.write(write.bytes)
+                            output.flush()
+                        }
+                        StreamWrite.Fin -> {
+                            try { socket.shutdownOutput() } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                closeStream(tunnelId, streamId)
+            }
+        }
+        return channel to job
     }
 
     private suspend fun readFromSocket(tunnelId: String, streamId: Int, socket: Socket) {
@@ -325,6 +359,8 @@ class AndroidTunnelManager(
         val tunnel = tunnels[tunnelId] ?: return
         val stream = tunnel.streams.remove(streamId) ?: return
         stream.readJob?.cancel()
+        stream.writeChannel?.close()
+        stream.writeJob?.cancel()
         try { stream.socket.close() } catch (_: Exception) {}
     }
 
@@ -334,6 +370,8 @@ class AndroidTunnelManager(
         try { tunnel.serverSocket?.close() } catch (_: Exception) {}
         for ((streamId, stream) in tunnel.streams) {
             stream.readJob?.cancel()
+            stream.writeChannel?.close()
+            stream.writeJob?.cancel()
             try { stream.socket.close() } catch (_: Exception) {}
         }
         tunnel.streams.clear()
