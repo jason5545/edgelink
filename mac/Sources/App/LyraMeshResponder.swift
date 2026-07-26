@@ -562,6 +562,9 @@ final class LyraMeshResponder {
             sendEncryptedSyncAnnounce(endpointDescription: syncAnnounceEndpoint, key: syncSessionKey)
             return
         }
+        guard channelSocket == nil, !channelNegotiationStarted else {
+            return
+        }
         guard let deviceIdHex = deviceIdHexProvider() else {
             return
         }
@@ -735,9 +738,11 @@ final class LyraMeshResponder {
                 continue
             }
         }
-        guard !fileBytes.isEmpty else {
-            DiagnosticsLog.warn("xiaomi.mishare.file_receive_empty sender=\(senderName)")
-            return
+        if fileBytes.isEmpty {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.file_send_request requestId=\(requestId) sender=\(senderName) " +
+                    "taskId=\(taskId) name=\(filename) inlineBytes=0"
+            )
         }
         var responseBody = Data()
         LyraProtoWriter.appendVarintField(1, value: requestId, to: &responseBody)
@@ -767,6 +772,9 @@ final class LyraMeshResponder {
             )
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.file_send_response_failed", error)
+        }
+        if fileBytes.isEmpty {
+            return
         }
         if filename.isEmpty {
             filename = taskId.isEmpty ? "mishare-\(Int(Date().timeIntervalSince1970))" : taskId

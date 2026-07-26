@@ -267,20 +267,7 @@ final class XiaomiMiShareDiscovery: NSObject {
         debugInfo: String?,
         resolvedIPv4: String?
     ) {
-        guard payload?.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
-              let meshPort = payload?.meshPort, meshPort != 0,
-              let host = resolvedIPv4 ?? Self.parseDebugInfoIPv4(debugInfo)
-        else {
-            return
-        }
-        if meshAnnouncer == nil {
-            meshAnnouncer = LyraMeshAnnouncer(
-                deviceIdHexProvider: { [weak self] in self?.publishedDeviceIdHex },
-                displayNameProvider: { [weak self] in self?.publishedDisplayName ?? "EdgeLink Mac" }
-            )
-        }
-        DiagnosticsLog.info("xiaomi.mishare.announcer_start host=\(host) port=\(meshPort)")
-        meshAnnouncer?.start(host: host, port: meshPort)
+        return
     }
 
     private static func parseDebugInfoIPv4(_ debugInfo: String?) -> String? {
