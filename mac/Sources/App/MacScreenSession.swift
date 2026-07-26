@@ -2016,6 +2016,7 @@ private struct RendererStatsSnapshot {
     let totalConvertMs: Double
     let pendingMainFrames: Int
     let maxPendingMainFrames: Int
+    let droppedFrames: Int
 }
 
 private final class MacScreenStatsLogger {
@@ -2294,6 +2295,7 @@ private final class MacScreenStatsLogger {
         line.append(" renderDrawFps=\(format1(drawnFps))")
         line.append(" pending=\(renderer.pendingMainFrames)")
         line.append(" maxPending=\(renderer.maxPendingMainFrames)")
+        line.append(" dropped=\(renderer.droppedFrames)")
         line.append(" convertMs=\(format1(convertMs))")
         line.append(" unsupported=\(renderer.unsupportedFrames)")
     }
@@ -2333,6 +2335,8 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     private var totalConvertMs = 0.0
     private var pendingMainFrames = 0
     private var maxPendingMainFrames = 0
+    private var renderInFlight = false
+    private var droppedFrames = 0
     private var lastRenderFrameAt: TimeInterval = 0
     private var lastControlSentAt: TimeInterval = 0
 
@@ -2424,23 +2428,50 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         renderPixelBuffer(pixelBuffer, crop: crop, rotation: 0)
     }
 
-    private func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer, crop: CGRect?, rotation: Int) {
-        let convertStartedAt = ProcessInfo.processInfo.systemUptime
-        var image = CIImage(cvPixelBuffer: pixelBuffer)
-        if let crop {
-            image = image.cropped(to: crop)
-        }
-        image = rotated(image, rotation: rotation)
+    private let renderQueue = DispatchQueue(label: "com.edgelink.mac.renderer", qos: .userInteractive)
 
-        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+    private func renderPixelBuffer(_ pixelBuffer: CVPixelBuffer, crop: CGRect?, rotation: Int) {
+        statsLock.lock()
+        if renderInFlight {
+            droppedFrames += 1
+            statsLock.unlock()
             return
         }
-        recordConvertedFrame(ms: (ProcessInfo.processInfo.systemUptime - convertStartedAt) * 1000.0)
-        recordMainFrameQueued()
-        DispatchQueue.main.async { [weak self] in
-            self?.layer?.contents = cgImage
-            self?.recordMainFrameDrawn()
+        renderInFlight = true
+        statsLock.unlock()
+
+        renderQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            let convertStartedAt = ProcessInfo.processInfo.systemUptime
+            var image = CIImage(cvPixelBuffer: pixelBuffer)
+            if let crop {
+                image = image.cropped(to: crop)
+            }
+            image = self.rotated(image, rotation: rotation)
+
+            guard let cgImage = self.ciContext.createCGImage(image, from: image.extent) else {
+                self.clearRenderInFlight()
+                return
+            }
+            self.recordConvertedFrame(ms: (ProcessInfo.processInfo.systemUptime - convertStartedAt) * 1000.0)
+            self.recordMainFrameQueued()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.layer?.contents = cgImage
+                self.recordMainFrameDrawn()
+                self.clearRenderInFlight()
+            }
         }
+    }
+
+    private func clearRenderInFlight() {
+        statsLock.lock()
+        renderInFlight = false
+        statsLock.unlock()
     }
 
     func clear() {
@@ -2458,6 +2489,7 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         totalConvertMs = 0
         pendingMainFrames = 0
         maxPendingMainFrames = 0
+        droppedFrames = 0
         lastRenderFrameAt = 0
         lastControlSentAt = 0
         statsLock.unlock()
@@ -2479,7 +2511,8 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
             convertedFrames: convertedFrames,
             totalConvertMs: totalConvertMs,
             pendingMainFrames: pendingMainFrames,
-            maxPendingMainFrames: maxPendingMainFrames
+            maxPendingMainFrames: maxPendingMainFrames,
+            droppedFrames: droppedFrames
         )
         maxPendingMainFrames = pendingMainFrames
         statsLock.unlock()
