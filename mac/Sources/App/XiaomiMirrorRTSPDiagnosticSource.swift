@@ -3236,10 +3236,38 @@ private final class XiaomiMirrorRTPMediaSender {
         Double(now >= timestamp ? now - timestamp : 0) / 1_000_000_000
     }
 
+    private var mptDecodeQueueProbeSent: UInt64 = 0
+    private var mptDecodeQueueProbeCompleted: UInt64 = 0
+    private var mptDecodeQueueJamRecoveryCount = 0
+
+    private func checkMPTDecodeQueueLiveness() {
+        guard mptSinkHEVCDecoder != nil else {
+            return
+        }
+        mptDecodeQueueProbeSent += 1
+        let probe = mptDecodeQueueProbeSent
+        mptDecodeQueue.async { [weak self] in
+            self?.mptDecodeQueueProbeCompleted = probe
+        }
+        let lag = mptDecodeQueueProbeSent - mptDecodeQueueProbeCompleted
+        if lag >= 4 {
+            mptDecodeQueueJamRecoveryCount += 1
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.decode_queue_jammed session=\(sessionID.uuidString) " +
+                    "lag=\(lag) probeSent=\(mptDecodeQueueProbeSent) probeCompleted=\(mptDecodeQueueProbeCompleted) " +
+                    "recoveries=\(mptDecodeQueueJamRecoveryCount) decodedFrames=\(mptSinkDecodedFrames)"
+            )
+            mptSinkHEVCDecoder?.requireRandomAccess(reason: "decode_queue_jammed")
+            mptDecodeQueueProbeSent = 0
+            mptDecodeQueueProbeCompleted = 0
+        }
+    }
+
     private func checkMPTSinkPacketWatchdog() {
         guard mptSinkOnly, !stopped else {
             return
         }
+        checkMPTDecodeQueueLiveness()
         let now = DispatchTime.now().uptimeNanoseconds
         // Judge source liveness by any arriving push, not only in-order
         // delivered ones: a lost KCP segment blocks delivery while the
