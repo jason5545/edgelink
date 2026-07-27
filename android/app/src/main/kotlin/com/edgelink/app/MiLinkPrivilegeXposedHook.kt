@@ -494,6 +494,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         if (MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(packageName, processName)) {
             hookMirrorCallProviderAccessCheck(classLoader)
             hookMirrorRemoteExperiment(classLoader)
+            installXiaomiMirrorSynergyStatusGuard(classLoader, "install")
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
             hookMiConnectNetworkingPermission(classLoader)
@@ -3265,6 +3266,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
     ): String {
         val (mirror, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context)
             ?: return "officialIme=skipped:no_manager"
+        installXiaomiMirrorSynergyStatusGuard(classLoader, "prepare:$source")
         val begin = false
         val callbackClass = runCatching {
             findTargetClass(classLoader, XIAOMI_MIRROR_ACCEPT_INPUT_CALLBACK)
@@ -3298,6 +3300,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             log("mirror keyboard beginSynergy failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
             false
         }
+        val monitor = registerXiaomiMirrorSynergyMonitor()
         val display = invokeMirrorManagerBoolean(
             mirrorManager,
             "setDisplayIdForInputMethod",
@@ -3312,7 +3315,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         )
         val summary =
             "officialIme{begin=$begin callback=${callback != null} registered=$registered " +
-                "synergy=$synergy beginSynergy=$beginSynergy display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
+                "synergy=$synergy beginSynergy=$beginSynergy monitor=$monitor display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
                 "$acceptInputState}"
         log("mirror keyboard official ime session source=$source $summary")
         return summary
@@ -3324,6 +3327,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         source: String
     ) {
         val (_, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context) ?: return
+        resetXiaomiMirrorSynergyStatus(classLoader, "release:$source")
+        val monitorReleased = unregisterXiaomiMirrorSynergyMonitor()
         val display = invokeMirrorManagerBoolean(
             mirrorManager,
             "setDisplayIdForInputMethod",
@@ -3347,7 +3352,169 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
         val unregistered = invokeMirrorManagerBoolean(mirrorManager, "unRegAcceptInputCallback", emptyArray())
         xiaomiMirrorAcceptInputCallback = null
-        log("mirror keyboard official ime closed source=$source display=$display synergy=$synergy endSynergy=$endSynergy unregistered=$unregistered")
+        log("mirror keyboard official ime closed source=$source monitor=$monitorReleased display=$display synergy=$synergy endSynergy=$endSynergy unregistered=$unregistered")
+    }
+
+    private var xiaomiMirrorSynergyMonitorBinder: android.os.Binder? = null
+
+    private fun transactXiaomiMirrorImms(code: Int, writePayload: ((android.os.Parcel) -> Unit)?): Boolean =
+        runCatching {
+            val service = Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String::class.java)
+                .invoke(null, "input_method") as? android.os.IBinder ?: return@runCatching false
+            val data = android.os.Parcel.obtain()
+            val reply = android.os.Parcel.obtain()
+            try {
+                data.writeInterfaceToken(XIAOMI_MIRROR_IMMS_DESCRIPTOR)
+                writePayload?.invoke(data)
+                if (!service.transact(code, data, reply, 0)) {
+                    return@runCatching false
+                }
+                reply.readException()
+                true
+            } finally {
+                reply.recycle()
+                data.recycle()
+            }
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log(
+                "mirror imms transact $code failed: " +
+                    "${cause.javaClass.simpleName}: ${cause.message}"
+            )
+            false
+        }
+
+    private fun registerXiaomiMirrorSynergyMonitor(): Boolean {
+        if (xiaomiMirrorSynergyMonitorBinder == null) {
+            xiaomiMirrorSynergyMonitorBinder = object : android.os.Binder() {
+                override fun onTransact(
+                    code: Int,
+                    data: android.os.Parcel,
+                    reply: android.os.Parcel?,
+                    flags: Int
+                ): Boolean = true
+            }
+        }
+        return transactXiaomiMirrorImms(XIAOMI_MIRROR_IMMS_CODE_REGISTER_MONITOR) { data ->
+            data.writeStrongBinder(xiaomiMirrorSynergyMonitorBinder)
+        }
+    }
+
+    private fun unregisterXiaomiMirrorSynergyMonitor(): Boolean =
+        transactXiaomiMirrorImms(XIAOMI_MIRROR_IMMS_CODE_UNREGISTER_MONITOR, null)
+
+    private var xiaomiMirrorSynergyGuardRegistered = false
+    private var xiaomiMirrorSynergyGuardLastMode = -1
+
+    private fun installXiaomiMirrorSynergyStatusGuard(classLoader: ClassLoader, source: String) {
+        if (xiaomiMirrorSynergyGuardRegistered) return
+        val context = xiaomiMirrorApplicationContext(classLoader) ?: return
+        val handler = Handler(Looper.getMainLooper())
+        runCatching {
+            xiaomiMirrorSynergyGuardLastMode =
+                Settings.Secure.getInt(context.contentResolver, "synergy_mode", 0)
+            context.contentResolver.registerContentObserver(
+                Settings.Secure.getUriFor("synergy_mode"),
+                false,
+                object : android.database.ContentObserver(handler) {
+                    override fun onChange(selfChange: Boolean) {
+                        val mode = Settings.Secure.getInt(context.contentResolver, "synergy_mode", 0)
+                        val previous = xiaomiMirrorSynergyGuardLastMode
+                        xiaomiMirrorSynergyGuardLastMode = mode
+                        if (previous == 0 && mode == 1) {
+                            handler.postDelayed(
+                                { resetXiaomiMirrorSynergyStatus(classLoader, "watcher") },
+                                XIAOMI_MIRROR_SYNERGY_RESET_DELAY_MS
+                            )
+                        }
+                    }
+                }
+            )
+            xiaomiMirrorSynergyGuardRegistered = true
+            log(
+                "mirror synergy status guard installed source=$source " +
+                    "mode=$xiaomiMirrorSynergyGuardLastMode"
+            )
+        }.onFailure { error ->
+            log(
+                "mirror synergy status guard install failed source=$source: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    private fun resetXiaomiMirrorSynergyStatus(classLoader: ClassLoader, source: String) {
+        runCatching {
+            val context = xiaomiMirrorApplicationContext(classLoader) ?: return@runCatching
+            if (Settings.Secure.getInt(context.contentResolver, "synergy_mode", 0) != 1) {
+                return@runCatching
+            }
+            val (inputManager, injectMethod) = resolveXiaomiMirrorInputManager(classLoader)
+                ?: return@runCatching
+            val nowMs = SystemClock.uptimeMillis()
+            val event = obtainXiaomiMirrorSynergyResetEvent(nowMs)
+            try {
+                injectMethod.invoke(inputManager, event, XIAOMI_MIRROR_INJECT_MODE_ASYNC)
+            } finally {
+                event.recycle()
+            }
+            log("mirror synergy status reset injected source=$source")
+        }.onFailure { error ->
+            val cause = error.cause ?: error
+            log(
+                "mirror synergy status reset failed source=$source: " +
+                    "${cause.javaClass.simpleName}: ${cause.message}"
+            )
+        }
+    }
+
+    private fun obtainXiaomiMirrorSynergyResetEvent(nowMs: Long): android.view.MotionEvent {
+        val pointerProperties = arrayOf(
+            android.view.MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = android.view.MotionEvent.TOOL_TYPE_FINGER
+            }
+        )
+        val pointerCoords = arrayOf(
+            android.view.MotionEvent.PointerCoords().apply {
+                x = XIAOMI_MIRROR_SYNERGY_RESET_X
+                y = XIAOMI_MIRROR_SYNERGY_RESET_Y
+                size = 1f
+            }
+        )
+        val officialEvent = resolveXiaomiMirrorObtain15()?.let { obtain15 ->
+            runCatching {
+                obtain15.invoke(
+                    null,
+                    nowMs,
+                    nowMs,
+                    android.view.MotionEvent.ACTION_MOVE,
+                    1,
+                    pointerProperties,
+                    pointerCoords,
+                    0,
+                    0,
+                    1f,
+                    1f,
+                    XIAOMI_MIRROR_SYNERGY_RESET_DEVICE_ID,
+                    0,
+                    android.view.InputDevice.SOURCE_TOUCHSCREEN,
+                    0,
+                    0
+                ) as? android.view.MotionEvent
+            }.getOrNull()
+        }
+        return officialEvent ?: android.view.MotionEvent.obtain(
+            nowMs,
+            nowMs,
+            android.view.MotionEvent.ACTION_MOVE,
+            XIAOMI_MIRROR_SYNERGY_RESET_X,
+            XIAOMI_MIRROR_SYNERGY_RESET_Y,
+            0
+        ).apply {
+            source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+        }
     }
 
     private fun xiaomiMirrorContextAndManager(classLoader: ClassLoader, fallbackContext: Context): Pair<Context, Any>? =
@@ -7083,8 +7250,15 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
         private const val XIAOMI_MIRROR_WHEEL_AXIS_MAX = 8f
         private const val XIAOMI_MIRROR_INPUT_DEVICE_ID = -100
+        private const val XIAOMI_MIRROR_IMMS_DESCRIPTOR = "com.android.internal.view.IInputMethodManager"
+        private const val XIAOMI_MIRROR_IMMS_CODE_UNREGISTER_MONITOR = 16777212
+        private const val XIAOMI_MIRROR_IMMS_CODE_REGISTER_MONITOR = 16777213
+        private const val XIAOMI_MIRROR_SYNERGY_RESET_DEVICE_ID = 0
+        private const val XIAOMI_MIRROR_SYNERGY_RESET_X = 500f
+        private const val XIAOMI_MIRROR_SYNERGY_RESET_Y = 300f
+        private const val XIAOMI_MIRROR_SYNERGY_RESET_DELAY_MS = 150L
         private const val XIAOMI_MIRROR_INPUT_EVENT_FLAGS = 0x800000
-        private const val XIAOMI_MIRROR_KEY_EVENT_FLAGS = 0x8
+        private const val XIAOMI_MIRROR_KEY_EVENT_FLAGS = 0x800008
         private const val XIAOMI_MIRROR_INJECT_MODE_ASYNC = 0
         private const val XIAOMI_MIRROR_UHID_GID = 3011
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
