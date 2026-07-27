@@ -2426,15 +2426,9 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         source: String
     ) {
         closeXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
-        val synergyCleared = runCatching {
-            Settings.Secure.putInt(context.contentResolver, "synergy_mode", 0)
-        }.getOrDefault(false)
         val mouseShare = notifyXiaomiMirrorMouseShareMode(classLoader, enabled = false)
         xiaomiMirrorKeyboardSessionArmed = false
-        log(
-            "mirror keyboard state released source=$source synergyCleared=$synergyCleared " +
-                "mouseShare=$mouseShare"
-        )
+        log("mirror keyboard state released source=$source mouseShare=$mouseShare")
     }
 
     private fun sendXiaomiMirrorText(
@@ -3259,40 +3253,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             ?: return "settings=skipped:no_context"
         xiaomiMirrorKeyboardSessionArmed = true
         val officialIme = prepareXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
-        val inputState = setXiaomiMirrorInputMethodState(
-            classLoader,
-            context,
-            XIAOMI_MIRROR_INPUT_STATE_MIRROR_ACTIVE,
-            source
-        )
-        log("mirror keyboard state open source=$source $inputState $officialIme")
-        return "$inputState $officialIme"
-    }
-
-    private fun setXiaomiMirrorInputMethodState(
-        classLoader: ClassLoader,
-        context: Context,
-        state: Int,
-        source: String
-    ): String {
-        val api = runCatching {
-            val (mirror, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context)
-                ?: return@runCatching false
-            mirrorManager.javaClass
-                .getMethod("setMirrorInputMethodState", Context::class.java, Integer.TYPE)
-                .invoke(mirrorManager, mirror, state)
-            true
-        }.getOrElse { error ->
-            log("mirror keyboard setMirrorInputMethodState failed source=$source state=$state: ${error.javaClass.simpleName}: ${error.message}")
-            false
-        }
-        val setting = runCatching {
-            Settings.Secure.putInt(context.contentResolver, "mirror_input_state", state)
-        }.getOrElse { error ->
-            log("mirror keyboard setting mirror_input_state failed source=$source state=$state: ${error.javaClass.simpleName}: ${error.message}")
-            false
-        }
-        return "mirrorInputState=$state api=$api setting=$setting"
+        log("mirror keyboard state open source=$source $officialIme")
+        return officialIme
     }
 
     private fun prepareXiaomiMirrorOfficialInputMethodSession(
@@ -3324,8 +3286,17 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             mirrorManager,
             "sendSynergyOperate",
             arrayOf(Integer.TYPE),
-            XIAOMI_MIRROR_SYNERGY_OPERATE_OFF
+            XIAOMI_MIRROR_SYNERGY_OPERATE_ON
         )
+        val beginSynergy = runCatching {
+            mirrorManager.javaClass
+                .getMethod("beginSynergy", Context::class.java)
+                .invoke(mirrorManager, mirror)
+            true
+        }.getOrElse { error ->
+            log("mirror keyboard beginSynergy failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+            false
+        }
         val display = invokeMirrorManagerBoolean(
             mirrorManager,
             "setDisplayIdForInputMethod",
@@ -3338,13 +3309,10 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             displayId = XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID,
             source = "$source:prime"
         )
-        val setting = runCatching {
-            Settings.Secure.putInt(mirror.contentResolver, "synergy_mode", 0)
-        }.getOrDefault(false)
         val summary =
             "officialIme{begin=$begin callback=${callback != null} registered=$registered " +
-                "synergy=$synergy display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
-                "$acceptInputState setting=$setting}"
+                "synergy=$synergy beginSynergy=$beginSynergy display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
+                "$acceptInputState}"
         log("mirror keyboard official ime session source=$source $summary")
         return summary
     }
@@ -3367,9 +3335,18 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             arrayOf(Integer.TYPE),
             XIAOMI_MIRROR_SYNERGY_OPERATE_OFF
         )
+        val endSynergy = runCatching {
+            mirrorManager.javaClass
+                .getMethod("endSynergy", Context::class.java)
+                .invoke(mirrorManager, context)
+            true
+        }.getOrElse { error ->
+            log("mirror keyboard endSynergy failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
+            false
+        }
         val unregistered = invokeMirrorManagerBoolean(mirrorManager, "unRegAcceptInputCallback", emptyArray())
         xiaomiMirrorAcceptInputCallback = null
-        log("mirror keyboard official ime closed source=$source display=$display synergy=$synergy unregistered=$unregistered")
+        log("mirror keyboard official ime closed source=$source display=$display synergy=$synergy endSynergy=$endSynergy unregistered=$unregistered")
     }
 
     private fun xiaomiMirrorContextAndManager(classLoader: ClassLoader, fallbackContext: Context): Pair<Context, Any>? =
@@ -7099,7 +7076,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK_JADX_NAME = "a4.InterfaceC0495i"
         private const val XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG = 32
         private const val XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED = 1
-        private const val XIAOMI_MIRROR_INPUT_STATE_MIRROR_ACTIVE = 0
+        private const val XIAOMI_MIRROR_SYNERGY_OPERATE_ON = 1
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_OFF = 0
         private const val XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID = -100
         private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
