@@ -494,6 +494,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         if (MiLinkPrivilegeHookPolicy.shouldHookXiaomiMirror(packageName, processName)) {
             hookMirrorCallProviderAccessCheck(classLoader)
             hookMirrorRemoteExperiment(classLoader)
+            hookMirrorWifiOpenGate(classLoader)
             installXiaomiMirrorSynergyStatusGuard(classLoader, "install")
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
@@ -688,6 +689,58 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             }
         }.onFailure { error ->
             log("failed to hook cast client service check: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorWifiOpenGate(classLoader: ClassLoader) {
+        runCatching {
+            if (readSystemProperty("debug.edgelink.mirror_wifi_gate") == "off") {
+                log("mirror wifi-open gate hook disabled by property")
+                return@runCatching
+            }
+            val controllerClass = findTargetClass(classLoader, XIAOMI_MIRROR_WIFI_OPEN_CONTROLLER)
+            val callbackClass = findTargetClass(classLoader, XIAOMI_MIRROR_WIFI_OPEN_CALLBACK)
+            val taskClass = findTargetClass(classLoader, XIAOMI_MIRROR_WIFI_OPEN_TASK)
+            installHook(
+                resolveMethod(controllerClass, "k", callbackClass)
+            ) { chain ->
+                val callback = chain.args.getOrNull(0)
+                if (callback == null) {
+                    return@installHook chain.proceed()
+                }
+                log("mirror wifi-open dialog bypassed, continuing connect")
+                val deliver = {
+                    runCatching {
+                        callbackClass.getMethod("onSuccess").invoke(callback)
+                    }.onFailure { error ->
+                        log("mirror wifi-open onSuccess failed: ${error.javaClass.simpleName}: ${error.message}")
+                    }
+                }
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    deliver()
+                } else {
+                    Handler(Looper.getMainLooper()).post { deliver() }
+                }
+                null
+            }
+            installHook(
+                resolveMethod(controllerClass, "l", Integer.TYPE, taskClass)
+            ) { chain ->
+                val task = chain.args.getOrNull(1)
+                if (task == null) {
+                    return@installHook chain.proceed()
+                }
+                log("mirror wifi-open blocking gate bypassed")
+                taskClass.getMethod("run").invoke(task) as? Int ?: chain.proceed()
+            }
+            installHook(
+                resolveMethod(controllerClass, "j")
+            ) { _ ->
+                true
+            }
+            log("mirror wifi-open gate hooked")
+        }.onFailure { error ->
+            log("failed to hook mirror wifi-open gate: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -7281,6 +7334,9 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_LONG_PRESS_HOLD_MS = 500L
         private const val XIAOMI_MIRROR_UHID_GID = 3011
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
+        private const val XIAOMI_MIRROR_WIFI_OPEN_CONTROLLER = "p2.x"
+        private const val XIAOMI_MIRROR_WIFI_OPEN_CALLBACK = "p2.x\$c"
+        private const val XIAOMI_MIRROR_WIFI_OPEN_TASK = "p2.x\$e"
         private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"
         private const val XIAOMI_MIRROR_DISPLAY = "r3.AbstractC1397I"
         private const val XIAOMI_MIRROR_DISPLAY_HELPER = "r3.M"
