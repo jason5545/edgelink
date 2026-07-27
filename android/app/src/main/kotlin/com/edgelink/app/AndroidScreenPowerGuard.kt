@@ -3,7 +3,9 @@
 package com.edgelink.app
 
 import android.content.Context
+import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -15,6 +17,8 @@ import kotlinx.coroutines.launch
 private const val SCREEN_DIM_DELAY_MS = 5_000L
 private const val DIMMED_SCREEN_BRIGHTNESS = 1
 private const val SCREEN_POWER_PREFS = "edgelink_screen_power"
+private const val MIRROR_CALL_PROVIDER_AUTHORITY = "com.xiaomi.mirror.callprovider"
+private const val MIRROR_KEEP_AWAKE_METHOD = "edgeLinkKeepAwake"
 private const val KEY_LEGACY_HAS_SNAPSHOT = "hasSnapshot"
 private const val KEY_HAS_BRIGHTNESS_SNAPSHOT = "hasBrightnessSnapshot"
 private const val KEY_BRIGHTNESS_MODE = "brightnessMode"
@@ -41,6 +45,7 @@ class AndroidScreenPowerGuard(context: Context) {
 
     fun onSharingStarted() {
         sharingActive = true
+        setMirrorKeepAwake(active = true)
         ScreenPowerForegroundService.start(appContext)
         disableScreensaver()
         mainHandler.removeCallbacks(dimRunnable)
@@ -53,7 +58,39 @@ class AndroidScreenPowerGuard(context: Context) {
         mainHandler.removeCallbacks(dimRunnable)
         restoreBrightnessIfNeeded(reason = "sharing_stopped")
         restoreScreensaverIfNeeded(reason = "sharing_stopped")
+        setMirrorKeepAwake(active = false)
         ScreenPowerForegroundService.stop(appContext)
+    }
+
+    private fun setMirrorKeepAwake(active: Boolean) {
+        secureSettingsScope.launch {
+            val result = runCatching {
+                val extras = Bundle().apply { putBoolean("active", active) }
+                if (Build.VERSION.SDK_INT >= 29) {
+                    resolver.call(MIRROR_CALL_PROVIDER_AUTHORITY, MIRROR_KEEP_AWAKE_METHOD, null, extras)
+                } else {
+                    resolver.call(
+                        Uri.parse("content://$MIRROR_CALL_PROVIDER_AUTHORITY"),
+                        MIRROR_KEEP_AWAKE_METHOD,
+                        null,
+                        extras
+                    )
+                }
+            }
+            result.onSuccess { bundle ->
+                val applied = bundle?.getBoolean("keepAwakeApplied", false) == true
+                if (applied) {
+                    EdgeLinkLog.info("screen.android.mirror_keep_awake_set active=$active")
+                } else {
+                    EdgeLinkLog.warn(
+                        "screen.android.mirror_keep_awake_not_applied active=$active " +
+                            "error=${bundle?.getString("keepAwakeError").orEmpty()}"
+                    )
+                }
+            }.onFailure { error ->
+                EdgeLinkLog.warn("screen.android.mirror_keep_awake_failed active=$active", error)
+            }
+        }
     }
 
     private fun dimIfSharingActive() {
