@@ -2227,7 +2227,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 if (mirrorKeepAwakeLock?.isHeld != true) {
                     @Suppress("DEPRECATION")
                     mirrorKeepAwakeLock = powerManager.newWakeLock(
-                        PowerManager.SCREEN_DIM_WAKE_LOCK,
+                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
                         MIRROR_KEEP_AWAKE_TAG
                     ).apply {
                         setReferenceCounted(false)

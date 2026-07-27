@@ -1541,62 +1541,32 @@ final class EdgeLinkRuntime: ObservableObject {
             reason: shouldRebuildSession ? "session_rebuild" : "source_recovery"
         )
         if shouldRebuildSession {
-            let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = Self.xiaomiScreenSessionRebuildTimeoutMs
             stopXiaomiMirrorRTSPDiagnosticSource(reason: "screen_recovery_session_rebuild")
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_recovery_session_rebuild")
-            var args: [String: String] = [
-                "peerPort": String(peerPort),
-                "forceFakeRemote": "true",
-                "recovery": "true",
-                "sessionRecovery": "true",
-                "recoveryAttempt": String(attempt),
-                "recoveryReason": event.reason
-            ]
-            if let peerHost {
-                args["peerHost"] = peerHost
-            }
-            addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
-            addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
-            DiagnosticsLog.warn(
-                "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
-                    "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
-                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
-                    "action=session_rebuild timeoutMs=\(timeoutMs) " +
-                    "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
-                    "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
-            )
-            guard let requestId = sendMiLinkCommand(command: command, args: args) else {
-                xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建指令未送出")
-                DiagnosticsLog.warn(
-                    "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
-                        "attempt=\(attempt) reason=\(event.reason) action=session_rebuild"
+            // The listener restart above completes asynchronously and can hit
+            // a bind race (Address already in use) that the retry clears about
+            // a second later. Wait briefly for readiness so the LAN probe args
+            // survive; otherwise the phone permanently falls back to the
+            // cloud relay for the rebuilt session.
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+                let listenerReady = await self.waitForXiaomiMirrorRTSPListenerReady(
+                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds
                 )
-                return
-            }
-            markXiaomiScreenSessionRebuildStarted(
-                requestId: requestId,
-                sourceSessionID: event.sessionID,
-                reason: event.reason
-            )
-            if let cloudflareMirrorSessionId {
-                xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
-                    sessionId: cloudflareMirrorSessionId,
-                    lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
-                    reason: "screen_recovery_session_rebuild"
+                self.sendXiaomiMirrorSessionRebuildCommand(
+                    event: event,
+                    attempt: attempt,
+                    route: xiaomiScreenRoute,
+                    peerHost: peerHost,
+                    peerPort: peerPort,
+                    cloudflareMirrorSessionId: cloudflareMirrorSessionId,
+                    timeoutMs: timeoutMs,
+                    listenerReadyForLANProbe: listenerReady
                 )
             }
-            armPendingXiaomiScreenCommand(
-                requestId: requestId,
-                command: command,
-                route: xiaomiScreenRoute,
-                timeoutMs: timeoutMs
-            )
-            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建連線中")
-            DiagnosticsLog.info(
-                "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
-                    "command=\(command) attempt=\(attempt) action=session_rebuild"
-            )
             return
         }
         if shouldSuppressXiaomiScreenSourceRecoveryForCooldown(event: event, phase: "after_rebuild_decision") {
@@ -1645,6 +1615,102 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info(
             "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
                 "command=\(command) attempt=\(attempt) action=source_only_keep_rtsp"
+        )
+    }
+
+    private func waitForXiaomiMirrorRTSPListenerReady(timeoutSeconds: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let ready = xiaomiMirrorRTSPDiagnosticSource.isListenerReady()
+        if !ready {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_listener_ready_timeout waitSeconds=\(timeoutSeconds)"
+            )
+        }
+        return ready
+    }
+
+    private func sendXiaomiMirrorSessionRebuildCommand(
+        event: XiaomiMirrorRTSPRecoveryEvent,
+        attempt: Int,
+        route xiaomiScreenRoute: String,
+        peerHost: String?,
+        peerPort: UInt16,
+        cloudflareMirrorSessionId: String?,
+        timeoutMs: Int,
+        listenerReadyForLANProbe: Bool
+    ) {
+        guard !xiaomiScreenUserStopped else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_suppressed reason=user_stopped_before_rebuild_send " +
+                    "rtspSession=\(event.sessionID.uuidString) attempt=\(attempt)"
+            )
+            return
+        }
+        guard pendingXiaomiScreenFallback == nil else {
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_recovery_suppressed reason=already_pending phase=rebuild_send " +
+                    "rtspSession=\(event.sessionID.uuidString)"
+            )
+            return
+        }
+        let command = "xiaomi.mirror.startMainDisplay"
+        var args: [String: String] = [
+            "peerPort": String(peerPort),
+            "forceFakeRemote": "true",
+            "recovery": "true",
+            "sessionRecovery": "true",
+            "recoveryAttempt": String(attempt),
+            "recoveryReason": event.reason
+        ]
+        if let peerHost {
+            args["peerHost"] = peerHost
+        }
+        addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
+        addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
+        DiagnosticsLog.warn(
+            "xiaomi.mac.screen_recovery_command_start command=\(command) route=\(xiaomiScreenRoute) " +
+                "attempt=\(attempt) trigger=\(event.trigger) reason=\(event.reason) " +
+                "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
+                "action=session_rebuild timeoutMs=\(timeoutMs) listenerReady=\(listenerReadyForLANProbe) " +
+                "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
+                "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
+        )
+        guard let requestId = sendMiLinkCommand(command: command, args: args) else {
+            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建指令未送出")
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_command_failed_before_send route=\(xiaomiScreenRoute) " +
+                    "attempt=\(attempt) reason=\(event.reason) action=session_rebuild"
+            )
+            return
+        }
+        markXiaomiScreenSessionRebuildStarted(
+            requestId: requestId,
+            sourceSessionID: event.sessionID,
+            reason: event.reason
+        )
+        if let cloudflareMirrorSessionId {
+            xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+                sessionId: cloudflareMirrorSessionId,
+                lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+                reason: "screen_recovery_session_rebuild"
+            )
+        }
+        armPendingXiaomiScreenCommand(
+            requestId: requestId,
+            command: command,
+            route: xiaomiScreenRoute,
+            timeoutMs: timeoutMs
+        )
+        xiaomiMiLinkCommandStatus = String(localized: "小米鏡像重建連線中")
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_recovery_command_sent requestId=\(requestId) " +
+                "command=\(command) attempt=\(attempt) action=session_rebuild"
         )
     }
 
@@ -1811,6 +1877,13 @@ final class EdgeLinkRuntime: ObservableObject {
         event: XiaomiMirrorRTSPRecoveryEvent,
         attempt: Int
     ) -> Bool {
+        // The source paused its video elementary stream (static/dimmed screen
+        // or a suspended encoder): media packets keep flowing but no video PES
+        // arrives. Rebuilding the session cannot fix that and only churns the
+        // RTSP listener/KCP state, so stick to source-recovery IDR kicks.
+        if event.reason == "video_es_absent" {
+            return false
+        }
         if event.reason == "rtsp_keepalive_missed" {
             return true
         }
@@ -1835,7 +1908,8 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private static func isXiaomiScreenFrameStall(_ reason: String) -> Bool {
-        reason == "decoded_frame_stalled_beyond_threshold" ||
+        reason == "video_es_absent" ||
+            reason == "decoded_frame_stalled_beyond_threshold" ||
             reason.hasPrefix("decoded_frame_stalled")
     }
 
@@ -4396,6 +4470,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenStartupDecodedFrameThreshold: UInt64 = 300
     private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 45
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
+    private static let xiaomiScreenRebuildListenerReadyWaitSeconds: Double = 4
     private static let phoneRelayDebugDefaultNumber = "800"
     private static let phoneRelayDebugMaxTimeoutSeconds: TimeInterval = 30
 

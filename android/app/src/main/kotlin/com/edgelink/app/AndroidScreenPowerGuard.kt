@@ -14,8 +14,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
+// HyperOS pauses the MirrorControl encoder at very low brightness: 0 and 1
+// both stall the video stream; 10 verified smooth, now trying 5.
 private const val SCREEN_DIM_DELAY_MS = 5_000L
-private const val DIMMED_SCREEN_BRIGHTNESS = 1
+private const val DIMMED_SCREEN_BRIGHTNESS = 5
 private const val SCREEN_POWER_PREFS = "edgelink_screen_power"
 private const val MIRROR_CALL_PROVIDER_AUTHORITY = "com.xiaomi.mirror.callprovider"
 private const val MIRROR_KEEP_AWAKE_METHOD = "edgeLinkKeepAwake"

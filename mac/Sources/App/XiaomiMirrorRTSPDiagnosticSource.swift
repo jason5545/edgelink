@@ -2891,6 +2891,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTDecodedFrameUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var lastMPTVideoPESUptimeNanoseconds: UInt64 = 0
     private var lastMPTFrameStallDecoderResetUptimeNanoseconds: UInt64 = 0
     private var mptSinkFrameStallDecoderResetCount: UInt64 = 0
     private var externalRTPReceiverStarted = false
@@ -2968,6 +2969,9 @@ private final class XiaomiMirrorRTPMediaSender {
                     self?.mptDecodeQueue.async {
                         audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
                     }
+                },
+                onVideoPES: { [weak self] in
+                    self?.lastMPTVideoPESUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
                 }
             )
         }
@@ -3234,8 +3238,18 @@ private final class XiaomiMirrorRTPMediaSender {
         if let elapsedFrameSeconds,
            elapsedFrameSeconds >= Self.mptSinkNoFrameTimeoutSeconds,
            elapsedMediaSeconds < 2 {
+            // Distinguish a real decode/bitstream stall from the source simply
+            // not emitting a video elementary stream (paused encoder, static
+            // or dimmed screen). Rebuilding the session cannot fix the latter,
+            // so it gets its own reason and only source-recovery IDR kicks.
+            let videoESStaleSeconds = lastMPTVideoPESUptimeNanoseconds > 0
+                ? Self.elapsedSeconds(since: lastMPTVideoPESUptimeNanoseconds, now: now)
+                : Double.infinity
+            let stallReason = videoESStaleSeconds >= Self.mptSinkVideoESAbsentThresholdSeconds
+                ? "video_es_absent"
+                : "decoded_frame_stalled_beyond_threshold"
             let stall = mptStallSnapshot(
-                reason: "decoded_frame_stalled_beyond_threshold",
+                reason: stallReason,
                 elapsedMediaSeconds: elapsedMediaSeconds,
                 elapsedFrameSeconds: elapsedFrameSeconds
             )
@@ -3244,14 +3258,17 @@ private final class XiaomiMirrorRTPMediaSender {
                     "elapsedFrameSeconds=\(String(format: "%.2f", elapsedFrameSeconds)) " +
                     "thresholdSeconds=\(Self.mptSinkNoFrameTimeoutSeconds) " +
                     "elapsedMediaSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) " +
+                    "videoESStaleSeconds=\(videoESStaleSeconds == .infinity ? "none" : String(format: "%.2f", videoESStaleSeconds)) " +
                     "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
                     "decodedFrames=\(mptSinkDecodedFrames) officialAction=fast_source_recovery_keep_rtsp"
             )
-            resetMPTSinkDecoderAfterFrameStallIfNeeded(
-                elapsedFrameSeconds: elapsedFrameSeconds,
-                elapsedMediaSeconds: elapsedMediaSeconds,
-                now: now
-            )
+            if stallReason != "video_es_absent" {
+                resetMPTSinkDecoderAfterFrameStallIfNeeded(
+                    elapsedFrameSeconds: elapsedFrameSeconds,
+                    elapsedMediaSeconds: elapsedMediaSeconds,
+                    now: now
+                )
+            }
             onMPTMediaStalled?(stall)
         }
     }
@@ -4301,6 +4318,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let kcpACKBatchDelaySeconds: Double = 0.005
     private static let mptSinkNoPacketTimeoutSeconds: Double = 6
     private static let mptSinkNoFrameTimeoutSeconds: Double = 2
+    private static let mptSinkVideoESAbsentThresholdSeconds: Double = 5
     private static let mptSinkFrameStallDecoderResetMinIntervalSeconds: Double = 1.5
     private static let rtspInterleavedMagic: UInt8 = 0x24
     private static let rtspInterleavedHeaderLength = 4
@@ -4970,6 +4988,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
     private let sessionID: UUID
     private let onAccessUnit: ([Data], UInt64?) -> Void
     private let onPrivateAudioPES: ((Data, UInt64?) -> Void)?
+    private let onVideoPES: (() -> Void)?
     private var pmtPID: UInt16?
     private var videoPID: UInt16?
     private var privateAudioPID: UInt16?
@@ -4991,11 +5010,13 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
     init(
         sessionID: UUID,
         onAccessUnit: @escaping ([Data], UInt64?) -> Void,
-        onPrivateAudioPES: ((Data, UInt64?) -> Void)? = nil
+        onPrivateAudioPES: ((Data, UInt64?) -> Void)? = nil,
+        onVideoPES: (() -> Void)? = nil
     ) {
         self.sessionID = sessionID
         self.onAccessUnit = onAccessUnit
         self.onPrivateAudioPES = onPrivateAudioPES
+        self.onVideoPES = onVideoPES
         self.accessUnitAssembler = XiaomiMirrorHEVCAccessUnitAssembler(sessionID: sessionID, onAccessUnit: onAccessUnit)
     }
 
@@ -5233,6 +5254,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             return
         }
         pesParsed += 1
+        onVideoPES?()
         accessUnitAssembler.pushPESPayload(currentPES, pts90k: currentPESPTS90k)
         if pesParsed <= 5 || pesParsed % 100 == 0 {
             DiagnosticsLog.info(
