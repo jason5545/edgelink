@@ -2436,6 +2436,64 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         )
     }
 
+    private fun sendXiaomiMirrorText(
+        classLoader: ClassLoader,
+        text: String
+    ): XiaomiMirrorKeyboardInjectionResult {
+        val context = xiaomiMirrorApplicationContext(classLoader)
+            ?: return XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "edgelink.inputmanager.text",
+                message = "context unavailable"
+            )
+        val (_, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context)
+            ?: return XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "edgelink.inputmanager.text",
+                message = "mirror manager unavailable"
+            )
+        return runCatching {
+            mirrorManager.javaClass
+                .getMethod("sendChineseText", String::class.java)
+                .invoke(mirrorManager, text)
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = true,
+                route = "edgelink.inputmanager.text",
+                message = "committed text len=${text.length}"
+            )
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            log("mirror keyboard text commit failed: ${cause.javaClass.simpleName}: ${cause.message}")
+            XiaomiMirrorKeyboardInjectionResult(
+                accepted = false,
+                route = "edgelink.inputmanager.text",
+                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
+            )
+        }
+    }
+
+    private fun xiaomiMirrorKeyCharForUsLayout(keyCode: Int, shift: Boolean): Char? = when (keyCode) {
+        in android.view.KeyEvent.KEYCODE_A..android.view.KeyEvent.KEYCODE_Z ->
+            ('a' + (keyCode - android.view.KeyEvent.KEYCODE_A)).let { if (shift) it.uppercaseChar() else it }
+        in android.view.KeyEvent.KEYCODE_0..android.view.KeyEvent.KEYCODE_9 -> {
+            val digit = keyCode - android.view.KeyEvent.KEYCODE_0
+            if (shift) ")!@#$%^&*("[digit] else '0' + digit
+        }
+        android.view.KeyEvent.KEYCODE_SPACE -> ' '
+        android.view.KeyEvent.KEYCODE_COMMA -> if (shift) '<' else ','
+        android.view.KeyEvent.KEYCODE_PERIOD -> if (shift) '>' else '.'
+        android.view.KeyEvent.KEYCODE_SLASH -> if (shift) '?' else '/'
+        android.view.KeyEvent.KEYCODE_SEMICOLON -> if (shift) ':' else ';'
+        android.view.KeyEvent.KEYCODE_APOSTROPHE -> if (shift) '"' else '\''
+        android.view.KeyEvent.KEYCODE_LEFT_BRACKET -> if (shift) '{' else '['
+        android.view.KeyEvent.KEYCODE_RIGHT_BRACKET -> if (shift) '}' else ']'
+        android.view.KeyEvent.KEYCODE_BACKSLASH -> if (shift) '|' else '\\'
+        android.view.KeyEvent.KEYCODE_MINUS -> if (shift) '_' else '-'
+        android.view.KeyEvent.KEYCODE_EQUALS -> if (shift) '+' else '='
+        android.view.KeyEvent.KEYCODE_GRAVE -> if (shift) '~' else '`'
+        else -> null
+    }
+
     private fun notifyXiaomiMirrorMouseShareMode(classLoader: ClassLoader, enabled: Boolean): Boolean =
         runCatching {
             val managerClass = findFirstTargetClass(
@@ -2464,6 +2522,22 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 route = "edgelink.inputmanager.keyboard",
                 message = "invalid keyCode=$keyCode"
             )
+        }
+        if (androidKeyCodeToMetaState(keyCode) == 0) {
+            val shiftActive = synchronized(xiaomiMirrorKeyboardPressedKeys) {
+                (xiaomiMirrorKeyboardMetaMask or modifiers) and android.view.KeyEvent.META_SHIFT_ON != 0
+            }
+            val typedChar = xiaomiMirrorKeyCharForUsLayout(keyCode, shiftActive)
+            if (typedChar != null) {
+                if (!down) {
+                    return XiaomiMirrorKeyboardInjectionResult(
+                        accepted = true,
+                        route = "edgelink.inputmanager.text",
+                        message = "text key-up skipped keyCode=$keyCode"
+                    )
+                }
+                return sendXiaomiMirrorText(classLoader, typedChar.toString())
+            }
         }
         val resolved = resolveXiaomiMirrorInputManager(classLoader)
             ?: return XiaomiMirrorKeyboardInjectionResult(
