@@ -2519,7 +2519,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 message = "invalid keyCode=$keyCode"
             )
         }
-        if (characters.isNotEmpty()) {
+        val printableCharacters = characters.filter { !it.isISOControl() }
+        if (printableCharacters.isNotEmpty()) {
             if (!down) {
                 return XiaomiMirrorKeyboardInjectionResult(
                     accepted = true,
@@ -2527,7 +2528,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                     message = "text key-up skipped keyCode=$keyCode"
                 )
             }
-            return sendXiaomiMirrorText(classLoader, characters)
+            return sendXiaomiMirrorText(classLoader, printableCharacters)
         }
         if (androidKeyCodeToMetaState(keyCode) == 0) {
             val shiftActive = synchronized(xiaomiMirrorKeyboardPressedKeys) {
@@ -7083,7 +7084,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_WHEEL_AXIS_MAX = 8f
         private const val XIAOMI_MIRROR_INPUT_DEVICE_ID = -100
         private const val XIAOMI_MIRROR_INPUT_EVENT_FLAGS = 0x800000
-        private const val XIAOMI_MIRROR_KEY_EVENT_FLAGS = 0x800008
+        private const val XIAOMI_MIRROR_KEY_EVENT_FLAGS = 0x8
         private const val XIAOMI_MIRROR_INJECT_MODE_ASYNC = 0
         private const val XIAOMI_MIRROR_UHID_GID = 3011
         private const val XIAOMI_MIRROR_SHARE_PROCESSOR = "M3.o"
