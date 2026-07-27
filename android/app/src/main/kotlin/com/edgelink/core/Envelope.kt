@@ -43,6 +43,9 @@ object EnvelopeTypes {
     const val RTC_OFFER = "rtc.offer"
     const val RTC_ANSWER = "rtc.answer"
     const val RTC_ICE = "rtc.ice"
+    const val MILINK_MIRROR_RTC_OFFER = "milink.mirror.rtc.offer"
+    const val MILINK_MIRROR_RTC_ANSWER = "milink.mirror.rtc.answer"
+    const val MILINK_MIRROR_RTC_ICE = "milink.mirror.rtc.ice"
     const val CLIPBOARD_SET = "clipboard.set"
     const val CLIPBOARD_HISTORY_REQUEST = "clipboard.history.request"
     const val CLIPBOARD_HISTORY_RESPONSE = "clipboard.history.response"
@@ -170,6 +173,26 @@ data class RtcIceBody(
 )
 
 @Serializable
+data class MiLinkMirrorRtcOfferBody(
+    val sessionId: String,
+    val sdp: String
+)
+
+@Serializable
+data class MiLinkMirrorRtcAnswerBody(
+    val sessionId: String,
+    val sdp: String
+)
+
+@Serializable
+data class MiLinkMirrorRtcIceBody(
+    val sessionId: String,
+    val mid: String,
+    val index: Int,
+    val candidate: String
+)
+
+@Serializable
 data class ClipboardSetBody(
     val text: String,
     val ts: Long,
@@ -201,7 +224,8 @@ data class StatusCapsBody(
     val clipboardHistory: Boolean = true,
     val clipboardThumbnail: Boolean = true,
     val clipboardBlob: Boolean = false,
-    val photoSync: Boolean = false
+    val photoSync: Boolean = false,
+    val mirrorTurnDataChannel: Boolean = false
 )
 
 @Serializable

@@ -542,6 +542,34 @@ SDP / ICE signaling 仍是 secure frame envelope，雙向傳送：
 這裡只定義 signaling envelope；WebRTC library、MediaProjection、AudioPlaybackCapture、
 AccessibilityService 的平台實作不屬於本章協定格式。
 
+#### Xiaomi 鏡像 KCP-over-TURN 媒體（`milink.mirror.rtc.*`）
+
+Xiaomi 鏡像在 cloudflare fallback 場景（LAN probe 失敗）有一條獨立的 WebRTC data
+channel 媒體路線，與 `edgelink-screen` 的 `rtc.*` session 完全分開：
+
+- `milink.mirror.rtc.offer` b:`{"sessionId":string,"sdp":string}`
+- `milink.mirror.rtc.answer` b:`{"sessionId":string,"sdp":string}`
+- `milink.mirror.rtc.ice` b:`{"sessionId":string,"mid":string,"index":int,"candidate":string}`
+
+- `sessionId` 與 `milink.command` args / `milink.mirror.media` 的 `mirrorSessionId` 相同，
+  用來區分同時存在的多個鏡像協商，避免與 screen 路線的 `rtc.*` 糾纏。
+- 發起方向：Mac 是 offerer（鏡像控制方），Android 是 answerer。
+- 選路：`milink.command` args 的 `mediaTransport=cloudflare` + `mirrorTurn=1` 表示 Mac
+  支援 TURN 路線；Android 在 LAN probe 失敗後，若雙端 `status.caps` 的
+  `mirrorTurnDataChannel` 皆為 true，回 `milink.command.result` 帶
+  `mediaTransport=turn`，否則維持 `cloudflare`（WS/TCP fallback，行為不變）。
+- PeerConnection 只用 `/v1/turn/credentials` 回傳的 TURN UDP url（
+  `iceTransportPolicy=relay`，不帶 STUN/host candidate）。
+- Data channel：label `edgelink-mirror-media`，`ordered=false`、`maxRetransmits=0`，
+  binary message；一則 message 承載一個原始 libmpt KCP datagram（手機 bridge 不終結
+  KCP，Mac 端餵進與 LAN direct 相同的 `MiplayKcpTransport` sink；ACK 沿同一 channel
+  送回手機注入 loopback source endpoint）。
+- 逾時與降級：data channel 建立逾時 8 秒（或 ICE/協商失敗、TURN credential 取不到）
+  時，雙端各自落回現行 WS/TCP cloudflare 路線（手機 bridge 切回終結 KCP +
+  `rtp_payload_batch` envelope），不需額外協商。
+- 加密：小米 TS 層 AES-CBC（不變）+ WebRTC DTLS-SCTP；媒體不進 secure frame，
+  control/signaling 維持原 E2EE envelope。
+
 ### Notification Sync
 
 `notification.post` 與 `notification.remove` 是雙向 envelope。接收端用 `id + sourceDeviceId`
@@ -671,6 +699,9 @@ Xiaomi 裝置另有相容路線：Mac 在 `milink.command.result` 處理路徑�
 - `clipboardThumbnail`：是否能在 history item / `clipboard.set` 帶 capped thumbnail。
 - `clipboardBlob`：是否支援 `clipboard.blob.request` / `.chunk` 按需拉取原始 blob
   （見「Clipboard Blob Transfer」）。省略視為 false。
+- `mirrorTurnDataChannel`：是否支援 Xiaomi 鏡像的 KCP-over-TURN 媒體路線
+  （`milink.mirror.rtc.*` signaling + `edgelink-mirror-media` data channel）。
+  省略視為 false；任一端不支援時鏡像 fallback 維持現行 cloudflare WebSocket 路線。
 
 未知欄位一律忽略（前向相容）。舊版 peer 收到 `status.caps` 直接丟掉；新版 peer 收到沒帶
 caps（或舊版）視為 `clipboardHistory=false, clipboardThumbnail=false, clipboardBlob=false`，

@@ -18,6 +18,9 @@ final class CommandDispatcher {
     private let onMiLinkStatus: @Sendable (MiLinkStatusBody) -> Void
     private let onMiLinkFrame: @Sendable (MiLinkFrameBody) -> Void
     private let onMiLinkMirrorMedia: @Sendable (MiLinkMirrorMediaBody) -> Void
+    private let onMiLinkMirrorRtcOffer: @Sendable (MiLinkMirrorRtcOfferBody) -> Void
+    private let onMiLinkMirrorRtcAnswer: @Sendable (MiLinkMirrorRtcAnswerBody) -> Void
+    private let onMiLinkMirrorRtcIce: @Sendable (MiLinkMirrorRtcIceBody) -> Void
     private let onMiLinkCommandResult: @Sendable (MiLinkCommandResultBody) -> Void
     private let onBatteryStatus: @Sendable (BatteryStatusBody) -> Void
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
@@ -48,6 +51,9 @@ final class CommandDispatcher {
         onMiLinkStatus: @escaping @Sendable (MiLinkStatusBody) -> Void = { _ in },
         onMiLinkFrame: @escaping @Sendable (MiLinkFrameBody) -> Void = { _ in },
         onMiLinkMirrorMedia: @escaping @Sendable (MiLinkMirrorMediaBody) -> Void = { _ in },
+        onMiLinkMirrorRtcOffer: @escaping @Sendable (MiLinkMirrorRtcOfferBody) -> Void = { _ in },
+        onMiLinkMirrorRtcAnswer: @escaping @Sendable (MiLinkMirrorRtcAnswerBody) -> Void = { _ in },
+        onMiLinkMirrorRtcIce: @escaping @Sendable (MiLinkMirrorRtcIceBody) -> Void = { _ in },
         onMiLinkCommandResult: @escaping @Sendable (MiLinkCommandResultBody) -> Void = { _ in },
         onBatteryStatus: @escaping @Sendable (BatteryStatusBody) -> Void = { _ in },
         onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
@@ -75,6 +81,9 @@ final class CommandDispatcher {
         self.onMiLinkStatus = onMiLinkStatus
         self.onMiLinkFrame = onMiLinkFrame
         self.onMiLinkMirrorMedia = onMiLinkMirrorMedia
+        self.onMiLinkMirrorRtcOffer = onMiLinkMirrorRtcOffer
+        self.onMiLinkMirrorRtcAnswer = onMiLinkMirrorRtcAnswer
+        self.onMiLinkMirrorRtcIce = onMiLinkMirrorRtcIce
         self.onMiLinkCommandResult = onMiLinkCommandResult
         self.onBatteryStatus = onBatteryStatus
         self.onTunnelEnvelope = onTunnelEnvelope
@@ -230,6 +239,18 @@ final class CommandDispatcher {
         case EnvelopeType.miLinkMirrorMedia:
             let envelope = try decoder.decode(Envelope<MiLinkMirrorMediaBody>.self, from: plaintext)
             onMiLinkMirrorMedia(envelope.b)
+            return nil
+        case EnvelopeType.miLinkMirrorRtcOffer:
+            let envelope = try decoder.decode(Envelope<MiLinkMirrorRtcOfferBody>.self, from: plaintext)
+            onMiLinkMirrorRtcOffer(envelope.b)
+            return nil
+        case EnvelopeType.miLinkMirrorRtcAnswer:
+            let envelope = try decoder.decode(Envelope<MiLinkMirrorRtcAnswerBody>.self, from: plaintext)
+            onMiLinkMirrorRtcAnswer(envelope.b)
+            return nil
+        case EnvelopeType.miLinkMirrorRtcIce:
+            let envelope = try decoder.decode(Envelope<MiLinkMirrorRtcIceBody>.self, from: plaintext)
+            onMiLinkMirrorRtcIce(envelope.b)
             return nil
         case EnvelopeType.miLinkCommandResult:
             let envelope = try decoder.decode(Envelope<MiLinkCommandResultBody>.self, from: plaintext)

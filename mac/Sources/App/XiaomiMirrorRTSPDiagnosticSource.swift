@@ -119,6 +119,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private var cloudflareMirrorReceiver: XiaomiMirrorRTPMediaSender?
     private var cloudflareMirrorHEVCParameterSets: XiaomiMirrorHEVCParameterSets?
     private var cloudflareMirrorPacketsReceived: UInt64 = 0
+    private var turnMirrorDatagramsReceived: UInt64 = 0
 
     private let sourceRTPPort: UInt16 = 19_002
     private let officialMPTClientPort: UInt16 = 15_550
@@ -191,6 +192,12 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         }
     }
 
+    func handleTurnMirrorMedia(_ datagram: Data, sessionId: String) {
+        performOnQueue {
+            self.handleTurnMirrorMediaOnQueue(datagram, sessionId: sessionId)
+        }
+    }
+
     func stopCloudflareMirrorRTPReceiver(reason: String) {
         performOnQueue {
             self.stopCloudflareMirrorRTPReceiverOnQueue(reason: reason)
@@ -246,6 +253,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             cloudflareMirrorReceiverID = receiverID
             cloudflareMirrorReceiver = receiver
             cloudflareMirrorPacketsReceived = 0
+            turnMirrorDatagramsReceived = 0
             receiver.onExternalDatagramSend = { [weak self] packet in
                 self?.queue.async {
                     guard let self, self.cloudflareMirrorSessionId == sessionId else {
@@ -346,11 +354,28 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         receiver.pushExternalRTPPacket(packet, sequence: body.sequence)
     }
 
+    private func handleTurnMirrorMediaOnQueue(_ datagram: Data, sessionId: String) {
+        guard sessionId == cloudflareMirrorSessionId, let receiver = cloudflareMirrorReceiver else {
+            DiagnosticsLog.info(
+                "mirror.turn.kcp_ignored sessionId=\(sessionId) active=\(cloudflareMirrorSessionId ?? "none") bytes=\(datagram.count)"
+            )
+            return
+        }
+        turnMirrorDatagramsReceived += 1
+        if turnMirrorDatagramsReceived == 1 || turnMirrorDatagramsReceived % 100 == 0 {
+            DiagnosticsLog.info(
+                "mirror.turn.kcp_in sessionId=\(sessionId) datagrams=\(turnMirrorDatagramsReceived) bytes=\(datagram.count)"
+            )
+        }
+        receiver.pushExternalRTPPacket(datagram, sequence: nil)
+    }
+
     private func stopCloudflareMirrorRTPReceiverOnQueue(reason: String) {
         guard let receiver = cloudflareMirrorReceiver else {
             cloudflareMirrorSessionId = nil
             cloudflareMirrorReceiverID = nil
             cloudflareMirrorPacketsReceived = 0
+            turnMirrorDatagramsReceived = 0
             return
         }
         let sessionId = cloudflareMirrorSessionId ?? "none"
@@ -363,6 +388,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         cloudflareMirrorReceiverID = nil
         cloudflareMirrorReceiver = nil
         cloudflareMirrorPacketsReceived = 0
+        turnMirrorDatagramsReceived = 0
     }
 
     private func handleCloudflareMirrorStalled(_ stall: XiaomiMirrorMPTStallSnapshot) {

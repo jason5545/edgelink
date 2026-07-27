@@ -265,7 +265,12 @@ Mac `xcodebuild` BUILD SUCCEEDED；Android `:app:compileDebugKotlin` 通過。
 - [x] Android 送端 backlog → 單調增長（55→273/2min），上行 6.9Mbps 需求偏緊
 - [x] TURN anycast 落點 → HiNet 實測 6.6ms（方案 E 可行性背書）
 - [ ] batch 3ms 前後對比（本次量測已是 3ms；舊數據對照 2026-07-27 前 log）
-- [ ] 方案 E 上線後同口径對比（oneWayMs p50/p90、stall 次數）
+- [ ] 方案 E 上線後同口径對比（RTT p50/p90、stall 次數）——埋點已落地
+  （2026-07-27 雙端實作完成，見 §10 實作狀態），待真機 60s 影片對比：
+  - WS 路線：`xiaomi.mirror.cloudflare.latency oneWayMs` 分布、
+    `decoded_frame_stalled_beyond_threshold` 次數、decoded fps
+  - TURN 路線：`mirror.turn.stats rttMs` 分布（類比 RTT）、同兩項 stall/fps 指標
+  - 驗收門檻：stall 次數 < WS 一半；`mirror.turn.stats` RTT p50 < 60ms
 
 ## 10. KCP-over-TURN 包裝（方案 E 定稿，2026-07-27）
 
@@ -303,3 +308,37 @@ Mac `xcodebuild` BUILD SUCCEEDED；Android `:app:compileDebugKotlin` 通過。
   （參考 screen 路線 rtc.offer/answer/ice，mirror 用獨立 type 避免與
   edgelink-screen session 糾纏）。
 - 降級順序：LAN direct → KCP-over-TURN → 現行 WS/TCP fallback（原樣保留）。
+
+### 實作狀態（2026-07-27 雙端落地）
+
+已交付：
+
+| 層 | 內容 | 位置 |
+|---|---|---|
+| signaling | `milink.mirror.rtc.offer/answer/ice`（帶 `mirrorSessionId`，與 screen 路線 `rtc.*` 隔離） | mac `EdgeLinkKit/Envelope.swift`、android `core/Envelope.kt` |
+| caps | `status.caps` 新增 `mirrorTurnDataChannel`（雙端送 `true`，缺席視為 false） | 同上 |
+| Mac | `MacMirrorTurnSession`：offerer、TURN-UDP-only `iceServers` + `iceTransportPolicy=relay`、DC `ordered=false/maxRetransmits=0`（label `edgelink-mirror-media`）、8s open 逾時、5s getStats | mac/Sources/App/MacMirrorTurnSession.swift |
+| Mac 接線 | command result `mediaTransport=turn` → 啟動 receiver（與 WS 同一顆）+ TURN session；DC 收到 datagram → `handleTurnMirrorMedia` → `pushExternalRTPPacket`（與 LAN direct 同一顆 `MiplayKcpTransport` sink）；ACK 出口 `sendXiaomiMirrorCloudflareDatagram(Batch)` 在 TURN active 時改送 DC；逾時/失敗 → `xiaomiMirrorActiveMediaTransport` 退回 `cloudflare`（WS 路線自動接手，無需重協商） | EdgeLinkRuntime.swift、XiaomiMirrorRTSPDiagnosticSource.swift、CommandDispatcher.swift |
+| Android | `AndroidMirrorTurnSession`：answerer、同 TURN-UDP-only + relay policy、DC open 後 attach bridge | android/app/.../AndroidMirrorTurnSession.kt |
+| Android bridge | TURN 模式純 UDP shuttle：loopback 收 KCP datagram → DC 送（不終結 KCP）；DC 收 → 注入 `sourceRtpEndpoint`（沿用 self-echo 過濾與 loopback ACK 位址改寫）；8s 無 DC open（或 signaling 失敗）→ `switchToWebSocketFallback` 切回終結 KCP + `rtp_payload_batch`，WS 行為與今天一致 | AndroidMiLinkMirrorMediaBridge.kt |
+| 選路 | LAN direct（不變）→ TURN（雙端 caps 皆 true 且 LAN probe 失敗，`milink.command` args `mirrorTurn=1` 提示）→ WS/TCP（原樣）；舊端忽略 `mirrorTurn` 與 `mirrorTurnDataChannel`，自然落 WS | AndroidMiLinkCommandBridge.kt、EdgeLinkRuntime.swift |
+
+量測埋點（雙端 log keyword）：
+
+- `mirror.turn.dc_open`（含 elapsedMs）/ `mirror.turn.dc_failed`（含 reason）
+- `mirror.turn.ice_state state=`（candidate pair 類型見 `mirror.turn.stats path=`）
+- Mac：`mirror.turn.kcp_in datagrams=`（每 100）、`mirror.turn.ack_out`（每 100）
+- Android：`mirror.turn.dc_out datagrams= bytes=`（每 100）、`mirror.turn.loopback_in`（每 100）
+- `mirror.turn.stats`（每 5s：`currentRoundTripTime`、`availableOutgoingBitrate`、path）
+- 降級事件：Mac `xiaomi.mac.screen_media_transport_fallback from=turn to=cloudflare`、
+  Android `mirror.turn.ws_fallback`
+
+驗證狀態：Mac `xcodebuild` BUILD SUCCEEDED（EdgeLinkKit 全部單測通過）、
+Android `:app:compileDebugKotlin` 通過，雙端已安裝。真機前後對比數據待補（§9）。
+
+注意事項：
+
+- macOS WebRTC umbrella header 原本不含 `RTCDataChannelConfiguration.h`
+  （Mac 先前只收不建 data channel），已在 `mac/project.yml` 的 header patch 加入 import。
+- TURN 路線的 RTT 類比指標用 WebRTC getStats 的 `currentRoundTripTime`（candidate
+  pair 層），不是 §6 的 `oneWayMs`（TURN 路線媒體不帶 `body.ts`）。

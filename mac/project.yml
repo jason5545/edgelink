@@ -50,6 +50,7 @@ targets:
           #import <WebRTC/RTCCVPixelBuffer.h>
           #import <WebRTC/RTCConfiguration.h>
           #import <WebRTC/RTCDataChannel.h>
+          #import <WebRTC/RTCDataChannelConfiguration.h>
           #import <WebRTC/RTCI420Buffer.h>
           #import <WebRTC/RTCIceCandidate.h>
           #import <WebRTC/RTCIceServer.h>

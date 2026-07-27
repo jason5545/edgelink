@@ -52,6 +52,9 @@ public enum EnvelopeType {
     public static let rtcOffer = "rtc.offer"
     public static let rtcAnswer = "rtc.answer"
     public static let rtcIce = "rtc.ice"
+    public static let miLinkMirrorRtcOffer = "milink.mirror.rtc.offer"
+    public static let miLinkMirrorRtcAnswer = "milink.mirror.rtc.answer"
+    public static let miLinkMirrorRtcIce = "milink.mirror.rtc.ice"
     public static let clipboardSet = "clipboard.set"
     public static let clipboardHistoryRequest = "clipboard.history.request"
     public static let clipboardHistoryResponse = "clipboard.history.response"
@@ -210,6 +213,40 @@ public struct RtcIceBody: Codable, Equatable, Sendable {
     }
 }
 
+public struct MiLinkMirrorRtcOfferBody: Codable, Equatable, Sendable {
+    public let sessionId: String
+    public let sdp: String
+
+    public init(sessionId: String, sdp: String) {
+        self.sessionId = sessionId
+        self.sdp = sdp
+    }
+}
+
+public struct MiLinkMirrorRtcAnswerBody: Codable, Equatable, Sendable {
+    public let sessionId: String
+    public let sdp: String
+
+    public init(sessionId: String, sdp: String) {
+        self.sessionId = sessionId
+        self.sdp = sdp
+    }
+}
+
+public struct MiLinkMirrorRtcIceBody: Codable, Equatable, Sendable {
+    public let sessionId: String
+    public let mid: String
+    public let index: Int
+    public let candidate: String
+
+    public init(sessionId: String, mid: String, index: Int, candidate: String) {
+        self.sessionId = sessionId
+        self.mid = mid
+        self.index = index
+        self.candidate = candidate
+    }
+}
+
 public struct ClipboardSetBody: Codable, Equatable, Sendable {
     public let text: String
     public let ts: Int64
@@ -259,12 +296,14 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
     public let clipboardThumbnail: Bool
     public let clipboardBlob: Bool
     public let photoSync: Bool
+    public let mirrorTurnDataChannel: Bool
 
-    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true, photoSync: Bool = false) {
+    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true, photoSync: Bool = false, mirrorTurnDataChannel: Bool = false) {
         self.clipboardHistory = clipboardHistory
         self.clipboardThumbnail = clipboardThumbnail
         self.clipboardBlob = clipboardBlob
         self.photoSync = photoSync
+        self.mirrorTurnDataChannel = mirrorTurnDataChannel
     }
 
     public init(from decoder: Decoder) throws {
@@ -273,6 +312,7 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
         clipboardThumbnail = try container.decodeIfPresent(Bool.self, forKey: .clipboardThumbnail) ?? false
         clipboardBlob = try container.decodeIfPresent(Bool.self, forKey: .clipboardBlob) ?? false
         photoSync = try container.decodeIfPresent(Bool.self, forKey: .photoSync) ?? false
+        mirrorTurnDataChannel = try container.decodeIfPresent(Bool.self, forKey: .mirrorTurnDataChannel) ?? false
     }
 }
 

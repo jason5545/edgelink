@@ -45,6 +45,8 @@ import com.edgelink.core.TunnelFlowBody
 import com.edgelink.core.TunnelOpenBody
 import com.edgelink.core.TunnelOpenResultBody
 import com.edgelink.core.MiLinkMirrorMediaBody
+import com.edgelink.core.MiLinkMirrorRtcIceBody
+import com.edgelink.core.MiLinkMirrorRtcOfferBody
 import com.edgelink.core.MiLinkStatusBody
 import com.edgelink.core.NotificationPostBody
 import com.edgelink.core.NotificationRemoveBody
@@ -191,6 +193,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     @Volatile
     private var peerCapabilityThumbnail = false
     private var peerCapabilityBlob = false
+    @Volatile
+    private var peerCapabilityMirrorTurn = false
+    private var mirrorTurnSession: AndroidMirrorTurnSession? = null
     private val clipboardBlobReassembler = ClipboardBlobReassembler()
     private var pendingClipboardBlobId: String? = null
     private var pendingClipboardBlobCallback: ((Boolean) -> Unit)? = null
@@ -206,7 +211,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onMirrorCloudBridgeStopRequested = { reason ->
             AndroidMiLinkMirrorMediaBridge.stop(reason)
-        }
+        },
+        peerMirrorTurnDataChannelSupported = { peerCapabilityMirrorTurn }
     )
     private val miLinkScreenPowerGuard = AndroidScreenPowerGuard(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
@@ -273,6 +279,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onScreenStopReceived = {
             stopMiLinkScreenPowerGuard()
         },
+        onMirrorTurnSessionStop = {
+            closeMirrorTurnSession("screen_stop")
+        },
         onMiLinkCommandResult = { body, result ->
             handleMiLinkCommandResult(body, result)
         },
@@ -303,6 +312,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onMacAwake = {
             handleMacAwake()
+        },
+        onMiLinkMirrorRtcOffer = { body ->
+            handleMiLinkMirrorRtcOffer(body)
+        },
+        onMiLinkMirrorRtcIce = { body ->
+            mirrorTurnSession?.handleIce(body)
         },
         onTunnelEnvelope = { type, body ->
             tunnelManager.handleEnvelope(type, body)
@@ -458,6 +473,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         pendingPhoneRelaySelectionRequestId = null
         pendingPhoneRelaySelectionTimeoutJob = null
         latestTurnCredentials = null
+        closeMirrorTurnSession("shutdown")
         session?.close()
         scope.cancel()
     }
@@ -716,6 +732,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     private fun startMiLinkMirrorCloudBridge(request: AndroidMiLinkMirrorCloudBridgeRequest) {
+        if (!request.turnMode) {
+            closeMirrorTurnSession("cloud_bridge_ws_mode")
+        }
         AndroidMiLinkMirrorMediaBridge.start(request) { media: MiLinkMirrorMediaBody ->
             val activeSession = session ?: return@start
             runCatching {
@@ -727,6 +746,44 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 )
             }
         }
+    }
+
+    private fun closeMirrorTurnSession(reason: String) {
+        val active = mirrorTurnSession
+        mirrorTurnSession = null
+        active?.close(reason)
+    }
+
+    private suspend fun handleMiLinkMirrorRtcOffer(body: MiLinkMirrorRtcOfferBody) {
+        closeMirrorTurnSession("replace")
+        val credentials = ensureTurnCredentials("mirror_turn_offer")
+        if (credentials == null || !credentials.isFresh()) {
+            EdgeLinkLog.warn("mirror.turn.dc_failed sessionId=${body.sessionId} reason=no_turn_credentials")
+            AndroidMiLinkMirrorMediaBridge.switchToWebSocketFallback("no_turn_credentials")
+            return
+        }
+        val turnSession = AndroidMirrorTurnSession(
+            context = appContext,
+            sessionId = body.sessionId,
+            iceServers = currentScreenIceServerConfigs(),
+            sendPlaintext = ::sendPlaintext,
+            onDatagram = { data ->
+                AndroidMiLinkMirrorMediaBridge.handleTurnDatagram(data)
+            },
+            onDataChannelOpen = {
+                val attached = AndroidMiLinkMirrorMediaBridge.attachTurnDataChannel(body.sessionId) { data ->
+                    mirrorTurnSession?.send(data)
+                }
+                if (!attached) {
+                    mirrorTurnSession?.close("bridge_attach_rejected")
+                }
+            },
+            onFailed = { reason ->
+                AndroidMiLinkMirrorMediaBridge.switchToWebSocketFallback("signal_$reason")
+            }
+        )
+        mirrorTurnSession = turnSession
+        turnSession.handleOffer(body)
     }
 
     private fun handleMiLinkCommandResult(body: MiLinkCommandBody, result: MiLinkCommandResultBody) {
@@ -863,6 +920,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         session = null
         AndroidMiLinkMirrorMediaBridge.stop("disconnect")
         AndroidMirrorScreenRemoteKeeper.stop("disconnect")
+        closeMirrorTurnSession("disconnect")
         stopMiLinkScreenPowerGuard()
         screenSession.stop()
         stateFlow.update {
@@ -1602,6 +1660,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         connectionJob?.cancel()
         AndroidMiLinkMirrorMediaBridge.stop("connection_restart")
         AndroidMirrorScreenRemoteKeeper.stop("connection_restart")
+        closeMirrorTurnSession("connection_restart")
         stopMiLinkScreenPowerGuard()
         screenSession.stop()
         session?.close()
@@ -2106,8 +2165,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         peerCapabilityHistory = caps.clipboardHistory
         peerCapabilityThumbnail = caps.clipboardThumbnail
         peerCapabilityBlob = caps.clipboardBlob
+        peerCapabilityMirrorTurn = caps.mirrorTurnDataChannel
         stateFlow.update { it.copy(peerClipboardBlob = caps.clipboardBlob) }
-        EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail} blob=${caps.clipboardBlob}")
+        EdgeLinkLog.info("clipboard.android.caps_received history=${caps.clipboardHistory} thumbnail=${caps.clipboardThumbnail} blob=${caps.clipboardBlob} mirrorTurn=${caps.mirrorTurnDataChannel}")
     }
 
     private fun handleClipboardHistoryResponse(response: ClipboardHistoryResponseBody) {
@@ -2283,11 +2343,16 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         peerCapabilityHistory = false
         peerCapabilityThumbnail = false
         peerCapabilityBlob = false
+        peerCapabilityMirrorTurn = false
         stateFlow.update { it.copy(peerClipboardBlob = false) }
         cancelPendingClipboardBlob(success = false, reason = "new_session")
         sendEnvelope(
             EnvelopeTypes.STATUS_CAPS,
-            StatusCapsBody(clipboardBlob = true, photoSync = stateFlow.value.photoSyncEnabled)
+            StatusCapsBody(
+                clipboardBlob = true,
+                photoSync = stateFlow.value.photoSyncEnabled,
+                mirrorTurnDataChannel = true
+            )
         )
         sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
         EdgeLinkLog.info("clipboard.android.caps_sent hostId=${identity.deviceId}")
@@ -2735,6 +2800,7 @@ private class AndroidCommandDispatcher(
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
     private val onScreenStopReceived: () -> Unit,
+    private val onMirrorTurnSessionStop: () -> Unit = {},
     private val onMiLinkCommandResult: (MiLinkCommandBody, MiLinkCommandResultBody) -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,
     private val onPhoneActionResult: (PhoneActionBody, PhoneActionResultBody) -> Unit,
@@ -2742,6 +2808,8 @@ private class AndroidCommandDispatcher(
     private val onPhoneRelayMedia: suspend (PhoneRelayMediaBody) -> Unit,
     private val onMacSleep: () -> Unit,
     private val onMacAwake: () -> Unit,
+    private val onMiLinkMirrorRtcOffer: suspend (MiLinkMirrorRtcOfferBody) -> Unit = {},
+    private val onMiLinkMirrorRtcIce: (MiLinkMirrorRtcIceBody) -> Unit = {},
     private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> },
     private val onStatusCaps: (StatusCapsBody) -> Unit = {},
     private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {},
@@ -2897,6 +2965,16 @@ private class AndroidCommandDispatcher(
                 AndroidMiLinkMirrorMediaBridge.handleMedia(envelope.b)
                 null
             }
+            EnvelopeTypes.MILINK_MIRROR_RTC_OFFER -> {
+                val envelope = EnvelopeCodec.decode<MiLinkMirrorRtcOfferBody>(plaintext)
+                onMiLinkMirrorRtcOffer(envelope.b)
+                null
+            }
+            EnvelopeTypes.MILINK_MIRROR_RTC_ICE -> {
+                val envelope = EnvelopeCodec.decode<MiLinkMirrorRtcIceBody>(plaintext)
+                onMiLinkMirrorRtcIce(envelope.b)
+                null
+            }
             EnvelopeTypes.MILINK_COMMAND -> {
                 val envelope = EnvelopeCodec.decode<MiLinkCommandBody>(plaintext)
                 val result = miLinkCommandBridge.handle(envelope.b)
@@ -2911,6 +2989,7 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.SCREEN_STOP -> {
                 AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
                 AndroidMirrorScreenRemoteKeeper.stop("screen_stop")
+                onMirrorTurnSessionStop()
                 onScreenStopReceived()
                 screenSession.stop()
                 null

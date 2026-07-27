@@ -1224,7 +1224,7 @@ class AndroidScreenSession(
         private val CONTROL_STATS_DELAYS_MS = longArrayOf(0L, 300L, 900L)
         private val initialized = AtomicBoolean(false)
 
-        private fun ensureWebRtcInitialized(context: Context) {
+        internal fun ensureWebRtcInitialized(context: Context) {
             if (initialized.compareAndSet(false, true)) {
                 PeerConnectionFactory.initialize(
                     PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)

@@ -38,6 +38,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
     private const val KCP_ADVERTISED_RECEIVE_WINDOW = 128
     private const val OWN_ADDRESSES_REFRESH_MS = 30_000L
+    private const val TURN_DATA_CHANNEL_TIMEOUT_MS = 8_000L
     private const val ACK_WATCH_WINDOW_PUSHES = 2_000L
     private const val ACK_WATCH_MIN_PUSHES = 500L
     private const val LOCAL_RTP_RECEIVE_BUFFER_BYTES = 8 * 1024 * 1024
@@ -86,6 +87,7 @@ object AndroidMiLinkMirrorMediaBridge {
                     sessionId = sessionId,
                     localRtspPorts = localRtspPorts,
                     startReason = request.reason,
+                    turnMode = request.turnMode,
                     sendMedia = sendMedia
                 )
                 activeSession = bridge
@@ -134,10 +136,37 @@ object AndroidMiLinkMirrorMediaBridge {
         session.sendDatagramToSource(body)
     }
 
+    fun attachTurnDataChannel(sessionId: String, sendDatagram: (ByteArray) -> Unit): Boolean {
+        val session = activeSession
+        if (session == null || sessionId != activeSessionId) {
+            EdgeLinkLog.info(
+                "mirror.turn.attach_ignored sessionId=$sessionId active=${activeSessionId ?: "none"}"
+            )
+            return false
+        }
+        return session.attachTurnDataChannel(sendDatagram)
+    }
+
+    fun detachTurnDataChannel(sessionId: String, reason: String) {
+        val session = activeSession
+        if (session != null && sessionId == activeSessionId) {
+            session.detachTurnDataChannel(reason)
+        }
+    }
+
+    fun handleTurnDatagram(data: ByteArray) {
+        activeSession?.sendTurnDatagramToSource(data)
+    }
+
+    fun switchToWebSocketFallback(reason: String) {
+        activeSession?.switchToWebSocketFallback(reason)
+    }
+
     private class MirrorMediaBridgeSession(
         sessionId: String,
         private val localRtspPorts: List<Int>,
         private val startReason: String,
+        private val turnMode: Boolean,
         sendMedia: suspend (MiLinkMirrorMediaBody) -> Unit
     ) {
         @Volatile
@@ -212,6 +241,128 @@ object AndroidMiLinkMirrorMediaBridge {
         private var sourceRtpEndpoint: InetSocketAddress? = null
         private var rtpPackets = 0
         private var macToSourceDatagrams = 0
+        @Volatile
+        private var turnDataChannelActive = false
+        @Volatile
+        private var turnFallbackTriggered = false
+        @Volatile
+        private var turnSendDatagram: ((ByteArray) -> Unit)? = null
+        private var turnLoopbackIn = 0L
+        private var turnLoopbackDropped = 0L
+        private var turnAckInjected = 0L
+        private var kcpSink: MiLinkMirrorKcpSink? = null
+        private var ackViaLoopback = true
+        private var ownAddresses: Set<InetAddress> = emptySet()
+        private var ownAddressesRefreshedAtMs = 0L
+
+        fun attachTurnDataChannel(sendDatagram: (ByteArray) -> Unit): Boolean {
+            if (!turnMode || turnFallbackTriggered) {
+                EdgeLinkLog.info(
+                    "mirror.turn.attach_rejected sessionId=$sessionId turnMode=$turnMode fallback=$turnFallbackTriggered"
+                )
+                return false
+            }
+            turnSendDatagram = sendDatagram
+            turnDataChannelActive = true
+            EdgeLinkLog.info("mirror.turn.bridge_attached sessionId=$sessionId")
+            return true
+        }
+
+        fun detachTurnDataChannel(reason: String) {
+            if (turnSendDatagram != null || turnDataChannelActive) {
+                EdgeLinkLog.info("mirror.turn.bridge_detached sessionId=$sessionId reason=$reason")
+            }
+            turnDataChannelActive = false
+            turnSendDatagram = null
+        }
+
+        fun switchToWebSocketFallback(reason: String) {
+            if (!turnMode || turnFallbackTriggered) {
+                return
+            }
+            turnFallbackTriggered = true
+            turnDataChannelActive = false
+            turnSendDatagram = null
+            EdgeLinkLog.warn(
+                "mirror.turn.ws_fallback sessionId=$sessionId reason=$reason loopbackIn=$turnLoopbackIn dropped=$turnLoopbackDropped"
+            )
+        }
+
+        private fun resolveAckTarget(socket: DatagramSocket, target: InetSocketAddress): InetSocketAddress {
+            if (!ackViaLoopback || target.address.isLoopbackAddress) {
+                return target
+            }
+            val now = System.currentTimeMillis()
+            if (now - ownAddressesRefreshedAtMs > OWN_ADDRESSES_REFRESH_MS) {
+                ownAddressesRefreshedAtMs = now
+                ownAddresses = runCatching {
+                    NetworkInterface.getNetworkInterfaces().toList()
+                        .flatMap { it.inetAddresses.toList() }
+                        .toSet()
+                }.getOrDefault(emptySet())
+            }
+            if (!ownAddresses.contains(target.address)) {
+                return target
+            }
+            return InetSocketAddress(InetAddress.getLoopbackAddress(), target.port)
+        }
+
+        fun sendTurnDatagramToSource(data: ByteArray) {
+            if (!turnMode || turnFallbackTriggered || !turnDataChannelActive) {
+                return
+            }
+            val udp = udpSocket
+            val target = sourceRtpEndpoint
+            if (udp == null || udp.isClosed || target == null) {
+                return
+            }
+            turnAckInjected += 1
+            if (turnAckInjected == 1L || turnAckInjected % 500 == 0L) {
+                EdgeLinkLog.info(
+                    "mirror.turn.ack_inject sessionId=$sessionId count=$turnAckInjected " +
+                        "to=${target.address.hostAddress}:${target.port} bytes=${data.size}"
+                )
+            }
+            runCatching {
+                udp.send(DatagramPacket(data, data.size, target))
+                // The source's KCP session is keyed by (src IP, port): an ACK
+                // delivered from 127.0.0.1 is dropped when the source session
+                // remote is the phone's own non-loopback address, while a
+                // loopback-bound source is unreachable via that address.
+                // Send to both candidate destinations; the source dedups.
+                val ackTarget = resolveAckTarget(udp, target)
+                if (ackTarget != target) {
+                    udp.send(DatagramPacket(data, data.size, ackTarget))
+                }
+            }
+        }
+
+        private fun ensureKcpSink(socket: DatagramSocket): MiLinkMirrorKcpSink =
+            kcpSink ?: MiLinkMirrorKcpSink(
+                sessionId = { sessionId },
+                receiveWindow = { KCP_ADVERTISED_RECEIVE_WINDOW },
+                onSendDatagram = { reply ->
+                    val target = sourceRtpEndpoint
+                    if (target != null && !socket.isClosed) {
+                        runCatching {
+                            val ackTarget = resolveAckTarget(socket, target)
+                            socket.send(DatagramPacket(reply, reply.size, ackTarget))
+                        }
+                    }
+                },
+                onPayload = { payload ->
+                    payloadsQueued += 1
+                    if (rtpBatchQueue.trySend(payload).isFailure) {
+                        rtpBatchDatagramsDropped += 1
+                        if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
+                            EdgeLinkLog.warn(
+                                "xiaomi.mirror.android.cloudflare_rtp_batch_queue_full sessionId=$sessionId " +
+                                    "dropped=$rtpBatchDatagramsDropped"
+                            )
+                        }
+                    }
+                }
+            ).also { kcpSink = it }
 
         suspend fun run() = coroutineScope {
             sendStatus("bridge_starting")
@@ -229,6 +380,14 @@ object AndroidMiLinkMirrorMediaBridge {
             val udpJob = launch { receiveRTP(udp) }
             val batchJob = launch { flushRTPBatches() }
             val rtspKeepaliveJob = launch { rtspKeepaliveLoop() }
+            if (turnMode) {
+                launch {
+                    delay(TURN_DATA_CHANNEL_TIMEOUT_MS)
+                    if (!turnDataChannelActive) {
+                        switchToWebSocketFallback("dc_open_timeout")
+                    }
+                }
+            }
             try {
                 while (currentCoroutineContext().isActive) {
                     try {
@@ -375,52 +534,6 @@ object AndroidMiLinkMirrorMediaBridge {
 
         private suspend fun receiveRTP(socket: DatagramSocket) {
             val buffer = ByteArray(64 * 1024)
-            var ackViaLoopback = true
-            var ownAddresses: Set<InetAddress> = emptySet()
-            var ownAddressesRefreshedAtMs = 0L
-            fun resolveAckTarget(target: InetSocketAddress): InetSocketAddress {
-                if (!ackViaLoopback || target.address.isLoopbackAddress) {
-                    return target
-                }
-                val now = System.currentTimeMillis()
-                if (now - ownAddressesRefreshedAtMs > OWN_ADDRESSES_REFRESH_MS) {
-                    ownAddressesRefreshedAtMs = now
-                    ownAddresses = runCatching {
-                        NetworkInterface.getNetworkInterfaces().toList()
-                            .flatMap { it.inetAddresses.toList() }
-                            .toSet()
-                    }.getOrDefault(emptySet())
-                }
-                if (!ownAddresses.contains(target.address)) {
-                    return target
-                }
-                return InetSocketAddress(InetAddress.getLoopbackAddress(), target.port)
-            }
-            val kcpSink = MiLinkMirrorKcpSink(
-                sessionId = { sessionId },
-                receiveWindow = { KCP_ADVERTISED_RECEIVE_WINDOW },
-                onSendDatagram = { reply ->
-                    val target = sourceRtpEndpoint
-                    if (target != null && !socket.isClosed) {
-                        runCatching {
-                            val ackTarget = resolveAckTarget(target)
-                            socket.send(DatagramPacket(reply, reply.size, ackTarget))
-                        }
-                    }
-                },
-                onPayload = { payload ->
-                    payloadsQueued += 1
-                    if (rtpBatchQueue.trySend(payload).isFailure) {
-                        rtpBatchDatagramsDropped += 1
-                        if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
-                            EdgeLinkLog.warn(
-                                "xiaomi.mirror.android.cloudflare_rtp_batch_queue_full sessionId=$sessionId " +
-                                    "dropped=$rtpBatchDatagramsDropped"
-                            )
-                        }
-                    }
-                }
-            )
             var ackWatchLastPushes = 0L
             var ackWatchLastDuplicates = 0L
             var ackWatchLoggedLoopback = false
@@ -450,6 +563,23 @@ object AndroidMiLinkMirrorMediaBridge {
                 val data = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
                 sourceRtpEndpoint = InetSocketAddress(packet.address, packet.port)
                 rtpPackets += 1
+                if (turnMode && !turnFallbackTriggered) {
+                    turnLoopbackIn += 1
+                    if (turnLoopbackIn == 1L || turnLoopbackIn % 100 == 0L) {
+                        EdgeLinkLog.info(
+                            "mirror.turn.loopback_in sessionId=$sessionId count=$turnLoopbackIn " +
+                                "from=${packet.address.hostAddress}:${packet.port} bytes=${data.size} " +
+                                "fp=${EdgeLinkLog.fingerprint(data)}"
+                        )
+                    }
+                    val forward = turnSendDatagram
+                    if (turnDataChannelActive && forward != null) {
+                        forward(data)
+                    } else {
+                        turnLoopbackDropped += 1
+                    }
+                    continue
+                }
                 if (rtpPackets == 1 || rtpPackets % 100 == 0) {
                     EdgeLinkLog.info(
                         "xiaomi.mirror.android.cloudflare_local_rtp_in sessionId=$sessionId " +
@@ -457,13 +587,14 @@ object AndroidMiLinkMirrorMediaBridge {
                             "bytes=${data.size} ${rtpSummary(data)} fp=${EdgeLinkLog.fingerprint(data)}"
                     )
                 }
-                kcpSink.receiveDatagram(data)
-                val watchPushes = kcpSink.pushReceived
+                val sink = ensureKcpSink(socket)
+                sink.receiveDatagram(data)
+                val watchPushes = sink.pushReceived
                 if (watchPushes - ackWatchLastPushes >= ACK_WATCH_WINDOW_PUSHES) {
-                    val dupDelta = kcpSink.duplicateDropped - ackWatchLastDuplicates
+                    val dupDelta = sink.duplicateDropped - ackWatchLastDuplicates
                     val pushDelta = watchPushes - ackWatchLastPushes
                     ackWatchLastPushes = watchPushes
-                    ackWatchLastDuplicates = kcpSink.duplicateDropped
+                    ackWatchLastDuplicates = sink.duplicateDropped
                     val replyEndpoint = sourceRtpEndpoint
                     if (ackViaLoopback && !ackWatchLoggedLoopback && replyEndpoint != null &&
                         !replyEndpoint.address.isLoopbackAddress
