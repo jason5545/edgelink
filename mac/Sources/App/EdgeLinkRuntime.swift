@@ -1713,6 +1713,44 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
 
+        if !xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
+            startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_recovery_source")
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+                _ = await self.waitForXiaomiMirrorRTSPListenerReady(
+                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds
+                )
+                self.sendXiaomiMirrorSourceRecoveryCommand(
+                    event: event,
+                    attempt: attempt,
+                    route: xiaomiScreenRoute,
+                    peerHost: peerHost,
+                    peerPort: peerPort,
+                    cloudflareMirrorSessionId: cloudflareMirrorSessionId
+                )
+            }
+            return
+        }
+        sendXiaomiMirrorSourceRecoveryCommand(
+            event: event,
+            attempt: attempt,
+            route: xiaomiScreenRoute,
+            peerHost: peerHost,
+            peerPort: peerPort,
+            cloudflareMirrorSessionId: cloudflareMirrorSessionId
+        )
+    }
+
+    private func sendXiaomiMirrorSourceRecoveryCommand(
+        event: XiaomiMirrorRTSPRecoveryEvent,
+        attempt: Int,
+        route xiaomiScreenRoute: String,
+        peerHost: String?,
+        peerPort: UInt16,
+        cloudflareMirrorSessionId: String?
+    ) {
         let command = "xiaomi.mirror.requestSourceRecovery"
         var args: [String: String] = [
             "peerPort": String(peerPort),
@@ -3086,9 +3124,9 @@ final class EdgeLinkRuntime: ObservableObject {
                     notificationPresenter: notificationPresenter,
                     screenSession: screenSession,
                     clipboardHistoryStore: clipboardHistoryStore,
-                    onStatusPong: { [weak self] in
+                    onStatusPong: { [weak self] pong in
                         Task { @MainActor in
-                            self?.recordSecurePong(generation: channelGeneration)
+                            self?.recordSecurePong(generation: channelGeneration, pong: pong)
                         }
                     },
                     onSmsMessage: { [weak self] message in
