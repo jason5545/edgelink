@@ -36,6 +36,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
     private const val RTP_BATCH_MAX_DELAY_MS = 10L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
+    private const val KCP_ADVERTISED_RECEIVE_WINDOW = 128
     private const val LOCAL_RTP_RECEIVE_BUFFER_BYTES = 8 * 1024 * 1024
     private const val ANDROID_TO_MAC = "android_to_mac"
     private const val MAC_TO_ANDROID = "mac_to_android"
@@ -369,6 +370,29 @@ object AndroidMiLinkMirrorMediaBridge {
 
         private suspend fun receiveRTP(socket: DatagramSocket) {
             val buffer = ByteArray(64 * 1024)
+            val kcpSink = MiLinkMirrorKcpSink(
+                sessionId = sessionId,
+                receiveWindow = { KCP_ADVERTISED_RECEIVE_WINDOW },
+                onSendDatagram = { reply ->
+                    val target = sourceRtpEndpoint
+                    if (target != null && !socket.isClosed) {
+                        runCatching {
+                            socket.send(DatagramPacket(reply, reply.size, target))
+                        }
+                    }
+                },
+                onPayload = { payload ->
+                    if (rtpBatchQueue.trySend(payload).isFailure) {
+                        rtpBatchDatagramsDropped += 1
+                        if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
+                            EdgeLinkLog.warn(
+                                "xiaomi.mirror.android.cloudflare_rtp_batch_queue_full sessionId=$sessionId " +
+                                    "dropped=$rtpBatchDatagramsDropped"
+                            )
+                        }
+                    }
+                }
+            )
             while (currentCoroutineContext().isActive) {
                 val packet = DatagramPacket(buffer, buffer.size)
                 try {
@@ -402,15 +426,7 @@ object AndroidMiLinkMirrorMediaBridge {
                             "bytes=${data.size} ${rtpSummary(data)} fp=${EdgeLinkLog.fingerprint(data)}"
                     )
                 }
-                if (rtpBatchQueue.trySend(data).isFailure) {
-                    rtpBatchDatagramsDropped += 1
-                    if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
-                        EdgeLinkLog.warn(
-                            "xiaomi.mirror.android.cloudflare_rtp_batch_queue_full sessionId=$sessionId " +
-                                "dropped=$rtpBatchDatagramsDropped"
-                        )
-                    }
-                }
+                kcpSink.receiveDatagram(data)
             }
         }
 
@@ -454,7 +470,7 @@ object AndroidMiLinkMirrorMediaBridge {
                     MiLinkMirrorMediaBody(
                         sessionId = sessionId,
                         direction = ANDROID_TO_MAC,
-                        kind = "rtp_batch",
+                        kind = "rtp_payload_batch",
                         dataBase64 = Base64.getEncoder().encodeToString(packed),
                         bytes = packed.size,
                         sequence = rtpBatchesSent,

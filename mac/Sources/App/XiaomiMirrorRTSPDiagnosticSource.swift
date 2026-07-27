@@ -293,7 +293,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             return
         }
         guard body.direction == "android_to_mac",
-              body.kind == "rtp" || body.kind == "rtp_batch",
+              body.kind == "rtp" || body.kind == "rtp_batch" || body.kind == "rtp_payload_batch",
               let dataBase64 = body.dataBase64,
               let packet = Data(base64Encoded: dataBase64),
               let receiver = cloudflareMirrorReceiver else {
@@ -311,14 +311,18 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     "bytes=\(packet.count) kind=\(body.kind) fp=\(DiagnosticsLog.fingerprint(packet))"
             )
         }
-        if body.kind == "rtp_batch" {
+        if body.kind == "rtp_batch" || body.kind == "rtp_payload_batch" {
             var offset = 0
             while offset + 2 <= packet.count,
                   let datagramLength = packet.readUInt16BE(at: offset),
                   offset + 2 + Int(datagramLength) <= packet.count {
                 let start = offset + 2
                 let end = start + Int(datagramLength)
-                receiver.pushExternalRTPPacket(packet.subdata(in: start..<end), sequence: body.sequence)
+                if body.kind == "rtp_payload_batch" {
+                    receiver.pushExternalRTPPayload(packet.subdata(in: start..<end), sequence: body.sequence)
+                } else {
+                    receiver.pushExternalRTPPacket(packet.subdata(in: start..<end), sequence: body.sequence)
+                }
                 offset = end
             }
             if offset != packet.count {
@@ -3024,6 +3028,17 @@ private final class XiaomiMirrorRTPMediaSender {
             self.kcpDatagramsReceived += 1
             self.recordMPTMediaPacketActivity(reason: "cloudflare_datagram")
             self.kcpTransport.receiveDatagram(packet)
+        }
+    }
+
+    func pushExternalRTPPayload(_ payload: Data, sequence: Int?) {
+        queue.async {
+            guard self.mptSinkOnly, self.externalRTPReceiverStarted, !self.stopped else {
+                return
+            }
+            self.kcpDatagramsReceived += 1
+            self.recordMPTMediaPacketActivity(reason: "cloudflare_payload")
+            self.handleMPTSinkKCPPayload(payload, sn: 0)
         }
     }
 
