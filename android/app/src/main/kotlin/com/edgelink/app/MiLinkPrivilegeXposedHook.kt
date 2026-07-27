@@ -2262,8 +2262,9 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         val keyCode = extras.intCompat("keyCode", -1)
         val down = extras.booleanCompat("down")
         val modifiers = extras.intCompat("modifiers", 0)
+        val characters = extras.getString("characters").orEmpty()
         val requestId = extras.getString("requestId").orEmpty()
-        val injection = injectXiaomiMirrorKeyboardViaInputManager(classLoader, keyCode, down, modifiers)
+        val injection = injectXiaomiMirrorKeyboardViaInputManager(classLoader, keyCode, down, modifiers, characters)
         log(
             "mirror keyboard provider requestId=$requestId keyCode=$keyCode down=$down " +
                 "modifiers=$modifiers accepted=${injection.accepted} route=${injection.route} " +
@@ -2514,7 +2515,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         classLoader: ClassLoader,
         keyCode: Int,
         down: Boolean,
-        modifiers: Int
+        modifiers: Int,
+        characters: String = ""
     ): XiaomiMirrorKeyboardInjectionResult {
         if (keyCode <= 0) {
             return XiaomiMirrorKeyboardInjectionResult(
@@ -2522,6 +2524,16 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 route = "edgelink.inputmanager.keyboard",
                 message = "invalid keyCode=$keyCode"
             )
+        }
+        if (characters.isNotEmpty()) {
+            if (!down) {
+                return XiaomiMirrorKeyboardInjectionResult(
+                    accepted = true,
+                    route = "edgelink.inputmanager.text",
+                    message = "text key-up skipped keyCode=$keyCode"
+                )
+            }
+            return sendXiaomiMirrorText(classLoader, characters)
         }
         if (androidKeyCodeToMetaState(keyCode) == 0) {
             val shiftActive = synchronized(xiaomiMirrorKeyboardPressedKeys) {
@@ -3312,7 +3324,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             mirrorManager,
             "sendSynergyOperate",
             arrayOf(Integer.TYPE),
-            XIAOMI_MIRROR_SYNERGY_OPERATE_ON
+            XIAOMI_MIRROR_SYNERGY_OPERATE_OFF
         )
         val display = invokeMirrorManagerBoolean(
             mirrorManager,
@@ -7088,7 +7100,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG = 32
         private const val XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED = 1
         private const val XIAOMI_MIRROR_INPUT_STATE_MIRROR_ACTIVE = 0
-        private const val XIAOMI_MIRROR_SYNERGY_OPERATE_ON = 1
         private const val XIAOMI_MIRROR_SYNERGY_OPERATE_OFF = 0
         private const val XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID = -100
         private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
