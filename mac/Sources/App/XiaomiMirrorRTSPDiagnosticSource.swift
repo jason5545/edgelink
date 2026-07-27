@@ -2849,28 +2849,8 @@ private final class XiaomiMirrorRTPMediaSender {
     private var rtpPayloadOctetsSent: UInt64 = 0
     private var rtcpSRSent: UInt64 = 0
     private var lastRTPTimestamp: UInt32 = 0
-    private var kcpSendSN: UInt32 = 0
-    private var kcpRemoteNextReceiveSN: UInt32 = 0
-    private var kcpPacketsSent: UInt64 = 0
-    private var kcpBytesSent: UInt64 = 0
-    private var kcpACKsReceived: UInt64 = 0
-    private var kcpACKSent: UInt64 = 0
-    private var kcpWASKReceived: UInt64 = 0
-    private var kcpWINSSent: UInt64 = 0
-    private var kcpWINSReceived: UInt64 = 0
-    private var kcpPUSHReceived: UInt64 = 0
     private var kcpDatagramsReceived: UInt64 = 0
     private var kcpDatagramReceiveErrors: UInt64 = 0
-    private var kcpLatestACKSN: UInt32?
-    private var kcpLatestRemoteUNA: UInt32?
-    private var kcpConversationID: UInt32?
-    private var kcpConversationIgnoredCount: UInt64 = 0
-    private var kcpReceiveBuffer: [UInt32: KCPIncomingSegment] = [:]
-    private var kcpOutOfOrderBufferedCount: UInt64 = 0
-    private var kcpDuplicateDroppedCount: UInt64 = 0
-    private var kcpReceiveResyncCount: UInt64 = 0
-    private var kcpOutOfOrderStartedUptimeNanoseconds: UInt64 = 0
-    private var kcpOutOfOrderExpectedSN: UInt32?
     private var mptSinkInterleavedBuffer = Data()
     private var mptSinkInterleavedFramesReceived: UInt64 = 0
     private var mptSinkInterleavedMalformedCount: UInt64 = 0
@@ -2889,7 +2869,6 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkDecodedFrames: UInt64 = 0
     private var mptSinkDecodeFailedFrames: UInt64 = 0
     private var lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-    private var lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTDecodedFrameUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var lastMPTVideoPESUptimeNanoseconds: UInt64 = 0
     private var lastMPTFrameStallDecoderResetUptimeNanoseconds: UInt64 = 0
@@ -2897,10 +2876,18 @@ private final class XiaomiMirrorRTPMediaSender {
     private var externalRTPReceiverStarted = false
     private var stopped = false
     var onExternalDatagramSend: ((Data) -> Void)?
-    var onExternalDatagramBatchSend: (([Data]) -> Void)?
-    private var kcpACKBatch: [Data] = []
-    private var kcpACKBatchWorkItem: DispatchWorkItem?
-    private let kcpACKBatchLock = NSLock()
+    var onExternalDatagramBatchSend: (([Data]) -> Void)? {
+        didSet {
+            if onExternalDatagramBatchSend != nil {
+                kcpTransport.onSendDatagramBatch = { [weak self] packets in
+                    self?.onExternalDatagramBatchSend?(packets)
+                }
+            } else {
+                kcpTransport.onSendDatagramBatch = nil
+            }
+        }
+    }
+    private let kcpTransport: MiplayKcpTransport
 
     init(
         transportMode: XiaomiMirrorRTSPTransportMode,
@@ -2928,7 +2915,11 @@ private final class XiaomiMirrorRTPMediaSender {
         self.onMPTMediaStalled = onMPTMediaStalled
         self.initialHEVCParameterSets = initialHEVCParameterSets
         self.onMPTHEVCParameterSets = onMPTHEVCParameterSets
-        self.kcpConversationID = mptSinkOnly ? nil : Self.defaultKCPConversationID
+        self.kcpTransport = MiplayKcpTransport(
+            sinkMode: mptSinkOnly,
+            conversationID: mptSinkOnly ? nil : MiplayKcpTransport.defaultConversationID,
+            sessionDescription: sessionID.uuidString
+        )
         self.encoder = try XiaomiMirrorH264Encoder(
             width: XiaomiMirrorVideoDefaults.width,
             height: XiaomiMirrorVideoDefaults.height,
@@ -2975,6 +2966,27 @@ private final class XiaomiMirrorRTPMediaSender {
                 }
             )
         }
+        kcpTransport.onSendDatagram = { [weak self] packet in
+            _ = self?.sendMPTDatagram(packet)
+        }
+        kcpTransport.onRTPPayload = { [weak self] payload, sn in
+            guard let self else {
+                return
+            }
+            self.recordMPTMediaPacketActivity(reason: "kcp_push")
+            self.handleMPTSinkKCPPayload(payload, sn: sn)
+        }
+        kcpTransport.onTransportLoss = { [weak self] reason, detail in
+            self?.resetMPTSinkAfterTransportLoss(reason: reason, detail: detail)
+        }
+        kcpTransport.onLog = { level, message in
+            switch level {
+            case .info:
+                DiagnosticsLog.info(message)
+            case .warning:
+                DiagnosticsLog.warn(message)
+            }
+        }
     }
 
     func start() {
@@ -3011,7 +3023,7 @@ private final class XiaomiMirrorRTPMediaSender {
             }
             self.kcpDatagramsReceived += 1
             self.recordMPTMediaPacketActivity(reason: "cloudflare_datagram")
-            self.handleKCPDatagram(packet)
+            self.kcpTransport.receiveDatagram(packet)
         }
     }
 
@@ -3153,7 +3165,7 @@ private final class XiaomiMirrorRTPMediaSender {
             startMPTSinkPacketWatchdog()
         }
         startMPTReceiveSource(fd: fd)
-        let convDescription = kcpConversationID.map { Self.hex32($0) } ?? "pending_peer_first_segment"
+        let convDescription = kcpTransport.conversationID.map { Self.hex32($0) } ?? "pending_peer_first_segment"
         DiagnosticsLog.info(
             "xiaomi.mirror.mpt.start session=\(sessionID.uuidString) destination=\(destinationHost):\(destinationRTPPort) " +
                 "localPort=\(localRTPPort) socket=raw_udp_recvfrom conv=\(convDescription) " +
@@ -3186,7 +3198,7 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        kcpTransport.lastPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
@@ -3216,7 +3228,7 @@ private final class XiaomiMirrorRTPMediaSender {
         // delivered ones: a lost KCP segment blocks delivery while the
         // source keeps sending, and must go through resync instead of
         // source recovery.
-        let elapsedMediaSeconds = Self.elapsedSeconds(since: lastMPTAnyPushUptimeNanoseconds, now: now)
+        let elapsedMediaSeconds = Self.elapsedSeconds(since: kcpTransport.lastPushUptimeNanoseconds, now: now)
         let elapsedFrameSeconds = mptSinkDecodedFrames > 0 || mptSinkRTPPacketsReceived > 20
             ? Self.elapsedSeconds(since: lastMPTDecodedFrameUptimeNanoseconds, now: now)
             : nil
@@ -3229,7 +3241,7 @@ private final class XiaomiMirrorRTPMediaSender {
             DiagnosticsLog.warn(
                 "xiaomi.mirror.mpt.no_packets_timeout session=\(sessionID.uuidString) " +
                     "elapsedSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) " +
-                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
                     "decodedFrames=\(mptSinkDecodedFrames) officialAction=keep_sink_request_source_recovery"
             )
             onMPTMediaStalled?(stall)
@@ -3259,7 +3271,7 @@ private final class XiaomiMirrorRTPMediaSender {
                     "thresholdSeconds=\(Self.mptSinkNoFrameTimeoutSeconds) " +
                     "elapsedMediaSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) " +
                     "videoESStaleSeconds=\(videoESStaleSeconds == .infinity ? "none" : String(format: "%.2f", videoESStaleSeconds)) " +
-                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
                     "decodedFrames=\(mptSinkDecodedFrames) officialAction=fast_source_recovery_keep_rtsp"
             )
             if stallReason != "video_es_absent" {
@@ -3284,7 +3296,7 @@ private final class XiaomiMirrorRTPMediaSender {
             elapsedMediaSeconds: elapsedMediaSeconds,
             elapsedFrameSeconds: elapsedFrameSeconds,
             datagramsReceived: kcpDatagramsReceived,
-            pushReceived: kcpPUSHReceived,
+            pushReceived: kcpTransport.pushReceived,
             inboundRTP: mptSinkRTPPacketsReceived,
             decodedFrames: mptSinkDecodedFrames
         )
@@ -3295,10 +3307,10 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         lastMPTMediaPacketUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        if kcpPUSHReceived <= 5 || kcpPUSHReceived % 100 == 0 {
+        if kcpTransport.pushReceived <= 5 || kcpTransport.pushReceived % 100 == 0 {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.media_packet_activity session=\(sessionID.uuidString) " +
-                    "reason=\(reason) pushReceived=\(kcpPUSHReceived) rtpReceived=\(mptSinkRTPPacketsReceived) " +
+                    "reason=\(reason) pushReceived=\(kcpTransport.pushReceived) rtpReceived=\(mptSinkRTPPacketsReceived) " +
                     "decodedFrames=\(mptSinkDecodedFrames)"
             )
         }
@@ -3437,7 +3449,7 @@ private final class XiaomiMirrorRTPMediaSender {
         rtpPayloadOctetsSent += UInt64(payload.count)
         lastRTPTimestamp = timestamp
         if transportMode == .mpt {
-            sendKCPPush(payload: packet, rtpSequence: currentSequence)
+            kcpTransport.sendPush(payload: packet, rtpSequence: currentSequence)
         } else {
             connection?.send(content: packet, completion: .contentProcessed { error in
                 if let error {
@@ -3447,38 +3459,6 @@ private final class XiaomiMirrorRTPMediaSender {
                     )
                 }
             })
-        }
-    }
-
-    private func sendKCPPush(payload: Data, rtpSequence: UInt16) {
-        let sn = kcpSendSN
-        kcpSendSN &+= 1
-        guard let packet = makeKCPSegment(
-            cmd: Self.kcpCommandPush,
-            ts: Self.monotonicMilliseconds(),
-            sn: sn,
-            una: kcpRemoteNextReceiveSN,
-            payload: payload
-        ) else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_push_skipped session=\(sessionID.uuidString) reason=missing_conv sn=\(sn) rtpSeq=\(rtpSequence)"
-            )
-            return
-        }
-        guard sendMPTDatagram(packet) else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_push_failed session=\(sessionID.uuidString) sn=\(sn) rtpSeq=\(rtpSequence) errno=\(errno)"
-            )
-            return
-        }
-        kcpPacketsSent += 1
-        kcpBytesSent += UInt64(packet.count)
-        if kcpPacketsSent <= 5 || kcpPacketsSent % 300 == 0 {
-            DiagnosticsLog.info(
-                "xiaomi.mirror.mpt.kcp_push_sent session=\(sessionID.uuidString) sn=\(sn) rtpSeq=\(rtpSequence) " +
-                    "bytes=\(packet.count) payloadBytes=\(payload.count) una=\(kcpRemoteNextReceiveSN) " +
-                    "packetsSent=\(kcpPacketsSent) bytesSent=\(kcpBytesSent)"
-            )
         }
     }
 
@@ -3566,7 +3546,7 @@ private final class XiaomiMirrorRTPMediaSender {
                             "firstBytes=\(Self.hexPreview(data, limit: 12))"
                     )
                 }
-                handleKCPDatagram(data)
+                kcpTransport.receiveDatagram(data)
                 continue
             }
             if byteCount == 0 {
@@ -3582,229 +3562,6 @@ private final class XiaomiMirrorRTPMediaSender {
             )
             return
         }
-    }
-
-    private func handleKCPDatagram(_ data: Data) {
-        var offset = 0
-        var parsedSegments = 0
-        while offset + Self.kcpHeaderLength <= data.count {
-            guard let segment = KCPIncomingSegment(data: data, offset: offset) else {
-                break
-            }
-            let segmentLength = Self.kcpHeaderLength + Int(segment.length)
-            guard offset + segmentLength <= data.count else {
-                DiagnosticsLog.warn(
-                    "xiaomi.mirror.mpt.kcp_malformed session=\(sessionID.uuidString) bytes=\(data.count) " +
-                        "offset=\(offset) declaredLength=\(segment.length)"
-                )
-                break
-            }
-            handleKCPSegment(segment)
-            offset += segmentLength
-            parsedSegments += 1
-        }
-        if parsedSegments == 0 {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_malformed session=\(sessionID.uuidString) bytes=\(data.count) " +
-                    "firstBytes=\(Self.hexPreview(data, limit: 16))"
-            )
-        }
-    }
-
-    private func handleKCPSegment(_ segment: KCPIncomingSegment) {
-        guard establishKCPConversationIfNeeded(from: segment) else {
-            logIgnoredKCPConversation(segment)
-            return
-        }
-        guard segment.conv == kcpConversationID else {
-            logIgnoredKCPConversation(segment)
-            return
-        }
-        switch segment.command {
-        case Self.kcpCommandACK:
-            kcpACKsReceived += 1
-            kcpLatestACKSN = segment.sn
-            kcpLatestRemoteUNA = segment.una
-            if kcpACKsReceived <= 5 || kcpACKsReceived % 100 == 0 {
-                DiagnosticsLog.info(
-                    "xiaomi.mirror.mpt.kcp_ack_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
-                        "una=\(segment.una) ts=\(segment.ts) acks=\(kcpACKsReceived) packetsSent=\(kcpPacketsSent)"
-                )
-            }
-        case Self.kcpCommandWASK:
-            kcpWASKReceived += 1
-            sendKCPWINS(responseTo: segment)
-            DiagnosticsLog.info(
-                "xiaomi.mirror.mpt.kcp_wask_received session=\(sessionID.uuidString) count=\(kcpWASKReceived) " +
-                    "sn=\(segment.sn) una=\(segment.una)"
-            )
-        case Self.kcpCommandWINS:
-            kcpWINSReceived += 1
-            if kcpWINSReceived <= 5 || kcpWINSReceived % 20 == 0 {
-                DiagnosticsLog.info(
-                    "xiaomi.mirror.mpt.kcp_wins_received session=\(sessionID.uuidString) count=\(kcpWINSReceived) " +
-                        "sn=\(segment.sn) una=\(segment.una)"
-                )
-            }
-        case Self.kcpCommandPush:
-            kcpPUSHReceived += 1
-            handleKCPPush(segment)
-        default:
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_unknown_received session=\(sessionID.uuidString) " +
-                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn) len=\(segment.length)"
-            )
-        }
-    }
-
-    private func handleKCPPush(_ segment: KCPIncomingSegment) {
-        // Any arriving push — even out-of-order or buffered — proves the
-        // source is still sending. Head-of-line blocking behind a lost
-        // segment must not read as "no packets from source".
-        lastMPTAnyPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        if mptSinkOnly,
-           mptSinkRTPPacketsReceived == 0,
-           kcpReceiveBuffer.isEmpty,
-           kcpRemoteNextReceiveSN == 0,
-           segment.sn != 0 {
-            kcpRemoteNextReceiveSN = segment.sn
-            resetMPTSinkAfterTransportLoss(
-                reason: "kcp_first_push_resync",
-                detail: "sn=\(segment.sn)"
-            )
-        }
-        let delta = Self.sequenceDelta(segment.sn, from: kcpRemoteNextReceiveSN)
-        if delta == 0 {
-            deliverKCPPush(segment)
-            kcpRemoteNextReceiveSN &+= 1
-            drainKCPReceiveBuffer()
-            sendKCPACK(responseTo: segment)
-            return
-        }
-        if delta < 0 {
-            kcpDuplicateDroppedCount += 1
-            sendKCPACK(responseTo: segment)
-            if kcpDuplicateDroppedCount <= 5 || kcpDuplicateDroppedCount % 50 == 0 {
-                DiagnosticsLog.warn(
-                    "xiaomi.mirror.mpt.kcp_duplicate_dropped session=\(sessionID.uuidString) " +
-                        "sn=\(segment.sn) expected=\(kcpRemoteNextReceiveSN) duplicates=\(kcpDuplicateDroppedCount)"
-                )
-            }
-            return
-        }
-
-        if kcpReceiveBuffer.count >= Self.kcpReceiveBufferLimit || delta > Int64(Self.kcpReceiveMaxGap) {
-            kcpReceiveResyncCount += 1
-            kcpReceiveBuffer.removeAll(keepingCapacity: true)
-            resetKCPOutOfOrderTracking()
-            resetMPTSinkAfterTransportLoss(
-                reason: "kcp_receive_resync",
-                detail: "sn=\(segment.sn) expected=\(kcpRemoteNextReceiveSN) gap=\(delta)"
-            )
-            kcpRemoteNextReceiveSN = segment.sn
-            deliverKCPPush(segment)
-            kcpRemoteNextReceiveSN &+= 1
-            sendKCPACK(responseTo: segment)
-            return
-        }
-
-        noteKCPOutOfOrderBufferingIfNeeded()
-        if kcpReceiveBuffer[segment.sn] == nil {
-            kcpReceiveBuffer[segment.sn] = segment
-            kcpOutOfOrderBufferedCount += 1
-        }
-        if shouldResyncStalledKCPReceiveBuffer(delta: delta) {
-            resyncStalledKCPReceiveBuffer(responseTo: segment, delta: delta)
-            return
-        }
-        sendKCPACK(responseTo: segment)
-        if kcpOutOfOrderBufferedCount <= 5 || kcpOutOfOrderBufferedCount % 50 == 0 {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_out_of_order_buffered session=\(sessionID.uuidString) " +
-                    "sn=\(segment.sn) expected=\(kcpRemoteNextReceiveSN) gap=\(delta) " +
-                    "buffered=\(kcpReceiveBuffer.count) total=\(kcpOutOfOrderBufferedCount)"
-            )
-        }
-    }
-
-    private func drainKCPReceiveBuffer() {
-        while let segment = kcpReceiveBuffer.removeValue(forKey: kcpRemoteNextReceiveSN) {
-            deliverKCPPush(segment)
-            kcpRemoteNextReceiveSN &+= 1
-        }
-        if kcpReceiveBuffer.isEmpty {
-            resetKCPOutOfOrderTracking()
-        }
-    }
-
-    private func noteKCPOutOfOrderBufferingIfNeeded() {
-        guard kcpReceiveBuffer.isEmpty,
-              kcpOutOfOrderStartedUptimeNanoseconds == 0 else {
-            return
-        }
-        kcpOutOfOrderStartedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-        kcpOutOfOrderExpectedSN = kcpRemoteNextReceiveSN
-    }
-
-    private func shouldResyncStalledKCPReceiveBuffer(delta: Int64) -> Bool {
-        guard mptSinkOnly,
-              !kcpReceiveBuffer.isEmpty,
-              kcpOutOfOrderStartedUptimeNanoseconds > 0 else {
-            return false
-        }
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard now - kcpOutOfOrderStartedUptimeNanoseconds >= Self.kcpReceiveStallResyncDelayNanoseconds else {
-            return false
-        }
-        // At low packet rates (static screen) the count/gap thresholds below
-        // can take longer than the 6s stall watchdog, so bound any
-        // head-of-line stall by time as well.
-        if !kcpReceiveBuffer.isEmpty,
-           now - kcpOutOfOrderStartedUptimeNanoseconds >= Self.kcpReceiveStallResyncMaxStallNanoseconds {
-            return true
-        }
-        return delta >= Self.kcpReceiveStallResyncMinGap ||
-            kcpReceiveBuffer.count >= Self.kcpReceiveStallResyncMinBuffered
-    }
-
-    private func resyncStalledKCPReceiveBuffer(responseTo segment: KCPIncomingSegment, delta: Int64) {
-        guard let targetSN = kcpReceiveBuffer.keys.min() else {
-            return
-        }
-        let previousExpected = kcpOutOfOrderExpectedSN ?? kcpRemoteNextReceiveSN
-        let buffered = kcpReceiveBuffer.count
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - kcpOutOfOrderStartedUptimeNanoseconds) / 1_000_000
-        kcpReceiveResyncCount += 1
-        resetMPTSinkAfterTransportLoss(
-            reason: "kcp_out_of_order_stalled_resync",
-            detail: "target=\(targetSN) expected=\(previousExpected) gap=\(delta) buffered=\(buffered) elapsedMs=\(String(format: "%.0f", elapsedMs))"
-        )
-        kcpRemoteNextReceiveSN = targetSN
-        drainKCPReceiveBuffer()
-        sendKCPACK(responseTo: segment)
-        DiagnosticsLog.warn(
-            "xiaomi.mirror.mpt.kcp_out_of_order_stalled_resync session=\(sessionID.uuidString) " +
-                "target=\(targetSN) previousExpected=\(previousExpected) gap=\(delta) " +
-                "buffered=\(buffered) elapsedMs=\(String(format: "%.0f", elapsedMs)) " +
-                "resyncs=\(kcpReceiveResyncCount)"
-        )
-    }
-
-    private func resetKCPOutOfOrderTracking() {
-        kcpOutOfOrderStartedUptimeNanoseconds = 0
-        kcpOutOfOrderExpectedSN = nil
-    }
-
-    private func deliverKCPPush(_ segment: KCPIncomingSegment) {
-        recordMPTMediaPacketActivity(reason: "kcp_push")
-        if kcpPUSHReceived <= 5 || kcpPUSHReceived % 20 == 0 {
-            DiagnosticsLog.info(
-                "xiaomi.mirror.mpt.kcp_push_received session=\(sessionID.uuidString) sn=\(segment.sn) " +
-                    "payloadBytes=\(segment.length) remoteNext=\(kcpRemoteNextReceiveSN) " +
-                    "pushReceived=\(kcpPUSHReceived) payloadFirstBytes=\(Self.hexPreview(segment.payload, limit: 12))"
-            )
-        }
-        handleMPTSinkKCPPayload(segment.payload, sn: segment.sn)
     }
 
     private func handleMPTSinkKCPPayload(_ payload: Data, sn: UInt32) {
@@ -3947,7 +3704,7 @@ private final class XiaomiMirrorRTPMediaSender {
         }
         DiagnosticsLog.warn(
             "xiaomi.mirror.mpt.transport_discontinuity session=\(sessionID.uuidString) " +
-                "reason=\(reason) \(detail) kcpResync=\(kcpReceiveResyncCount) " +
+                "reason=\(reason) \(detail) kcpResync=\(kcpTransport.receiveResyncCount) " +
                 "rtpGaps=\(mptSinkRTPSequenceGapCount)"
         )
     }
@@ -3981,7 +3738,7 @@ private final class XiaomiMirrorRTPMediaSender {
             "xiaomi.mirror.mpt.decoder_reset_deferred_for_frame_stall session=\(sessionID.uuidString) " +
                 "count=\(resetCount) elapsedFrameSeconds=\(String(format: "%.2f", elapsedFrameSeconds)) " +
                 "elapsedMediaSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) " +
-                "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpPUSHReceived) " +
+                "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) " +
                 "inboundRTP=\(mptSinkRTPPacketsReceived) decodedFrames=\(mptSinkDecodedFrames)"
         )
     }
@@ -4042,101 +3799,6 @@ private final class XiaomiMirrorRTPMediaSender {
         return (data[0] >> 6) == 2
     }
 
-    private func sendKCPACK(responseTo segment: KCPIncomingSegment) {
-        guard let packet = makeKCPSegment(
-            cmd: Self.kcpCommandACK,
-            ts: segment.ts,
-            sn: segment.sn,
-            una: kcpRemoteNextReceiveSN,
-            payload: Data()
-        ) else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_ack_send_skipped session=\(sessionID.uuidString) reason=missing_conv " +
-                    "peerConv=\(Self.hex32(segment.conv)) sn=\(segment.sn)"
-            )
-            return
-        }
-        if sendKCPACKPacket(packet) {
-            kcpACKSent += 1
-            if kcpACKSent <= 5 || kcpACKSent % 50 == 0 {
-                DiagnosticsLog.info(
-                    "xiaomi.mirror.mpt.kcp_ack_sent session=\(sessionID.uuidString) sn=\(segment.sn) " +
-                        "una=\(kcpRemoteNextReceiveSN) conv=\(Self.hex32(segment.conv)) ackSent=\(kcpACKSent)"
-                )
-            }
-        } else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_ack_send_failed session=\(sessionID.uuidString) sn=\(segment.sn) errno=\(errno)"
-            )
-        }
-    }
-
-    private func sendKCPACKPacket(_ packet: Data) -> Bool {
-        guard onExternalDatagramBatchSend != nil else {
-            return sendMPTDatagram(packet)
-        }
-        var flushNow = false
-        kcpACKBatchLock.lock()
-        kcpACKBatch.append(packet)
-        if kcpACKBatch.count >= Self.kcpACKBatchMaxCount {
-            flushNow = true
-        } else if kcpACKBatchWorkItem == nil {
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.flushKCPACKBatch()
-            }
-            kcpACKBatchWorkItem = workItem
-            DispatchQueue.global(qos: .userInteractive).asyncAfter(
-                deadline: .now() + Self.kcpACKBatchDelaySeconds,
-                execute: workItem
-            )
-        }
-        kcpACKBatchLock.unlock()
-        if flushNow {
-            flushKCPACKBatch()
-        }
-        return true
-    }
-
-    private func flushKCPACKBatch() {
-        kcpACKBatchLock.lock()
-        kcpACKBatchWorkItem?.cancel()
-        kcpACKBatchWorkItem = nil
-        let packets = kcpACKBatch
-        kcpACKBatch.removeAll(keepingCapacity: true)
-        kcpACKBatchLock.unlock()
-        guard !packets.isEmpty else {
-            return
-        }
-        if let onExternalDatagramBatchSend {
-            onExternalDatagramBatchSend(packets)
-        } else {
-            for packet in packets {
-                _ = sendMPTDatagram(packet)
-            }
-        }
-    }
-
-    private func sendKCPWINS(responseTo segment: KCPIncomingSegment) {
-        guard let packet = makeKCPSegment(
-            cmd: Self.kcpCommandWINS,
-            ts: segment.ts,
-            sn: segment.sn,
-            una: kcpRemoteNextReceiveSN,
-            payload: Data()
-        ) else {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_wins_send_skipped session=\(sessionID.uuidString) reason=missing_conv " +
-                    "peerConv=\(Self.hex32(segment.conv)) sn=\(segment.sn)"
-            )
-            return
-        }
-        if sendMPTDatagram(packet) {
-            kcpWINSSent += 1
-        } else {
-            DiagnosticsLog.warn("xiaomi.mirror.mpt.kcp_wins_send_failed session=\(sessionID.uuidString) errno=\(errno)")
-        }
-    }
-
     private func sendMPTDatagram(_ packet: Data) -> Bool {
         if let onExternalDatagramSend {
             onExternalDatagramSend(packet)
@@ -4162,59 +3824,12 @@ private final class XiaomiMirrorRTPMediaSender {
                 }
             }
         }
-        return sent == packet.count
-    }
-
-    private func makeKCPSegment(cmd: UInt8, ts: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data? {
-        guard let conv = kcpConversationID else {
-            return nil
-        }
-        var packet = Data(capacity: Self.kcpHeaderLength + payload.count)
-        packet.appendUInt32LE(conv)
-        packet.append(cmd)
-        packet.append(0)
-        packet.appendUInt16LE(Self.kcpReceiveWindow)
-        packet.appendUInt32LE(ts)
-        packet.appendUInt32LE(sn)
-        packet.appendUInt32LE(una)
-        packet.appendUInt32LE(UInt32(truncatingIfNeeded: payload.count))
-        packet.append(payload)
-        return packet
-    }
-
-    private func establishKCPConversationIfNeeded(from segment: KCPIncomingSegment) -> Bool {
-        if kcpConversationID != nil {
-            return true
-        }
-        guard mptSinkOnly else {
-            kcpConversationID = Self.defaultKCPConversationID
-            return true
-        }
-        guard Self.isKnownKCPCommand(segment.command), segment.conv != 0 else {
-            return false
-        }
-        kcpConversationID = segment.conv
-        if segment.command == Self.kcpCommandPush {
-            kcpRemoteNextReceiveSN = segment.sn
-        }
-        DiagnosticsLog.info(
-            "xiaomi.mirror.mpt.kcp_conv_initialized session=\(sessionID.uuidString) " +
-                "role=sink_receiver conv=\(Self.hex32(segment.conv)) cmd=0x\(String(segment.command, radix: 16)) " +
-                "sn=\(segment.sn) una=\(segment.una) len=\(segment.length)"
-        )
-        return true
-    }
-
-    private func logIgnoredKCPConversation(_ segment: KCPIncomingSegment) {
-        kcpConversationIgnoredCount += 1
-        if kcpConversationIgnoredCount <= 5 || kcpConversationIgnoredCount % 50 == 0 {
-            let expected = kcpConversationID.map { Self.hex32($0) } ?? "uninitialized"
+        if sent != packet.count {
             DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.kcp_conv_ignored session=\(sessionID.uuidString) " +
-                    "expected=\(expected) actual=\(Self.hex32(segment.conv)) " +
-                    "cmd=0x\(String(segment.command, radix: 16)) sn=\(segment.sn) count=\(kcpConversationIgnoredCount)"
+                "xiaomi.mirror.mpt.datagram_send_failed session=\(sessionID.uuidString) bytes=\(packet.count) sent=\(sent) errno=\(errno)"
             )
         }
+        return sent == packet.count
     }
 
     private static func currentNTPTimestamp() -> (seconds: UInt32, fraction: UInt32) {
@@ -4223,10 +3838,6 @@ private final class XiaomiMirrorRTPMediaSender {
         let seconds = UInt32(timestamp)
         let fraction = UInt32((timestamp - floor(timestamp)) * 4_294_967_296)
         return (seconds, fraction)
-    }
-
-    private static func monotonicMilliseconds() -> UInt32 {
-        UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
     private static func hexPreview(_ data: Data, limit: Int) -> String {
@@ -4279,18 +3890,18 @@ private final class XiaomiMirrorRTPMediaSender {
         if transportMode == .mpt {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.stop session=\(sessionID.uuidString) reason=\(reason) " +
-                    "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) kcpPackets=\(kcpPacketsSent) " +
-                    "bytesSent=\(kcpBytesSent) acks=\(kcpACKsReceived) ackSent=\(kcpACKSent) " +
-                    "wask=\(kcpWASKReceived) winsReceived=\(kcpWINSReceived) winsSent=\(kcpWINSSent) " +
-                    "pushReceived=\(kcpPUSHReceived) datagrams=\(kcpDatagramsReceived) recvErrors=\(kcpDatagramReceiveErrors) " +
+                    "frames=\(framesSent) rtpPackets=\(rtpPacketsSent) kcpPackets=\(kcpTransport.packetsSent) " +
+                    "bytesSent=\(kcpTransport.bytesSent) acks=\(kcpTransport.acksReceived) ackSent=\(kcpTransport.acksSent) " +
+                    "wask=\(kcpTransport.waskReceived) winsReceived=\(kcpTransport.winsReceived) winsSent=\(kcpTransport.winsSent) " +
+                    "pushReceived=\(kcpTransport.pushReceived) datagrams=\(kcpDatagramsReceived) recvErrors=\(kcpDatagramReceiveErrors) " +
                     "interleavedFrames=\(mptSinkInterleavedFramesReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
                     "inboundTS=\(mptSinkTSPacketsReceived) rtpMalformed=\(mptSinkRTPMalformedCount) " +
                     "interleavedMalformed=\(mptSinkInterleavedMalformedCount) tsCaptureBytes=\(mptSinkTSCaptureBytes) " +
                     "decodedFrames=\(mptSinkDecodedFrames) decodeFailed=\(mptSinkDecodeFailedFrames) " +
                     "tsCapturePath=\(Self.mptSinkTSCapturePath) " +
-                    "latestAck=\(kcpLatestACKSN.map(String.init) ?? "none") " +
-                    "latestRemoteUna=\(kcpLatestRemoteUNA.map(String.init) ?? "none") " +
-                    "conv=\(kcpConversationID.map { Self.hex32($0) } ?? "none") convIgnored=\(kcpConversationIgnoredCount)"
+                    "latestAck=\(kcpTransport.latestACKSN.map(String.init) ?? "none") " +
+                    "latestRemoteUna=\(kcpTransport.latestRemoteUNA.map(String.init) ?? "none") " +
+                    "conv=\(kcpTransport.conversationID.map { Self.hex32($0) } ?? "none") convIgnored=\(kcpTransport.conversationIgnoredCount)"
             )
         } else {
             DiagnosticsLog.info(
@@ -4300,22 +3911,7 @@ private final class XiaomiMirrorRTPMediaSender {
         }
     }
 
-    private static let defaultKCPConversationID: UInt32 = 0x1234_5678
-    private static let kcpCommandPush: UInt8 = 0x51
-    private static let kcpCommandACK: UInt8 = 0x52
-    private static let kcpCommandWASK: UInt8 = 0x53
-    private static let kcpCommandWINS: UInt8 = 0x54
-    private static let kcpHeaderLength = 24
-    private static let kcpReceiveWindow: UInt16 = 600
-    private static let kcpReceiveBufferLimit = 600
-    private static let kcpReceiveMaxGap: UInt32 = 1_200
-    private static let kcpReceiveStallResyncDelayNanoseconds: UInt64 = 900_000_000
-    private static let kcpReceiveStallResyncMaxStallNanoseconds: UInt64 = 2_500_000_000
-    private static let kcpReceiveStallResyncMinGap: Int64 = 128
-    private static let kcpReceiveStallResyncMinBuffered = 48
     private static let officialMPTSocketBufferBytes: Int32 = 6_291_456
-    private static let kcpACKBatchMaxCount = 16
-    private static let kcpACKBatchDelaySeconds: Double = 0.005
     private static let mptSinkNoPacketTimeoutSeconds: Double = 6
     private static let mptSinkNoFrameTimeoutSeconds: Double = 2
     private static let mptSinkVideoESAbsentThresholdSeconds: Double = 5
@@ -4327,10 +3923,6 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let mpegTSPacketLength = 188
     private static let mptSinkTSCapturePath = "/private/tmp/edgelink-xiaomi-mirror.ts"
     private static let mptSinkTSCaptureLimitBytes = 8 * 1024 * 1024
-
-    private static func isKnownKCPCommand(_ command: UInt8) -> Bool {
-        command == kcpCommandPush || command == kcpCommandACK || command == kcpCommandWASK || command == kcpCommandWINS
-    }
 
     private static func inspectMPEGTS(_ payload: Data) -> MPEGTSInspection {
         let packetCount = payload.count / mpegTSPacketLength
@@ -4355,10 +3947,6 @@ private final class XiaomiMirrorRTPMediaSender {
 
     private static func hexPID(_ value: UInt16) -> String {
         String(format: "0x%04x", value)
-    }
-
-    private static func sequenceDelta(_ current: UInt32, from previous: UInt32) -> Int64 {
-        Int64(Int32(bitPattern: current &- previous))
     }
 
     private static func sequenceDelta(_ current: UInt16, from previous: UInt16) -> Int {
@@ -4417,41 +4005,6 @@ private final class XiaomiMirrorRTPMediaSender {
         }
         let host = String(cString: hostBuffer)
         return "\(host):\(port)"
-    }
-}
-
-private struct KCPIncomingSegment {
-    let conv: UInt32
-    let command: UInt8
-    let fragment: UInt8
-    let window: UInt16
-    let ts: UInt32
-    let sn: UInt32
-    let una: UInt32
-    let length: UInt32
-    let payload: Data
-
-    init?(data: Data, offset: Int) {
-        guard offset + 24 <= data.count,
-              let conv = data.readUInt32LE(at: offset),
-              let window = data.readUInt16LE(at: offset + 6),
-              let ts = data.readUInt32LE(at: offset + 8),
-              let sn = data.readUInt32LE(at: offset + 12),
-              let una = data.readUInt32LE(at: offset + 16),
-              let length = data.readUInt32LE(at: offset + 20) else {
-            return nil
-        }
-        self.conv = conv
-        self.command = data[offset + 4]
-        self.fragment = data[offset + 5]
-        self.window = window
-        self.ts = ts
-        self.sn = sn
-        self.una = una
-        self.length = length
-        let payloadStart = offset + 24
-        let payloadEnd = payloadStart + Int(length)
-        self.payload = payloadEnd <= data.count ? data[payloadStart..<payloadEnd] : Data()
     }
 }
 
@@ -6284,35 +5837,6 @@ private extension Data {
         append(UInt8((value >> 16) & 0xff))
         append(UInt8((value >> 8) & 0xff))
         append(UInt8(value & 0xff))
-    }
-
-    mutating func appendUInt16LE(_ value: UInt16) {
-        append(UInt8(value & 0xff))
-        append(UInt8((value >> 8) & 0xff))
-    }
-
-    mutating func appendUInt32LE(_ value: UInt32) {
-        append(UInt8(value & 0xff))
-        append(UInt8((value >> 8) & 0xff))
-        append(UInt8((value >> 16) & 0xff))
-        append(UInt8((value >> 24) & 0xff))
-    }
-
-    func readUInt16LE(at offset: Int) -> UInt16? {
-        guard offset >= 0, offset + 1 < count else {
-            return nil
-        }
-        return UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
-    }
-
-    func readUInt32LE(at offset: Int) -> UInt32? {
-        guard offset >= 0, offset + 3 < count else {
-            return nil
-        }
-        return UInt32(self[offset]) |
-            (UInt32(self[offset + 1]) << 8) |
-            (UInt32(self[offset + 2]) << 16) |
-            (UInt32(self[offset + 3]) << 24)
     }
 
     func readUInt16BE(at offset: Int) -> UInt16? {
