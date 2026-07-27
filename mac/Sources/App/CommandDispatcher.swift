@@ -26,6 +26,8 @@ final class CommandDispatcher {
     private let onClipboardBlobRequest: @Sendable (ClipboardBlobRequestBody) -> Void
     private let onClipboardBlobChunk: @Sendable (ClipboardBlobChunkBody) -> Void
     private let onClipboardSetApplied: @Sendable () -> Void
+    private let photoSyncService: MacPhotoSyncService?
+    private let onPhotoStatus: @Sendable (PhotoStatusBody) -> Void
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -53,7 +55,9 @@ final class CommandDispatcher {
         onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in },
         onClipboardBlobRequest: @escaping @Sendable (ClipboardBlobRequestBody) -> Void = { _ in },
         onClipboardBlobChunk: @escaping @Sendable (ClipboardBlobChunkBody) -> Void = { _ in },
-        onClipboardSetApplied: @escaping @Sendable () -> Void = {}
+        onClipboardSetApplied: @escaping @Sendable () -> Void = {},
+        photoSyncService: MacPhotoSyncService? = nil,
+        onPhotoStatus: @escaping @Sendable (PhotoStatusBody) -> Void = { _ in }
     ) {
         self.inputInjector = inputInjector
         self.clipboardSync = clipboardSync
@@ -79,6 +83,8 @@ final class CommandDispatcher {
         self.onClipboardBlobRequest = onClipboardBlobRequest
         self.onClipboardBlobChunk = onClipboardBlobChunk
         self.onClipboardSetApplied = onClipboardSetApplied
+        self.photoSyncService = photoSyncService
+        self.onPhotoStatus = onPhotoStatus
     }
 
     func handle(_ plaintext: Data) throws -> Data? {
@@ -150,6 +156,26 @@ final class CommandDispatcher {
         case EnvelopeType.clipboardBlobChunk:
             let envelope = try decoder.decode(Envelope<ClipboardBlobChunkBody>.self, from: plaintext)
             onClipboardBlobChunk(envelope.b)
+            return nil
+        case EnvelopeType.photoManifest:
+            let envelope = try decoder.decode(Envelope<PhotoManifestBody>.self, from: plaintext)
+            guard let service = photoSyncService else {
+                return nil
+            }
+            let wanted = service.filterWanted(envelope.b.items)
+            DiagnosticsLog.info("photo.mac.manifest_received total=\(envelope.b.items.count) wanted=\(wanted.count)")
+            return try encoder.encode(Envelope(t: EnvelopeType.photoRequest, b: PhotoRequestBody(ids: wanted)))
+        case EnvelopeType.photoBegin:
+            let envelope = try decoder.decode(Envelope<PhotoBeginBody>.self, from: plaintext)
+            photoSyncService?.handleBegin(envelope.b)
+            return nil
+        case EnvelopeType.photoChunk:
+            let envelope = try decoder.decode(Envelope<PhotoChunkBody>.self, from: plaintext)
+            photoSyncService?.handleChunk(envelope.b)
+            return nil
+        case EnvelopeType.photoStatus:
+            let envelope = try decoder.decode(Envelope<PhotoStatusBody>.self, from: plaintext)
+            onPhotoStatus(envelope.b)
             return nil
         case EnvelopeType.notificationPost:
             let envelope = try decoder.decode(Envelope<NotificationPostBody>.self, from: plaintext)

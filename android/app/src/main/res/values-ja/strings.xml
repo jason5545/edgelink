@@ -52,6 +52,16 @@
   <string name="value_not_paired">未ペアリング</string>
   <string name="section_sync">同期</string>
   <string name="toggle_auto_reconnect">自動再接続</string>
+
+  <string name="toggle_photo_sync">写真を Mac に同期</string>
+  <string name="action_photo_sync_now">写真を今すぐ同期</string>
+  <string name="permission_photos_missing">写真と動画の権限が必要です</string>
+  <string name="photo_sync_scanning">新しい写真をスキャン中…</string>
+  <string name="photo_sync_waiting">%1$d 件の新規項目を報告、Mac の応答待ち…</string>
+  <string name="photo_sync_sending">送信中 %1$d/%2$d</string>
+  <string name="photo_sync_done">%1$d 件を同期しました</string>
+  <string name="photo_sync_idle">同期する新しい写真はありません</string>
+  <string name="photo_sync_no_permission">写真の権限が許可されていません</string>
   <string name="toggle_mac_notification_sync">Mac 通知の同期</string>
   <string name="section_screen_share">画面キャスト</string>
   <string name="toggle_screen_share_privacy">キャスト中のプライバシー保護</string>

@@ -52,6 +52,16 @@
   <string name="value_not_paired">尚未配对</string>
   <string name="section_sync">同步</string>
   <string name="toggle_auto_reconnect">自动重新连接</string>
+
+  <string name="toggle_photo_sync">照片同步到 Mac</string>
+  <string name="action_photo_sync_now">立即同步照片</string>
+  <string name="permission_photos_missing">需要照片和视频权限</string>
+  <string name="photo_sync_scanning">正在扫描新照片…</string>
+  <string name="photo_sync_waiting">已上报 %1$d 个新项目，等待 Mac 回复…</string>
+  <string name="photo_sync_sending">传输中 %1$d/%2$d</string>
+  <string name="photo_sync_done">已同步 %1$d 个项目</string>
+  <string name="photo_sync_idle">没有需要同步的新照片</string>
+  <string name="photo_sync_no_permission">尚未授予照片权限</string>
   <string name="toggle_mac_notification_sync">Mac 通知同步</string>
   <string name="section_screen_share">屏幕投放</string>
   <string name="toggle_screen_share_privacy">投放隐私保护</string>

@@ -37,6 +37,11 @@ class MainActivity : ComponentActivity() {
             controller.refreshNotificationAccess()
         }
 
+    private val photoPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            controller.refreshPhotoAccess()
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         EdgeLinkForegroundService.ensureStarted(applicationContext)
@@ -48,7 +53,9 @@ class MainActivity : ComponentActivity() {
             ::handleOpenRemoteInputSettings,
             ::handleOpenScreenDimmingSettings,
             ::handleOpenSmsSettings,
-            ::handleQuit
+            ::handleQuit,
+            ::handlePhotoSyncChange,
+            { photoPermissionLauncher.launch(AndroidPhotoSync.requiredPermissions()) }
         )
         setContent {
             val state by controller.state.collectAsState()
@@ -59,6 +66,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         controller.refreshNotificationAccess()
+        controller.refreshPhotoAccess()
         controller.notifyAppForegrounded()
     }
 
@@ -98,6 +106,13 @@ class MainActivity : ComponentActivity() {
     private fun handleQuit() {
         controller.onQuit()
         finishAndRemoveTask()
+    }
+
+    private fun handlePhotoSyncChange(enabled: Boolean) {
+        controller.onPhotoSyncChange(enabled)
+        if (enabled) {
+            photoPermissionLauncher.launch(AndroidPhotoSync.requiredPermissions())
+        }
     }
 
     private fun ensureNotificationPermissions() {
@@ -142,7 +157,9 @@ private class EdgeLinkActivityActions(
     private val openRemoteInputSettingsHandler: () -> Unit,
     private val openScreenDimmingSettingsHandler: () -> Unit,
     private val openSmsSettingsHandler: () -> Unit,
-    private val quitHandler: () -> Unit
+    private val quitHandler: () -> Unit,
+    private val photoSyncChangeHandler: (Boolean) -> Unit,
+    private val requestPhotoAccessHandler: () -> Unit
 ) : EdgeLinkActions {
     override fun onPointer(body: InputPointerBody) = delegate.onPointer(body)
     override fun onKey(body: InputKeyBody) = delegate.onKey(body)
@@ -157,6 +174,9 @@ private class EdgeLinkActivityActions(
     override fun onAutoReconnectChange(enabled: Boolean) = delegate.onAutoReconnectChange(enabled)
     override fun onNotificationSyncChange(enabled: Boolean) = notificationSyncChangeHandler.invoke(enabled)
     override fun onScreenSharePrivacyChange(enabled: Boolean) = delegate.onScreenSharePrivacyChange(enabled)
+    override fun onPhotoSyncChange(enabled: Boolean) = photoSyncChangeHandler.invoke(enabled)
+    override fun onPhotoSyncNow() = delegate.onPhotoSyncNow()
+    override fun onRequestPhotoAccess() = requestPhotoAccessHandler.invoke()
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
     override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()

@@ -62,6 +62,13 @@ object EnvelopeTypes {
     const val TUNNEL_ERROR = "tunnel.error"
     const val TUNNEL_FLOW = "tunnel.flow"
     const val BATTERY_STATUS = "battery.status"
+    const val PHOTO_MANIFEST = "photo.manifest"
+    const val PHOTO_REQUEST = "photo.request"
+    const val PHOTO_BEGIN = "photo.begin"
+    const val PHOTO_CHUNK = "photo.chunk"
+    const val PHOTO_ACK = "photo.ack"
+    const val PHOTO_SYNC_REQUEST = "photo.sync.request"
+    const val PHOTO_STATUS = "photo.status"
 }
 
 object EnvelopeCodec {
@@ -181,7 +188,8 @@ enum class ClipboardKind(val intValue: Int) {
 data class StatusCapsBody(
     val clipboardHistory: Boolean = true,
     val clipboardThumbnail: Boolean = true,
-    val clipboardBlob: Boolean = false
+    val clipboardBlob: Boolean = false,
+    val photoSync: Boolean = false
 )
 
 @Serializable
@@ -439,5 +447,58 @@ data class BatteryStatusBody(
     val charging: Boolean,
     val plugged: String? = null,
     val temperature: Double? = null,
+    val ts: Long
+)
+
+@Serializable
+data class PhotoManifestItemBody(
+    val id: String,
+    val name: String,
+    val mime: String,
+    val bytes: Long,
+    val dateTakenMs: Long,
+    val isVideo: Boolean = false
+)
+
+@Serializable
+data class PhotoManifestBody(
+    val items: List<PhotoManifestItemBody> = emptyList()
+)
+
+@Serializable
+data class PhotoRequestBody(
+    val ids: List<String> = emptyList()
+)
+
+@Serializable
+data class PhotoBeginBody(
+    val id: String,
+    val name: String,
+    val mime: String,
+    val bytes: Long,
+    val dateTakenMs: Long,
+    val isVideo: Boolean = false
+)
+
+@Serializable
+data class PhotoChunkBody(
+    val id: String,
+    val seq: Int,
+    val fin: Boolean,
+    val hash: String? = null,
+    val payloadBase64: String
+)
+
+@Serializable
+data class PhotoAckBody(
+    val ids: List<String> = emptyList(),
+    val failedIds: List<String> = emptyList()
+)
+
+@Serializable
+data class PhotoStatusBody(
+    val state: String,
+    val total: Int = 0,
+    val done: Int = 0,
     val ts: Long
 )

@@ -93,6 +93,7 @@ targets:
         NSUserActivityTypes:
           - INSendMessageIntent
         NSMicrophoneUsageDescription: EdgeLink uses the microphone only when Android requests relayed microphone audio.
+        NSPhotoLibraryUsageDescription: EdgeLink imports photos and videos received from your Android phone into the Photos library so they sync to iCloud.
         NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
   EdgeLinkKitTests:
     type: bundle.unit-test

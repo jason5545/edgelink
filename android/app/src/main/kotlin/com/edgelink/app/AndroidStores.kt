@@ -117,6 +117,43 @@ class SharedPreferencesSettingsStore(context: Context) {
             .putLong("smsLastSeenRowId", rowId)
             .apply()
     }
+
+    fun photoSyncEnabled(): Boolean =
+        prefs.getBoolean("photoSyncEnabled", false)
+
+    fun savePhotoSyncEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean("photoSyncEnabled", enabled)
+            .apply()
+    }
+
+    fun photoSyncWatermarkSec(): Long =
+        prefs.getLong("photoSyncWatermarkSec", 0L)
+
+    fun savePhotoSyncWatermarkSec(value: Long) {
+        prefs.edit()
+            .putLong("photoSyncWatermarkSec", value)
+            .apply()
+    }
+
+    fun photoSyncAckedIds(): Set<String> =
+        prefs.getStringSet("photoSyncAckedIds", emptySet()).orEmpty()
+
+    fun addPhotoSyncAckedIds(ids: Collection<String>) {
+        val updated = photoSyncAckedIds().toMutableSet()
+        updated.addAll(ids)
+        prefs.edit()
+            .putStringSet("photoSyncAckedIds", updated)
+            .apply()
+    }
+
+    fun prunePhotoSyncAckedIds(maxEntries: Int = 2_000) {
+        val current = photoSyncAckedIds()
+        if (current.size <= maxEntries) return
+        prefs.edit()
+            .putStringSet("photoSyncAckedIds", current.toList().takeLast(maxEntries).toSet())
+            .apply()
+    }
 }
 
 private fun SharedPreferences.getBase64(key: String): ByteArray? =

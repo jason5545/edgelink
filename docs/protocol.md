@@ -811,6 +811,54 @@ Blob table（本機，不進 wire）：
 - 對端沒有 `clipboardBlob=true`：退回舊行為——> 48 KB 的 text 截斷送出、圖片只有
   thumbnail。
 
+### Photo Sync（Android → Mac）
+
+單向照片/影片同步：Android 掃描 MediaStore 新項目，Mac 挑選未同步的項目拉取，
+驗證後匯入系統「照片」圖庫（進而上傳 iCloud）。檔案大小不受 clipboard blob 的
+8 MB 上限限制，傳輸改為串流落盤。
+
+能力協商：雙端 `status.caps` 帶 `photoSync: true`（布林，向前相容，缺席視為 false）。
+
+流程：
+
+1. Android（session 建立後自動、或收到 `photo.sync.request`、或使用者手動觸發）
+   掃描 `DATE_ADDED > watermark` 且未被 ack 過的圖片與影片，送 `photo.manifest`。
+   item `id` 為 `img-<mediastore id>` / `vid-<mediastore id>`。
+2. Mac 以本機 SQLite（`synced_photos.item_id`）去重，回 `photo.request` 帶想要的
+   `ids`（作為 dispatcher reply）。
+3. Android 依序串流每個檔案：`photo.begin` → N 個 `photo.chunk` → 最後一個 chunk
+   `fin=true` 並帶完整檔案的 SHA-256 hex（單趟讀取、邊送邊算）。
+4. Mac 串流寫入暫存檔，收齊 `fin` 後校驗 hash；通過則以 PhotoKit
+   （`PHAssetCreationRequest`，保留 `creationDate`）匯入照片圖庫，成功後寫入
+   `synced_photos` 並回 `photo.ack`；失敗的 id 放 `failedIds`。
+5. Android 收到 ack：把成功 id 記入 acked set（不再重送）；若無 failed，把
+   watermark 推進到這批的最大 `DATE_ADDED`。失敗項留在下一輪 manifest 重試。
+
+Envelope：
+
+```json
+{"t":"photo.manifest","b":{"items":[{"id":"img-123","name":"IMG_0001.jpg","mime":"image/jpeg","bytes":3456789,"dateTakenMs":1751941001000,"isVideo":false}]}}
+{"t":"photo.request","b":{"ids":["img-123"]}}
+{"t":"photo.begin","b":{"id":"img-123","name":"IMG_0001.jpg","mime":"image/jpeg","bytes":3456789,"dateTakenMs":1751941001000,"isVideo":false}}
+{"t":"photo.chunk","b":{"id":"img-123","seq":0,"fin":false,"payloadBase64":"..."}}
+{"t":"photo.chunk","b":{"id":"img-123","seq":104,"fin":true,"hash":"<sha256 hex of full file>","payloadBase64":"..."}}
+{"t":"photo.ack","b":{"ids":["img-123"],"failedIds":[]}}
+{"t":"photo.sync.request","b":{}}
+{"t":"photo.status","b":{"state":"sending","total":12,"done":3,"ts":1751941001}}
+```
+
+規則：
+
+- chunk payload 解碼後 ≤ 32 KB，`seq` 從 0 遞增且必須連續（out-of-order 即丟棄該
+  傳輸並回 failed）。與 clipboard blob 不同：`hash` 只在 `fin` chunk 帶（單趟串流），
+  不在 `seq=0` 帶。
+- `photo.begin` 必須先於該 id 的第一個 chunk；同 id 重新 begin 視為重啟傳輸。
+- session 結束時 Mac 丟棄所有未完成傳輸與暫存檔；Android 未收 ack 的項目不推進
+  watermark，下次 session 的 manifest 會再次包含。
+- Android 端需要 `READ_MEDIA_IMAGES` + `READ_MEDIA_VIDEO`（API 33+）或
+  `READ_EXTERNAL_STORAGE`（≤ 32）；未授權時靜默跳過並在 UI 提示。
+- `photo.status` 僅供 UI 進度顯示，`state` ∈ `idle|manifest|sending|acked`。
+
 ## 7. Transports
 
 ### Relay

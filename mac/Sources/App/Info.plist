@@ -37,6 +37,8 @@
 	<string>Copyright 2026 EdgeLink contributors</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>EdgeLink uses the microphone only when Android requests relayed microphone audio.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>EdgeLink imports photos and videos received from your Android phone into the Photos library so they sync to iCloud.</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>INSendMessageIntent</string>

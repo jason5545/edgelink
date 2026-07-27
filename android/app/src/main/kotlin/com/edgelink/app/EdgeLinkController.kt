@@ -56,6 +56,13 @@ import com.edgelink.core.PhoneCallStatusBody
 import com.edgelink.core.PhoneRelayEndpointBody
 import com.edgelink.core.PhoneRelayMediaBody
 import com.edgelink.core.PhoneRelayStartRequestBody
+import com.edgelink.core.PhotoAckBody
+import com.edgelink.core.PhotoBeginBody
+import com.edgelink.core.PhotoChunkBody
+import com.edgelink.core.PhotoManifestBody
+import com.edgelink.core.PhotoManifestItemBody
+import com.edgelink.core.PhotoRequestBody
+import com.edgelink.core.PhotoStatusBody
 import com.edgelink.core.PinnedPeer
 import com.edgelink.core.RtcIceBody
 import com.edgelink.core.RtcSdpBody
@@ -188,6 +195,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var pendingClipboardBlobTimeoutJob: Job? = null
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
+    private val photoSync = AndroidPhotoSync(appContext, settingsStore)
     private val phoneCallController = AndroidPhoneCallController(appContext)
     private val miLinkCommandBridge = AndroidMiLinkCommandBridge(
         appContext,
@@ -311,6 +319,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onClipboardSetApplied = {
             refreshClipboardHistory()
+        },
+        onPhotoRequest = { body ->
+            handlePhotoRequest(body)
+        },
+        onPhotoAck = { body ->
+            handlePhotoAck(body)
+        },
+        onPhotoSyncRequest = {
+            launchPhotoSync("manual_remote")
         }
     )
 
@@ -330,6 +347,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var connectionJob: Job? = null
     private var pairingJob: Job? = null
     private var smsPendingDrainJob: Job? = null
+    private var photoSyncJob: Job? = null
+    private var photoSendJob: Job? = null
+    @Volatile
+    private var pendingPhotoItems: Map<String, AndroidPhotoSync.MediaItem> = emptyMap()
     private var shizukuAutoRepairJob: Job? = null
     private var turnCredentialJob: Job? = null
     private var pendingCallRelayBridgeJob: Job? = null
@@ -887,6 +908,29 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         screenSession.onPrivacyPreferenceChanged()
     }
 
+    override fun onPhotoSyncChange(enabled: Boolean) {
+        settingsStore.savePhotoSyncEnabled(enabled)
+        stateFlow.update {
+            it.copy(
+                photoSyncEnabled = enabled,
+                photoMediaAccessGranted = photoSync.hasPermission()
+            )
+        }
+        EdgeLinkLog.info("photo.android.sync_enabled enabled=$enabled")
+        if (enabled) {
+            launchPhotoSync("toggle_on")
+        }
+    }
+
+    override fun onPhotoSyncNow() {
+        refreshPhotoAccess()
+        launchPhotoSync("manual_button")
+    }
+
+    override fun onRequestPhotoAccess() {
+        refreshPhotoAccess()
+    }
+
     override fun onOpenNotificationSettings() {
         if (tryHandleNotificationAccessWithShizuku()) {
             return
@@ -1192,7 +1236,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
                 screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
                 screenSharePrivacyControlAvailable = AndroidScreenShareProtectionGuard.canControl(appContext),
-                smsAccessGranted = smsSync.smsAccessGranted(),
+            smsAccessGranted = smsSync.smsAccessGranted(),
+            photoSyncEnabled = settingsStore.photoSyncEnabled(),
+            photoMediaAccessGranted = photoSync.hasPermission(),
                 shizukuAvailable = shizukuState.available,
                 shizukuSupported = shizukuState.supported,
                 shizukuPermissionGranted = shizukuState.permissionGranted,
@@ -2235,9 +2281,202 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         peerCapabilityBlob = false
         stateFlow.update { it.copy(peerClipboardBlob = false) }
         cancelPendingClipboardBlob(success = false, reason = "new_session")
-        sendEnvelope(EnvelopeTypes.STATUS_CAPS, StatusCapsBody(clipboardBlob = true))
+        sendEnvelope(
+            EnvelopeTypes.STATUS_CAPS,
+            StatusCapsBody(clipboardBlob = true, photoSync = stateFlow.value.photoSyncEnabled)
+        )
         sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
         EdgeLinkLog.info("clipboard.android.caps_sent hostId=${identity.deviceId}")
+        launchPhotoSync("session_connect")
+    }
+
+    private fun launchPhotoSync(reason: String) {
+        if (!stateFlow.value.photoSyncEnabled) {
+            return
+        }
+        val activeSession = session
+        if (activeSession == null) {
+            EdgeLinkLog.info("photo.android.sync_deferred reason=$reason no_session")
+            return
+        }
+        if (!photoSync.hasPermission()) {
+            stateFlow.update {
+                it.copy(
+                    photoMediaAccessGranted = false,
+                    photoSyncStatus = appContext.getString(R.string.photo_sync_no_permission)
+                )
+            }
+            EdgeLinkLog.info("photo.android.sync_skipped reason=$reason no_permission")
+            return
+        }
+        if (photoSyncJob?.isActive == true) {
+            EdgeLinkLog.info("photo.android.sync_already_running reason=$reason")
+            return
+        }
+        photoSyncJob = scope.launch(Dispatchers.IO) {
+            runPhotoManifest(activeSession, reason)
+        }
+    }
+
+    private suspend fun runPhotoManifest(activeSession: SecureSessionClient, reason: String) {
+        runCatching {
+            stateFlow.update { it.copy(photoSyncStatus = appContext.getString(R.string.photo_sync_scanning)) }
+            val items = photoSync.scanNewItems()
+            if (items.isEmpty()) {
+                pendingPhotoItems = emptyMap()
+                stateFlow.update { it.copy(photoSyncStatus = appContext.getString(R.string.photo_sync_idle)) }
+                sendPhotoStatus("idle")
+                return@runCatching
+            }
+            pendingPhotoItems = items.associateBy { it.id }
+            val manifest = PhotoManifestBody(
+                items = items.map { item ->
+                    PhotoManifestItemBody(
+                        id = item.id,
+                        name = item.name,
+                        mime = item.mime,
+                        bytes = item.bytes,
+                        dateTakenMs = item.dateTakenMs,
+                        isVideo = item.isVideo
+                    )
+                }
+            )
+            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.PHOTO_MANIFEST, manifest))
+            stateFlow.update {
+                it.copy(photoSyncStatus = appContext.getString(R.string.photo_sync_waiting, items.size))
+            }
+            sendPhotoStatus("manifest", total = items.size)
+            EdgeLinkLog.info("photo.android.manifest_sent count=${items.size} reason=$reason")
+        }.onFailure { error ->
+            EdgeLinkLog.error("photo.android.manifest_failed reason=$reason", error)
+        }
+    }
+
+    private fun handlePhotoRequest(body: PhotoRequestBody) {
+        val activeSession = session ?: return
+        val wanted = body.ids.toSet()
+        val items = pendingPhotoItems.values.filter { it.id in wanted }.sortedBy { it.dateAddedSec }
+        if (items.isEmpty()) {
+            EdgeLinkLog.info("photo.android.request_empty requested=${body.ids.size}")
+            return
+        }
+        if (photoSendJob?.isActive == true) {
+            EdgeLinkLog.info("photo.android.send_already_running requested=${items.size}")
+            return
+        }
+        photoSendJob = scope.launch(Dispatchers.IO) {
+            var done = 0
+            for (item in items) {
+                val success = runCatching {
+                    streamPhotoItem(activeSession, item)
+                }.onFailure { error ->
+                    EdgeLinkLog.error("photo.android.stream_failed id=${item.id}", error)
+                }.isSuccess
+                if (success) {
+                    done += 1
+                    val currentDone = done
+                    stateFlow.update {
+                        it.copy(photoSyncStatus = appContext.getString(R.string.photo_sync_sending, currentDone, items.size))
+                    }
+                    sendPhotoStatus("sending", total = items.size, done = done)
+                }
+            }
+            EdgeLinkLog.info("photo.android.send_batch_done sent=$done total=${items.size}")
+        }
+    }
+
+    private suspend fun streamPhotoItem(activeSession: SecureSessionClient, item: AndroidPhotoSync.MediaItem) {
+        activeSession.sendPlaintext(
+            EnvelopeCodec.encode(
+                EnvelopeTypes.PHOTO_BEGIN,
+                PhotoBeginBody(
+                    id = item.id,
+                    name = item.name,
+                    mime = item.mime,
+                    bytes = item.bytes,
+                    dateTakenMs = item.dateTakenMs,
+                    isVideo = item.isVideo
+                )
+            )
+        )
+        val digest = AndroidPhotoSync.newDigest()
+        val input = photoSync.openItem(item) ?: throw java.io.IOException("open_input_failed id=${item.id}")
+        input.use { stream ->
+            val buffer = ByteArray(AndroidPhotoSync.CHUNK_BYTES)
+            var seq = 0
+            var pending: ByteArray? = null
+            while (true) {
+                val read = stream.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+                pending?.let { chunk ->
+                    activeSession.sendPlaintext(
+                        EnvelopeCodec.encode(
+                            EnvelopeTypes.PHOTO_CHUNK,
+                            PhotoChunkBody(
+                                id = item.id,
+                                seq = seq - 1,
+                                fin = false,
+                                payloadBase64 = Base64.getEncoder().encodeToString(chunk)
+                            )
+                        )
+                    )
+                }
+                pending = buffer.copyOf(read)
+                seq += 1
+            }
+            val hash = AndroidPhotoSync.sha256Hex(digest)
+            val last = pending
+            if (last == null) {
+                activeSession.sendPlaintext(
+                    EnvelopeCodec.encode(
+                        EnvelopeTypes.PHOTO_CHUNK,
+                        PhotoChunkBody(id = item.id, seq = 0, fin = true, hash = hash, payloadBase64 = "")
+                    )
+                )
+            } else {
+                activeSession.sendPlaintext(
+                    EnvelopeCodec.encode(
+                        EnvelopeTypes.PHOTO_CHUNK,
+                        PhotoChunkBody(
+                            id = item.id,
+                            seq = seq - 1,
+                            fin = true,
+                            hash = hash,
+                            payloadBase64 = Base64.getEncoder().encodeToString(last)
+                        )
+                    )
+                )
+            }
+        }
+    }
+
+    private fun handlePhotoAck(body: PhotoAckBody) {
+        val ackedItems = pendingPhotoItems.values.filter { it.id in body.ids.toSet() }
+        photoSync.markAcknowledged(body.ids)
+        if (body.failedIds.isEmpty() && ackedItems.isNotEmpty()) {
+            photoSync.advanceWatermark(ackedItems)
+        }
+        val remaining = pendingPhotoItems - body.ids.toSet()
+        pendingPhotoItems = remaining
+        EdgeLinkLog.info(
+            "photo.android.ack received=${body.ids.size} failed=${body.failedIds.size} pending=${remaining.size}"
+        )
+        stateFlow.update {
+            it.copy(photoSyncStatus = appContext.getString(R.string.photo_sync_done, body.ids.size))
+        }
+        sendPhotoStatus("acked", done = body.ids.size)
+    }
+
+    private fun sendPhotoStatus(state: String, total: Int = 0, done: Int = 0) {
+        sendEnvelope(
+            EnvelopeTypes.PHOTO_STATUS,
+            PhotoStatusBody(state = state, total = total, done = done, ts = System.currentTimeMillis() / 1_000L)
+        )
+    }
+
+    fun refreshPhotoAccess() {
+        stateFlow.update { it.copy(photoMediaAccessGranted = photoSync.hasPermission()) }
     }
 
     private fun launchSmsPendingDrain(reason: String) {
@@ -2504,7 +2743,10 @@ private class AndroidCommandDispatcher(
     private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {},
     private val onClipboardBlobRequest: (ClipboardBlobRequestBody) -> Unit = {},
     private val onClipboardBlobChunk: (ClipboardBlobChunkBody) -> Unit = {},
-    private val onClipboardSetApplied: () -> Unit = {}
+    private val onClipboardSetApplied: () -> Unit = {},
+    private val onPhotoRequest: (PhotoRequestBody) -> Unit = {},
+    private val onPhotoAck: (PhotoAckBody) -> Unit = {},
+    private val onPhotoSyncRequest: () -> Unit = {}
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2579,6 +2821,20 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.CLIPBOARD_BLOB_CHUNK -> {
                 val envelope = EnvelopeCodec.decode<ClipboardBlobChunkBody>(plaintext)
                 onClipboardBlobChunk(envelope.b)
+                null
+            }
+            EnvelopeTypes.PHOTO_REQUEST -> {
+                val envelope = EnvelopeCodec.decode<PhotoRequestBody>(plaintext)
+                onPhotoRequest(envelope.b)
+                null
+            }
+            EnvelopeTypes.PHOTO_ACK -> {
+                val envelope = EnvelopeCodec.decode<PhotoAckBody>(plaintext)
+                onPhotoAck(envelope.b)
+                null
+            }
+            EnvelopeTypes.PHOTO_SYNC_REQUEST -> {
+                onPhotoSyncRequest()
                 null
             }
             EnvelopeTypes.NOTIFICATION_POST -> {

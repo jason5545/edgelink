@@ -215,6 +215,9 @@ data class EdgeLinkUiState(
     val notificationPostGranted: Boolean = true,
     val screenDimmingAccessGranted: Boolean = false,
     val smsAccessGranted: Boolean = false,
+    val photoSyncEnabled: Boolean = false,
+    val photoMediaAccessGranted: Boolean = false,
+    val photoSyncStatus: String = "",
     val shizukuAvailable: Boolean = false,
     val shizukuSupported: Boolean = false,
     val shizukuPermissionGranted: Boolean = false,
@@ -240,6 +243,9 @@ interface EdgeLinkActions {
     fun onAutoReconnectChange(enabled: Boolean)
     fun onNotificationSyncChange(enabled: Boolean)
     fun onScreenSharePrivacyChange(enabled: Boolean)
+    fun onPhotoSyncChange(enabled: Boolean)
+    fun onPhotoSyncNow()
+    fun onRequestPhotoAccess()
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
     fun onOpenScreenDimmingSettings()
@@ -263,6 +269,9 @@ interface EdgeLinkActions {
         override fun onAutoReconnectChange(enabled: Boolean) = Unit
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onScreenSharePrivacyChange(enabled: Boolean) = Unit
+        override fun onPhotoSyncChange(enabled: Boolean) = Unit
+        override fun onPhotoSyncNow() = Unit
+        override fun onRequestPhotoAccess() = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
         override fun onOpenScreenDimmingSettings() = Unit
@@ -811,6 +820,53 @@ private fun SettingsScreen(
                         onCheckedChange = actions::onNotificationSyncChange,
                         onOpenSettings = actions::onOpenNotificationSettings
                     )
+                    HorizontalDivider()
+                    SettingsToggleRow(
+                        label = stringResource(R.string.toggle_photo_sync),
+                        checked = state.photoSyncEnabled,
+                        onCheckedChange = actions::onPhotoSyncChange
+                    )
+                    if (state.photoSyncEnabled && !state.photoMediaAccessGranted) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = stringResource(R.string.permission_photos_missing),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilledTonalButton(onClick = actions::onRequestPhotoAccess) {
+                                Text(permissionActionLabel(state))
+                            }
+                        }
+                    }
+                    if (state.photoSyncEnabled && state.photoMediaAccessGranted) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (state.photoSyncStatus.isNotEmpty()) {
+                                Text(
+                                    text = state.photoSyncStatus,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            } else {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
+                            FilledTonalButton(
+                                onClick = actions::onPhotoSyncNow,
+                                enabled = state.isConnected
+                            ) {
+                                Text(stringResource(R.string.action_photo_sync_now))
+                            }
+                        }
+                    }
                 }
             }
 

@@ -63,6 +63,13 @@ public enum EnvelopeType {
     public static let tunnelError = "tunnel.error"
     public static let tunnelFlow = "tunnel.flow"
     public static let batteryStatus = "battery.status"
+    public static let photoManifest = "photo.manifest"
+    public static let photoRequest = "photo.request"
+    public static let photoBegin = "photo.begin"
+    public static let photoChunk = "photo.chunk"
+    public static let photoAck = "photo.ack"
+    public static let photoSyncRequest = "photo.sync.request"
+    public static let photoStatus = "photo.status"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -231,11 +238,13 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
     public let clipboardHistory: Bool
     public let clipboardThumbnail: Bool
     public let clipboardBlob: Bool
+    public let photoSync: Bool
 
-    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true) {
+    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true, photoSync: Bool = false) {
         self.clipboardHistory = clipboardHistory
         self.clipboardThumbnail = clipboardThumbnail
         self.clipboardBlob = clipboardBlob
+        self.photoSync = photoSync
     }
 
     public init(from decoder: Decoder) throws {
@@ -243,6 +252,7 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
         clipboardHistory = try container.decodeIfPresent(Bool.self, forKey: .clipboardHistory) ?? false
         clipboardThumbnail = try container.decodeIfPresent(Bool.self, forKey: .clipboardThumbnail) ?? false
         clipboardBlob = try container.decodeIfPresent(Bool.self, forKey: .clipboardBlob) ?? false
+        photoSync = try container.decodeIfPresent(Bool.self, forKey: .photoSync) ?? false
     }
 }
 
@@ -791,6 +801,126 @@ public struct MiLinkFrameBody: Codable, Equatable, Sendable {
         self.bytes = bytes
         self.hasNext = hasNext
         self.ts = ts
+    }
+}
+
+public struct PhotoManifestItemBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let mime: String
+    public let bytes: Int64
+    public let dateTakenMs: Int64
+    public let isVideo: Bool
+
+    public init(id: String, name: String, mime: String, bytes: Int64, dateTakenMs: Int64, isVideo: Bool = false) {
+        self.id = id
+        self.name = name
+        self.mime = mime
+        self.bytes = bytes
+        self.dateTakenMs = dateTakenMs
+        self.isVideo = isVideo
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        mime = try container.decode(String.self, forKey: .mime)
+        bytes = try container.decode(Int64.self, forKey: .bytes)
+        dateTakenMs = try container.decode(Int64.self, forKey: .dateTakenMs)
+        isVideo = try container.decodeIfPresent(Bool.self, forKey: .isVideo) ?? false
+    }
+}
+
+public struct PhotoManifestBody: Codable, Equatable, Sendable {
+    public let items: [PhotoManifestItemBody]
+
+    public init(items: [PhotoManifestItemBody]) {
+        self.items = items
+    }
+}
+
+public struct PhotoRequestBody: Codable, Equatable, Sendable {
+    public let ids: [String]
+
+    public init(ids: [String]) {
+        self.ids = ids
+    }
+}
+
+public struct PhotoBeginBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let mime: String
+    public let bytes: Int64
+    public let dateTakenMs: Int64
+    public let isVideo: Bool
+
+    public init(id: String, name: String, mime: String, bytes: Int64, dateTakenMs: Int64, isVideo: Bool = false) {
+        self.id = id
+        self.name = name
+        self.mime = mime
+        self.bytes = bytes
+        self.dateTakenMs = dateTakenMs
+        self.isVideo = isVideo
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        mime = try container.decode(String.self, forKey: .mime)
+        bytes = try container.decode(Int64.self, forKey: .bytes)
+        dateTakenMs = try container.decode(Int64.self, forKey: .dateTakenMs)
+        isVideo = try container.decodeIfPresent(Bool.self, forKey: .isVideo) ?? false
+    }
+}
+
+public struct PhotoChunkBody: Codable, Equatable, Sendable {
+    public let id: String
+    public let seq: Int
+    public let fin: Bool
+    public let hash: String?
+    public let payloadBase64: String
+
+    public init(id: String, seq: Int, fin: Bool, hash: String? = nil, payloadBase64: String) {
+        self.id = id
+        self.seq = seq
+        self.fin = fin
+        self.hash = hash
+        self.payloadBase64 = payloadBase64
+    }
+}
+
+public struct PhotoAckBody: Codable, Equatable, Sendable {
+    public let ids: [String]
+    public let failedIds: [String]
+
+    public init(ids: [String], failedIds: [String] = []) {
+        self.ids = ids
+        self.failedIds = failedIds
+    }
+}
+
+public struct PhotoStatusBody: Codable, Equatable, Sendable {
+    public let state: String
+    public let total: Int
+    public let done: Int
+    public let ts: Int64
+
+    public init(state: String, total: Int = 0, done: Int = 0, ts: Int64) {
+        self.state = state
+        self.total = total
+        self.done = done
+        self.ts = ts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        state = try container.decode(String.self, forKey: .state)
+        total = try container.decodeIfPresent(Int.self, forKey: .total) ?? 0
+        done = try container.decodeIfPresent(Int.self, forKey: .done) ?? 0
+        ts = try container.decode(Int64.self, forKey: .ts)
     }
 }
 

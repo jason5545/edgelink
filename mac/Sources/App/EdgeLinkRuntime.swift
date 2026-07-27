@@ -64,6 +64,8 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var phoneBatteryLevel: Int?
     @Published private(set) var phoneBatteryCharging = false
     @Published private(set) var phoneBatterySource = ""
+    @Published private(set) var photoSyncEnabled: Bool
+    @Published private(set) var photoSyncStatus = ""
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -90,6 +92,24 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var fetchingClipboardBlobId: String?
     @Published private(set) var peerClipboardBlobSupported = false
     private let notificationPresenter = MacNotificationPresenter()
+    private lazy var photoSyncService: MacPhotoSyncService? = {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return MacPhotoSyncService(
+            directory: base.appendingPathComponent("EdgeLink/photo-sync", isDirectory: true),
+            onImportDone: { [weak self] acked, failed in
+                Task { @MainActor in
+                    self?.sendPhotoAck(acked: acked, failed: failed)
+                }
+            },
+            onStatus: { [weak self] text in
+                Task { @MainActor in
+                    self?.photoSyncStatus = text
+                }
+            }
+        )
+    }()
     private let incomingCallPresenter = MacIncomingCallPresenter()
     private let verificationCodeBridge = MacVerificationCodeBridge()
     private let macNotificationSource = MacNotificationDatabaseSource()
@@ -193,6 +213,7 @@ final class EdgeLinkRuntime: ObservableObject {
         verificationCodeAutoCopyEnabled = UserDefaults.standard.object(forKey: Self.verificationCodeAutoCopyDefaultsKey) as? Bool ?? true
         phoneRelayEchoCancellationEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayEchoCancellationDefaultsKey) as? Bool ?? true
         lastDialedPhoneNumber = UserDefaults.standard.string(forKey: Self.lastDialedPhoneNumberDefaultsKey) ?? ""
+        photoSyncEnabled = UserDefaults.standard.object(forKey: Self.photoSyncEnabledDefaultsKey) as? Bool ?? true
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -393,6 +414,61 @@ final class EdgeLinkRuntime: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.verificationCodeAutoCopyDefaultsKey)
         verificationCodeAutoCopyEnabled = enabled
         DiagnosticsLog.info("verification.mac.auto_copy_enabled enabled=\(enabled)")
+    }
+
+    func setPhotoSyncEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.photoSyncEnabledDefaultsKey)
+        photoSyncEnabled = enabled
+        DiagnosticsLog.info("photo.mac.sync_enabled enabled=\(enabled)")
+    }
+
+    func requestPhotoSyncNow() {
+        guard let session = currentSession, isConnected else {
+            photoSyncStatus = String(localized: "尚未連線")
+            return
+        }
+        guard let data = try? encoder.encode(Envelope(t: EnvelopeType.photoSyncRequest, b: EmptyBody())) else {
+            return
+        }
+        photoSyncStatus = String(localized: "已要求手機掃描新照片…")
+        Task {
+            do {
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info("photo.mac.sync_request_sent")
+            } catch {
+                DiagnosticsLog.error("photo.mac.sync_request_failed", error)
+            }
+        }
+    }
+
+    private func sendPhotoAck(acked: [String], failed: [String]) {
+        guard !acked.isEmpty || !failed.isEmpty else {
+            return
+        }
+        guard let session = currentSession, isConnected,
+              let data = try? encoder.encode(
+                Envelope(t: EnvelopeType.photoAck, b: PhotoAckBody(ids: acked, failedIds: failed))
+              ) else {
+            return
+        }
+        Task {
+            try? await session.sendPlaintext(data)
+        }
+    }
+
+    private func handlePhotoStatus(_ status: PhotoStatusBody) {
+        switch status.state {
+        case "idle":
+            photoSyncStatus = String(localized: "手機沒有新照片")
+        case "manifest":
+            photoSyncStatus = String(localized: "手機回報 \(status.total) 個新項目")
+        case "sending":
+            photoSyncStatus = String(localized: "接收中 \(status.done)/\(status.total)")
+        case "acked":
+            photoSyncStatus = String(localized: "同步完成")
+        default:
+            break
+        }
     }
 
     func copyLatestVerificationCode() {
@@ -3051,6 +3127,12 @@ final class EdgeLinkRuntime: ObservableObject {
                         Task { @MainActor in
                             self?.refreshClipboardHistory()
                         }
+                    },
+                    photoSyncService: photoSyncService,
+                    onPhotoStatus: { [weak self] status in
+                        Task { @MainActor in
+                            self?.handlePhotoStatus(status)
+                        }
                     }
                 )
                 let session = SecureSessionHost(
@@ -3116,7 +3198,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 peerCapabilityBlob = false
                 peerClipboardBlobSupported = false
                 cancelPendingClipboardBlob(success: false, reason: "new_session")
-                if let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody())) {
+                photoSyncService?.resetTransfers(reason: "new_session")
+                if let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody(photoSync: photoSyncEnabled))) {
                     try? await session.sendPlaintext(capsData)
                     DiagnosticsLog.info("clipboard.mac.caps_sent hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 }
@@ -3132,6 +3215,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 defer {
                     clipboardTask.cancel()
                     notificationTask.cancel()
+                    photoSyncService?.resetTransfers(reason: "session_end")
                     if currentSession === session {
                         currentSession = nil
                         screenSession.clearSender()
@@ -4449,6 +4533,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let verificationCodeAutoCopyDefaultsKey = "verificationCodeAutoCopyEnabled"
     private static let lastDialedPhoneNumberDefaultsKey = "lastDialedPhoneNumber"
     private static let phoneRelayEchoCancellationDefaultsKey = "phoneRelayEchoCancellationEnabled"
+    private static let photoSyncEnabledDefaultsKey = "photoSyncEnabled"
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102

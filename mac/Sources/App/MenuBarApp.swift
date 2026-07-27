@@ -300,6 +300,31 @@ private struct SettingsSection: View {
                 )
             )
             .toggleStyle(.switch)
+
+            Toggle(
+                "照片同步到圖庫",
+                isOn: Binding(
+                    get: { runtime.photoSyncEnabled },
+                    set: { runtime.setPhotoSyncEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+
+            if runtime.photoSyncEnabled {
+                Button {
+                    runtime.requestPhotoSyncNow()
+                } label: {
+                    Label("立即同步照片", systemImage: "photo.on.rectangle.angled")
+                }
+                .disabled(!runtime.isConnected)
+
+                if !runtime.photoSyncStatus.isEmpty {
+                    Text(runtime.photoSyncStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
         }
     }
 }
