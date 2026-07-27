@@ -37,6 +37,9 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTP_BATCH_MAX_DELAY_MS = 10L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
     private const val KCP_ADVERTISED_RECEIVE_WINDOW = 128
+    private const val OWN_ADDRESSES_REFRESH_MS = 30_000L
+    private const val ACK_WATCH_WINDOW_PUSHES = 2_000L
+    private const val ACK_WATCH_MIN_PUSHES = 500L
     private const val LOCAL_RTP_RECEIVE_BUFFER_BYTES = 8 * 1024 * 1024
     private const val ANDROID_TO_MAC = "android_to_mac"
     private const val MAC_TO_ANDROID = "mac_to_android"
@@ -149,6 +152,8 @@ object AndroidMiLinkMirrorMediaBridge {
         )
         private var rtpBatchesSent = 0
         private var rtpBatchDatagramsDropped = 0
+        private var payloadsQueued = 0L
+        private var payloadsBatched = 0L
 
         fun retarget(newSessionId: String, newSendMedia: suspend (MiLinkMirrorMediaBody) -> Unit) {
             sessionId = newSessionId
@@ -370,18 +375,41 @@ object AndroidMiLinkMirrorMediaBridge {
 
         private suspend fun receiveRTP(socket: DatagramSocket) {
             val buffer = ByteArray(64 * 1024)
+            var ackViaLoopback = true
+            var ownAddresses: Set<InetAddress> = emptySet()
+            var ownAddressesRefreshedAtMs = 0L
+            fun resolveAckTarget(target: InetSocketAddress): InetSocketAddress {
+                if (!ackViaLoopback || target.address.isLoopbackAddress) {
+                    return target
+                }
+                val now = System.currentTimeMillis()
+                if (now - ownAddressesRefreshedAtMs > OWN_ADDRESSES_REFRESH_MS) {
+                    ownAddressesRefreshedAtMs = now
+                    ownAddresses = runCatching {
+                        NetworkInterface.getNetworkInterfaces().toList()
+                            .flatMap { it.inetAddresses.toList() }
+                            .toSet()
+                    }.getOrDefault(emptySet())
+                }
+                if (!ownAddresses.contains(target.address)) {
+                    return target
+                }
+                return InetSocketAddress(InetAddress.getLoopbackAddress(), target.port)
+            }
             val kcpSink = MiLinkMirrorKcpSink(
-                sessionId = sessionId,
+                sessionId = { sessionId },
                 receiveWindow = { KCP_ADVERTISED_RECEIVE_WINDOW },
                 onSendDatagram = { reply ->
                     val target = sourceRtpEndpoint
                     if (target != null && !socket.isClosed) {
                         runCatching {
-                            socket.send(DatagramPacket(reply, reply.size, target))
+                            val ackTarget = resolveAckTarget(target)
+                            socket.send(DatagramPacket(reply, reply.size, ackTarget))
                         }
                     }
                 },
                 onPayload = { payload ->
+                    payloadsQueued += 1
                     if (rtpBatchQueue.trySend(payload).isFailure) {
                         rtpBatchDatagramsDropped += 1
                         if (rtpBatchDatagramsDropped == 1 || rtpBatchDatagramsDropped % 100 == 0) {
@@ -393,6 +421,9 @@ object AndroidMiLinkMirrorMediaBridge {
                     }
                 }
             )
+            var ackWatchLastPushes = 0L
+            var ackWatchLastDuplicates = 0L
+            var ackWatchLoggedLoopback = false
             while (currentCoroutineContext().isActive) {
                 val packet = DatagramPacket(buffer, buffer.size)
                 try {
@@ -427,6 +458,32 @@ object AndroidMiLinkMirrorMediaBridge {
                     )
                 }
                 kcpSink.receiveDatagram(data)
+                val watchPushes = kcpSink.pushReceived
+                if (watchPushes - ackWatchLastPushes >= ACK_WATCH_WINDOW_PUSHES) {
+                    val dupDelta = kcpSink.duplicateDropped - ackWatchLastDuplicates
+                    val pushDelta = watchPushes - ackWatchLastPushes
+                    ackWatchLastPushes = watchPushes
+                    ackWatchLastDuplicates = kcpSink.duplicateDropped
+                    val replyEndpoint = sourceRtpEndpoint
+                    if (ackViaLoopback && !ackWatchLoggedLoopback && replyEndpoint != null &&
+                        !replyEndpoint.address.isLoopbackAddress
+                    ) {
+                        ackWatchLoggedLoopback = true
+                        EdgeLinkLog.info(
+                            "xiaomi.mirror.android.kcp_ack_loopback sessionId=$sessionId " +
+                                "source=${replyEndpoint.address.hostAddress}:${replyEndpoint.port}"
+                        )
+                    }
+                    if (ackViaLoopback && ackWatchLoggedLoopback && pushDelta >= ACK_WATCH_MIN_PUSHES &&
+                        dupDelta * 4 > pushDelta
+                    ) {
+                        ackViaLoopback = false
+                        EdgeLinkLog.warn(
+                            "xiaomi.mirror.android.kcp_ack_loopback_fallback sessionId=$sessionId " +
+                                "dupDelta=$dupDelta pushDelta=$pushDelta"
+                        )
+                    }
+                }
             }
         }
 
@@ -450,12 +507,20 @@ object AndroidMiLinkMirrorMediaBridge {
                     scratch.write(next)
                     payloadBytes += next.size + 2
                     datagrams += 1
+                    payloadsBatched += 1
                     next = kotlinx.coroutines.withTimeoutOrNull(RTP_BATCH_MAX_DELAY_MS) {
                         rtpBatchQueue.receiveCatching().getOrNull()
                     }
                 }
                 if (datagrams == 0) {
                     continue
+                }
+                if (rtpBatchesSent % 500 == 0) {
+                    val backlog = payloadsQueued - payloadsBatched
+                    EdgeLinkLog.info(
+                        "xiaomi.mirror.android.cloudflare_queue_health sessionId=$sessionId " +
+                            "queued=$payloadsQueued batched=$payloadsBatched backlog=$backlog"
+                    )
                 }
                 val packed = scratch.toByteArray()
                 rtpBatchesSent += 1
@@ -841,6 +906,7 @@ object AndroidMiLinkMirrorMediaBridge {
                 "wfd_audio_codecs" to "AAC 00000001 00",
                 "wfd_audio_codecs_v2" to "2 0 0 0",
                 "wfd_video_formats" to XIAOMI_OFFICIAL_HEVC_VIDEO_FORMATS,
+                "wfd_video_bitrate" to XIAOMI_OFFICIAL_VIDEO_BITRATE.toString(),
                 "wfd_video_enctype" to "1 1",
                 "wfd_video_gamuttype" to "1 1",
                 "wfd_current_video_info" to "-1 -1 -1 -1",
@@ -955,10 +1021,12 @@ object AndroidMiLinkMirrorMediaBridge {
 }
 
 private const val XIAOMI_OFFICIAL_HEVC_VIDEO_FORMATS = "40 0 2 10 1ffff 1fffffff 0fff 0 0 0 0 none none"
+private const val XIAOMI_OFFICIAL_VIDEO_BITRATE = 5_000_000
 private val OFFICIAL_ALWAYS_RETURNED_PARAMETERS = setOf(
     "wfd_audio_codecs",
     "wfd_audio_codecs_v2",
     "wfd_video_formats",
+    "wfd_video_bitrate",
     "wfd_current_video_info",
     "wfd_client_rtp_ports",
     "wfd_content_sp_protection",

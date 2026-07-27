@@ -3,7 +3,7 @@ package com.edgelink.app
 import java.util.TreeMap
 
 class MiLinkMirrorKcpSink(
-    private val sessionId: String,
+    private val sessionId: () -> String,
     private val receiveWindow: () -> Int,
     private val onSendDatagram: (ByteArray) -> Unit,
     private val onPayload: (ByteArray) -> Unit,
@@ -55,7 +55,7 @@ class MiLinkMirrorKcpSink(
             if (offset + segmentLength > data.size) {
                 malformed += 1
                 logWarn(
-                    "xiaomi.mirror.android.kcp_malformed sessionId=$sessionId " +
+                    "xiaomi.mirror.android.kcp_malformed sessionId=${sessionId()} " +
                         "bytes=${data.size} offset=$offset declaredLength=$length"
                 )
                 return
@@ -68,7 +68,7 @@ class MiLinkMirrorKcpSink(
             malformed += 1
             if (malformed <= 5 || malformed % 50 == 0L) {
                 logWarn(
-                    "xiaomi.mirror.android.kcp_malformed sessionId=$sessionId " +
+                    "xiaomi.mirror.android.kcp_malformed sessionId=${sessionId()} " +
                         "bytes=${data.size} malformed=$malformed bytes=${data.size}"
                 )
             }
@@ -88,7 +88,7 @@ class MiLinkMirrorKcpSink(
             conversationId = conv
             nextReceiveSn = sn
             logInfo(
-                "xiaomi.mirror.android.kcp_conversation sessionId=$sessionId " +
+                "xiaomi.mirror.android.kcp_conversation sessionId=${sessionId()} " +
                     "conv=0x${conv.toString(16)} firstSn=$sn"
             )
         }
@@ -102,12 +102,12 @@ class MiLinkMirrorKcpSink(
                 sendSegment(COMMAND_WINS, ts, sn)
                 winsSent += 1
                 logInfo(
-                    "xiaomi.mirror.android.kcp_wask sessionId=$sessionId count=$waskReceived sn=$sn"
+                    "xiaomi.mirror.android.kcp_wask sessionId=${sessionId()} count=$waskReceived sn=$sn"
                 )
             }
             COMMAND_ACK, COMMAND_WINS -> Unit
             else -> logInfo(
-                "xiaomi.mirror.android.kcp_unknown sessionId=$sessionId " +
+                "xiaomi.mirror.android.kcp_unknown sessionId=${sessionId()} " +
                     "cmd=0x${command.toString(16)} sn=$sn len=$payloadLength"
             )
         }
@@ -128,7 +128,7 @@ class MiLinkMirrorKcpSink(
             sendSegment(COMMAND_ACK, ts, sn)
             if (duplicateDropped <= 5 || duplicateDropped % 50 == 0L) {
                 logWarn(
-                    "xiaomi.mirror.android.kcp_duplicate sessionId=$sessionId " +
+                    "xiaomi.mirror.android.kcp_duplicate sessionId=${sessionId()} " +
                         "sn=$sn expected=$nextReceiveSn duplicates=$duplicateDropped"
                 )
             }
@@ -138,7 +138,7 @@ class MiLinkMirrorKcpSink(
             resyncCount += 1
             receiveBuffer.clear()
             logWarn(
-                "xiaomi.mirror.android.kcp_resync sessionId=$sessionId " +
+                "xiaomi.mirror.android.kcp_resync sessionId=${sessionId()} " +
                     "sn=$sn expected=$nextReceiveSn gap=$delta resyncs=$resyncCount"
             )
             nextReceiveSn = sn
@@ -152,7 +152,7 @@ class MiLinkMirrorKcpSink(
             outOfOrderBuffered += 1
             if (outOfOrderBuffered <= 5 || outOfOrderBuffered % 50 == 0L) {
                 logWarn(
-                    "xiaomi.mirror.android.kcp_out_of_order sessionId=$sessionId " +
+                    "xiaomi.mirror.android.kcp_out_of_order sessionId=${sessionId()} " +
                         "sn=$sn expected=$nextReceiveSn gap=$delta buffered=${receiveBuffer.size}"
                 )
             }
@@ -176,7 +176,7 @@ class MiLinkMirrorKcpSink(
         }
         if (pushReceived <= 5 || pushReceived % 100 == 0L) {
             logInfo(
-                "xiaomi.mirror.android.kcp_push sessionId=$sessionId sn=$sn " +
+                "xiaomi.mirror.android.kcp_push sessionId=${sessionId()} sn=$sn " +
                     "payloadBytes=$length pushReceived=$pushReceived"
             )
         }

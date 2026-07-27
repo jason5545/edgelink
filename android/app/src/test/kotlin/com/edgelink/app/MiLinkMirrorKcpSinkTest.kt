@@ -10,7 +10,7 @@ class MiLinkMirrorKcpSinkTest {
     private val payloads = mutableListOf<ByteArray>()
 
     private fun newSink(): MiLinkMirrorKcpSink = MiLinkMirrorKcpSink(
-        sessionId = "test",
+        sessionId = { "test" },
         receiveWindow = { 128 },
         onSendDatagram = { sent.add(it) },
         onPayload = { payloads.add(it) },

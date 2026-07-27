@@ -2862,6 +2862,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkRTPMalformedCount: UInt64 = 0
     private var mptSinkRTPDuplicateDroppedCount: UInt64 = 0
     private var mptSinkRTPSequenceGapCount: UInt64 = 0
+    private var mptSinkSoftLossCount: UInt64 = 0
     private var mptSinkLastRTPSequenceNumber: UInt16?
     private var mptSinkTSPacketsReceived: UInt64 = 0
     private var mptSinkTSCaptureHandle: FileHandle?
@@ -3038,6 +3039,7 @@ private final class XiaomiMirrorRTPMediaSender {
             }
             self.kcpDatagramsReceived += 1
             self.recordMPTMediaPacketActivity(reason: "cloudflare_payload")
+            self.kcpTransport.lastPushUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
             self.handleMPTSinkKCPPayload(payload, sn: 0)
         }
     }
@@ -3724,6 +3726,17 @@ private final class XiaomiMirrorRTPMediaSender {
         )
     }
 
+    private func noteMPTSinkSoftTransportLoss(reason: String, detail: String) {
+        mptSinkSoftLossCount += 1
+        mptSinkInterleavedBuffer.removeAll(keepingCapacity: true)
+        mptSinkTSDemuxer?.noteSoftTransportDiscontinuity(reason: reason)
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.mpt.transport_soft_discontinuity session=\(sessionID.uuidString) " +
+                "reason=\(reason) \(detail) kcpResync=\(kcpTransport.receiveResyncCount) " +
+                "rtpGaps=\(mptSinkRTPSequenceGapCount) softLosses=\(mptSinkSoftLossCount)"
+        )
+    }
+
     private func resetMPTSinkDecoderAfterFrameStallIfNeeded(
         elapsedFrameSeconds: Double,
         elapsedMediaSeconds: Double,
@@ -3931,6 +3944,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let mptSinkNoFrameTimeoutSeconds: Double = 2
     private static let mptSinkVideoESAbsentThresholdSeconds: Double = 5
     private static let mptSinkFrameStallDecoderResetMinIntervalSeconds: Double = 1.5
+    private static let mptSinkSoftLossMaxMissingPackets = 2
     private static let rtspInterleavedMagic: UInt8 = 0x24
     private static let rtspInterleavedHeaderLength = 4
     private static let rtpMinimumHeaderLength = 12
@@ -4618,6 +4632,19 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         )
     }
 
+    func noteSoftTransportDiscontinuity(reason: String) {
+        currentPES.removeAll(keepingCapacity: true)
+        currentPESPTS90k = nil
+        currentAudioPES.removeAll(keepingCapacity: true)
+        currentAudioPESPTS90k = nil
+        continuityCounters.removeAll(keepingCapacity: true)
+        accessUnitAssembler.resetAfterSoftLoss(reason: reason)
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.mpt.ts_soft_discontinuity session=\(sessionID.uuidString) " +
+                "reason=\(reason) pes=\(pesParsed) audioPES=\(audioPESParsed) packets=\(packetsParsed)"
+        )
+    }
+
     private func parseTSPacket(_ packet: Data, rtpTimestamp: UInt32) {
         guard packet.count == Self.packetLength, packet[0] == Self.syncByte else {
             return
@@ -4922,6 +4949,7 @@ private final class XiaomiMirrorHEVCAccessUnitAssembler {
     private var pendingPTS90k: UInt64?
     private var accessUnits = 0
     private var waitingForRandomAccess = false
+    private var discardUntilNextFirstSlice = false
     private var droppedUntilRandomAccess: UInt64 = 0
 
     init(sessionID: UUID, onAccessUnit: @escaping ([Data], UInt64?) -> Void) {
@@ -4947,6 +4975,14 @@ private final class XiaomiMirrorHEVCAccessUnitAssembler {
         )
     }
 
+    func resetAfterSoftLoss(reason: String) {
+        clearPending()
+        discardUntilNextFirstSlice = true
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.mpt.hevc_au_soft_drop session=\(sessionID.uuidString) reason=\(reason)"
+        )
+    }
+
     private func pushNALUnit(_ nalUnit: Data, pts90k: UInt64?) {
         guard nalUnit.count >= 2 else {
             return
@@ -4954,6 +4990,13 @@ private final class XiaomiMirrorHEVCAccessUnitAssembler {
         let nalType = Self.nalType(nalUnit)
         let vcl = Self.isVCLNALType(nalType)
         let firstSlice = vcl && nalUnit.count > 2 && (nalUnit[2] & 0x80) != 0
+        if discardUntilNextFirstSlice {
+            if firstSlice {
+                discardUntilNextFirstSlice = false
+            } else if vcl {
+                return
+            }
+        }
         if firstSlice && pendingHasVCL {
             flushPending()
         }
