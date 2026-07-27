@@ -7,7 +7,7 @@ final class CommandDispatcher {
     private let notificationPresenter: MacNotificationPresenter
     private let screenSession: MacScreenSession?
     private let clipboardHistoryStore: ClipboardHistoryStore?
-    private let onStatusPong: @Sendable () -> Void
+    private let onStatusPong: @Sendable (StatusPongBody) -> Void
     private let onSmsMessage: @Sendable (SmsMessageBody) -> Void
     private let onSmsSendResult: @Sendable (SmsSendResultBody) -> Void
     private let onPhoneActionResult: @Sendable (PhoneActionResultBody) -> Void
@@ -37,7 +37,7 @@ final class CommandDispatcher {
         notificationPresenter: MacNotificationPresenter = MacNotificationPresenter(),
         screenSession: MacScreenSession? = nil,
         clipboardHistoryStore: ClipboardHistoryStore? = nil,
-        onStatusPong: @escaping @Sendable () -> Void = {},
+        onStatusPong: @escaping @Sendable (StatusPongBody) -> Void = { _ in },
         onSmsMessage: @escaping @Sendable (SmsMessageBody) -> Void = { _ in },
         onSmsSendResult: @escaping @Sendable (SmsSendResultBody) -> Void = { _ in },
         onPhoneActionResult: @escaping @Sendable (PhoneActionResultBody) -> Void = { _ in },
@@ -91,9 +91,15 @@ final class CommandDispatcher {
         let header = try decoder.decode(EnvelopeHeader.self, from: plaintext)
         switch header.t {
         case EnvelopeType.statusPing:
-            return try encoder.encode(Envelope(t: EnvelopeType.statusPong, b: EmptyBody()))
+            let ping = try decoder.decode(Envelope<StatusPingBody>.self, from: plaintext)
+            let receivedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+            return try encoder.encode(Envelope(
+                t: EnvelopeType.statusPong,
+                b: StatusPongBody(t0: ping.b.t0, ta: receivedAtMs, tb: Int64(Date().timeIntervalSince1970 * 1000))
+            ))
         case EnvelopeType.statusPong:
-            onStatusPong()
+            let pong = try decoder.decode(Envelope<StatusPongBody>.self, from: plaintext)
+            onStatusPong(pong.b)
             return nil
         case EnvelopeType.inputPointer:
             let envelope = try decoder.decode(Envelope<InputPointerBody>.self, from: plaintext)

@@ -42,6 +42,7 @@ export interface RelaySocketAttachment {
   authenticated: boolean;
   deviceId?: string;
   role?: "host" | "client";
+  colo?: string;
 }
 
 export const json = (body: unknown, init: ResponseInit = {}) => {

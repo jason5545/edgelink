@@ -71,7 +71,7 @@ private data class RelayReadyEnvelope(
     val b: Body
 ) {
     @Serializable
-    data class Body(val role: String)
+    data class Body(val role: String, val colo: String? = null)
 }
 
 private class OkHttpRelayByteChannel(
@@ -111,7 +111,7 @@ private class OkHttpRelayByteChannel(
             EnvelopeCodec.json.decodeFromString(RelayReadyEnvelope.serializer(), text)
         }.getOrNull()
         if (envelope?.t == "relay.ready") {
-            EdgeLinkLog.info("relay.transport.ready hostId=$hostId deviceId=$deviceId role=${envelope.b.role}")
+            EdgeLinkLog.info("relay.transport.ready hostId=$hostId deviceId=$deviceId role=${envelope.b.role} colo=${envelope.b.colo ?: "unknown"}")
             ready.complete(Unit)
             startAppPing()
         } else if (text == RELAY_APP_PONG_TEXT) {

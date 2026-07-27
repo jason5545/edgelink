@@ -14,6 +14,26 @@ public struct EmptyBody: Codable, Sendable {
     public init() {}
 }
 
+public struct StatusPingBody: Codable, Sendable {
+    public let t0: Int64?
+
+    public init(t0: Int64? = nil) {
+        self.t0 = t0
+    }
+}
+
+public struct StatusPongBody: Codable, Sendable {
+    public let t0: Int64?
+    public let ta: Int64?
+    public let tb: Int64?
+
+    public init(t0: Int64? = nil, ta: Int64? = nil, tb: Int64? = nil) {
+        self.t0 = t0
+        self.ta = ta
+        self.tb = tb
+    }
+}
+
 public enum EnvelopeType {
     public static let statusPing = "status.ping"
     public static let statusPong = "status.pong"

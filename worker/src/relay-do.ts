@@ -52,7 +52,11 @@ export class RelayDO implements DurableObject {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.serializeAttachment({ authenticated: false } satisfies RelaySocketAttachment);
+    const colo = request.cf?.colo;
+    server.serializeAttachment({
+      authenticated: false,
+      ...(typeof colo === "string" ? { colo } : {})
+    } satisfies RelaySocketAttachment);
     this.state.acceptWebSocket(server);
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
     return new Response(null, { status: 101, webSocket: client });
@@ -114,15 +118,17 @@ export class RelayDO implements DurableObject {
       return;
     }
 
+    const colo = readAttachment(sender).colo;
     sender.serializeAttachment({
       authenticated: true,
       deviceId: body.b.deviceId,
-      role
+      role,
+      ...(colo ? { colo } : {})
     } satisfies RelaySocketAttachment);
 
     this.closeReplacedRoleSockets(sender, body.b.deviceId, role);
 
-    sender.send(JSON.stringify({ t: "relay.ready", b: { role } }));
+    sender.send(JSON.stringify({ t: "relay.ready", b: { role, ...(colo ? { colo } : {}) } }));
   }
 
   private async issueTurnCredentials(request: Request): Promise<Response> {

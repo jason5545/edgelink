@@ -21,6 +21,8 @@ import com.edgelink.core.ClipboardHistoryResponseBody
 import com.edgelink.core.ClipboardKind
 import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.StatusCapsBody
+import com.edgelink.core.StatusPingBody
+import com.edgelink.core.StatusPongBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
 import com.edgelink.core.CtrlPointerBody
@@ -2034,7 +2036,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 )
                 error("Secure relay timed out after ${livenessAgeMs}ms without inbound activity.")
             }
-            activeSession.sendPlaintext(EnvelopeCodec.encode(EnvelopeTypes.STATUS_PING, EmptyBody))
+            activeSession.sendPlaintext(
+                EnvelopeCodec.encode(EnvelopeTypes.STATUS_PING, StatusPingBody(t0 = System.currentTimeMillis()))
+            )
             delay(PING_INTERVAL_MS)
         }
     }
@@ -2750,8 +2754,26 @@ private class AndroidCommandDispatcher(
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
-            EnvelopeTypes.STATUS_PING -> EnvelopeCodec.encode(EnvelopeTypes.STATUS_PONG, EmptyBody)
+            EnvelopeTypes.STATUS_PING -> {
+                val ping = runCatching { EnvelopeCodec.decode<StatusPingBody>(plaintext).b }.getOrNull()
+                val receivedAtMs = System.currentTimeMillis()
+                EnvelopeCodec.encode(
+                    EnvelopeTypes.STATUS_PONG,
+                    StatusPongBody(t0 = ping?.t0, ta = receivedAtMs, tb = System.currentTimeMillis())
+                )
+            }
             EnvelopeTypes.STATUS_PONG -> {
+                val pong = runCatching { EnvelopeCodec.decode<StatusPongBody>(plaintext).b }.getOrNull()
+                val t0 = pong?.t0
+                if (t0 != null && pong.ta != null && pong.tb != null) {
+                    val nowMs = System.currentTimeMillis()
+                    val rttMs = nowMs - t0
+                    val offsetMs = (pong.ta + pong.tb) / 2 - (t0 + rttMs / 2)
+                    EdgeLinkLog.info(
+                        "relay.android.secure_rtt rttMs=$rttMs offsetMs=$offsetMs " +
+                            "peerTa=${pong.ta} peerTb=${pong.tb}"
+                    )
+                }
                 onPong()
                 null
             }

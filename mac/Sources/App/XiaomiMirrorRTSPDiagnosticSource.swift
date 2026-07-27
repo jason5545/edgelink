@@ -97,6 +97,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     var onPeerStop: ((String, UUID, UInt64) -> Void)?
     var onCloudflareMirrorOutboundDatagram: ((Data, String) -> Void)?
     var onCloudflareMirrorOutboundDatagramBatch: (([Data], String) -> Void)?
+    var relayClockSyncProvider: (() -> (offsetMs: Int64, rttMs: Int64)?)?
 
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorRTSPDiagnosticSource")
     private let queueKey = DispatchSpecificKey<Void>()
@@ -310,6 +311,15 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     "count=\(cloudflareMirrorPacketsReceived) sequence=\(body.sequence.map(String.init) ?? "none") " +
                     "bytes=\(packet.count) kind=\(body.kind) fp=\(DiagnosticsLog.fingerprint(packet))"
             )
+            if let sync = relayClockSyncProvider?() {
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                let oneWayMs = nowMs - (body.ts - sync.offsetMs)
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.cloudflare.latency sessionId=\(body.sessionId) " +
+                        "sequence=\(body.sequence.map(String.init) ?? "none") oneWayMs=\(oneWayMs) " +
+                        "rttMs=\(sync.rttMs) offsetMs=\(sync.offsetMs) bodyTs=\(body.ts)"
+                )
+            }
         }
         if body.kind == "rtp_batch" || body.kind == "rtp_payload_batch" {
             var offset = 0

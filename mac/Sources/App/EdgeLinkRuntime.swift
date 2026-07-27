@@ -140,6 +140,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private var lanSessionTask: Task<Void, Never>?
     private var hostSessionDidConnect = false
     private var lastSecurePongAt = Date.distantPast
+    private var relaySecureRttMs: Int64?
+    private var relayClockOffsetMs: Int64?
+    private let relayClockSyncBox = RelayClockSyncBox()
     private var pendingAwakeNotification = false
     private var resumeConnectionAfterWake = false
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
@@ -290,6 +293,9 @@ final class EdgeLinkRuntime: ObservableObject {
             Task { @MainActor in
                 self?.sendXiaomiMirrorCloudflareDatagramBatch(packets, sessionId: sessionId)
             }
+        }
+        xiaomiMirrorRTSPDiagnosticSource.relayClockSyncProvider = { [relayClockSyncBox] in
+            relayClockSyncBox.snapshot()
         }
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
             Task { @MainActor in
@@ -3408,11 +3414,22 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    private func recordSecurePong(generation: UUID) {
+    private func recordSecurePong(generation: UUID, pong: StatusPongBody? = nil) {
         guard currentChannelGeneration == generation else {
             return
         }
         lastSecurePongAt = Date()
+        if let pong, let t0 = pong.t0, let ta = pong.ta, let tb = pong.tb {
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let rttMs = nowMs - t0
+            let offsetMs = (ta + tb) / 2 - (t0 + rttMs / 2)
+            relaySecureRttMs = rttMs
+            relayClockOffsetMs = offsetMs
+            relayClockSyncBox.update(offsetMs: offsetMs, rttMs: rttMs)
+            DiagnosticsLog.info(
+                "relay.mac.secure_rtt rttMs=\(rttMs) offsetMs=\(offsetMs) peerTa=\(ta) peerTb=\(tb)"
+            )
+        }
         if isConnected {
             connectionStatus = "Connected"
         }
@@ -3458,7 +3475,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 throw SecureKeepaliveError.pongTimedOut
             }
 
-            let data = try encoder.encode(Envelope(t: EnvelopeType.statusPing, b: EmptyBody()))
+            let data = try encoder.encode(Envelope(
+                t: EnvelopeType.statusPing,
+                b: StatusPingBody(t0: Int64(Date().timeIntervalSince1970 * 1000))
+            ))
             try await session.sendPlaintext(data)
         }
     }
@@ -4774,4 +4794,26 @@ private enum SecureKeepaliveError: Error {
     case receiveLoopEnded
     case pongTimedOut
     case redundantSession
+}
+
+final class RelayClockSyncBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var offsetMs: Int64?
+    private var rttMs: Int64?
+
+    func update(offsetMs: Int64, rttMs: Int64) {
+        lock.lock()
+        self.offsetMs = offsetMs
+        self.rttMs = rttMs
+        lock.unlock()
+    }
+
+    func snapshot() -> (offsetMs: Int64, rttMs: Int64)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let offsetMs, let rttMs else {
+            return nil
+        }
+        return (offsetMs, rttMs)
+    }
 }

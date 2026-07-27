@@ -28,7 +28,7 @@ final class RelayTransport {
                 DiagnosticsLog.warn("relay.transport.mac.unexpected_ready hostId=\(hostId) text=\(ready)")
                 throw RelayTransportError.unexpectedReadyMessage
             }
-            DiagnosticsLog.info("relay.transport.mac.ready hostId=\(hostId) deviceId=\(identity.deviceId) role=\(readyEnvelope.b.role)")
+            DiagnosticsLog.info("relay.transport.mac.ready hostId=\(hostId) deviceId=\(identity.deviceId) role=\(readyEnvelope.b.role) colo=\(readyEnvelope.b.colo ?? "unknown")")
             channel.startKeepalive()
             return channel
         } catch {
@@ -282,6 +282,7 @@ private final class RelayPingWaiter: @unchecked Sendable {
 private struct RelayReadyEnvelope: Decodable {
     struct Body: Decodable {
         let role: String
+        let colo: String?
     }
 
     let t: String

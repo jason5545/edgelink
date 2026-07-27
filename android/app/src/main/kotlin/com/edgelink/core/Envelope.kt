@@ -13,6 +13,18 @@ data class Envelope<T>(
 @Serializable
 object EmptyBody
 
+@Serializable
+data class StatusPingBody(
+    val t0: Long? = null
+)
+
+@Serializable
+data class StatusPongBody(
+    val t0: Long? = null,
+    val ta: Long? = null,
+    val tb: Long? = null
+)
+
 object EnvelopeTypes {
     const val STATUS_PING = "status.ping"
     const val STATUS_PONG = "status.pong"

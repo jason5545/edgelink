@@ -34,7 +34,7 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTSP_PLAY_RESPONSE_TIMEOUT_MS = 2_500L
     private const val RTSP_KEEPALIVE_INTERVAL_MS = 30_000L
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
-    private const val RTP_BATCH_MAX_DELAY_MS = 10L
+    private const val RTP_BATCH_MAX_DELAY_MS = 3L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
     private const val KCP_ADVERTISED_RECEIVE_WINDOW = 128
     private const val OWN_ADDRESSES_REFRESH_MS = 30_000L
