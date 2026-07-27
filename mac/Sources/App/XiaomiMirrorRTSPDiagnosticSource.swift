@@ -5127,6 +5127,11 @@ private final class XiaomiMirrorHEVCDecoder {
     private var needsRandomAccess = false
     private var droppedUntilRandomAccess: UInt64 = 0
     private var resetOnNextRandomAccessReason: String?
+    var callbacksReceived: UInt64 = 0
+    var callbacksErrorStatus: UInt64 = 0
+    var callbacksWithoutImage: UInt64 = 0
+    private var sampleBufferFailures: UInt64 = 0
+    private var nonVCLAccessUnits: UInt64 = 0
 
     init(sessionID: UUID) {
         self.sessionID = sessionID
@@ -5172,6 +5177,13 @@ private final class XiaomiMirrorHEVCDecoder {
         }
         updateParameterSets(from: accessUnit)
         guard accessUnit.contains(where: { XiaomiMirrorHEVCAccessUnitAssembler.isVCLNALType(Self.nalType($0)) }) else {
+            nonVCLAccessUnits += 1
+            if nonVCLAccessUnits <= 5 || nonVCLAccessUnits % 60 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mirror.mpt.hevc_decode_non_vcl session=\(sessionID.uuidString) " +
+                        "count=\(nonVCLAccessUnits) nals=\(Self.nalTypesSummary(accessUnit))"
+                )
+            }
             return
         }
         let hasRandomAccess = accessUnit.contains {
@@ -5223,7 +5235,15 @@ private final class XiaomiMirrorHEVCDecoder {
                 pts90k: pts90k,
                 isRandomAccess: hasRandomAccess
               ) else {
+            sampleBufferFailures += 1
             onDecodeFailed?()
+            if sampleBufferFailures <= 5 || sampleBufferFailures % 30 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.hevc_sample_buffer_failed session=\(sessionID.uuidString) " +
+                        "count=\(sampleBufferFailures) nals=\(Self.nalTypesSummary(accessUnit)) " +
+                        "pts90k=\(pts90k.map(String.init) ?? "none")"
+                )
+            }
             return
         }
         decodeRequests += 1
@@ -5246,6 +5266,8 @@ private final class XiaomiMirrorHEVCDecoder {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.hevc_decode_submitted session=\(sessionID.uuidString) " +
                     "requests=\(decodeRequests) nals=\(accessUnit.count) randomAccess=\(hasRandomAccess) " +
+                    "callbacks=\(callbacksReceived) cbNoImage=\(callbacksWithoutImage) " +
+                    "cbError=\(callbacksErrorStatus) sampleFailures=\(sampleBufferFailures) " +
                     "pts90k=\(pts90k.map(String.init) ?? "none")"
             )
         }
@@ -5412,6 +5434,10 @@ private final class XiaomiMirrorHEVCDecoder {
             blockBufferOut: &blockBuffer
         )
         guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_block_buffer_create_failed session=\(sessionID.uuidString) " +
+                    "status=\(blockStatus) bytes=\(sampleData.count)"
+            )
             return nil
         }
         let replaceStatus = sampleData.withUnsafeBytes { rawBuffer in
@@ -5426,6 +5452,10 @@ private final class XiaomiMirrorHEVCDecoder {
             )
         }
         guard replaceStatus == kCMBlockBufferNoErr else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.hevc_block_buffer_replace_failed session=\(sessionID.uuidString) " +
+                    "status=\(replaceStatus) bytes=\(sampleData.count)"
+            )
             return nil
         }
         var timing = CMSampleTimingInfo(
@@ -5507,17 +5537,33 @@ private final class XiaomiMirrorHEVCDecoder {
 
     private static let asynchronousDecodeFrameFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
 
-    private static let outputCallback: VTDecompressionOutputCallback = { refCon, _, status, _, imageBuffer, _, _ in
+    private static let outputCallback: VTDecompressionOutputCallback = { refCon, _, status, infoFlags, imageBuffer, _, _ in
         guard let refCon else {
             return
         }
         let decoder = Unmanaged<XiaomiMirrorHEVCDecoder>.fromOpaque(refCon).takeUnretainedValue()
-        guard status == noErr, let imageBuffer else {
+        decoder.callbacksReceived += 1
+        if status != noErr {
+            decoder.callbacksErrorStatus += 1
             decoder.onDecodeFailed?()
             decoder.requireRandomAccess(reason: "decoder_output_status_\(status)")
             DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.hevc_decoder_output_failed session=\(decoder.sessionID.uuidString) status=\(status)"
+                "xiaomi.mirror.mpt.hevc_decoder_output_failed session=\(decoder.sessionID.uuidString) " +
+                    "status=\(status) infoFlags=\(infoFlags.rawValue) callbacks=\(decoder.callbacksReceived)"
             )
+            return
+        }
+        guard let imageBuffer else {
+            decoder.callbacksWithoutImage += 1
+            decoder.onDecodeFailed?()
+            decoder.requireRandomAccess(reason: "decoder_output_no_image")
+            if decoder.callbacksWithoutImage <= 5 || decoder.callbacksWithoutImage % 30 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.hevc_decoder_output_no_image session=\(decoder.sessionID.uuidString) " +
+                        "infoFlags=\(infoFlags.rawValue) count=\(decoder.callbacksWithoutImage) " +
+                        "callbacks=\(decoder.callbacksReceived)"
+                )
+            }
             return
         }
         decoder.handleDecoded(pixelBuffer: imageBuffer)
