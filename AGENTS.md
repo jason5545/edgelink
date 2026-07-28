@@ -1,5 +1,6 @@
 # EdgeLink Agent Notes
 
+- **Xiaomi mirror: dim is NOT the issue — do NOT touch dim/power/Hangup-related code** (`AndroidScreenPowerGuard`, dim/brightness logic, MIUI Hangup/synergy power-key paths). Verified 2026-07-28: video keeps flowing with virtual display at brightness 2.44E-4, DIM, even screen_off (official Hangup behavior); static screen → zero frames is normal encoder behavior, not a stall. These areas were painstakingly tuned; changing them historically causes regressions.
 - When building the macOS app for local install, use Apple Development Team ID `MW4GWYGX56`.
 - Keep `mac/project.yml` as the source of truth for Xcode signing settings, then run `xcodegen generate` from `mac/` after editing it.
 - Install the built app into `/Applications` with `ditto`, not Finder drag/drop:
