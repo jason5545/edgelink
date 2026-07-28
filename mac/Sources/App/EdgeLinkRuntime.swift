@@ -67,6 +67,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var phoneBatterySource = ""
     @Published private(set) var photoSyncEnabled: Bool
     @Published private(set) var photoSyncStatus = ""
+    @Published private(set) var biometricAppLockEnabled: Bool
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -124,6 +125,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
     private var lyraFileSendSession: LyraFileSendSession?
+    let macTrustManager = MacTrustManager()
+    private var lyraCastTrustSession: LyraCastTrustSession?
     private let tunnelManager = TunnelManager()
     private let encoder = JSONEncoder()
     private var currentSession: SecureSessionHost?
@@ -223,6 +226,7 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayEchoCancellationEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayEchoCancellationDefaultsKey) as? Bool ?? true
         lastDialedPhoneNumber = UserDefaults.standard.string(forKey: Self.lastDialedPhoneNumberDefaultsKey) ?? ""
         photoSyncEnabled = UserDefaults.standard.object(forKey: Self.photoSyncEnabledDefaultsKey) as? Bool ?? true
+        biometricAppLockEnabled = UserDefaults.standard.bool(forKey: Self.biometricAppLockEnabledDefaultsKey)
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -445,6 +449,21 @@ final class EdgeLinkRuntime: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.photoSyncEnabledDefaultsKey)
         photoSyncEnabled = enabled
         DiagnosticsLog.info("photo.mac.sync_enabled enabled=\(enabled)")
+    }
+
+    func setBiometricAppLockEnabled(_ enabled: Bool) async -> Bool {
+        if enabled {
+            do {
+                try await BiometricAuthManager.shared.evaluate(reason: "開啟 EdgeLink 的 \(BiometricAuthManager.shared.biometricLabel) 鎖定")
+            } catch {
+                DiagnosticsLog.info("biometric.mac.lock_enable_rejected error=\(error.localizedDescription)")
+                return false
+            }
+        }
+        UserDefaults.standard.set(enabled, forKey: Self.biometricAppLockEnabledDefaultsKey)
+        biometricAppLockEnabled = enabled
+        DiagnosticsLog.info("biometric.mac.lock_enabled enabled=\(enabled)")
+        return true
     }
 
     func requestPhotoSyncNow() {
@@ -1034,6 +1053,52 @@ final class EdgeLinkRuntime: ObservableObject {
     @discardableResult
     func openPhoneMiShare() -> String? {
         sendMiLinkCommand(command: "xiaomi.mishare.openSettings")
+    }
+
+    func startPhoneTrustUnlock() {
+        guard lyraCastTrustSession == nil else { return }
+        let endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
+        guard !endpoints.isEmpty,
+              let discoveredDeviceId = xiaomiMiShareDiscovery.localDeviceIdHex
+        else {
+            xiaomiMiLinkCommandStatus = String(localized: "看不到手機，請確認手機已開啟妙享桌面")
+            DiagnosticsLog.warn("xiaomi.cast.trust_no_phone_endpoint")
+            return
+        }
+        let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let deviceIdHex = cloneId?.isEmpty == false ? cloneId! : discoveredDeviceId
+        DiagnosticsLog.info("xiaomi.cast.trust_device_id id=\(deviceIdHex) cloned=\(cloneId != nil) endpoints=\(endpoints.count)")
+        let session = LyraCastTrustSession(
+            endpoints: endpoints,
+            deviceIdHex: deviceIdHex,
+            displayName: xiaomiMiShareDiscovery.localDisplayName,
+            trustManager: macTrustManager
+        )
+        session.onStatus = { [weak self] status in
+            DispatchQueue.main.async {
+                self?.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：\(status)")
+            }
+        }
+        lyraCastTrustSession = session
+        macTrustManager.autoUnlockOnReady = true
+        session.start()
+        xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：連接手機…")
+        DiagnosticsLog.info("xiaomi.cast.trust_started endpoints=\(endpoints.count) first=\(endpoints.first?.host ?? "none"):\(endpoints.first?.port ?? 0)")
+    }
+
+    func stopPhoneTrustUnlock() {
+        lyraCastTrustSession?.cancel()
+        lyraCastTrustSession = nil
+        macTrustManager.stop()
+    }
+
+    func requestPhoneTrustBind() {
+        macTrustManager.requestBind()
+    }
+
+    func requestPhoneUnlock() async {
+        await macTrustManager.requestUnlock()
     }
 
     @discardableResult
@@ -4778,6 +4843,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let lastDialedPhoneNumberDefaultsKey = "lastDialedPhoneNumber"
     private static let phoneRelayEchoCancellationDefaultsKey = "phoneRelayEchoCancellationEnabled"
     private static let photoSyncEnabledDefaultsKey = "photoSyncEnabled"
+    private static let biometricAppLockEnabledDefaultsKey = "biometricAppLockEnabled"
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102

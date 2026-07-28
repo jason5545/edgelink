@@ -104,12 +104,56 @@ final class LyraMeshResponder {
         startAnnounceTimer()
     }
 
+    func currentPhoneEndpoint() -> (host: String, port: UInt16)? {
+        let live = syncAnnounceEndpoint ?? lastEndpointDescription
+        guard let live, let endpoint = Self.parseEndpoint(live) else {
+            return nil
+        }
+        return endpoint
+    }
+
+    func persistedPhoneEndpoints() -> [(host: String, port: UInt16)] {
+        let history = UserDefaults.standard.stringArray(forKey: Self.phoneEndpointHistoryDefaultsKey) ?? []
+        return history.compactMap { Self.parseEndpoint($0) }
+    }
+
+    static func recordPhoneEndpoint(_ description: String) {
+        let defaults = UserDefaults.standard
+        defaults.set(description, forKey: lastPhoneEndpointDefaultsKey)
+        defaults.set(Date().timeIntervalSince1970, forKey: lastPhoneEndpointTimeDefaultsKey)
+        var history = defaults.stringArray(forKey: phoneEndpointHistoryDefaultsKey) ?? []
+        history.removeAll { $0 == description }
+        history.insert(description, at: 0)
+        if history.count > 5 {
+            history = Array(history.prefix(5))
+        }
+        defaults.set(history, forKey: phoneEndpointHistoryDefaultsKey)
+    }
+
+    private static let lastPhoneEndpointDefaultsKey = "lyraLastPhoneMeshEndpoint"
+    private static let lastPhoneEndpointTimeDefaultsKey = "lyraLastPhoneMeshEndpointTime"
+    private static let phoneEndpointHistoryDefaultsKey = "lyraPhoneMeshEndpointHistory"
+
+    static func parseEndpoint(_ description: String) -> (host: String, port: UInt16)? {
+        guard let separator = description.lastIndex(of: ":") else {
+            return nil
+        }
+        let host = String(description[description.startIndex..<separator])
+        guard let port = UInt16(description[description.index(after: separator)...]), !host.isEmpty else {
+            return nil
+        }
+        return (host, port)
+    }
+
     private func startAnnounceTimer() {
         announceTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: announceQueue)
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
-            guard let self, let endpoint = self.lastEndpointDescription else { return }
+            guard let self else { return }
+            let endpoint = self.lastEndpointDescription
+                ?? UserDefaults.standard.string(forKey: Self.lastPhoneEndpointDefaultsKey)
+            guard let endpoint else { return }
             self.sendAnnounce(endpointDescription: endpoint)
         }
         announceTimer = timer
@@ -118,6 +162,7 @@ final class LyraMeshResponder {
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
         lastEndpointDescription = endpoint.debugDescription
+        Self.recordPhoneEndpoint(endpoint.debugDescription)
         if frame.packType == 5 {
             handlePayloadV2(frame: frame, endpoint: endpoint)
             return
@@ -571,7 +616,7 @@ final class LyraMeshResponder {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
             deviceName: displayNameProvider(),
-            deviceType: 14,
+            deviceType: 4,
             deviceId: deviceIdHex,
             uidHash: "61F2",
             hwModel: Self.hardwareModel(),
@@ -579,7 +624,8 @@ final class LyraMeshResponder {
             services: [
                 LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
                 LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
+                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
             ],
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
@@ -1544,7 +1590,7 @@ final class LyraMeshResponder {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
             deviceName: displayNameProvider(),
-            deviceType: 14,
+            deviceType: 4,
             deviceId: deviceIdHex,
             uidHash: "61F2",
             hwModel: Self.hardwareModel(),
@@ -1552,7 +1598,8 @@ final class LyraMeshResponder {
             services: [
                 LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
                 LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
+                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
+                LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
             ],
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"

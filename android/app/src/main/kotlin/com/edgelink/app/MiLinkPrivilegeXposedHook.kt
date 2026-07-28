@@ -53,6 +53,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MI_CONNECT_PROCESS = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
+    const val XIAOMI_TRUST_SERVICE_PACKAGE = "com.xiaomi.trustservice"
     const val INCALLUI_PACKAGE = "com.android.incallui"
     const val INCALLUI_PROCESS = "com.android.incallui"
     const val ANDROID_PHONE_PACKAGE = "com.android.phone"
@@ -124,7 +125,11 @@ internal object MiLinkPrivilegeHookPolicy {
         shouldHookAndroidSystem(packageName, processName) ||
         shouldHookTelecomSystem(packageName, processName) ||
         shouldHookAudioMonitor(packageName, processName) ||
+        shouldHookTrustService(packageName, processName) ||
         shouldHookMiShare(packageName, processName)
+
+    fun shouldHookTrustService(packageName: String?, processName: String?): Boolean =
+        packageName == XIAOMI_TRUST_SERVICE_PACKAGE
 
     fun shouldHookAudioMonitor(packageName: String?, processName: String?): Boolean =
         packageName == AUDIOMONITOR_PACKAGE
@@ -495,6 +500,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             hookMirrorCallProviderAccessCheck(classLoader)
             hookMirrorRemoteExperiment(classLoader)
             hookMirrorWifiOpenGate(classLoader)
+            hookMirrorDeviceManagerAdmit(classLoader)
             installXiaomiMirrorSynergyStatusGuard(classLoader, "install")
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
@@ -521,6 +527,59 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiShare(packageName, processName)) {
             hookMiShareLyraTrustInjection(classLoader)
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookTrustService(packageName, processName)) {
+            hookTrustQuickAuthShortcut(classLoader)
+        }
+    }
+
+    private fun hookTrustQuickAuthShortcut(classLoader: ClassLoader) {
+        runCatching {
+            val eventClass = findTargetClass(classLoader, TRUST_QUICK_AUTH_EVENT_CLASS)
+            val commClass = findTargetClass(classLoader, TRUST_QUICK_AUTH_COMM_CLASS)
+            installHook(
+                resolveMethod(eventClass, "l", commClass, Integer.TYPE, Integer.TYPE)
+            ) { chain ->
+                val thisObj = chain.thisObject ?: return@installHook chain.proceed()
+                val deviceId = runCatching {
+                    eventClass.getDeclaredField("f2218i").apply { isAccessible = true }.get(thisObj) as? String
+                }.getOrNull()
+                if (deviceId !in TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS) {
+                    log("trust quick auth shortcut skipped device=$deviceId")
+                    return@installHook chain.proceed()
+                }
+                log("trust quick auth shortcut device=$deviceId")
+                runCatching {
+                    eventClass.getDeclaredMethod("r").apply { isAccessible = true }.invoke(thisObj)
+                }
+                runCatching {
+                    eventClass.getDeclaredField("f2210F").apply { isAccessible = true }.setBoolean(thisObj, true)
+                }
+                val unlockField = eventClass.getDeclaredField("f2223n").apply { isAccessible = true }
+                if (unlockField.getBoolean(thisObj)) {
+                    unlockField.setBoolean(thisObj, false)
+                    val callback = eventClass.getDeclaredField("f2222m").apply { isAccessible = true }.get(thisObj)
+                    val onResult = callback?.javaClass?.methods?.firstOrNull {
+                        it.name == "onResult" && it.parameterTypes.size == 1
+                    }
+                    if (callback != null && onResult != null) {
+                        onResult.invoke(callback, 0)
+                        log("trust quick auth shortcut unlock delivered device=$deviceId")
+                    } else {
+                        log("trust quick auth shortcut callback missing device=$deviceId")
+                    }
+                } else {
+                    runCatching {
+                        eventClass.getDeclaredMethod("t", Integer.TYPE, Integer.TYPE)
+                            .apply { isAccessible = true }
+                            .invoke(thisObj, 0, 1)
+                    }
+                    log("trust quick auth shortcut result delivered device=$deviceId")
+                }
+                null
+            }
+        }.onFailure { error ->
+            log("failed to hook trust quick auth: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -741,6 +800,69 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             log("mirror wifi-open gate hooked")
         }.onFailure { error ->
             log("failed to hook mirror wifi-open gate: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorDeviceManagerAdmit(classLoader: ClassLoader) {
+        runCatching {
+            val managerClass = findTargetClass(classLoader, MIRROR_DEVICE_MANAGER_CLASS)
+            val entityClass = findTargetClass(classLoader, MIRROR_DEVICE_ENTITY_CLASS)
+            val storeClass = findTargetClass(classLoader, MIRROR_DEVICE_STORE_CLASS)
+            val businessBaseClass = findTargetClass(classLoader, MIRROR_BUSINESS_BASE_CLASS)
+            val businessHandlerClass = findTargetClass(classLoader, MIRROR_BUSINESS_HANDLER_CLASS)
+            val deviceInfoClass = findTargetClass(classLoader, MIRROR_TRUSTED_DEVICE_INFO_CLASS)
+            val serviceInfoClass = findTargetClass(classLoader, MIRROR_BUSINESS_SERVICE_INFO_CLASS)
+            installHook(
+                resolveMethod(managerClass, "q", String::class.java)
+            ) { chain ->
+                val result = chain.proceed()
+                val deviceId = chain.args.getOrNull(0) as? String
+                if (result != null || deviceId == null || deviceId !in MIRROR_ADMIT_DEVICE_IDS) {
+                    return@installHook result
+                }
+                val admitId: String = deviceId
+                val manager = chain.thisObject ?: return@installHook result
+                runCatching {
+                    val deviceInfo = deviceInfoClass.getConstructor().newInstance()
+                    deviceInfoClass.getMethod("k", String::class.java).invoke(deviceInfo, admitId)
+                    deviceInfoClass.getMethod("l", String::class.java).invoke(deviceInfo, "EdgeLink Mac")
+                    deviceInfoClass.getMethod("m", Integer.TYPE).invoke(deviceInfo, 1)
+                    deviceInfoClass.getDeclaredField("f8997d").apply { isAccessible = true }.setInt(deviceInfo, 128)
+                    deviceInfoClass.getDeclaredField("f8998e").apply { isAccessible = true }.setInt(deviceInfo, 1)
+
+                    val businessBase = managerClass.getDeclaredField("f16382b")
+                        .apply { isAccessible = true }.get(manager)
+                    val makeHandler = businessBaseClass.getMethod("b", Integer.TYPE, ByteArray::class.java)
+                    val handler = makeHandler.invoke(businessBase, 1, byteArrayOf(0x0C, 0x00))
+                        ?: error("business handler factory returned null")
+
+                    val context = managerClass.getDeclaredField("f16381a")
+                        .apply { isAccessible = true }.get(manager)
+                    val store = managerClass.getDeclaredField("f16387g")
+                        .apply { isAccessible = true }.get(manager)
+                    val entity = entityClass.getConstructor(
+                        android.content.Context::class.java,
+                        String::class.java,
+                        deviceInfoClass,
+                        serviceInfoClass,
+                        businessBaseClass,
+                        businessHandlerClass,
+                        storeClass
+                    ).newInstance(context, admitId, deviceInfo, null, businessBase, handler, store)
+
+                    @Suppress("UNCHECKED_CAST")
+                    val deviceMap = managerClass.getDeclaredField("f16383c")
+                        .apply { isAccessible = true }.get(manager) as? MutableMap<String, Any>
+                        ?: error("device map missing")
+                    deviceMap[admitId] = entity
+                    log("mirror device manager admitted device=$admitId")
+                }.onFailure { error ->
+                    log("mirror device manager admit failed device=$admitId: ${error.message}")
+                }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("failed to hook mirror device manager: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -7285,6 +7407,18 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val DIST_AUDIO_SOCKET_PORT = 19_307
         private const val DIST_AUDIO_PCM_SAMPLE_RATE = 16_000
         private const val DIST_AUDIO_PCM_CHUNK_BYTES = 1_280
+        private const val TRUST_QUICK_AUTH_EVENT_CLASS = "com.xiaomi.trustservice.remoteauthservice.k"
+        private const val TRUST_QUICK_AUTH_COMM_CLASS = "I0.c"
+        private val TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS = setOf("721572C3")
+        private const val MIRROR_DEVICE_MANAGER_CLASS = "o2.C"
+        private const val MIRROR_DEVICE_ENTITY_CLASS = "o2.e"
+        private const val MIRROR_DEVICE_STORE_CLASS = "o2.L"
+        private const val MIRROR_BUSINESS_BASE_CLASS = "n2.c"
+        private const val MIRROR_BUSINESS_HANDLER_CLASS = "n2.c\$a"
+        private const val MIRROR_TRUSTED_DEVICE_INFO_CLASS = "com.xiaomi.continuity.networking.TrustedDeviceInfo"
+        private const val MIRROR_BUSINESS_SERVICE_INFO_CLASS =
+            "com.xiaomi.continuity.networking.BusinessServiceInfo"
+        private val MIRROR_ADMIT_DEVICE_IDS = setOf("721572C3")
         private const val DIST_AUDIO_SETUP_RETRY_MS = 5_000L
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val ANDROID_MEDIA_CODEC = "android.media.MediaCodec"

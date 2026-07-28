@@ -63,6 +63,13 @@ final class LANSessionListener: @unchecked Sendable {
                     return
                 }
                 DiagnosticsLog.info("lan.mac.session_accepted endpoint=\(connection.endpoint)")
+                if case .hostPort(let host, _) = connection.endpoint {
+                    let ip = "\(host)".trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                    if !ip.isEmpty {
+                        UserDefaults.standard.set(ip, forKey: "lanLastPhoneIP")
+                        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lanLastPhoneIPTime")
+                    }
+                }
                 self.onAccept(LANTCPByteChannel(connection: connection, queue: self.queue))
             }
             nextListener.start(queue: queue)

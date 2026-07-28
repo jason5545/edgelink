@@ -220,6 +220,14 @@ final class XiaomiMiShareDiscovery: NSObject {
     }
 
     func currentPhoneMeshEndpoint() -> (host: String, port: UInt16)? {
+        currentPhoneMeshEndpoints().first
+    }
+
+    func currentPhoneMeshEndpoints() -> [(host: String, port: UInt16)] {
+        var endpoints: [(host: String, port: UInt16)] = []
+        if let live = meshResponder?.currentPhoneEndpoint() {
+            endpoints.append(live)
+        }
         for peer in peersByServiceName.values {
             guard let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:)),
                   appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
@@ -228,9 +236,22 @@ final class XiaomiMiShareDiscovery: NSObject {
             else {
                 continue
             }
-            return (host, meshPort)
+            endpoints.append((host, meshPort))
         }
-        return nil
+        let history = meshResponder?.persistedPhoneEndpoints() ?? []
+        endpoints.append(contentsOf: history)
+        if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
+            let lanTime = UserDefaults.standard.double(forKey: "lanLastPhoneIPTime")
+            if Date().timeIntervalSince1970 - lanTime < 86_400 {
+                var ports = Set(history.map(\.port))
+                ports.insert(46541)
+                for port in ports {
+                    endpoints.append((lanIP, port))
+                }
+            }
+        }
+        var seen = Set<String>()
+        return endpoints.filter { seen.insert("\($0.host):\($0.port)").inserted }
     }
 
     private static func firstIPv4Address(from addresses: [Data]?) -> String? {
