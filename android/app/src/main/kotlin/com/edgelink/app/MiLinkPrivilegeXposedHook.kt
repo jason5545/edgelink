@@ -542,7 +542,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             ) { chain ->
                 val thisObj = chain.thisObject ?: return@installHook chain.proceed()
                 val deviceId = runCatching {
-                    eventClass.getDeclaredField("f2218i").apply { isAccessible = true }.get(thisObj) as? String
+                    eventClass.getDeclaredField("i").apply { isAccessible = true }.get(thisObj) as? String
                 }.getOrNull()
                 if (deviceId !in TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS) {
                     log("trust quick auth shortcut skipped device=$deviceId")
@@ -553,12 +553,12 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                     eventClass.getDeclaredMethod("r").apply { isAccessible = true }.invoke(thisObj)
                 }
                 runCatching {
-                    eventClass.getDeclaredField("f2210F").apply { isAccessible = true }.setBoolean(thisObj, true)
+                    eventClass.getDeclaredField("F").apply { isAccessible = true }.setBoolean(thisObj, true)
                 }
-                val unlockField = eventClass.getDeclaredField("f2223n").apply { isAccessible = true }
+                val unlockField = eventClass.getDeclaredField("n").apply { isAccessible = true }
                 if (unlockField.getBoolean(thisObj)) {
                     unlockField.setBoolean(thisObj, false)
-                    val callback = eventClass.getDeclaredField("f2222m").apply { isAccessible = true }.get(thisObj)
+                    val callback = eventClass.getDeclaredField("m").apply { isAccessible = true }.get(thisObj)
                     val onResult = callback?.javaClass?.methods?.firstOrNull {
                         it.name == "onResult" && it.parameterTypes.size == 1
                     }
@@ -827,18 +827,18 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                     deviceInfoClass.getMethod("k", String::class.java).invoke(deviceInfo, admitId)
                     deviceInfoClass.getMethod("l", String::class.java).invoke(deviceInfo, "EdgeLink Mac")
                     deviceInfoClass.getMethod("m", Integer.TYPE).invoke(deviceInfo, 1)
-                    deviceInfoClass.getDeclaredField("f8997d").apply { isAccessible = true }.setInt(deviceInfo, 128)
-                    deviceInfoClass.getDeclaredField("f8998e").apply { isAccessible = true }.setInt(deviceInfo, 1)
+                    deviceInfoClass.getDeclaredField("d").apply { isAccessible = true }.setInt(deviceInfo, 128)
+                    deviceInfoClass.getDeclaredField("e").apply { isAccessible = true }.setInt(deviceInfo, 1)
 
-                    val businessBase = managerClass.getDeclaredField("f16382b")
+                    val businessBase = managerClass.getDeclaredField("b")
                         .apply { isAccessible = true }.get(manager)
                     val makeHandler = businessBaseClass.getMethod("b", Integer.TYPE, ByteArray::class.java)
                     val handler = makeHandler.invoke(businessBase, 1, byteArrayOf(0x0C, 0x00))
                         ?: error("business handler factory returned null")
 
-                    val context = managerClass.getDeclaredField("f16381a")
+                    val context = managerClass.getDeclaredField("a")
                         .apply { isAccessible = true }.get(manager)
-                    val store = managerClass.getDeclaredField("f16387g")
+                    val store = managerClass.getDeclaredField("g")
                         .apply { isAccessible = true }.get(manager)
                     val entity = entityClass.getConstructor(
                         android.content.Context::class.java,
@@ -851,7 +851,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                     ).newInstance(context, admitId, deviceInfo, null, businessBase, handler, store)
 
                     @Suppress("UNCHECKED_CAST")
-                    val deviceMap = managerClass.getDeclaredField("f16383c")
+                    val deviceMap = managerClass.getDeclaredField("c")
                         .apply { isAccessible = true }.get(manager) as? MutableMap<String, Any>
                         ?: error("device map missing")
                     deviceMap[admitId] = entity

@@ -1065,26 +1065,42 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.warn("xiaomi.cast.trust_no_phone_endpoint")
             return
         }
-        let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let deviceIdHex = cloneId?.isEmpty == false ? cloneId! : discoveredDeviceId
-        DiagnosticsLog.info("xiaomi.cast.trust_device_id id=\(deviceIdHex) cloned=\(cloneId != nil) endpoints=\(endpoints.count)")
-        let session = LyraCastTrustSession(
-            endpoints: endpoints,
-            deviceIdHex: deviceIdHex,
-            displayName: xiaomiMiShareDiscovery.localDisplayName,
-            trustManager: macTrustManager
-        )
-        session.onStatus = { [weak self] status in
-            DispatchQueue.main.async {
-                self?.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：\(status)")
+        xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：Touch ID 驗證…")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await BiometricAuthManager.shared.evaluate(reason: "解鎖手機鎖定螢幕")
+            } catch {
+                DiagnosticsLog.info("trust.mac.local_auth_rejected error=\(error.localizedDescription)")
+                await MainActor.run {
+                    self.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：已取消")
+                }
+                return
             }
+            let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let deviceIdHex = cloneId?.isEmpty == false ? cloneId! : discoveredDeviceId
+            DiagnosticsLog.info("xiaomi.cast.trust_device_id id=\(deviceIdHex) cloned=\(cloneId != nil) endpoints=\(endpoints.count)")
+            let session = LyraCastTrustSession(
+                endpoints: endpoints,
+                deviceIdHex: deviceIdHex,
+                displayName: self.xiaomiMiShareDiscovery.localDisplayName,
+                trustManager: self.macTrustManager
+            )
+            session.onStatus = { [weak self] status in
+                DispatchQueue.main.async {
+                    self?.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：\(status)")
+                }
+            }
+            await MainActor.run {
+                self.lyraCastTrustSession = session
+                self.macTrustManager.touchIdPreauthorized = true
+                self.macTrustManager.autoUnlockOnReady = true
+                session.start()
+                self.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：連接手機…")
+            }
+            DiagnosticsLog.info("xiaomi.cast.trust_started endpoints=\(endpoints.count) first=\(endpoints.first?.host ?? "none"):\(endpoints.first?.port ?? 0)")
         }
-        lyraCastTrustSession = session
-        macTrustManager.autoUnlockOnReady = true
-        session.start()
-        xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：連接手機…")
-        DiagnosticsLog.info("xiaomi.cast.trust_started endpoints=\(endpoints.count) first=\(endpoints.first?.host ?? "none"):\(endpoints.first?.port ?? 0)")
     }
 
     func stopPhoneTrustUnlock() {

@@ -18,7 +18,9 @@ final class MacTrustManager: ObservableObject {
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
+    var touchIdPreauthorized = false
     var onAuthActionSent: (() -> Void)?
+    var onAuthEventHandled: (() -> Void)?
 
     private var sessionID: UInt64 = 0
     private var awaitingAuthEvent = false
@@ -76,18 +78,23 @@ final class MacTrustManager: ObservableObject {
             return
         }
         state = .authenticating
-        do {
-            try await biometric.evaluate(reason: "解鎖手機鎖定螢幕")
-        } catch {
-            state = .ready(locked: true)
-            DiagnosticsLog.info("trust.mac.local_auth_rejected error=\(error.localizedDescription)")
-            return
+        if touchIdPreauthorized {
+            touchIdPreauthorized = false
+        } else {
+            do {
+                try await biometric.evaluate(reason: "解鎖手機鎖定螢幕")
+            } catch {
+                state = .ready(locked: true)
+                DiagnosticsLog.info("trust.mac.local_auth_rejected error=\(error.localizedDescription)")
+                return
+            }
         }
         awaitingAuthEvent = true
         var action = TrustAuthAction()
         action.feature = DuoScreenTrustFeature.unlockDevice
         action.method = DuoScreenTrustAuthMethod.fingerprint
         action.unlockUi = true
+        action.notCheckSetting = true
         send(.authAction(action))
         DiagnosticsLog.info("trust.mac.auth_action_sent")
         onAuthActionSent?()
@@ -124,19 +131,14 @@ final class MacTrustManager: ObservableObject {
     private func handleStatusEvent(_ event: TrustStatusEvent) {
         statusEvent = event
         if event.code == DuoScreenTrustCode.disabledBySetting {
-            if event.auth?.enableStatus == DuoScreenTrustEnableStatus.enabled.rawValue {
-                state = .ready(locked: true)
-                DiagnosticsLog.info(
-                    "trust.mac.status_setting_only enabled=1 assumed_ready " +
-                        "bind=\(event.auth?.bindStatus ?? -99) localRisk=\(event.auth?.localRisk ?? -99) remoteRisk=\(event.auth?.remoteRisk ?? -99)"
-                )
-                if autoUnlockOnReady {
-                    autoUnlockOnReady = false
-                    Task { await self.requestUnlock() }
-                }
-            } else {
-                state = .failed("手機未開啟跨裝置解鎖")
-                DiagnosticsLog.warn("trust.mac.status_setting_only enabled=\(event.auth?.enableStatus ?? -99)")
+            state = .ready(locked: true)
+            DiagnosticsLog.info(
+                "trust.mac.status_setting_only assumed_ready enabled=\(event.auth?.enableStatus ?? -99) " +
+                    "bind=\(event.auth?.bindStatus ?? -99) localRisk=\(event.auth?.localRisk ?? -99) remoteRisk=\(event.auth?.remoteRisk ?? -99)"
+            )
+            if autoUnlockOnReady {
+                autoUnlockOnReady = false
+                Task { await self.requestUnlock() }
             }
             return
         }
@@ -179,6 +181,7 @@ final class MacTrustManager: ObservableObject {
     private func handleAuthEvent(_ event: TrustAuthEvent) {
         guard awaitingAuthEvent, event.feature == DuoScreenTrustFeature.unlockDevice else { return }
         awaitingAuthEvent = false
+        defer { onAuthEventHandled?() }
         switch event.code {
         case DuoScreenTrustCode.success:
             state = .ready(locked: false)

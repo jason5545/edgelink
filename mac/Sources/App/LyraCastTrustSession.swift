@@ -88,6 +88,12 @@ final class LyraCastTrustSession {
             self.socket.onFrame = { [weak self] frame, endpoint, reply in
                 self?.handle(frame: frame, endpoint: endpoint, reply: reply)
             }
+            self.socket.onRawDatagram = { content, endpoint in
+                DiagnosticsLog.info(
+                    "xiaomi.cast.trust_raw_rx bytes=\(content.count) from=\(endpoint.debugDescription) " +
+                        "head=\(content.prefix(16).map { String(format: "%02x", $0) }.joined())"
+                )
+            }
             do {
                 try self.socket.start()
             } catch {
@@ -725,6 +731,7 @@ final class LyraCastTrustSession {
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
         lastProgress = Date()
+        DiagnosticsLog.info("xiaomi.cast.trust_frame_rx packType=\(frame.packType) bytes=\(frame.payload.count)")
         if frame.packType == 5 {
             handlePayloadV2(frame: frame)
             return
@@ -1041,9 +1048,15 @@ final class LyraCastTrustSession {
 
     private func handlePayloadV2(frame: LyraMeshPack.Frame) {
         let body = frame.payload
-        guard body.count > 30 else { return }
+        guard body.count > 30 else {
+            DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_short bytes=\(body.count)")
+            return
+        }
         let flag = body[body.index(body.startIndex, offsetBy: 1)]
-        guard flag == 1 else { return }
+        guard flag == 1 else {
+            DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_flag flag=\(flag) bytes=\(body.count)")
+            return
+        }
         let nonce = body[body.index(body.startIndex, offsetBy: 2)..<body.index(body.startIndex, offsetBy: 14)]
         let ciphertext = body[body.index(body.startIndex, offsetBy: 14)..<body.index(body.endIndex, offsetBy: -16)]
         let tag = body[body.index(body.endIndex, offsetBy: -16)..<body.endIndex]
@@ -1052,6 +1065,7 @@ final class LyraCastTrustSession {
             ciphertext: Data(ciphertext),
             tag: Data(tag)
         ) else {
+            DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_sealed_box_invalid bytes=\(body.count)")
             return
         }
         var keys: [SymmetricKey] = [channelKeySC, channelKeyCS].compactMap { $0 }
@@ -1063,15 +1077,19 @@ final class LyraCastTrustSession {
                 continue
             }
             guard let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext) else {
+                DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_decode_failed bytes=\(plaintext.count)")
                 return
             }
             if header.type == LyraChannelProtocol.CommandType.responseOfPeerPort.rawValue {
                 handlePeerPortResponse(commandBody)
             } else if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue {
                 handleMitrustPeerPortRequest(commandBody)
+            } else {
+                DiagnosticsLog.info("xiaomi.cast.trust_payload_v2_unknown_type type=\(header.type)")
             }
             return
         }
+        DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_decrypt_failed bytes=\(body.count) keys=\(keys.count)")
     }
 
     private func sendPeerPortRequest() {
@@ -1135,7 +1153,12 @@ final class LyraCastTrustSession {
                     self?.sendChannelMessage(frame)
                 }
                 self.trustManager.onAuthActionSent = { [weak self] in
-                    self?.queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.queue.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+                        self?.teardownPhysAfterAuth()
+                    }
+                }
+                self.trustManager.onAuthEventHandled = { [weak self] in
+                    self?.queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                         self?.teardownPhysAfterAuth()
                     }
                 }
