@@ -1904,6 +1904,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         if (!stateFlow.value.autoReconnectEnabled) {
             return false
         }
+        while (autoReconnectWakeups.tryReceive().isSuccess) {
+        }
         val woke = withTimeoutOrNull(delayMs) {
             autoReconnectWakeups.receive()
             true
@@ -1914,6 +1916,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     private suspend fun waitForMacAwake(identity: LocalIdentity, peer: PinnedPeer, generation: Int): Boolean {
         var unknownPolls = 0
+        while (autoReconnectWakeups.tryReceive().isSuccess) {
+        }
         while (coroutineContext.isActive && connectionGeneration.get() == generation && macSleepSuppressed) {
             val woke = withTimeoutOrNull(MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS) {
                 autoReconnectWakeups.receive()

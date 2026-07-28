@@ -3,6 +3,7 @@ import Combine
 import CryptoKit
 import EdgeLinkKit
 import Foundation
+import IOKit.pwr_mgt
 
 @MainActor
 final class EdgeLinkRuntime: ObservableObject {
@@ -3538,20 +3539,21 @@ final class EdgeLinkRuntime: ObservableObject {
     private func handleSystemSleep() async {
         DiagnosticsLog.info("runtime.mac.system_sleep")
         resumeConnectionAfterWake = currentConnectionGeneration != nil
+        var sleepAssertion = IOPMAssertionID(0)
+        IOPMAssertionCreateWithName(
+            kIOPMAssertionTypeNoIdleSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "EdgeLink sleep teardown" as CFString,
+            &sleepAssertion
+        )
+        defer { IOPMAssertionRelease(sleepAssertion) }
         if let session = currentSession,
            let data = try? encoder.encode(Envelope(t: EnvelopeType.macSleep, b: EmptyBody())) {
             try? await session.sendPlaintext(data)
             pendingAwakeNotification = true
-            try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        if let identity = localIdentity {
-            do {
-                try await presenceClient.report(hostId: identity.deviceId, identity: identity, state: .sleeping)
-                DiagnosticsLog.info("presence.mac.reported state=sleeping reason=system_sleep")
-            } catch {
-                DiagnosticsLog.warn("presence.mac.report_failed state=sleeping error=\(error.localizedDescription)")
-            }
-        }
+        reportPresence(.sleeping, reason: "system_sleep")
+        try? await Task.sleep(nanoseconds: 200_000_000)
         currentConnectionGeneration = nil
         connectionTask?.cancel()
         connectionTask = nil
