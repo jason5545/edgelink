@@ -153,7 +153,7 @@ class AndroidMirrorTurnSession(
         factory = localFactory
         val config = PeerConnection.RTCConfiguration(turnIceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            iceTransportsType = PeerConnection.IceTransportsType.RELAY
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
         }
         EdgeLinkLog.info(
             "mirror.turn.peer_connection_config sessionId=$sessionId servers=${turnIceServers.size} " +

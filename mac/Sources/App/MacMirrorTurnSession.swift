@@ -100,7 +100,7 @@ final class MacMirrorTurnSession: NSObject, @unchecked Sendable {
                 return RTCIceServer(urlStrings: server.urls)
             }
             config.sdpSemantics = .unifiedPlan
-            config.iceTransportPolicy = .relay
+            config.iceTransportPolicy = .all
 
             let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
             guard let peerConnection = factory.peerConnection(
