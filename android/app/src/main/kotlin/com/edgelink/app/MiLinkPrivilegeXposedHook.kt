@@ -872,7 +872,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 result
             }
             installHook(
-                resolveMethod(findTargetClass(classLoader, XIAOMI_MIRROR_LYRA_UTILS_ALT), "z", String::class.java)
+                resolveMethod(findTargetClass(classLoader, XIAOMI_MIRROR_LYRA_UTILS), "z", String::class.java)
             ) { chain ->
                 val result = chain.proceed()
                 val deviceId = chain.args.getOrNull(0) as? String
@@ -3867,6 +3867,14 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 }
                 chain.proceed()
             }
+            installHook(resolveMethod(sourceClass, "stopCapture")) { chain ->
+                val wasRemembered = lastFakeMirrorControlSource === chain.thisObject
+                val result = chain.proceed()
+                if (wasRemembered && shouldForceMirrorScreenTerminalPresent()) {
+                    propagateFakeMirrorSourceTeardown(chain.thisObject, "stopCapture")
+                }
+                result
+            }
             installHook(
                 resolveMethod(
                     sourceClass,
@@ -4722,6 +4730,24 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         lastFakeMirrorControlSource = source
         lastFakeMirrorControlSourceUptimeMs = SystemClock.uptimeMillis()
         log("mirror source remembered reason=$reason ${mirrorControlSourceRecoverySummary(source)}")
+    }
+
+    private fun propagateFakeMirrorSourceTeardown(source: Any, reason: String) {
+        val summary = mirrorControlSourceRecoverySummary(source)
+        Handler(Looper.getMainLooper()).post {
+            if (!generationActive) {
+                return@post
+            }
+            runCatching {
+                source.javaClass.getMethod("closeMirror").invoke(source)
+                log("mirror fake source teardown propagated reason=$reason $summary")
+            }.onFailure { error ->
+                log(
+                    "mirror fake source teardown propagate failed reason=$reason " +
+                        "${error.javaClass.simpleName}: ${error.message} $summary"
+                )
+            }
+        }
     }
 
     private fun closeStaleFakeMirrorControlSource(reason: String) {
@@ -7284,7 +7310,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_ADV_CONNECTION_REFERENCE_OBFUSCATED = "com.xiaomi.mirror.connection.g"
         private const val XIAOMI_MIRROR_CAST_BUSINESS_WRAPPER = "N2.d"
         private const val XIAOMI_MIRROR_ISLAND_UTILS = "com.xiaomi.mirror.cast.a"
-        private const val XIAOMI_MIRROR_LYRA_UTILS_ALT = "p184x3.z"
         private const val CIRCULATE_DEVICE_LIST_UTILS = "com.miui.circulate.world.ui.devicelist.q"
         private const val CIRCULATE_DEVICE_INFO = "com.miui.circulate.api.service.CirculateDeviceInfo"
         private const val XIAOMI_MIRROR_LYRA_BUSINESS = "N2.a"
@@ -7338,7 +7363,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_WIFI_OPEN_CALLBACK = "p2.x\$c"
         private const val XIAOMI_MIRROR_WIFI_OPEN_TASK = "p2.x\$e"
         private const val XIAOMI_MIRROR_DISPLAY_MANAGER = "r3.U"
-        private const val XIAOMI_MIRROR_DISPLAY = "r3.AbstractC1397I"
+        private const val XIAOMI_MIRROR_DISPLAY = "r3.I"
         private const val XIAOMI_MIRROR_DISPLAY_HELPER = "r3.M"
         private const val XIAOMI_MIRROR_DISPLAY_CALLBACK = "r3.Y\$a"
         private const val XIAOMI_MIRROR_STUB_AUDIO_ROUTE_STRATEGY = "k2.C1054b"
