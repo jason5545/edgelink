@@ -13,7 +13,9 @@ final class MacTrustManager: ObservableObject {
         case failed(String)
     }
 
-    @Published private(set) var state: State = .idle
+    @Published private(set) var state: State = .idle {
+        didSet { onStateChanged?(state) }
+    }
     @Published private(set) var statusEvent: TrustStatusEvent?
 
     var sendFrame: ((Data) -> Void)?
@@ -22,6 +24,7 @@ final class MacTrustManager: ObservableObject {
     var onAuthActionSent: (() -> Void)?
     var onAuthEventHandled: (() -> Void)?
     var onUnlockSucceeded: (() -> Void)?
+    var onStateChanged: ((State) -> Void)?
 
     private var sessionID: UInt64 = 0
     private var awaitingAuthEvent = false

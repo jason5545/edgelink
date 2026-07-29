@@ -12,7 +12,6 @@ final class BiometricAuthManager: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var context = LAContext()
     private var authenticating = false
 
     private(set) var lastErrorCode: Int?
@@ -59,7 +58,6 @@ final class BiometricAuthManager: @unchecked Sendable {
             throw BiometricAuthError.alreadyAuthenticating
         }
         authenticating = true
-        let ctx = context
         lock.unlock()
         defer {
             lock.lock()
@@ -67,6 +65,7 @@ final class BiometricAuthManager: @unchecked Sendable {
             lock.unlock()
         }
 
+        let ctx = LAContext()
         var error: NSError?
         guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
             lastErrorCode = error?.code
@@ -91,8 +90,6 @@ final class BiometricAuthManager: @unchecked Sendable {
 
     func invalidate() {
         lock.lock()
-        context.invalidate()
-        context = LAContext()
         authenticating = false
         lock.unlock()
     }

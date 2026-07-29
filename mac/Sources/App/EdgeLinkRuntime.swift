@@ -259,8 +259,40 @@ final class EdgeLinkRuntime: ObservableObject {
                 guard let self, self.resumeScreenStartAfterTrustUnlock else { return }
                 self.resumeScreenStartAfterTrustUnlock = false
                 DiagnosticsLog.info("xiaomi.mac.screen_unlock_gate_resumed")
+                try? await Task.sleep(for: .milliseconds(1300))
+                guard !Task.isCancelled else { return }
+                self.screenSession.phoneUnlockPhase = nil
                 self.stopPhoneTrustUnlock()
-                self.viewPhoneScreen()
+            }
+        }
+        macTrustManager.onStateChanged = { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                switch state {
+                case .queryingStatus:
+                    self.screenSession.phoneUnlockPhase = .connecting
+                case .authenticating:
+                    self.screenSession.phoneUnlockPhase = .unlocking
+                case .ready(let locked) where !locked:
+                    self.screenSession.phoneUnlockPhase = .succeeded
+                case .failed(let message):
+                    self.screenSession.phoneUnlockPhase = .failed(message)
+                default:
+                    break
+                }
+            }
+        }
+        screenSession.onPhoneUnlockRetry = { [weak self] in
+            Task { @MainActor in
+                self?.stopPhoneTrustUnlock()
+                self?.startPhoneTrustUnlock()
+            }
+        }
+        screenSession.onPhoneUnlockDismiss = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.stopPhoneTrustUnlock()
+                self.screenSession.phoneUnlockPhase = nil
             }
         }
         screenSession.onSessionActivityChanged = { [weak self] active in
@@ -1059,6 +1091,7 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：Touch ID 驗證…")
+        screenSession.phoneUnlockPhase = .verifyingTouchID
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -1068,8 +1101,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 await MainActor.run {
                     self.resumeScreenStartAfterTrustUnlock = false
                     self.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：已取消")
+                    self.screenSession.phoneUnlockPhase = nil
                 }
                 return
+            }
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                self.screenSession.showActiveWindow()
             }
             let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4196,16 +4234,12 @@ final class EdgeLinkRuntime: ObservableObject {
         } else if result.command.lowercased().contains("power") {
             DiagnosticsLog.info("battery.mac.milink_power_probe command=\(result.command) data=\(result.data)")
         }
-        if result.command == "xiaomi.mirror.startMainDisplay", result.route == "xiaomi.mirror.locked" {
+        if result.command == "xiaomi.mirror.startMainDisplay", result.data["locked"] == "true" {
             DiagnosticsLog.info("xiaomi.mac.screen_locked_gate requestId=\(result.requestId)")
-            pendingXiaomiScreenFallback = nil
-            pendingXiaomiScreenFallbackTask?.cancel()
-            pendingXiaomiScreenFallbackTask = nil
             resumeScreenStartAfterTrustUnlock = true
             xiaomiMiLinkCommandStatus = String(localized: "手機已鎖定，請先解鎖…")
             stopPhoneTrustUnlock()
             startPhoneTrustUnlock()
-            return
         }
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
         let updatesCommandStatus = !Self.isXiaomiMirrorKeyboardCommand(result.command)

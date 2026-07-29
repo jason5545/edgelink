@@ -22,7 +22,6 @@ final class LyraCastTrustSession {
 
     private let queue = DispatchQueue(label: "edgelink.lyra.cast", qos: .userInitiated)
     private var endpoints: [(host: String, port: UInt16)]
-    private var endpointIndex = 0
     private var host: String
     private var port: UInt16
     private let deviceIdHex: String
@@ -177,10 +176,6 @@ final class LyraCastTrustSession {
             progress(.physSync, String(localized: "連接手機…"))
         }
         guard attempt < 8, stage == .physSync, !cancelled, !endpoints.isEmpty else { return }
-        let target = endpoints[attempt % endpoints.count]
-        endpointIndex = attempt % endpoints.count
-        host = target.host
-        port = target.port
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
@@ -202,7 +197,16 @@ final class LyraCastTrustSession {
             payload: .syncDeviceInfoRequest(request)
         )
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: physConn)
-        send(frame: LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized()), label: "phys_sync")
+        let frame = LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized())
+        for target in endpoints {
+            host = target.host
+            port = target.port
+            send(frame: frame, label: "phys_sync")
+        }
+        if let first = endpoints.first {
+            host = first.host
+            port = first.port
+        }
         queue.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.sendPhysSyncRequest(attempt: attempt + 1)
         }

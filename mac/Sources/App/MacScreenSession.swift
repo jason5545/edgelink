@@ -193,6 +193,9 @@ struct XiaomiMirrorScreenConfiguration: Equatable {
 
 final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
+    @Published var phoneUnlockPhase: PhoneUnlockPhase?
+    var onPhoneUnlockRetry: (() -> Void)?
+    var onPhoneUnlockDismiss: (() -> Void)?
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
     @Published private(set) var hasRemoteAudio = false
@@ -1786,20 +1789,30 @@ struct PhoneScreenView: View {
 
     @ViewBuilder
     private var connectingOverlay: some View {
-        let content = VStack(spacing: 14) {
-            ConnectingSpinnerView()
-            Text(session.status)
-                .foregroundStyle(.secondary)
-                .font(.callout)
-        }
-        if #available(macOS 26.0, *) {
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .glassEffect(.regular, in: .rect)
+        if let phase = session.phoneUnlockPhase {
+            PhoneUnlockPhaseView(
+                phase: phase,
+                onRetry: { session.onPhoneUnlockRetry?() },
+                onDismiss: { session.onPhoneUnlockDismiss?() }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
         } else {
-            ZStack {
-                VisualEffectBlurView(material: .hudWindow, blendingMode: .withinWindow)
+            let content = VStack(spacing: 14) {
+                ConnectingSpinnerView()
+                Text(session.status)
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+            }
+            if #available(macOS 26.0, *) {
                 content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .glassEffect(.regular, in: .rect)
+            } else {
+                ZStack {
+                    VisualEffectBlurView(material: .hudWindow, blendingMode: .withinWindow)
+                    content
+                }
             }
         }
     }
@@ -1814,7 +1827,7 @@ struct PhoneScreenView: View {
                     .frame(width: videoFrame.width, height: videoFrame.height)
                     .position(x: videoFrame.midX, y: videoFrame.midY)
 
-                if !session.hasRemoteVideo {
+                if session.phoneUnlockPhase != nil || !session.hasRemoteVideo {
                     connectingOverlay
                 }
             }

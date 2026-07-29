@@ -1,7 +1,7 @@
 name: EdgeLink
 options:
   deploymentTarget:
-    macOS: "13.0"
+    macOS: "26.0"
   developmentLanguage: zh-Hant
 packages:
   WebRTC:
