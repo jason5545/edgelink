@@ -1,5 +1,6 @@
 package com.edgelink.app
 
+import android.app.KeyguardManager
 import android.content.ComponentName
 import android.content.ContentResolver
 import android.content.Context
@@ -266,6 +267,15 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun startMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
+        val keyguardManager = appContext.getSystemService(KeyguardManager::class.java)
+        if (keyguardManager?.isDeviceLocked == true) {
+            EdgeLinkLog.info("xiaomi.milink.command_locked_gate requestId=${body.requestId}")
+            return CommandResult(
+                success = false,
+                route = "xiaomi.mirror.locked",
+                message = "phone is locked"
+            )
+        }
         val requestedDeviceId = body.args["remoteDeviceId"].orEmpty().trim()
         val requestedFakeRemote = MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(requestedDeviceId)
         val forceFakeRemote = body.args["forceFakeRemote"] == "true"

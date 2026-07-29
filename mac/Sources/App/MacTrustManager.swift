@@ -21,6 +21,7 @@ final class MacTrustManager: ObservableObject {
     var touchIdPreauthorized = false
     var onAuthActionSent: (() -> Void)?
     var onAuthEventHandled: (() -> Void)?
+    var onUnlockSucceeded: (() -> Void)?
 
     private var sessionID: UInt64 = 0
     private var awaitingAuthEvent = false
@@ -186,6 +187,7 @@ final class MacTrustManager: ObservableObject {
         case DuoScreenTrustCode.success:
             state = .ready(locked: false)
             DiagnosticsLog.info("trust.mac.unlock_success")
+            onUnlockSucceeded?()
         case DuoScreenTrustCode.userCancel, DuoScreenTrustCode.timeoutCancel:
             state = .ready(locked: true)
             DiagnosticsLog.info("trust.mac.unlock_cancelled code=\(event.code)")

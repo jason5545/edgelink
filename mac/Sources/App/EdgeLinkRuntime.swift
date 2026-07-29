@@ -67,7 +67,6 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var phoneBatterySource = ""
     @Published private(set) var photoSyncEnabled: Bool
     @Published private(set) var photoSyncStatus = ""
-    @Published private(set) var biometricAppLockEnabled: Bool
 
     private let identityStore = KeychainIdentityStore()
     private let pairingStore: ApplicationSupportPairingStore?
@@ -149,6 +148,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let relayClockSyncBox = RelayClockSyncBox()
     private var pendingAwakeNotification = false
     private var resumeConnectionAfterWake = false
+    private var resumeScreenStartAfterTrustUnlock = false
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
@@ -226,7 +226,6 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneRelayEchoCancellationEnabled = UserDefaults.standard.object(forKey: Self.phoneRelayEchoCancellationDefaultsKey) as? Bool ?? true
         lastDialedPhoneNumber = UserDefaults.standard.string(forKey: Self.lastDialedPhoneNumberDefaultsKey) ?? ""
         photoSyncEnabled = UserDefaults.standard.object(forKey: Self.photoSyncEnabledDefaultsKey) as? Bool ?? true
-        biometricAppLockEnabled = UserDefaults.standard.bool(forKey: Self.biometricAppLockEnabledDefaultsKey)
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
@@ -253,6 +252,15 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.onWindowVisibilityChanged = { [weak self] visible in
             Task { @MainActor in
                 self?.isPhoneScreenViewerVisible = visible
+            }
+        }
+        macTrustManager.onUnlockSucceeded = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.resumeScreenStartAfterTrustUnlock else { return }
+                self.resumeScreenStartAfterTrustUnlock = false
+                DiagnosticsLog.info("xiaomi.mac.screen_unlock_gate_resumed")
+                self.stopPhoneTrustUnlock()
+                self.viewPhoneScreen()
             }
         }
         screenSession.onSessionActivityChanged = { [weak self] active in
@@ -449,21 +457,6 @@ final class EdgeLinkRuntime: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.photoSyncEnabledDefaultsKey)
         photoSyncEnabled = enabled
         DiagnosticsLog.info("photo.mac.sync_enabled enabled=\(enabled)")
-    }
-
-    func setBiometricAppLockEnabled(_ enabled: Bool) async -> Bool {
-        if enabled {
-            do {
-                try await BiometricAuthManager.shared.evaluate(reason: "開啟 EdgeLink 的 \(BiometricAuthManager.shared.biometricLabel) 鎖定")
-            } catch {
-                DiagnosticsLog.info("biometric.mac.lock_enable_rejected error=\(error.localizedDescription)")
-                return false
-            }
-        }
-        UserDefaults.standard.set(enabled, forKey: Self.biometricAppLockEnabledDefaultsKey)
-        biometricAppLockEnabled = enabled
-        DiagnosticsLog.info("biometric.mac.lock_enabled enabled=\(enabled)")
-        return true
     }
 
     func requestPhotoSyncNow() {
@@ -1073,6 +1066,7 @@ final class EdgeLinkRuntime: ObservableObject {
             } catch {
                 DiagnosticsLog.info("trust.mac.local_auth_rejected error=\(error.localizedDescription)")
                 await MainActor.run {
+                    self.resumeScreenStartAfterTrustUnlock = false
                     self.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：已取消")
                 }
                 return
@@ -4202,6 +4196,17 @@ final class EdgeLinkRuntime: ObservableObject {
         } else if result.command.lowercased().contains("power") {
             DiagnosticsLog.info("battery.mac.milink_power_probe command=\(result.command) data=\(result.data)")
         }
+        if result.command == "xiaomi.mirror.startMainDisplay", result.route == "xiaomi.mirror.locked" {
+            DiagnosticsLog.info("xiaomi.mac.screen_locked_gate requestId=\(result.requestId)")
+            pendingXiaomiScreenFallback = nil
+            pendingXiaomiScreenFallbackTask?.cancel()
+            pendingXiaomiScreenFallbackTask = nil
+            resumeScreenStartAfterTrustUnlock = true
+            xiaomiMiLinkCommandStatus = String(localized: "手機已鎖定，請先解鎖…")
+            stopPhoneTrustUnlock()
+            startPhoneTrustUnlock()
+            return
+        }
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
         let updatesCommandStatus = !Self.isXiaomiMirrorKeyboardCommand(result.command)
         if result.command == Self.xiaomiMirrorKeyboardReadyCommand {
@@ -4859,7 +4864,6 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let lastDialedPhoneNumberDefaultsKey = "lastDialedPhoneNumber"
     private static let phoneRelayEchoCancellationDefaultsKey = "phoneRelayEchoCancellationEnabled"
     private static let photoSyncEnabledDefaultsKey = "photoSyncEnabled"
-    private static let biometricAppLockEnabledDefaultsKey = "biometricAppLockEnabled"
     private static let phoneRelayProbePeerHostDefaultsKey = "phoneRelayProbePeerHost"
     private static let phoneRelayProbePeerPortDefaultsKey = "phoneRelayProbePeerPort"
     private static let phoneRelayProbePort: UInt16 = 7102

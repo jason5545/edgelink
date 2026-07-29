@@ -209,95 +209,12 @@ private struct MiShareSection: View {
                 Label("小米快傳傳檔給手機", systemImage: "paperplane")
             }
 
-            TrustUnlockSection(runtime: runtime, manager: runtime.macTrustManager)
-
             if !runtime.xiaomiMiLinkCommandStatus.isEmpty {
                 Text(runtime.xiaomiMiLinkCommandStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
-        }
-    }
-}
-
-private struct TrustUnlockSection: View {
-    @ObservedObject var runtime: EdgeLinkRuntime
-    @ObservedObject var manager: MacTrustManager
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            switch manager.state {
-            case .idle:
-                Button {
-                    runtime.startPhoneTrustUnlock()
-                } label: {
-                    Label("跨裝置解鎖手機", systemImage: "lock.open")
-                }
-            case .queryingStatus, .binding, .authenticating:
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(manager.state == .authenticating ? "Touch ID 驗證中…" : "連接中…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            case .needsBind:
-                Button {
-                    runtime.requestPhoneTrustBind()
-                } label: {
-                    Label("綁定跨裝置解鎖（需手機授權）", systemImage: "link.badge.plus")
-                }
-            case .ready(let locked):
-                if locked {
-                    Button {
-                        Task { await runtime.requestPhoneUnlock() }
-                    } label: {
-                        Label("用 \(BiometricAuthManager.shared.biometricLabel) 解鎖手機", systemImage: "touchid")
-                    }
-                } else {
-                    Label("手機已解鎖", systemImage: "lock.open.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            case .riskBlocked(let risk):
-                Label(riskMessage(risk), systemImage: "exclamationmark.shield")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            case .failed(let message):
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                    Button("重試") {
-                        runtime.stopPhoneTrustUnlock()
-                        runtime.startPhoneTrustUnlock()
-                    }
-                }
-            }
-
-            if manager.state != .idle {
-                Button("中斷連線") {
-                    runtime.stopPhoneTrustUnlock()
-                }
-                .font(.caption)
-            }
-        }
-    }
-
-    private func riskMessage(_ risk: DuoScreenTrustRisk) -> String {
-        switch risk {
-        case .deviceReboot:
-            return String(localized: "手機近期重新開機，請在手機上輸入密碼驗證")
-        case .passwordLongTimeNotUsed:
-            return String(localized: "手機長時間未輸入密碼，請在手機上驗證")
-        case .deviceLocked:
-            return String(localized: "手機已被鎖定，請稍後再試")
-        case .healthAbnormal:
-            return String(localized: "偵測到安全風險，請在手機上驗證")
-        case .none:
-            return String(localized: "請在手機上驗證")
         }
     }
 }
@@ -392,19 +309,6 @@ private struct SettingsSection: View {
                 )
             )
             .toggleStyle(.switch)
-
-            if BiometricAuthManager.shared.canEvaluate {
-                Toggle(
-                    "\(BiometricAuthManager.shared.biometricLabel) 鎖定",
-                    isOn: Binding(
-                        get: { runtime.biometricAppLockEnabled },
-                        set: { enabled in
-                            Task { await runtime.setBiometricAppLockEnabled(enabled) }
-                        }
-                    )
-                )
-                .toggleStyle(.switch)
-            }
 
             if runtime.photoSyncEnabled {
                 Button {
