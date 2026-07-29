@@ -116,11 +116,20 @@ internal object EdgeLinkShizukuCommandPolicy {
         if (isAllowedPhoneCommand(command)) {
             return true
         }
+        if (isAllowedProcNetUdpReadCommand(command)) {
+            return true
+        }
         if (isAllowedSystemPropertyCommand(command)) {
             return true
         }
         return isAllowedPermissionGrantCommand(command)
     }
+
+    private fun isAllowedProcNetUdpReadCommand(command: Array<String>): Boolean =
+        command.size == 3 &&
+            command[0] == "sh" &&
+            command[1] == "-c" &&
+            command[2] == "cat /proc/net/udp /proc/net/udp6"
 
     private fun isAllowedNotificationCommand(command: Array<String>): Boolean {
         if (command.size != 5) {

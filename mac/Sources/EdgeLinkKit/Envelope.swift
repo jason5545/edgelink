@@ -784,6 +784,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
     public let services: [MiLinkServiceCapabilityBody]?
     public let preferredRoutes: [String: String]?
     public let mirrorScreenRemoteActive: Bool?
+    public let lyraMeshPorts: [Int]?
     public let summary: String
     public let ts: Int64
 
@@ -805,6 +806,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         services: [MiLinkServiceCapabilityBody]? = nil,
         preferredRoutes: [String: String]? = nil,
         mirrorScreenRemoteActive: Bool? = nil,
+        lyraMeshPorts: [Int]? = nil,
         summary: String,
         ts: Int64
     ) {
@@ -825,6 +827,7 @@ public struct MiLinkStatusBody: Codable, Equatable, Sendable {
         self.services = services
         self.preferredRoutes = preferredRoutes
         self.mirrorScreenRemoteActive = mirrorScreenRemoteActive
+        self.lyraMeshPorts = lyraMeshPorts
         self.summary = summary
         self.ts = ts
     }

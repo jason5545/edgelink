@@ -67,6 +67,7 @@ final class LyraCastTrustSession {
     private var srvKeyCS: SymmetricKey?
     private var srvKeySC: SymmetricKey?
     private var srvChannelSocket: LyraChannelSocket?
+    private var srvReuseKey: SymmetricKey?
     private var srvChannelId: UInt32 = 0
 
     private static let serviceName = "com.xiaomi.mirror:cast"
@@ -409,10 +410,32 @@ final class LyraCastTrustSession {
     private func handleMitrustSyncInfo(_ data: Data, logiConn: LogiConnFrame) {
         srvConnId = logiConn.logiConnId
         srvPeerNetId = logiConn.localNetId
+        let ticketStore = MiTrustTicketStore.current()
         let fields = (try? LyraProtoReader.readFields(from: data)) ?? []
         var peerCred = Data()
-        for field in fields where field.number == 5 {
-            peerCred = field.lengthDelimitedValue ?? Data()
+        var peerKeyIndex: UInt64 = 0
+        var peerEncryptedCred = Data()
+        for field in fields {
+            switch field.number {
+            case 3: peerKeyIndex = field.varintValue ?? 0
+            case 5: peerCred = field.lengthDelimitedValue ?? Data()
+            case 6: peerEncryptedCred = field.lengthDelimitedValue ?? Data()
+            default: continue
+            }
+        }
+        DiagnosticsLog.info(
+            "xiaomi.cast.mitrust_peer_sync_info keyIndex=\(peerKeyIndex) credBytes=\(peerCred.count) encCredBytes=\(peerEncryptedCred.count)"
+        )
+        if !peerEncryptedCred.isEmpty {
+            if let plaintext = ticketStore.decryptCredBlob(peerEncryptedCred) {
+                DiagnosticsLog.info(
+                    "xiaomi.cast.mitrust_peer_cred_decrypted bytes=\(plaintext.count) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
+                )
+            } else {
+                DiagnosticsLog.warn(
+                    "xiaomi.cast.mitrust_peer_cred_decrypt_failed blobHead=\(peerEncryptedCred.prefix(40).map { String(format: "%02x", $0) }.joined())"
+                )
+            }
         }
         var peerConnId = Data()
         var peerPubKey = Data()
@@ -452,18 +475,29 @@ final class LyraCastTrustSession {
                 )
             }
         }
-        var cred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: connId, to: &cred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: privateKey.publicKey.rawRepresentation, to: &cred)
         var syncInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 15000, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(2, value: 48, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(3, value: 1, to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: Data(Self.mitrustServiceName.utf8), to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(
-            6, value: LyraMeshResponder.officialMacSyncInfoSignature, to: &syncInfo
-        )
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        if ticketStore.isEnabled {
+            srvReuseKey = ticketStore.ticketKey
+            LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+            LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
+            LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
+            if let ourEncCred = ticketStore.encryptLocalCred() {
+                LyraProtoWriter.appendLengthDelimitedField(6, value: ourEncCred, to: &syncInfo)
+                DiagnosticsLog.info("xiaomi.cast.mitrust_our_cred_tx bytes=\(ourEncCred.count)")
+            }
+        } else {
+            var cred = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: connId, to: &cred)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: privateKey.publicKey.rawRepresentation, to: &cred)
+            LyraProtoWriter.appendVarintField(2, value: 48, to: &syncInfo)
+            LyraProtoWriter.appendVarintField(3, value: 1, to: &syncInfo)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: Data(Self.mitrustServiceName.utf8), to: &syncInfo)
+            LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
+            LyraProtoWriter.appendLengthDelimitedField(
+                6, value: LyraMeshResponder.officialMacSyncInfoSignature, to: &syncInfo
+            )
+        }
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
         let frame = LogiConnFrame(logiConnId: srvConnId, localNetId: 1, remoteNetId: srvPeerNetId, inner: inner.serialized())
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
@@ -570,10 +604,10 @@ final class LyraCastTrustSession {
     }
 
     private func mitrustSendEncrypted(inner: LogiConnInnerFrame, label: String) {
-        guard let srvKeySC else { return }
+        guard let sendKey = srvReuseKey ?? srvKeySC else { return }
         do {
             let nonce = AES.GCM.Nonce()
-            let sealed = try AES.GCM.seal(inner.serialized(), using: srvKeySC, nonce: nonce)
+            let sealed = try AES.GCM.seal(inner.serialized(), using: sendKey, nonce: nonce)
             var encryptedInner = Data()
             encryptedInner.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
             encryptedInner.append(sealed.ciphertext)
@@ -593,7 +627,7 @@ final class LyraCastTrustSession {
     }
 
     private func handleMitrustEncrypted(_ logiConn: LogiConnFrame) {
-        for key in [srvKeyCS, srvKeySC].compactMap({ $0 }) + srvKeyCandidates {
+        for key in [srvReuseKey].compactMap({ $0 }) + [srvKeyCS, srvKeySC].compactMap({ $0 }) + srvKeyCandidates {
             guard let inner = mitrustDecrypt(logiConn, key: key) else {
                 continue
             }

@@ -203,6 +203,11 @@ object AndroidShizukuSupport {
             listOf(result).toOperationResult("secure_setting:$key")
         }
 
+    suspend fun runShellCommand(context: Context, command: Array<String>): ShizukuCommandResult? =
+        runCatching {
+            withService(context) { service -> service.runCommandResult(command) }
+        }.getOrNull()
+
     suspend fun probeMiLinkRoot(context: Context): ShizukuOperationResult {
         val state = currentState()
         if (state.uid != 0) {

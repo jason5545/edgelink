@@ -1137,6 +1137,31 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    private suspend fun probeLyraMeshPorts(): List<Int> {
+        val uid = LyraMeshPortProbe.uid(appContext) ?: return emptyList()
+        val hasShizuku = AndroidShizukuSupport.hasPermission()
+        val result = if (hasShizuku) {
+            AndroidShizukuSupport.runShellCommand(
+                appContext,
+                arrayOf("sh", "-c", "cat /proc/net/udp /proc/net/udp6")
+            )
+        } else {
+            null
+        }
+        EdgeLinkLog.info(
+            "lyra.android.mesh_ports_probe hasShizuku=$hasShizuku resultExit=${result?.exitCode} " +
+                "stdoutLen=${result?.stdout?.length} stderr=${result?.stderr?.take(80)}"
+        )
+        if (result != null && result.success) {
+            val ports = LyraMeshPortProbe.parse(result.stdout.lines(), uid)
+            EdgeLinkLog.info("lyra.android.mesh_ports source=shizuku ports=$ports")
+            return ports
+        }
+        val fallback = LyraMeshPortProbe.probeWildcardUdpPorts(appContext)
+        EdgeLinkLog.info("lyra.android.mesh_ports source=proc ports=$fallback")
+        return fallback
+    }
+
     private suspend fun probeMiLinkStatus(): MiLinkStatusBody {
         val rootProbe = AndroidShizukuSupport.probeMiLinkRoot(appContext)
         val attributionProbe = AndroidShizukuSupport.probeMiLinkAttributionSpoof(appContext)
@@ -1175,6 +1200,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             phoneMediaRelayCandidateCount = phoneContinuityProbe.mediaRelayCandidateCount,
             services = serviceCatalog.services,
             preferredRoutes = serviceCatalog.preferredRoutes,
+            lyraMeshPorts = probeLyraMeshPorts(),
             summary = summary,
             ts = System.currentTimeMillis() / 1_000L
         )

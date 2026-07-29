@@ -441,6 +441,7 @@ data class MiLinkStatusBody(
     val services: List<MiLinkServiceCapabilityBody> = emptyList(),
     val preferredRoutes: Map<String, String> = emptyMap(),
     val mirrorScreenRemoteActive: Boolean = false,
+    val lyraMeshPorts: List<Int> = emptyList(),
     val summary: String,
     val ts: Long
 )

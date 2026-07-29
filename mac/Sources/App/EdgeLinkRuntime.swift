@@ -4189,6 +4189,10 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handleMiLinkStatus(_ status: MiLinkStatusBody) {
         latestMiLinkStatus = status
+        if let ports = status.lyraMeshPorts, !ports.isEmpty {
+            UserDefaults.standard.set(ports, forKey: "lyraReportedPhoneMeshPorts")
+            DiagnosticsLog.info("milink.mac.lyra_mesh_ports ports=\(ports)")
+        }
         autoWarmXiaomiServicesIfNeeded(status)
         reconcileOrphanXiaomiMirrorIfNeeded(status)
         if deferredViewPhoneScreenTask != nil {

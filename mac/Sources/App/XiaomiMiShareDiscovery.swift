@@ -228,6 +228,14 @@ final class XiaomiMiShareDiscovery: NSObject {
         if let live = meshResponder?.currentPhoneEndpoint() {
             endpoints.append(live)
         }
+        if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
+            let reported = (UserDefaults.standard.array(forKey: "lyraReportedPhoneMeshPorts") as? [Int]) ?? []
+            for port in reported {
+                if let value = UInt16(exactly: port) {
+                    endpoints.append((lanIP, value))
+                }
+            }
+        }
         for peer in peersByServiceName.values {
             guard let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:)),
                   appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
