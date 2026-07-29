@@ -33,6 +33,7 @@ final class MacMirrorTurnSession: NSObject, @unchecked Sendable {
     private var didInitializeSSL = false
     private var startedAt: Date?
     private var openTimeoutWorkItem: DispatchWorkItem?
+    private var iceDisconnectedWorkItem: DispatchWorkItem?
     private var statsTimer: DispatchSourceTimer?
     private var datagramsSent: UInt64 = 0
     private var datagramsReceived: UInt64 = 0
@@ -343,6 +344,8 @@ final class MacMirrorTurnSession: NSObject, @unchecked Sendable {
     private func teardownPeerConnectionOnQueue() {
         openTimeoutWorkItem?.cancel()
         openTimeoutWorkItem = nil
+        iceDisconnectedWorkItem?.cancel()
+        iceDisconnectedWorkItem = nil
         statsTimer?.cancel()
         statsTimer = nil
         if let channel = dataChannel {
@@ -382,7 +385,26 @@ extension MacMirrorTurnSession: RTCPeerConnectionDelegate {
             case .disconnected:
                 if self.state == .waitingDataChannel {
                     DiagnosticsLog.info("mirror.turn.ice_disconnected sessionId=\(self.sessionId)")
+                } else if self.state == .active {
+                    // Frequently transient (Wi-Fi jitter); only fail over to
+                    // the WebSocket leg when it persists.
+                    guard self.iceDisconnectedWorkItem == nil else {
+                        break
+                    }
+                    let workItem = DispatchWorkItem { [weak self] in
+                        guard let self else {
+                            return
+                        }
+                        self.iceDisconnectedWorkItem = nil
+                        DiagnosticsLog.warn("mirror.turn.ice_disconnected_sustained sessionId=\(self.sessionId)")
+                        self.failOnQueue(reason: "ice_disconnected_sustained")
+                    }
+                    self.iceDisconnectedWorkItem = workItem
+                    self.queue.asyncAfter(deadline: .now() + 4, execute: workItem)
                 }
+            case .connected, .completed:
+                self.iceDisconnectedWorkItem?.cancel()
+                self.iceDisconnectedWorkItem = nil
             case .closed:
                 if self.state != .closed && self.state != .idle {
                     self.failOnQueue(reason: "ice_closed")
@@ -448,6 +470,7 @@ extension MacMirrorTurnSession: RTCDataChannelDelegate {
             } else if dataChannel.readyState == .closed || dataChannel.readyState == .closing {
                 if self.state == .active {
                     DiagnosticsLog.warn("mirror.turn.dc_closed sessionId=\(self.sessionId)")
+                    self.failOnQueue(reason: "dc_closed")
                 }
             }
         }

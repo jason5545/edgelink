@@ -57,6 +57,8 @@ class AndroidMirrorTurnSession(
     private var closed = false
     @Volatile
     private var dataChannelOpen = false
+    @Volatile
+    private var iceDisconnectedRunnable: Runnable? = null
     private val createdAtMs = android.os.SystemClock.elapsedRealtime()
     private var datagramsSent = 0L
     private var datagramsSentBytes = 0L
@@ -215,6 +217,9 @@ class AndroidMirrorTurnSession(
                 when (newState) {
                     PeerConnection.IceConnectionState.FAILED -> fail("ice_failed")
                     PeerConnection.IceConnectionState.CLOSED -> if (!closed) fail("ice_closed")
+                    PeerConnection.IceConnectionState.DISCONNECTED -> scheduleIceDisconnectedFail()
+                    PeerConnection.IceConnectionState.CONNECTED,
+                    PeerConnection.IceConnectionState.COMPLETED -> cancelIceDisconnectedFail()
                     else -> Unit
                 }
             }
@@ -259,6 +264,10 @@ class AndroidMirrorTurnSession(
                             val elapsedMs = android.os.SystemClock.elapsedRealtime() - createdAtMs
                             EdgeLinkLog.info("mirror.turn.dc_open sessionId=$sessionId elapsedMs=$elapsedMs")
                             onDataChannelOpen()
+                        } else if ((state == DataChannel.State.CLOSING || state == DataChannel.State.CLOSED) &&
+                            dataChannelOpen && !closed
+                        ) {
+                            fail("dc_closed")
                         }
                     }
 
@@ -329,6 +338,28 @@ class AndroidMirrorTurnSession(
         onFailed(reason)
     }
 
+    // ICE DISCONNECTED is frequently transient (Wi-Fi jitter); only treat it
+    // as fatal when it persists, so the bridge can fall back to WebSocket.
+    private fun scheduleIceDisconnectedFail() {
+        if (!dataChannelOpen || closed || iceDisconnectedRunnable != null) {
+            return
+        }
+        val runnable = Runnable {
+            iceDisconnectedRunnable = null
+            EdgeLinkLog.warn(
+                "mirror.turn.ice_disconnected_sustained sessionId=$sessionId waitMs=$ICE_DISCONNECTED_FAIL_MS"
+            )
+            fail("ice_disconnected_sustained")
+        }
+        iceDisconnectedRunnable = runnable
+        statsHandler?.postDelayed(runnable, ICE_DISCONNECTED_FAIL_MS)
+    }
+
+    private fun cancelIceDisconnectedFail() {
+        iceDisconnectedRunnable?.let { statsHandler?.removeCallbacks(it) }
+        iceDisconnectedRunnable = null
+    }
+
     private fun noopSdpObserver(): SdpObserver =
         object : SdpObserver {
             override fun onCreateSuccess(description: SessionDescription) = Unit
@@ -340,6 +371,7 @@ class AndroidMirrorTurnSession(
     companion object {
         const val DATA_CHANNEL_LABEL = "edgelink-mirror-media"
         private const val STATS_INTERVAL_MS = 5_000L
+        private const val ICE_DISCONNECTED_FAIL_MS = 4_000L
     }
 }
 

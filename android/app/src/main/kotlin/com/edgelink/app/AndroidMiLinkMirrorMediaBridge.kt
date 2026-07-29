@@ -33,6 +33,11 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTSP_KICKSTART_DELAY_MS = 800L
     private const val RTSP_PLAY_RESPONSE_TIMEOUT_MS = 2_500L
     private const val RTSP_KEEPALIVE_INTERVAL_MS = 30_000L
+    private const val TURN_IDR_REQUEST_POLL_MS = 200L
+    private const val TURN_PACER_BYTES_PER_SECOND = 600_000.0
+    private const val TURN_PACER_BYTES_PER_NS = TURN_PACER_BYTES_PER_SECOND / 1_000_000_000.0
+    private const val TURN_PACER_BURST_BYTES = 65_536
+    private const val TURN_PACER_MAX_DELAY_MS = 30L
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
     private const val RTP_BATCH_MAX_DELAY_MS = 3L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
@@ -251,7 +256,13 @@ object AndroidMiLinkMirrorMediaBridge {
         private var turnLoopbackDropped = 0L
         private var turnAckInjected = 0L
         private var kcpSink: MiLinkMirrorKcpSink? = null
-        private var ackViaLoopback = true
+        private var ackViaLoopback = false
+        private var turnPaceTokens = TURN_PACER_BURST_BYTES.toDouble()
+        private var turnPaceLastRefillNs = 0L
+        private var turnPaceDelayed = 0L
+        private var turnPaceDropped = 0L
+        @Volatile
+        private var turnIdrRequestPending = false
         private var ownAddresses: Set<InetAddress> = emptySet()
         private var ownAddressesRefreshedAtMs = 0L
 
@@ -264,6 +275,10 @@ object AndroidMiLinkMirrorMediaBridge {
             }
             turnSendDatagram = sendDatagram
             turnDataChannelActive = true
+            // The source starts streaming on PLAY before the data channel
+            // opens, so the first IDR is always dropped pre-attach. Ask for a
+            // fresh one as soon as the channel is up.
+            turnIdrRequestPending = true
             EdgeLinkLog.info("mirror.turn.bridge_attached sessionId=$sessionId")
             return true
         }
@@ -324,16 +339,12 @@ object AndroidMiLinkMirrorMediaBridge {
                 )
             }
             runCatching {
-                udp.send(DatagramPacket(data, data.size, target))
-                // The source's KCP session is keyed by (src IP, port): an ACK
-                // delivered from 127.0.0.1 is dropped when the source session
-                // remote is the phone's own non-loopback address, while a
-                // loopback-bound source is unreachable via that address.
-                // Send to both candidate destinations; the source dedups.
+                // Single destination: the resolved address (LAN by default;
+                // loopback only if the ack watch re-enables it). Sending to
+                // both made the source's KCP count duplicate ACKs, which is
+                // exactly its fast-retransmit trigger.
                 val ackTarget = resolveAckTarget(udp, target)
-                if (ackTarget != target) {
-                    udp.send(DatagramPacket(data, data.size, ackTarget))
-                }
+                udp.send(DatagramPacket(data, data.size, ackTarget))
             }
         }
 
@@ -381,6 +392,7 @@ object AndroidMiLinkMirrorMediaBridge {
             val batchJob = launch { flushRTPBatches() }
             val rtspKeepaliveJob = launch { rtspKeepaliveLoop() }
             if (turnMode) {
+                launch { turnIdrRequestLoop() }
                 launch {
                     delay(TURN_DATA_CHANNEL_TIMEOUT_MS)
                     if (!turnDataChannelActive) {
@@ -574,7 +586,9 @@ object AndroidMiLinkMirrorMediaBridge {
                     }
                     val forward = turnSendDatagram
                     if (turnDataChannelActive && forward != null) {
-                        forward(data)
+                        if (paceTurnDatagram(data.size)) {
+                            forward(data)
+                        }
                     } else {
                         turnLoopbackDropped += 1
                     }
@@ -930,6 +944,74 @@ object AndroidMiLinkMirrorMediaBridge {
             )
         }
 
+        // Token-bucket pacing for the relay leg. Measured Cloudflare TURN
+        // capacity is ~5-6 Mbps per allocation (tools/turn-capacity.py); the
+        // 5 Mbps encoder plus KCP retransmits otherwise overruns the pipe and
+        // collapses it. Pace just under the cap; short bursts pass through,
+        // sustained excess is delayed up to a bound, then dropped (the
+        // source's KCP retransmits drops).
+        private suspend fun paceTurnDatagram(bytes: Int): Boolean {
+            val now = System.nanoTime()
+            if (turnPaceLastRefillNs == 0L) {
+                turnPaceLastRefillNs = now
+            }
+            val elapsedNs = now - turnPaceLastRefillNs
+            turnPaceTokens = minOf(
+                TURN_PACER_BURST_BYTES.toDouble(),
+                turnPaceTokens + elapsedNs * TURN_PACER_BYTES_PER_NS
+            )
+            turnPaceLastRefillNs = now
+            turnPaceTokens -= bytes
+            if (turnPaceTokens >= 0) {
+                return true
+            }
+            val deficitMs = ((-turnPaceTokens) / TURN_PACER_BYTES_PER_NS / 1_000_000).toLong()
+            if (deficitMs <= TURN_PACER_MAX_DELAY_MS) {
+                turnPaceDelayed += 1
+                delay(deficitMs)
+                turnPaceTokens = 0.0
+                turnPaceLastRefillNs = System.nanoTime()
+                if (turnPaceDelayed == 1L || turnPaceDelayed % 2_000 == 0L) {
+                    EdgeLinkLog.info(
+                        "mirror.turn.pace_delayed sessionId=$sessionId count=$turnPaceDelayed delayMs=$deficitMs"
+                    )
+                }
+                return true
+            }
+            turnPaceDropped += 1
+            if (turnPaceDropped == 1L || turnPaceDropped % 500 == 0L) {
+                EdgeLinkLog.warn(
+                    "mirror.turn.pace_dropped sessionId=$sessionId count=$turnPaceDropped deficitMs=$deficitMs"
+                )
+            }
+            return false
+        }
+
+        private suspend fun turnIdrRequestLoop() {
+            while (currentCoroutineContext().isActive) {
+                delay(TURN_IDR_REQUEST_POLL_MS)
+                if (!turnIdrRequestPending || !sentPLAY || sessionHeader == null) {
+                    continue
+                }
+                turnIdrRequestPending = false
+                runCatching {
+                    sendRTSPRequest(
+                        method = "SET_PARAMETER",
+                        uri = presentationURL ?: "rtsp://localhost/wfd1.0/streamid=0",
+                        headers = listOfNotNull(
+                            sessionHeader?.let { "Session" to it },
+                            "Content-Type" to "text/parameters"
+                        ),
+                        body = "wfd_idr_request\r\n",
+                        label = "idr_request"
+                    )
+                    EdgeLinkLog.info(
+                        "xiaomi.mirror.android.cloudflare_rtsp_idr_sent sessionId=$sessionId reason=turn_attach"
+                    )
+                }
+            }
+        }
+
         private suspend fun rtspKeepaliveLoop() {
             while (currentCoroutineContext().isActive) {
                 delay(RTSP_KEEPALIVE_INTERVAL_MS)
@@ -1037,7 +1119,7 @@ object AndroidMiLinkMirrorMediaBridge {
                 "wfd_audio_codecs" to "AAC 00000001 00",
                 "wfd_audio_codecs_v2" to "2 0 0 0",
                 "wfd_video_formats" to XIAOMI_OFFICIAL_HEVC_VIDEO_FORMATS,
-                "wfd_video_bitrate" to XIAOMI_OFFICIAL_VIDEO_BITRATE.toString(),
+                "wfd_video_bitrate" to (if (turnMode) XIAOMI_TURN_VIDEO_BITRATE else XIAOMI_OFFICIAL_VIDEO_BITRATE).toString(),
                 "wfd_video_enctype" to "1 1",
                 "wfd_video_gamuttype" to "1 1",
                 "wfd_current_video_info" to "-1 -1 -1 -1",
@@ -1153,6 +1235,7 @@ object AndroidMiLinkMirrorMediaBridge {
 
 private const val XIAOMI_OFFICIAL_HEVC_VIDEO_FORMATS = "40 0 2 10 1ffff 1fffffff 0fff 0 0 0 0 none none"
 private const val XIAOMI_OFFICIAL_VIDEO_BITRATE = 5_000_000
+private const val XIAOMI_TURN_VIDEO_BITRATE = 4_000_000
 private val OFFICIAL_ALWAYS_RETURNED_PARAMETERS = setOf(
     "wfd_audio_codecs",
     "wfd_audio_codecs_v2",
