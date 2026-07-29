@@ -185,6 +185,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenIneffectiveSourceRecoveryStreak = 0
     private var xiaomiScreenLastIneffectiveRecoveryEvaluationAt = Date.distantPast
     private var xiaomiScreenUserStopped = false
+    private var xiaomiScreenStartGeneration: UInt64 = 0
     private var xiaomiMirrorActiveMediaTransport: String?
     private var xiaomiMirrorLanDirectFailureStreak = 0
     private var xiaomiMirrorLanDirectPenaltyUntil = Date.distantPast
@@ -628,7 +629,6 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             screenSession.setXiaomiMirrorRouteActive(true)
             screenSession.showConnectingWindow()
-            let command = "xiaomi.mirror.startMainDisplay"
             let timeoutMs = 12_000
             let peerHost = Self.xiaomiMirrorAdvertisedHost()
             let peerPort = Self.xiaomiMirrorRTSPDiagnosticPort
@@ -638,59 +638,116 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             let cloudflareMirrorSessionId = startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: "manual_start")
             xiaomiScreenUserStopped = false
+            xiaomiScreenStartGeneration &+= 1
+            let startGeneration = xiaomiScreenStartGeneration
             resetXiaomiScreenRecoveryState(reason: "manual_start")
             didPrepareXiaomiMirrorKeyboard = false
             xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
-            DiagnosticsLog.info(
-                "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active") " +
-                    "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
-                    "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
-                    "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
-                    "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) gatedByOfficialApp=false " +
-                    "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
-                    "xiaomiMirrorDeviceId=none timeoutMs=\(timeoutMs) " +
-                    "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
-                    "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
-            )
-            var args: [String: String] = [:]
-            if let peerHost {
-                args["peerHost"] = peerHost
-            }
-            args["peerPort"] = String(peerPort)
-            args["forceFakeRemote"] = "true"
-            addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
-            addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
-            let requestId = sendMiLinkCommand(
-                command: command,
-                args: args
-            )
-            if let requestId {
-                if let cloudflareMirrorSessionId {
-                    xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
-                        sessionId: cloudflareMirrorSessionId,
-                        lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
-                        reason: "screen_route_start"
-                    )
-                }
-                armPendingXiaomiScreenCommand(
-                    requestId: requestId,
-                    command: command,
-                    route: xiaomiScreenRoute ?? "xiaomi.mirror.active",
+            if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
+                sendXiaomiMirrorStartMainDisplayCommand(
+                    route: xiaomiScreenRoute,
+                    peerHost: peerHost,
+                    peerPort: peerPort,
+                    cloudflareMirrorSessionId: cloudflareMirrorSessionId,
                     timeoutMs: timeoutMs
                 )
-                prepareXiaomiMirrorKeyboardIfNeeded(source: "screen_route_start")
                 return
             }
-            screenSession.setXiaomiMirrorRouteActive(false)
-            activeXiaomiMirrorCloudflareSessionId = nil
-            xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "screen_command_failed")
-            DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")")
-            xiaomiMiLinkCommandStatus = String(localized: "小米鏡像指令未送出")
+            // The listener restarts asynchronously after a previous session's
+            // teardown. Send without waiting and the LAN probe args are dropped,
+            // which locks the phone into the cloud relay for the whole session
+            // (recovery cannot switch transports). Wait briefly so restarts on
+            // LAN keep the direct path the official app always uses.
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_start_await_listener port=\(peerPort) generation=\(startGeneration)"
+            )
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+                _ = await self.waitForXiaomiMirrorRTSPListenerReady(
+                    timeoutSeconds: Self.xiaomiScreenStartListenerReadyWaitSeconds,
+                    context: "screen_start"
+                )
+                guard startGeneration == self.xiaomiScreenStartGeneration,
+                      !self.xiaomiScreenUserStopped,
+                      self.pendingXiaomiScreenFallback == nil else {
+                    DiagnosticsLog.info(
+                        "xiaomi.mac.screen_start_send_cancelled generation=\(startGeneration) " +
+                            "userStopped=\(self.xiaomiScreenUserStopped) " +
+                            "pending=\(self.pendingXiaomiScreenFallback != nil)"
+                    )
+                    return
+                }
+                self.sendXiaomiMirrorStartMainDisplayCommand(
+                    route: xiaomiScreenRoute,
+                    peerHost: peerHost,
+                    peerPort: peerPort,
+                    cloudflareMirrorSessionId: cloudflareMirrorSessionId,
+                    timeoutMs: timeoutMs
+                )
+            }
             return
         }
         screenSession.setXiaomiMirrorRouteActive(false)
         startEdgeLinkPhoneScreen(reason: "generic")
+    }
+
+    private func sendXiaomiMirrorStartMainDisplayCommand(
+        route xiaomiScreenRoute: String?,
+        peerHost: String?,
+        peerPort: UInt16,
+        cloudflareMirrorSessionId: String?,
+        timeoutMs: Int
+    ) {
+        let command = "xiaomi.mirror.startMainDisplay"
+        let preferredScreenRoute = latestMiLinkStatus?.preferredRoutes?["screen"]
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_route_selected command=\(command) route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active") " +
+                "preferredRoute=\(preferredScreenRoute ?? "unknown") " +
+                "officialDiscoveryRequired=\(latestMiLinkStatus?.officialDiscoveryRequired ?? false) " +
+                "phoneDevices=\(latestMiLinkStatus?.phoneRemoteDeviceCount ?? 0) " +
+                "hyperConnectInstalled=\(xiaomiHyperConnectAvailable) gatedByOfficialApp=false " +
+                "peerHost=\(peerHost ?? "default") peerPort=\(peerPort) fakeRemote=true " +
+                "xiaomiMirrorDeviceId=none timeoutMs=\(timeoutMs) " +
+                "mediaTransport=\(cloudflareMirrorSessionId == nil ? "direct" : "cloudflare") " +
+                "cloudSessionId=\(cloudflareMirrorSessionId ?? "none")"
+        )
+        var args: [String: String] = [:]
+        if let peerHost {
+            args["peerHost"] = peerHost
+        }
+        args["peerPort"] = String(peerPort)
+        args["forceFakeRemote"] = "true"
+        addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
+        addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
+        let requestId = sendMiLinkCommand(
+            command: command,
+            args: args
+        )
+        if let requestId {
+            if let cloudflareMirrorSessionId {
+                xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+                    sessionId: cloudflareMirrorSessionId,
+                    lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+                    reason: "screen_route_start"
+                )
+            }
+            armPendingXiaomiScreenCommand(
+                requestId: requestId,
+                command: command,
+                route: xiaomiScreenRoute ?? "xiaomi.mirror.active",
+                timeoutMs: timeoutMs
+            )
+            prepareXiaomiMirrorKeyboardIfNeeded(source: "screen_route_start")
+            return
+        }
+        screenSession.setXiaomiMirrorRouteActive(false)
+        activeXiaomiMirrorCloudflareSessionId = nil
+        xiaomiMirrorRTSPDiagnosticSource.stopCloudflareMirrorRTPReceiver(reason: "screen_command_failed")
+        DiagnosticsLog.warn("xiaomi.mac.screen_command_failed_before_send route=\(xiaomiScreenRoute ?? "xiaomi.mirror.active")")
+        xiaomiMiLinkCommandStatus = String(localized: "小米鏡像指令未送出")
     }
 
     private func scheduleDeferredViewPhoneScreen() {
@@ -1833,7 +1890,8 @@ final class EdgeLinkRuntime: ObservableObject {
                     return
                 }
                 let listenerReady = await self.waitForXiaomiMirrorRTSPListenerReady(
-                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds
+                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds,
+                    context: "session_rebuild"
                 )
                 self.sendXiaomiMirrorSessionRebuildCommand(
                     event: event,
@@ -1859,7 +1917,8 @@ final class EdgeLinkRuntime: ObservableObject {
                     return
                 }
                 _ = await self.waitForXiaomiMirrorRTSPListenerReady(
-                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds
+                    timeoutSeconds: Self.xiaomiScreenRebuildListenerReadyWaitSeconds,
+                    context: "source_recovery"
                 )
                 self.sendXiaomiMirrorSourceRecoveryCommand(
                     event: event,
@@ -1935,7 +1994,7 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
-    private func waitForXiaomiMirrorRTSPListenerReady(timeoutSeconds: Double) async -> Bool {
+    private func waitForXiaomiMirrorRTSPListenerReady(timeoutSeconds: Double, context: String) async -> Bool {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
@@ -1946,7 +2005,7 @@ final class EdgeLinkRuntime: ObservableObject {
         let ready = xiaomiMirrorRTSPDiagnosticSource.isListenerReady()
         if !ready {
             DiagnosticsLog.warn(
-                "xiaomi.mac.screen_recovery_listener_ready_timeout waitSeconds=\(timeoutSeconds)"
+                "xiaomi.mac.screen_listener_ready_timeout context=\(context) waitSeconds=\(timeoutSeconds)"
             )
         }
         return ready
@@ -2050,6 +2109,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func stopXiaomiScreenRouteForUser(reason: String) {
         xiaomiScreenUserStopped = true
+        xiaomiScreenStartGeneration &+= 1
         releaseXiaomiMirrorKeyboard(reason: reason)
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
@@ -4925,6 +4985,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSessionRebuildCooldownSeconds: TimeInterval = 45
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let xiaomiScreenRebuildListenerReadyWaitSeconds: Double = 4
+    private static let xiaomiScreenStartListenerReadyWaitSeconds: Double = 2
     private static let xiaomiMirrorLanDirectMaxFailureStreak = 2
     private static let xiaomiMirrorLanDirectPenaltySeconds: TimeInterval = 600
     private static let phoneRelayDebugDefaultNumber = "800"
