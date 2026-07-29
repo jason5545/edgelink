@@ -869,22 +869,52 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
 
     private fun hookMirrorUnlockIslandGate(classLoader: ClassLoader) {
         runCatching {
+            val trustManagerClass = findTargetClass(classLoader, MIRROR_TRUST_MANAGER_CLASS)
+            val trustMessageClass = findTargetClass(classLoader, "com.xiaomi.mirror.message.TrustMessage")
             installHook(
-                resolveMethod(
-                    findTargetClass(classLoader, MIRROR_TRUST_MANAGER_CLASS),
-                    "O",
-                    String::class.java
-                )
+                resolveMethod(trustManagerClass, "J", String::class.java, trustMessageClass)
             ) { chain ->
+                val result = chain.proceed()
                 val deviceId = chain.args.getOrNull(0) as? String
-                if (deviceId in MIRROR_ADMIT_DEVICE_IDS) {
-                    log("mirror unlock island gate allowed device=$deviceId")
-                    return@installHook true
+                val message = chain.args.getOrNull(1)
+                if (deviceId != null && deviceId in MIRROR_ADMIT_DEVICE_IDS &&
+                    message != null &&
+                    message.javaClass.name.contains("AuthEventMessage")
+                ) {
+                    val code = runCatching {
+                        message.javaClass.getDeclaredField("code").apply { isAccessible = true }.getInt(message)
+                    }.getOrDefault(-1)
+                    if (code == 0) {
+                        log("mirror unlock island post device=$deviceId")
+                        postMirrorUnlockIsland(classLoader, deviceId, delayMs = 0)
+                        postMirrorUnlockIsland(classLoader, deviceId, delayMs = 3000)
+                    }
                 }
-                chain.proceed()
+                result
             }
         }.onFailure { error ->
             log("failed to hook mirror unlock island gate: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun postMirrorUnlockIsland(classLoader: ClassLoader, deviceId: String, delayMs: Long) {
+        val post = {
+            runCatching {
+                val mirrorClass = findTargetClass(classLoader, "com.xiaomi.mirror.Mirror")
+                val context = mirrorClass.getMethod("z").invoke(null) as? android.content.Context
+                    ?: error("Mirror.z() returned null")
+                val islandClass = findTargetClass(classLoader, "com.xiaomi.mirror.cast.a")
+                islandClass.getMethod("o", android.content.Context::class.java, String::class.java)
+                    .invoke(null, context, deviceId)
+                log("mirror unlock island posted device=$deviceId delayMs=$delayMs")
+            }.onFailure { error ->
+                log("mirror unlock island post failed device=$deviceId delayMs=$delayMs: ${error.message}")
+            }
+        }
+        if (delayMs <= 0) {
+            post()
+        } else {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ post() }, delayMs)
         }
     }
 
