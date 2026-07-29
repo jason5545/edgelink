@@ -501,6 +501,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             hookMirrorRemoteExperiment(classLoader)
             hookMirrorWifiOpenGate(classLoader)
             hookMirrorDeviceManagerAdmit(classLoader)
+            hookMirrorUnlockIslandGate(classLoader)
             installXiaomiMirrorSynergyStatusGuard(classLoader, "install")
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
@@ -826,7 +827,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                     val deviceInfo = deviceInfoClass.getConstructor().newInstance()
                     deviceInfoClass.getMethod("k", String::class.java).invoke(deviceInfo, admitId)
                     deviceInfoClass.getMethod("l", String::class.java).invoke(deviceInfo, "EdgeLink Mac")
-                    deviceInfoClass.getMethod("m", Integer.TYPE).invoke(deviceInfo, 1)
+                    deviceInfoClass.getMethod("m", Integer.TYPE).invoke(deviceInfo, 14)
                     deviceInfoClass.getDeclaredField("d").apply { isAccessible = true }.setInt(deviceInfo, 128)
                     deviceInfoClass.getDeclaredField("e").apply { isAccessible = true }.setInt(deviceInfo, 1)
 
@@ -863,6 +864,27 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             }
         }.onFailure { error ->
             log("failed to hook mirror device manager: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookMirrorUnlockIslandGate(classLoader: ClassLoader) {
+        runCatching {
+            installHook(
+                resolveMethod(
+                    findTargetClass(classLoader, MIRROR_TRUST_MANAGER_CLASS),
+                    "O",
+                    String::class.java
+                )
+            ) { chain ->
+                val deviceId = chain.args.getOrNull(0) as? String
+                if (deviceId in MIRROR_ADMIT_DEVICE_IDS) {
+                    log("mirror unlock island gate allowed device=$deviceId")
+                    return@installHook true
+                }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("failed to hook mirror unlock island gate: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -7419,6 +7441,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val MIRROR_BUSINESS_SERVICE_INFO_CLASS =
             "com.xiaomi.continuity.networking.BusinessServiceInfo"
         private val MIRROR_ADMIT_DEVICE_IDS = setOf("721572C3")
+        private const val MIRROR_TRUST_MANAGER_CLASS = "com.xiaomi.mirror.trust.k"
+        private const val MIRROR_ISLAND_STATUS_CLASS = "N2.u"
         private const val DIST_AUDIO_SETUP_RETRY_MS = 5_000L
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val ANDROID_MEDIA_CODEC = "android.media.MediaCodec"
