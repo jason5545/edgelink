@@ -158,6 +158,16 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         }
     }
 
+    func isControlChannelHealthy(id: UUID, maxAgeSeconds: TimeInterval) -> Bool {
+        performOnQueue {
+            guard let last = states[id]?.lastControlResponseAtUptimeNs else {
+                return false
+            }
+            let ageNs = DispatchTime.now().uptimeNanoseconds &- last
+            return Double(ageNs) / 1_000_000_000 <= maxAgeSeconds
+        }
+    }
+
     func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
         try performOnQueue {
             try self.connectOnQueue(
@@ -727,6 +737,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         }
         var state = states[id] ?? RTSPConnectionState()
         let request = state.pendingRequests.removeValue(forKey: cseq)
+        state.lastControlResponseAtUptimeNs = DispatchTime.now().uptimeNanoseconds
         if let session = message.headers["session"]?.split(separator: ";").first {
             state.session = String(session)
         }
@@ -2638,6 +2649,7 @@ private struct RTSPConnectionState {
     var keepaliveMisses = 0
     var keepaliveSentCount: UInt64 = 0
     var keepaliveAckCount: UInt64 = 0
+    var lastControlResponseAtUptimeNs: UInt64?
     var mediaSender: XiaomiMirrorRTPMediaSender?
     var timerSyncClient: XiaomiMirrorTimerSyncClient?
     var sentFirstRenderVideo = false

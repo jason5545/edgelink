@@ -186,6 +186,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastIneffectiveRecoveryEvaluationAt = Date.distantPast
     private var xiaomiScreenUserStopped = false
     private var xiaomiScreenStartGeneration: UInt64 = 0
+    private var xiaomiScreenSourceIdleSuppressionLastLogAt = Date.distantPast
     private var xiaomiMirrorActiveMediaTransport: String?
     private var xiaomiMirrorLanDirectFailureStreak = 0
     private var xiaomiMirrorLanDirectPenaltyUntil = Date.distantPast
@@ -1737,6 +1738,33 @@ final class EdgeLinkRuntime: ObservableObject {
                 "xiaomi.mac.screen_recovery_skipped reason=not_connected " +
                     "rtspSession=\(event.sessionID.uuidString) trigger=\(event.trigger)"
             )
+            return
+        }
+        // Static phone screen: the Xiaomi encoder legitimately stops emitting
+        // packets (official behavior — the official Mac client simply waits).
+        // When the RTSP control channel is still being acked and media has been
+        // frozen for a while, the source is idle, not broken: recovery churns
+        // uselessly and static-screen zero-packet events must not feed the
+        // lan_direct penalty streak. Decoder stalls with media still flowing
+        // (small elapsedMediaSeconds) and dead transports (control unhealthy)
+        // keep the normal recovery path.
+        if event.elapsedMediaSeconds >= Self.xiaomiScreenSourceIdleMinMediaStaleSeconds,
+           xiaomiMirrorRTSPDiagnosticSource.isControlChannelHealthy(
+               id: event.sessionID,
+               maxAgeSeconds: Self.xiaomiScreenControlHealthyMaxAgeSeconds
+           ) {
+            let now = Date()
+            if now.timeIntervalSince(xiaomiScreenSourceIdleSuppressionLastLogAt) >=
+                Self.xiaomiScreenSourceIdleSuppressionLogIntervalSeconds {
+                xiaomiScreenSourceIdleSuppressionLastLogAt = now
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_recovery_suppressed reason=control_healthy_source_idle " +
+                        "rtspSession=\(event.sessionID.uuidString) trigger=\(event.trigger) " +
+                        "stallReason=\(event.reason) " +
+                        "lastMediaSeconds=\(Self.formatSeconds(event.elapsedMediaSeconds)) " +
+                        "decodedFrames=\(event.decodedFrames)"
+                )
+            }
             return
         }
         updateXiaomiMirrorMediaTransportHealth(event: event)
@@ -4986,6 +5014,9 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let xiaomiScreenRebuildListenerReadyWaitSeconds: Double = 4
     private static let xiaomiScreenStartListenerReadyWaitSeconds: Double = 2
+    private static let xiaomiScreenSourceIdleMinMediaStaleSeconds: Double = 5
+    private static let xiaomiScreenControlHealthyMaxAgeSeconds: TimeInterval = 15
+    private static let xiaomiScreenSourceIdleSuppressionLogIntervalSeconds: TimeInterval = 30
     private static let xiaomiMirrorLanDirectMaxFailureStreak = 2
     private static let xiaomiMirrorLanDirectPenaltySeconds: TimeInterval = 600
     private static let phoneRelayDebugDefaultNumber = "800"
