@@ -167,6 +167,7 @@ private struct PhoneSection: View {
                 } label: {
                     Label("停止手機投放", systemImage: "stop.circle")
                 }
+                .accessibilityLabel("stopPhoneScreen")
             } else {
                 Button {
                     runtime.viewPhoneScreen()
@@ -177,6 +178,7 @@ private struct PhoneSection: View {
                     )
                 }
                 .disabled(!runtime.isConnected)
+                .accessibilityLabel("viewPhoneScreen")
             }
 
             Button {

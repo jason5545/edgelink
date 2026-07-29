@@ -186,6 +186,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var xiaomiScreenLastIneffectiveRecoveryEvaluationAt = Date.distantPast
     private var xiaomiScreenUserStopped = false
     private var xiaomiScreenStartGeneration: UInt64 = 0
+    private var xiaomiScreenLastUserStopAt: Date = .distantPast
     private var xiaomiScreenSourceIdleSuppressionLastLogAt = Date.distantPast
     private var xiaomiMirrorActiveMediaTransport: String?
     private var xiaomiMirrorLanDirectFailureStreak = 0
@@ -645,6 +646,71 @@ final class EdgeLinkRuntime: ObservableObject {
             didPrepareXiaomiMirrorKeyboard = false
             xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
             startXiaomiMirrorRTSPDiagnosticSourceIfNeeded(peerHost: peerHost, reason: "screen_route")
+            // MirrorControl unwinds the previous share asynchronously after a
+            // user stop (RTSP disconnect → source teardown). A startShare that
+            // arrives mid-teardown hangs the provider's serialized lifecycle
+            // (~15s) and wedges every later call. Give the teardown a bounded
+            // settle window before issuing the next start.
+            let userStopSettleRemainingMs: Int = {
+                guard xiaomiScreenLastUserStopAt > .distantPast else {
+                    return 0
+                }
+                let elapsedMs = Int(Date().timeIntervalSince(xiaomiScreenLastUserStopAt) * 1_000)
+                return max(0, Int(Self.xiaomiScreenUserStopSettleSeconds * 1_000) - elapsedMs)
+            }()
+            if userStopSettleRemainingMs > 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_start_settle reason=user_stop_teardown " +
+                        "settleMs=\(userStopSettleRemainingMs) generation=\(startGeneration)"
+                )
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: UInt64(userStopSettleRemainingMs) * 1_000_000)
+                    guard startGeneration == self.xiaomiScreenStartGeneration,
+                          !self.xiaomiScreenUserStopped,
+                          self.pendingXiaomiScreenFallback == nil else {
+                        DiagnosticsLog.info(
+                            "xiaomi.mac.screen_start_settle_cancelled generation=\(startGeneration) " +
+                                "userStopped=\(self.xiaomiScreenUserStopped) " +
+                                "pending=\(self.pendingXiaomiScreenFallback != nil)"
+                        )
+                        return
+                    }
+                    self.sendXiaomiMirrorStartMainDisplayWhenListenerReady(
+                        route: xiaomiScreenRoute,
+                        peerHost: peerHost,
+                        peerPort: peerPort,
+                        cloudflareMirrorSessionId: cloudflareMirrorSessionId,
+                        timeoutMs: timeoutMs,
+                        startGeneration: startGeneration
+                    )
+                }
+                return
+            }
+            sendXiaomiMirrorStartMainDisplayWhenListenerReady(
+                route: xiaomiScreenRoute,
+                peerHost: peerHost,
+                peerPort: peerPort,
+                cloudflareMirrorSessionId: cloudflareMirrorSessionId,
+                timeoutMs: timeoutMs,
+                startGeneration: startGeneration
+            )
+            return
+        }
+        screenSession.setXiaomiMirrorRouteActive(false)
+        startEdgeLinkPhoneScreen(reason: "generic")
+    }
+
+    private func sendXiaomiMirrorStartMainDisplayWhenListenerReady(
+        route xiaomiScreenRoute: String?,
+        peerHost: String?,
+        peerPort: UInt16,
+        cloudflareMirrorSessionId: String?,
+        timeoutMs: Int,
+        startGeneration: UInt64
+    ) {
             if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
                 sendXiaomiMirrorStartMainDisplayCommand(
                     route: xiaomiScreenRoute,
@@ -689,10 +755,6 @@ final class EdgeLinkRuntime: ObservableObject {
                     timeoutMs: timeoutMs
                 )
             }
-            return
-        }
-        screenSession.setXiaomiMirrorRouteActive(false)
-        startEdgeLinkPhoneScreen(reason: "generic")
     }
 
     private func sendXiaomiMirrorStartMainDisplayCommand(
@@ -2137,6 +2199,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func stopXiaomiScreenRouteForUser(reason: String) {
         xiaomiScreenUserStopped = true
+        xiaomiScreenLastUserStopAt = Date()
         xiaomiScreenStartGeneration &+= 1
         releaseXiaomiMirrorKeyboard(reason: reason)
         pendingXiaomiScreenFallbackTask?.cancel()
@@ -5014,6 +5077,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let xiaomiScreenRebuildListenerReadyWaitSeconds: Double = 4
     private static let xiaomiScreenStartListenerReadyWaitSeconds: Double = 2
+    private static let xiaomiScreenUserStopSettleSeconds: TimeInterval = 2
     private static let xiaomiScreenSourceIdleMinMediaStaleSeconds: Double = 5
     private static let xiaomiScreenControlHealthyMaxAgeSeconds: TimeInterval = 15
     private static let xiaomiScreenSourceIdleSuppressionLogIntervalSeconds: TimeInterval = 30
