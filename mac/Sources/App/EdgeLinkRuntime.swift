@@ -276,6 +276,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 case .ready(let locked) where !locked:
                     self.screenSession.phoneUnlockPhase = .succeeded
                 case .failed(let message):
+                    self.resumeScreenStartAfterTrustUnlock = false
                     self.screenSession.phoneUnlockPhase = .failed(message)
                 default:
                     break
@@ -4235,6 +4236,10 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.info("battery.mac.milink_power_probe command=\(result.command) data=\(result.data)")
         }
         if result.command == "xiaomi.mirror.startMainDisplay", result.data["locked"] == "true" {
+            guard !resumeScreenStartAfterTrustUnlock else {
+                DiagnosticsLog.info("xiaomi.mac.screen_locked_gate_ignored reason=unlock_in_progress requestId=\(result.requestId)")
+                return
+            }
             DiagnosticsLog.info("xiaomi.mac.screen_locked_gate requestId=\(result.requestId)")
             resumeScreenStartAfterTrustUnlock = true
             xiaomiMiLinkCommandStatus = String(localized: "手機已鎖定，請先解鎖…")
