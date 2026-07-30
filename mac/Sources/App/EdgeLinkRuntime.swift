@@ -1245,6 +1245,12 @@ final class EdgeLinkRuntime: ObservableObject {
                     self?.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：\(status)")
                 }
             }
+            session.onFinish = { [weak self, weak session] in
+                Task { @MainActor in
+                    guard let self, let session, self.lyraCastTrustSession === session else { return }
+                    self.lyraCastTrustSession = nil
+                }
+            }
             await MainActor.run {
                 self.lyraCastTrustSession = session
                 self.macTrustManager.touchIdPreauthorized = true

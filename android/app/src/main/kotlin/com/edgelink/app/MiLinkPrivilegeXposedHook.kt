@@ -530,7 +530,11 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             hookMiShareLyraTrustInjection(classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookTrustService(packageName, processName)) {
-            hookTrustQuickAuthShortcut(classLoader)
+            if (ENABLE_TRUST_QUICK_AUTH_SHORTCUT) {
+                hookTrustQuickAuthShortcut(classLoader)
+            } else {
+                log("trust quick auth shortcut disabled (official auth_token_A path test)")
+            }
         }
     }
 
@@ -7461,6 +7465,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val DIST_AUDIO_PCM_CHUNK_BYTES = 1_280
         private const val TRUST_QUICK_AUTH_EVENT_CLASS = "com.xiaomi.trustservice.remoteauthservice.k"
         private const val TRUST_QUICK_AUTH_COMM_CLASS = "I0.c"
+        private const val ENABLE_TRUST_QUICK_AUTH_SHORTCUT = false
         private val TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS = setOf("721572C3")
         private const val MIRROR_DEVICE_MANAGER_CLASS = "o2.C"
         private const val MIRROR_DEVICE_ENTITY_CLASS = "o2.e"

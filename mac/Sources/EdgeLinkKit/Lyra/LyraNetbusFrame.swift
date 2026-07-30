@@ -368,6 +368,7 @@ public struct PhysConnFrame: Equatable, Sendable {
 }
 
 public enum LogiConnInnerPayload: Equatable, Sendable {
+    case data(Data)
     case request(Data)
     case response(Data)
     case responseAck(Data)
@@ -378,6 +379,7 @@ public enum LogiConnInnerPayload: Equatable, Sendable {
 
     var fieldNumber: Int {
         switch self {
+        case .data: return 1
         case .request: return 2
         case .response: return 3
         case .responseAck: return 4
@@ -388,9 +390,9 @@ public enum LogiConnInnerPayload: Equatable, Sendable {
         }
     }
 
-    var data: Data {
+    public var data: Data {
         switch self {
-        case .request(let data), .response(let data), .responseAck(let data),
+        case .data(let data), .request(let data), .response(let data), .responseAck(let data),
              .disconnect(let data), .syncInfo(let data), .upgrade(let data),
              .authHandshake(let data):
             return data
@@ -399,6 +401,7 @@ public enum LogiConnInnerPayload: Equatable, Sendable {
 
     init?(fieldNumber: Int, data: Data) {
         switch fieldNumber {
+        case 1: self = .data(data)
         case 2: self = .request(data)
         case 3: self = .response(data)
         case 4: self = .responseAck(data)
@@ -438,7 +441,7 @@ public struct LogiConnInnerFrame: Equatable, Sendable {
         for field in fields {
             switch (field.number, field.wireType) {
             case (1, 0): frameType = UInt32(field.varintValue ?? 0)
-            case (2...8, 2):
+            case (1...8, 2):
                 if let value = field.lengthDelimitedValue {
                     payload = LogiConnInnerPayload(fieldNumber: field.number, data: value)
                 }

@@ -1153,6 +1153,10 @@ final class LyraMeshResponder {
         )
 
         if !serviceName.isEmpty {
+            if serviceName == "com.xiaomi.trustservice:mitrustservice" {
+                DiagnosticsLog.info("xiaomi.mishare.mesh_mitrust_ignored service=\(serviceName)")
+                return
+            }
             resetChannelState()
             handleSyncAuthRequest(
                 syncInfoData: syncInfoData, serviceName: serviceName,
@@ -1712,7 +1716,7 @@ final class LyraMeshResponder {
             uidHash: "61F2",
             displayName: displayNameProvider(),
             osVersion: osVersionString,
-            connMediumTypes: 0x40082,
+            connMediumTypes: 0x40182,
             romVersion: "5.1.174.10.6031221"
         )
         var networkInfo = Data()

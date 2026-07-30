@@ -59,7 +59,8 @@ final class XiaomiMiShareDiscovery: NSObject {
     func start(identitySeed: String, displayName: String) {
         stop(emitsSnapshot: false)
 
-        let deviceIdHex = Self.deviceIdHex(identitySeed: identitySeed)
+        let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")
+        let deviceIdHex = (cloneId?.isEmpty == false ? cloneId! : nil) ?? Self.deviceIdHex(identitySeed: identitySeed)
         publishedDeviceIdHex = deviceIdHex
         publishedDisplayName = Self.sanitizedDisplayName(displayName)
         lastError = nil

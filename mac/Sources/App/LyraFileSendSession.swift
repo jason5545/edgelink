@@ -226,7 +226,7 @@ final class LyraFileSendSession {
             uidHash: "61F2",
             displayName: displayName,
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
-            connMediumTypes: 0x40082,
+            connMediumTypes: 0x40182,
             romVersion: "5.1.208.10.fullCnRelease.0512164"
         )
         var request = Data()
