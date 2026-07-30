@@ -535,8 +535,248 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             } else {
                 log("trust quick auth shortcut disabled (official auth_token_A path test)")
             }
+            installTrustBindBridge(classLoader)
         }
     }
+
+    private fun installTrustBindBridge(classLoader: ClassLoader) {
+        runCatching {
+            val instrumentationClass = findTargetClass(classLoader, "android.app.Instrumentation")
+            installHook(
+                resolveMethod(
+                    instrumentationClass,
+                    "callApplicationOnCreate",
+                    android.app.Application::class.java
+                )
+            ) { chain ->
+                chain.proceed()
+                val app = chain.args.getOrNull(0) as? android.app.Application
+                if (app != null) {
+                    registerTrustBindReceiver(app, classLoader)
+                }
+                null
+            }
+        }.onFailure { error ->
+            log("trust bind bridge hook failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun registerTrustBindReceiver(app: android.app.Application, classLoader: ClassLoader) {
+        runCatching {
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    val said = intent.getStringExtra("said")
+                    val pub = intent.getStringExtra("pub")
+                    val hash = intent.getStringExtra("hash")
+                    thread(name = "edgelink-trust-bind") {
+                        if (intent.getStringExtra("bindremote") != null) {
+                            runTrustBindRemote(classLoader, intent.getStringExtra("bindremote")!!)
+                        } else if (said == null) {
+                            log("trust bind: missing said")
+                        } else if (intent.getStringExtra("seq") == "1") {
+                            runTrustBindSeq(classLoader, said, pub, hash)
+                        } else if (intent.getStringExtra("seq") == "2") {
+                            runTrustBindSeq(classLoader, said, null, null, selfTest = true)
+                        } else if (pub == null) {
+                            runTrustBindSeq(classLoader, said, null, null)
+                        } else {
+                            runTrustBind(classLoader, said, pub, hash)
+                        }
+                    }
+                }
+            }
+            app.registerReceiver(
+                receiver,
+                android.content.IntentFilter(TRUST_BIND_ACTION),
+                Context.RECEIVER_EXPORTED
+            )
+            log("trust bind bridge receiver registered")
+        }.onFailure { error ->
+            log("trust bind bridge register failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun runTrustBind(classLoader: ClassLoader, saidHex: String, pubHex: String, hashHex: String?) {
+        try {
+            val binder = Class.forName("android.os.ServiceManager")
+                .getDeclaredMethod("waitForService", String::class.java)
+                .invoke(null, TRUST_SHARED_AUTH_SERVICE) as? android.os.IBinder
+            if (binder == null) {
+                log("trust bind: shared auth service unavailable")
+                return
+            }
+            val stub = Class.forName("vendor.xiaomi.hardware.misauth.IMiSharedAuth\$Stub", false, classLoader)
+            val service = stub.getMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
+            val iface = Class.forName("vendor.xiaomi.hardware.misauth.IMiSharedAuth", false, classLoader)
+            log(
+                "trust bind iface methods: " + iface.methods.joinToString { method ->
+                    method.name + method.parameterTypes.joinToString(",", "(", ")") { it.simpleName }
+                }
+            )
+            val response = iface.methods
+                .first { method ->
+                    method.name == "loadBindPubAV2" && method.parameterTypes.contentEquals(
+                        arrayOf(ByteArray::class.java, ByteArray::class.java)
+                    )
+                }
+                .invoke(service, trustBindHex(saidHex), trustBindHex(pubHex))
+            log("trust bind loadBindPubAV2 ${describeSharedAuthResponse(response)}")
+            if (!hashHex.isNullOrEmpty()) {
+                val status = iface.methods
+                    .first { method ->
+                        method.name == "getDeviceBindStatusBV2" && method.parameterTypes.contentEquals(
+                            arrayOf(ByteArray::class.java, ByteArray::class.java)
+                        )
+                    }
+                    .invoke(service, trustBindHex(saidHex), trustBindHex(hashHex))
+                log("trust bind status ${describeSharedAuthResponse(status)}")
+            }
+        } catch (error: Throwable) {
+            log("trust bind failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun runTrustBindRemote(classLoader: ClassLoader, deviceId: String) {
+        try {
+            val i0Class = Class.forName("I0.c", false, classLoader)
+            val i0 = i0Class.declaredFields
+                .firstOrNull { Modifier.isStatic(it.modifiers) && it.type == i0Class }
+                ?.run {
+                    isAccessible = true
+                    get(null)
+                }
+            if (i0 == null) {
+                log("trust bindremote: no I0.c instance")
+                return
+            }
+            val kClass = Class.forName("com.xiaomi.trustservice.remoteauthservice.k", false, classLoader)
+            val kInstance = i0Class.declaredFields
+                .firstOrNull { !Modifier.isStatic(it.modifiers) && it.type == kClass }
+                ?.run {
+                    isAccessible = true
+                    get(i0)
+                }
+            if (kInstance == null) {
+                log("trust bindremote: no quick auth handler")
+                return
+            }
+            val callbackIface = Class.forName(
+                "com.xiaomi.trustservice.remoteauthservice.IMiRemoteAuthServiceCallback",
+                false,
+                classLoader
+            )
+            val callback = Proxy.newProxyInstance(classLoader, arrayOf(callbackIface)) { _, method, args ->
+                if (method.name == "onResult") {
+                    log("trust bindremote onResult: ${args?.joinToString()}")
+                }
+                null
+            }
+            val xMethod = kClass.methods.firstOrNull { method ->
+                method.parameterTypes.contentEquals(
+                    arrayOf(
+                        String::class.java,
+                        String::class.java,
+                        Boolean::class.javaPrimitiveType,
+                        i0Class,
+                        callbackIface
+                    )
+                )
+            }
+            if (xMethod == null) {
+                log(
+                    "trust bindremote: no binder entry, methods=" +
+                        kClass.methods.joinToString { it.name + it.parameterTypes.joinToString(",", "(", ")") { p -> p.simpleName } }
+                )
+                return
+            }
+            xMethod.invoke(kInstance, "com.edgelink.bridge", deviceId, false, i0, callback)
+            log("trust bindremote invoked for $deviceId")
+        } catch (error: Throwable) {
+            log("trust bindremote failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun runTrustBindSeq(classLoader: ClassLoader, saidHex: String, pubHex: String?, hashHex: String?, selfTest: Boolean = false) {
+        try {
+            val binder = Class.forName("android.os.ServiceManager")
+                .getDeclaredMethod("waitForService", String::class.java)
+                .invoke(null, TRUST_SHARED_AUTH_SERVICE) as? android.os.IBinder
+            if (binder == null) {
+                log("trust bindseq: shared auth service unavailable")
+                return
+            }
+            val stub = Class.forName("vendor.xiaomi.hardware.misauth.IMiSharedAuth\$Stub", false, classLoader)
+            val service = stub.getMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
+            val iface = Class.forName("vendor.xiaomi.hardware.misauth.IMiSharedAuth", false, classLoader)
+            fun invoke(name: String, vararg args: ByteArray): Any? {
+                val sig = Array(args.size) { ByteArray::class.java }
+                return iface.methods
+                    .first { it.name == name && it.parameterTypes.contentEquals(sig) }
+                    .invoke(service, *args.map { it as Any? }.toTypedArray())
+            }
+            val hatResp = invoke("getBindHATChallengeV2")
+            log("trust bindseq hat ${describeSharedAuthResponse(hatResp)}")
+            val hatPayload = sharedAuthPayload(hatResp)
+            if (hatPayload == null) {
+                log("trust bindseq: no hat payload")
+                return
+            }
+            val hat69 = ByteArray(69)
+            for (i in 1 until 69) {
+                if (i > hatPayload.size) break
+                hat69[i] = hatPayload[i - 1]
+            }
+            val pubResp = invoke("getBindPubV2", hat69, trustBindHex(saidHex))
+            log("trust bindseq pub ${describeSharedAuthResponse(pubResp)}")
+            if (selfTest) {
+                val ownBlob = sharedAuthPayload(pubResp)
+                if (ownBlob != null) {
+                    val loadResp = invoke("loadBindPubAV2", trustBindHex(saidHex), ownBlob)
+                    log("trust bindseq selfload ${describeSharedAuthResponse(loadResp)}")
+                }
+                return
+            }
+            if (!pubHex.isNullOrEmpty()) {
+                val loadResp = invoke("loadBindPubAV2", trustBindHex(saidHex), trustBindHex(pubHex))
+                log("trust bindseq load ${describeSharedAuthResponse(loadResp)}")
+                if (!hashHex.isNullOrEmpty()) {
+                    val statusResp = invoke("getDeviceBindStatusBV2", trustBindHex(saidHex), trustBindHex(hashHex))
+                    log("trust bindseq status ${describeSharedAuthResponse(statusResp)}")
+                }
+            }
+        } catch (error: Throwable) {
+            log("trust bindseq failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun sharedAuthPayload(response: Any?): ByteArray? {
+        if (response == null) return null
+        return response.javaClass.getDeclaredFields()
+            .firstOrNull { it.type == ByteArray::class.java }
+            ?.run {
+                isAccessible = true
+                get(response) as? ByteArray
+            }
+    }
+
+    private fun describeSharedAuthResponse(response: Any?): String {
+        if (response == null) return "null"
+        val fields = response.javaClass.getDeclaredFields()
+        val code = fields.firstOrNull { it.type == java.lang.Integer.TYPE }?.run {
+            isAccessible = true
+            getInt(response)
+        } ?: -1
+        val payload = fields.firstOrNull { it.type == ByteArray::class.java }?.run {
+            isAccessible = true
+            (get(response) as? ByteArray)?.joinToString("") { "%02x".format(it) }
+        }
+        return "code=$code payload=$payload"
+    }
+
+    private fun trustBindHex(value: String): ByteArray =
+        ByteArray(value.length / 2) { index ->
+            value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+        }
 
     private fun hookTrustQuickAuthShortcut(classLoader: ClassLoader) {
         runCatching {
@@ -7466,6 +7706,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val TRUST_QUICK_AUTH_EVENT_CLASS = "com.xiaomi.trustservice.remoteauthservice.k"
         private const val TRUST_QUICK_AUTH_COMM_CLASS = "I0.c"
         private const val ENABLE_TRUST_QUICK_AUTH_SHORTCUT = false
+        private const val TRUST_BIND_ACTION = "com.edgelink.mitrust.BIND"
+        private const val TRUST_SHARED_AUTH_SERVICE = "vendor.xiaomi.hardware.misauth.IMiSharedAuth/default"
         private val TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS = setOf("721572C3")
         private const val MIRROR_DEVICE_MANAGER_CLASS = "o2.C"
         private const val MIRROR_DEVICE_ENTITY_CLASS = "o2.e"

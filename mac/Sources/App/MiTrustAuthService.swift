@@ -57,16 +57,14 @@ final class MiTrustAuthService {
         switch eventName {
         case Event.tlsServerHello:
             handleTLSServerHello(message)
-        case Event.tlsClientHello:
-            handleTLSClientHello(message)
         case Event.tlsServerKeyAck:
+            handleTLSClientHello(message)
+        case Event.tlsClientHello:
             handleTLSServerKeyAck(message)
         case Event.bindRequest:
             handleBindRequest(message)
         case Event.bindResponse:
             DiagnosticsLog.info("xiaomi.mitrust.bind_response_rx keys=\(message.keys.sorted())")
-            DiagnosticsLog.info("xiaomi.mitrust.bind_request_tx")
-            sendJSON(["event_name": Event.bindRequest])
         case Event.statusRequest:
             handleStatusRequest(message)
         case Event.usingChallenge:
@@ -94,8 +92,6 @@ final class MiTrustAuthService {
             "sessionkey": key,
             "client_key_exchange": "client_key_exchange"
         ])
-        DiagnosticsLog.info("xiaomi.mitrust.bind_request_tx")
-        sendJSON(["event_name": Event.bindRequest])
     }
 
     private func handleTLSClientHello(_ message: [String: Any]) {
@@ -188,18 +184,31 @@ final class MiTrustAuthService {
             "finger_strength_A": 2,
             "remote_password_is_support": false
         ]
-        if hasKey, let privateKey = rsaPrivateKey(said: saidB),
-           let publicKey = SecKeyCopyPublicKey(privateKey),
-           let publicExt = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?,
-           publicExt.count == 0x10E
-        {
-            var pub = Data()
-            Self.appendUInt32LE(&pub, 0x100)
-            pub.append(publicExt[0x09..<0x109])
-            Self.appendUInt32LE(&pub, 3)
-            pub.append(publicExt[0x10B..<0x10E])
-            let hash = SHA256.hash(data: pub)
-            reply["pubkey_hash_A"] = Data(hash).hexString
+        if hasKey {
+            if let privateKey = rsaPrivateKey(said: saidB) {
+                if let publicKey = SecKeyCopyPublicKey(privateKey) {
+                    var exportError: Unmanaged<CFError>?
+                    if let publicExt = SecKeyCopyExternalRepresentation(publicKey, &exportError) as Data? {
+                        if publicExt.count == 0x10E {
+                            var pub = Data()
+                            Self.appendUInt32LE(&pub, 0x100)
+                            pub.append(publicExt[0x09..<0x109])
+                            Self.appendUInt32LE(&pub, 3)
+                            pub.append(publicExt[0x10B..<0x10E])
+                            let hash = SHA256.hash(data: pub)
+                            reply["pubkey_hash_A"] = Data(hash).hexString
+                        } else {
+                            DiagnosticsLog.warn("xiaomi.mitrust.status_pubkey_bad_size count=\(publicExt.count)")
+                        }
+                    } else {
+                        DiagnosticsLog.error("xiaomi.mitrust.status_pubkey_export_err", exportError?.takeRetainedValue())
+                    }
+                } else {
+                    DiagnosticsLog.warn("xiaomi.mitrust.status_pubkey_copy_failed")
+                }
+            } else {
+                DiagnosticsLog.warn("xiaomi.mitrust.status_pubkey_no_key")
+            }
         }
         DiagnosticsLog.info("xiaomi.mitrust.status_reply_tx hasKey=\(hasKey)")
         sendJSON(reply)
@@ -292,11 +301,17 @@ final class MiTrustAuthService {
         return uuid
     }
 
+    private func rsaKeyLabel(said: String, isPrivate: Bool) -> String {
+        let kind = isPrivate ? "private" : "public"
+        return "hyperconnect.trust.v2.\(kind):\(deviceIdHex):\(said.prefix(16))"
+    }
+
     private func rsaPrivateKey(said: String) -> SecKey? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-            kSecAttrApplicationLabel as String: Data("\(said)pri".utf8),
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: true),
             kSecReturnRef as String: true
         ]
         var result: CFTypeRef?
@@ -305,22 +320,20 @@ final class MiTrustAuthService {
     }
 
     private func generateRSAKeypair(said: String) -> SecKey? {
-        for label in ["\(said)pri", "\(said)pub"] {
+        for isPrivate in [true, false] {
             let delete: [String: Any] = [
                 kSecClass as String: kSecClassKey,
-                kSecAttrApplicationLabel as String: Data(label.utf8)
+                kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: isPrivate)
             ]
             SecItemDelete(delete as CFDictionary)
         }
         let privateAttrs: [String: Any] = [
             kSecAttrIsPermanent as String: true,
-            kSecAttrApplicationLabel as String: Data("\(said)pri".utf8),
-            kSecAttrLabel as String: "hyperconnect.trust.private:\(deviceIdHex)"
+            kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: true)
         ]
         let publicAttrs: [String: Any] = [
             kSecAttrIsPermanent as String: true,
-            kSecAttrApplicationLabel as String: Data("\(said)pub".utf8),
-            kSecAttrLabel as String: "hyperconnect.trust.public:\(deviceIdHex)"
+            kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: false)
         ]
         let params: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
@@ -333,6 +346,8 @@ final class MiTrustAuthService {
             DiagnosticsLog.error("xiaomi.mitrust.keygen_failed", error?.takeRetainedValue())
             return nil
         }
+        var signError: Unmanaged<CFError>?
+        _ = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, Data("warmup".utf8) as CFData, &signError)
         return key
     }
 
