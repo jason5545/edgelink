@@ -276,6 +276,55 @@ final class LyraAnalyzer {
         return formatter
     }()
 
+    func analyzeChannelFlow(_ flow: KCPFlow) {
+        for segment in flow.orderedPayloads {
+            let time = Self.timeFormatter.string(from: segment.timestamp)
+            let payload = segment.payload
+            if LyraChannelPlane.isTLVFrame(payload) {
+                out.section("[\(time)] \(flow.key) CHANNEL TLV sn=\(segment.sn)") { dump in
+                    LyraChannelPlane.dumpTLVFrame(payload, dump: &dump)
+                }
+                continue
+            }
+            guard let fragment = LyraChannelPlane.parseFragment(payload) else {
+                out.section("[\(time)] \(flow.key) CHANNEL raw sn=\(segment.sn)") { dump in
+                    dump.hex("payload", payload, maxBytes: 64)
+                }
+                continue
+            }
+            let encrypted = LyraChannelPlane.encryptedFlags.contains(fragment.flags)
+            out.section("[\(time)] \(flow.key) CHANNEL frag flags=\(String(fragment.flags, radix: 16)) off=\(fragment.offset) cnt=\(fragment.count) body=\(fragment.body.count)B sn=\(segment.sn)") { dump in
+                if encrypted {
+                    var opened = false
+                    for candidate in keyring.decryptionCandidates {
+                        if let plain = LyraCrypto.aesGcmDecrypt(key: candidate.key, blob: fragment.body) {
+                            decryptedBlobCount += 1
+                            opened = true
+                            dump.line("decrypt OK key=\"\(candidate.label)\" (\(plain.count)B)")
+                            if LyraChannelPlane.isTLVFrame(plain) {
+                                LyraChannelPlane.dumpTLVFrame(plain, dump: &dump)
+                            } else {
+                                dump.hex("plaintext", plain, maxBytes: 96)
+                                dumpProtoGeneric(plain, dump: &dump, depthLimit: 2)
+                            }
+                            break
+                        }
+                    }
+                    if !opened {
+                        failedBlobCount += 1
+                        dump.hex("encrypted fragment NO KEY", fragment.body, maxBytes: 48)
+                    }
+                } else {
+                    if LyraChannelPlane.isTLVFrame(fragment.body) {
+                        LyraChannelPlane.dumpTLVFrame(fragment.body, dump: &dump)
+                    } else {
+                        dump.hex("body", fragment.body, maxBytes: 96)
+                    }
+                }
+            }
+        }
+    }
+
     private func dumpMiConnect(_ payload: Data, flowKey: String, dump: inout Dump) {
         guard let top = Proto.fields(payload) else {
             dump.hex("unparsed MiConnectFrame", payload)

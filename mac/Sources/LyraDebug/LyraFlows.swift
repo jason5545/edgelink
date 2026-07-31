@@ -34,18 +34,28 @@ enum FlowAssembler {
         for packet in packets {
             var flow = flows[packet.flowKey, default: KCPFlow(key: packet.flowKey)]
             if flow.firstTimestamp == nil { flow.firstTimestamp = packet.timestamp }
-            do {
-                let segment = try LyraMeshDatagram.decodeSegment(packet.payload)
-                flow.sawKCP = true
-                if segment.command == LyraMeshDatagram.commandPush {
-                    flow.pushCount += 1
-                    if flow.segments[segment.sn] == nil, !segment.payload.isEmpty {
-                        flow.segments[segment.sn] = (segment.payload, packet.timestamp)
+            var offset = packet.payload.startIndex
+            var consumedAny = false
+            while offset + LyraMeshDatagram.headerLength <= packet.payload.endIndex {
+                let slice = packet.payload.subdata(in: offset..<packet.payload.endIndex)
+                do {
+                    let segment = try LyraMeshDatagram.decodeSegment(slice)
+                    consumedAny = true
+                    flow.sawKCP = true
+                    if segment.command == LyraMeshDatagram.commandPush {
+                        flow.pushCount += 1
+                        if flow.segments[segment.sn] == nil, !segment.payload.isEmpty {
+                            flow.segments[segment.sn] = (segment.payload, packet.timestamp)
+                        }
+                    } else if segment.command == LyraMeshDatagram.commandAck {
+                        flow.ackCount += 1
                     }
-                } else if segment.command == LyraMeshDatagram.commandAck {
-                    flow.ackCount += 1
+                    offset += LyraMeshDatagram.headerLength + segment.payload.count
+                } catch {
+                    break
                 }
-            } catch {
+            }
+            if !consumedAny {
                 flow.rawDatagrams.append((packet.timestamp, packet.payload))
             }
             flows[packet.flowKey] = flow

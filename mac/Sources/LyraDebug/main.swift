@@ -194,11 +194,17 @@ func runParse(_ options: CLIOptions) throws -> Int32 {
     }
     let analyzer = LyraAnalyzer(keyring: keyring)
     var allFrames: [MeshFrameRecord] = []
+    var channelFlows: [KCPFlow] = []
     var rawNotes: [String] = []
     let sortedKeys = flows.keys.sorted()
     for key in sortedKeys {
         guard let flow = flows[key] else { continue }
         if flow.sawKCP {
+            if LyraChannelPlane.looksLikeChannelFlow(flow) {
+                rawNotes.append("flow \(key): CHANNEL plane, \(flow.pushCount) PUSH / \(flow.ackCount) ACK")
+                channelFlows.append(flow)
+                continue
+            }
             let missing = flow.missingSNs
             let gapNote = missing.isEmpty ? "" : " MISSING SN: \(missing.prefix(10).map(String.init).joined(separator: ","))\(missing.count > 10 ? "…" : "")"
             rawNotes.append("flow \(key): KCP \(flow.pushCount) PUSH / \(flow.ackCount) ACK, \(flow.segments.count) unique segments\(gapNote)")
@@ -219,6 +225,9 @@ func runParse(_ options: CLIOptions) throws -> Int32 {
     print("--- frame stream (\(allFrames.count) frames) ---")
     for frame in allFrames {
         analyzer.analyzeFrame(frame, direction: frame.flowKey)
+    }
+    for flow in channelFlows {
+        analyzer.analyzeChannelFlow(flow)
     }
     print(analyzer.out.lines.joined(separator: "\n"))
     let summary = analyzer.summary()

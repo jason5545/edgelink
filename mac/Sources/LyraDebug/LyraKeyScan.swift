@@ -38,6 +38,16 @@ enum KeyScanner {
         }
         for key in flows.keys.sorted() {
             guard let flow = flows[key], flow.sawKCP else { continue }
+            if LyraChannelPlane.looksLikeChannelFlow(flow) {
+                for segment in flow.orderedPayloads {
+                    if blobs.count >= limit { return blobs }
+                    if let fragment = LyraChannelPlane.parseFragment(segment.payload),
+                       LyraChannelPlane.encryptedFlags.contains(fragment.flags) {
+                        add("channel-frag @\(key)", fragment.body)
+                    }
+                }
+                continue
+            }
             let (frames, _, _) = MeshFrameSplitter.split(flow: flow)
             for record in frames {
                 if blobs.count >= limit { return blobs }
