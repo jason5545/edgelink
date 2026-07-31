@@ -33,6 +33,14 @@ enum CLIError: Error, CustomStringConvertible {
           dumps (files named <base-hex>.bin) for 32-byte AES keys that open them
           (read-only GCM oracle). Hits are merged into the keyring.
 
+      lyra-debug bkdr [hash ...] [--from-logcat logcat.txt] --dump-dir <dir>
+                      [--pcap capture.pcap] [--keys base.json] [--out keys.json]
+          Rolling BKDR(131) fingerprint scan for 32-byte keys in memory dumps
+          (matches the native SetTransKey trans_key=<hash> log lines; much
+          faster than the GCM sweep and needs no oracle). With --pcap, every
+          candidate is verified by decrypting capture blobs; verified keys are
+          merged into the keyring.
+
       Exit status for `parse`: 0 if every auth handshake with sufficient key
       material passed (session key derived / blobs decrypted), 2 otherwise.
     """
@@ -80,6 +88,8 @@ func main() throws -> Int32 {
         return try runParse(options)
     case "keyscan":
         return try runKeyscan(options)
+    case "bkdr":
+        return try runBKDR(options)
     case "help", "--help", "-h":
         print(CLIError.usageText)
         return 0
@@ -135,6 +145,69 @@ func runKeys(_ options: CLIOptions) throws -> Int32 {
         print("unknown keys subcommand: \(subcommand)")
         return 1
     }
+}
+
+func runBKDR(_ options: CLIOptions) throws -> Int32 {
+    var targets = Set<UInt32>()
+    for arg in options.positional {
+        let cleaned = arg.replacingOccurrences(of: "trans_key=", with: "")
+        if let value = UInt32(cleaned) ?? UInt32(cleaned.dropFirst(2), radix: 16) {
+            targets.insert(value)
+        }
+    }
+    if let logcat = options.values["from-logcat"] {
+        targets.formUnion(BKDRScanner.transKeyHashes(fromLogcat: logcat))
+    }
+    guard let dumpDir = options.values["dump-dir"] else {
+        print("usage: lyra-debug bkdr [hash ...] [--from-logcat f] --dump-dir <dir> [--pcap c] [--keys k] [--out o]")
+        return 1
+    }
+    guard !targets.isEmpty else {
+        print("no target hashes (pass decimal/0x hashes or --from-logcat)")
+        return 1
+    }
+    let hits = BKDRScanner.scan(dumpDir: dumpDir, targets: targets)
+    var unique: [String: BKDRScanner.Hit] = [:]
+    for hit in hits {
+        unique[hit.key.hexString] = hit
+    }
+    print("\(unique.count) unique candidate key(s)")
+    var blobs: [KeyScanner.LabeledBlob] = []
+    if let pcapPath = options.values["pcap"] {
+        blobs = try KeyScanner.extractEncryptedBlobs(pcapPath: pcapPath)
+        print("verifying candidates against \(blobs.count) capture blob(s)…")
+    }
+    var keyring = Keyring()
+    if let base = options.values["keys"], FileManager.default.fileExists(atPath: base) {
+        keyring = try Keyring.load(path: base)
+    }
+    var verified = 0
+    for (hex, hit) in unique.sorted(by: { $0.key < $1.key }) {
+        var opened = [String]()
+        for blob in blobs {
+            if LyraCrypto.aesGcmDecrypt(key: hit.key, blob: blob.blob) != nil {
+                opened.append(blob.label)
+            }
+        }
+        if blobs.isEmpty || !opened.isEmpty {
+            verified += 1
+            print("  \(hex)  (\(hit.file)@0x\(String(hit.offset, radix: 16)), hash \(hit.hash))")
+            for label in opened.prefix(4) {
+                print("    opens: \(label)")
+            }
+            keyring.addSessionKey(label: "bkdr \(hit.hash) \(opened.first ?? "unverified")", key: hit.key)
+        }
+    }
+    if verified == 0 {
+        print("no candidates verified")
+        return 2
+    }
+    if options.values["out"] != nil || options.values["keys"] != nil {
+        let outPath = options.values["out"] ?? options.values["keys"]!
+        try keyring.save(path: outPath)
+        print("wrote \(verified) key(s) -> \(outPath)")
+    }
+    return 0
 }
 
 func runKeyscan(_ options: CLIOptions) throws -> Int32 {
