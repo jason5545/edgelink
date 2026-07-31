@@ -93,6 +93,11 @@ final class LyraCastTrustSession {
     private var mitrustPeerPortChannelId: UInt64 = 0
     private var mitrustPeerPort: UInt16?
     private var mitrustPeerPortResponseSent = false
+    // When the peer-port request arrived embedded in the quick-conn logi
+    // request, the phone's LogiConnClientHandler is not yet connected and
+    // silently drops payloads ("DoLogiConnPayloadReceived: not connected").
+    // Defer the response until the phone's response_ack (post-kConnected).
+    private var mitrustPeerPortAwaitingAck = false
     private var passkeyPair: LyraPasskeyPairServer?
     // Set when the phone dialed our published mesh port directly (PIN-bind /
     // pairing flow) and the responder handed the mitrustservice conn to us.
@@ -225,6 +230,18 @@ final class LyraCastTrustSession {
         } catch {
             DiagnosticsLog.error("xiaomi.cast.trust_tx_failed label=\(label)", error)
         }
+    }
+
+    // Coarse cross-queue gate (same convention as handlesAdoptedMitrust):
+    // true while a phone-dialed mitrustservice conn is adopted and its
+    // channel may still be open. The responder suppresses its plaintext
+    // netId=1 announce during this window — the phone assigns netIds
+    // sequentially from 1, so a live conn can own netId 1, and plaintext
+    // payload-v2 frames landing on it are misparsed as channel commands
+    // (52013 "channel invalid id" spam, e.g. f1 decoded as "Book" from our
+    // device name).
+    func mitrustConnActive() -> Bool {
+        srvConnId != 0 && (srvChannelSocket != nil || Date().timeIntervalSince(mitrustActivityAt) < 120)
     }
 
     // Called by LyraMeshResponder when the phone opens a mitrustservice logi
@@ -568,6 +585,7 @@ final class LyraCastTrustSession {
             mitrustPeerPortChannelId = 0
             mitrustPeerPort = nil
             mitrustPeerPortResponseSent = false
+            mitrustPeerPortAwaitingAck = false
         }
         srvConnId = logiConn.logiConnId
         srvPeerNetId = logiConn.localNetId
@@ -769,11 +787,11 @@ final class LyraCastTrustSession {
                 z: secret, clientRandom: clientRandom, serverRandom: serverRandom
             )
             DiagnosticsLog.info("xiaomi.cast.mitrust_keyagree_compare code=\(compareCode)")
-            if let onPairingCompareCode {
-                onPairingCompareCode(compareCode)
-            } else {
-                LyraPairingPresenter.showCompareCode(compareCode)
-            }
+            // The compare code is a UI-layer nicety only meaningful when the
+            // phone also displays it during manual pairing. The phone-dialed
+            // bind/unlock flow confirms on the phone side, so a modal alert
+            // here is pure noise (it fires on every mitrust KeyAgree).
+            onPairingCompareCode?(compareCode)
         } catch {
             DiagnosticsLog.error("xiaomi.cast.mitrust_upgrade_ecdh_failed", error)
             return
@@ -1117,6 +1135,8 @@ final class LyraCastTrustSession {
             }
             if inner.frameType == 3 {
                 DiagnosticsLog.info("xiaomi.cast.mitrust_logi_response_ack_rx")
+                mitrustPeerPortAwaitingAck = false
+                sendMitrustPeerPortResponseIfReady()
                 return
             }
             let payloadData = inner.payload?.data ?? Data()
@@ -1167,6 +1187,7 @@ final class LyraCastTrustSession {
         mitrustSendEncrypted(inner: response, label: "mitrust_logi_response")
 
         if let peerPortRequest {
+            mitrustPeerPortAwaitingAck = true
             handleMitrustPeerPortRequest(peerPortRequest)
         }
     }
@@ -1241,9 +1262,12 @@ final class LyraCastTrustSession {
     }
 
     private func sendMitrustPeerPortResponseIfReady() {
-        // Official servers fire responseOfPeerPort ~90ms after LOGI_CONN_RESPONSE
-        // without waiting for the response ack. Body is PLAINTEXT payload-v2
-        // (flag=0) with only f1/f3/f5/f7 (58B total including the 16B header).
+        // Official servers fire responseOfPeerPort only after the phone's logi
+        // conn is connected — earlier payloads are silently dropped by the
+        // phone's LogiConnClientHandler ("not connected"). For requests that
+        // arrived embedded in the quick-conn sync we wait for response_ack;
+        // explicit post-connect 99B requests are answered immediately.
+        guard !mitrustPeerPortAwaitingAck else { return }
         guard !mitrustPeerPortResponseSent,
               mitrustPeerPortChannelId != 0,
               let port = mitrustPeerPort,
@@ -1487,6 +1511,20 @@ final class LyraCastTrustSession {
                 "xiaomi.cast.trust_logi_disconnect bytes=\(payload.count) " +
                     "hex=\(payload.prefix(32).map { String(format: "%02x", $0) }.joined())"
             )
+            if logiConn.logiConnId == logiConnId {
+                // The phone released our cast channel (52011 "channel peer
+                // sdk release" after idle). Mark it dead — writing into it
+                // silently goes nowhere (UDP) and leaves the unlock UI stuck
+                // at queryingStatus. Without an adopted mitrust conn, finish
+                // so the next unlock attempt re-dials a fresh session.
+                channelReady = false
+                channelSocket?.stop()
+                channelSocket = nil
+                DiagnosticsLog.info("xiaomi.cast.trust_channel_released_by_peer")
+                if srvConnId == 0 {
+                    finishLocked()
+                }
+            }
         default:
             DiagnosticsLog.info(
                 "xiaomi.cast.trust_logi_other frameType=\(inner.frameType) bytes=\(logiConn.inner.count)"

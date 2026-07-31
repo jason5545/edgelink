@@ -21,6 +21,9 @@ final class MiTrustAuthService {
     private let deviceIdHex: String
     private let queue = DispatchQueue(label: "edgelink.mitrust.auth", qos: .userInitiated)
     private var sessionKeyHex: String?
+    private var clientHelloAt: Date?
+    private var bindRequestSeen = false
+    private var bindResponseSent = false
     private let sendRawJSON: (Data) -> Void
 
     init(deviceIdHex: String, sendRawJSON: @escaping (Data) -> Void) {
@@ -137,6 +140,24 @@ final class MiTrustAuthService {
     }
 
     private func handleTLSClientHello(_ message: [String: Any]) {
+        // The phone retransmits 595 on a short timer while our 593 is still in
+        // flight. Answer those transport-level retries with the SAME session
+        // key; only start a fresh session once a bind attempt (546) intervened
+        // (the phone restarts the whole flow after a bind-stage reset).
+        if let existing = sessionKeyHex, !bindRequestSeen,
+           let at = clientHelloAt, Date().timeIntervalSince(at) < 10
+        {
+            DiagnosticsLog.info("xiaomi.mitrust.tls_server_hello_tx dedupe=true")
+            sendJSON([
+                "event_name": Event.tlsServerHello,
+                "sessionkey": existing,
+                "server_done": "server_done"
+            ])
+            return
+        }
+        clientHelloAt = Date()
+        bindRequestSeen = false
+        bindResponseSent = false
         let keyHex = Self.randomHexString(byteCount: 32)
         sessionKeyHex = keyHex
         DiagnosticsLog.info("xiaomi.mitrust.tls_server_hello_tx")
@@ -157,6 +178,16 @@ final class MiTrustAuthService {
     private func handleBindRequest(_ message: [String: Any]) {
         guard let saidB = message["shared_auth_id_B"] as? String, !saidB.isEmpty else {
             DiagnosticsLog.warn("xiaomi.mitrust.bind_missing_said")
+            return
+        }
+        // The phone retransmits 546 on a short timer while our 547 is still in
+        // flight. Re-answering advances a phantom bind on our side and the
+        // duplicate 547 hits the phone's post-bind stage as "illegal remote
+        // stage" (error 24 + full reset). Answer only the first 546 per
+        // session; a genuine restart re-runs 595 first and clears this.
+        bindRequestSeen = true
+        guard !bindResponseSent else {
+            DiagnosticsLog.info("xiaomi.mitrust.bind_request_dedupe said_prefix=\(saidB.prefix(8))")
             return
         }
         guard let sessionKeyHex, let aesKey = Self.data(fromHex: sessionKeyHex) else {
@@ -197,6 +228,7 @@ final class MiTrustAuthService {
                 using: SymmetricKey(data: aesKey)
             )
             DiagnosticsLog.info("xiaomi.mitrust.bind_response_tx said_prefix=\(saidB.prefix(8))")
+            bindResponseSent = true
             sendJSON([
                 "event_name": Event.bindResponse,
                 "ciphertext": cipherHex,

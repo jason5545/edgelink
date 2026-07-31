@@ -632,6 +632,9 @@ final class LyraMeshResponder {
         guard channelSocket == nil, !channelNegotiationStarted else {
             return
         }
+        if let session = Self.activeTrustSession, session.mitrustConnActive() {
+            return
+        }
         guard let deviceIdHex = deviceIdHexProvider() else {
             return
         }
