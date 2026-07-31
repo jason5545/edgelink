@@ -96,6 +96,17 @@ targets:
         NSMicrophoneUsageDescription: EdgeLink uses the microphone only when Android requests relayed microphone audio.
         NSPhotoLibraryUsageDescription: EdgeLink imports photos and videos received from your Android phone into the Photos library so they sync to iCloud.
         NSHumanReadableCopyright: "Copyright 2026 EdgeLink contributors"
+  LyraDebug:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/LyraDebug
+      - Sources/EdgeLinkKit
+    settings:
+      base:
+        PRODUCT_NAME: lyra-debug
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MW4GWYGX56
   EdgeLinkKitTests:
     type: bundle.unit-test
     platform: macOS
@@ -107,6 +118,10 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
 schemes:
+  LyraDebug:
+    build:
+      targets:
+        LyraDebug: all
   EdgeLinkKit:
     build:
       targets:
