@@ -3019,6 +3019,7 @@ private class AndroidCommandDispatcher(
             EnvelopeTypes.SCREEN_STOP -> {
                 AndroidMiLinkMirrorMediaBridge.stop("screen_stop")
                 AndroidMirrorScreenRemoteKeeper.stop("screen_stop")
+                miLinkCommandBridge.closeFakeMirrorNow("screen_stop")
                 onMirrorTurnSessionStop()
                 onScreenStopReceived()
                 screenSession.stop()

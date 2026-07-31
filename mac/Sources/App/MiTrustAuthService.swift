@@ -26,6 +26,48 @@ final class MiTrustAuthService {
     init(deviceIdHex: String, sendRawJSON: @escaping (Data) -> Void) {
         self.deviceIdHex = deviceIdHex
         self.sendRawJSON = sendRawJSON
+        dumpRegisteredPubkeys()
+    }
+
+    private func dumpRegisteredPubkeys() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+                kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                kSecReturnAttributes as String: true,
+                kSecReturnRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitAll
+            ]
+            var result: CFTypeRef?
+            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                  let items = result as? [[String: Any]]
+            else { return }
+            for item in items {
+                guard let label = item[kSecAttrLabel as String] as? String,
+                      label.hasPrefix("hyperconnect.trust.v2.private:\(self.deviceIdHex):"),
+                      let priv = item[kSecValueRef as String] as! SecKey?,
+                      let pub = SecKeyCopyPublicKey(priv),
+                      let ext = SecKeyCopyExternalRepresentation(pub, nil) as Data?,
+                      ext.count == 0x10E
+                else { continue }
+                var pubData = Data()
+                Self.appendUInt32LE(&pubData, 0x100)
+                pubData.append(ext[0x09..<0x109])
+                Self.appendUInt32LE(&pubData, 3)
+                pubData.append(ext[0x10B..<0x10E])
+                var blob = Data()
+                Self.appendUInt32LE(&blob, 0x33)
+                Self.appendUInt32LE(&blob, UInt32(pubData.count))
+                blob.append(pubData)
+                let hash = SHA256.hash(data: pubData)
+                DiagnosticsLog.info(
+                    "xiaomi.mitrust.registered_pubkey said_prefix=\(label.suffix(16)) " +
+                        "pub=\(blob.hexString) hash=\(Data(hash).hexString)"
+                )
+            }
+        }
     }
 
     func handleChannelPayload(_ payload: Data) {
@@ -197,6 +239,14 @@ final class MiTrustAuthService {
                             pub.append(publicExt[0x10B..<0x10E])
                             let hash = SHA256.hash(data: pub)
                             reply["pubkey_hash_A"] = Data(hash).hexString
+                            var blob = Data()
+                            Self.appendUInt32LE(&blob, 0x33)
+                            Self.appendUInt32LE(&blob, UInt32(pub.count))
+                            blob.append(pub)
+                            DiagnosticsLog.info(
+                                "xiaomi.mitrust.status_reply_pubkey said_prefix=\(saidB.prefix(16)) " +
+                                    "pub=\(blob.hexString) hash=\(Data(hash).hexString)"
+                            )
                         } else {
                             DiagnosticsLog.warn("xiaomi.mitrust.status_pubkey_bad_size count=\(publicExt.count)")
                         }

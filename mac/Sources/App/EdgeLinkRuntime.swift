@@ -265,7 +265,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(1300))
                 guard !Task.isCancelled else { return }
                 self.screenSession.phoneUnlockPhase = nil
-                self.stopPhoneTrustUnlock()
+                // The cast channel session is persistent (supervisor-owned);
+                // do not tear it down here — the mirror rides it.
             }
         }
         macTrustManager.onStateChanged = { [weak self] state in
@@ -361,6 +362,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.handleXiaomiMirrorTurnFallbackToWebSocket(sessionId: sessionId, reason: reason)
             }
         }
+        startCastChannelSupervisor()
         phoneRelayProbe.onSinkPCMStats = { [weak self] stats in
             Task { @MainActor in
                 self?.handlePhoneRelayPCMStats(stats)
@@ -711,6 +713,38 @@ final class EdgeLinkRuntime: ObservableObject {
         timeoutMs: Int,
         startGeneration: UInt64
     ) {
+            let channelReady = ensureCastTrustChannel(reason: "screen_start")
+            if !channelReady, lyraCastTrustSession != nil {
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_start_await_cast_channel generation=\(startGeneration)"
+                )
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let deadline = Date().addingTimeInterval(Self.xiaomiScreenCastChannelWaitSeconds)
+                    while Date() < deadline {
+                        if self.lyraCastTrustSession?.isChannelReady == true { break }
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                    }
+                    let ready = self.lyraCastTrustSession?.isChannelReady == true
+                    DiagnosticsLog.info(
+                        "xiaomi.mac.screen_start_cast_channel_wait ready=\(ready) generation=\(startGeneration)"
+                    )
+                    guard startGeneration == self.xiaomiScreenStartGeneration,
+                          !self.xiaomiScreenUserStopped,
+                          self.pendingXiaomiScreenFallback == nil else {
+                        return
+                    }
+                    self.sendXiaomiMirrorStartMainDisplayWhenListenerReady(
+                        route: xiaomiScreenRoute,
+                        peerHost: peerHost,
+                        peerPort: peerPort,
+                        cloudflareMirrorSessionId: cloudflareMirrorSessionId,
+                        timeoutMs: timeoutMs,
+                        startGeneration: startGeneration
+                    )
+                }
+                return
+            }
             if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
                 sendXiaomiMirrorStartMainDisplayCommand(
                     route: xiaomiScreenRoute,
@@ -1201,15 +1235,120 @@ final class EdgeLinkRuntime: ObservableObject {
         sendMiLinkCommand(command: "xiaomi.mishare.openSettings")
     }
 
-    func startPhoneTrustUnlock() {
-        guard lyraCastTrustSession == nil else { return }
+    // Keeps a persistent cast channel to the phone so mirror starts skip the
+    // ~5s channel setup. Rebuilds when the session dies, stalls without a
+    // channel, or goes silent (network change, phone restart, conn timeout).
+    private var castChannelSupervisorTimer: Timer?
+
+    private func startCastChannelSupervisor() {
+        castChannelSupervisorTimer?.invalidate()
+        let timer = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.runCastChannelSupervisorTick()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        castChannelSupervisorTimer = timer
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            self?.runCastChannelSupervisorTick()
+        }
+    }
+
+    private func runCastChannelSupervisorTick() {
+        guard !resumeScreenStartAfterTrustUnlock else { return }
+        switch macTrustManager.state {
+        case .authenticating, .binding, .queryingStatus:
+            return
+        default:
+            break
+        }
+        if let session = lyraCastTrustSession {
+            let stuckBuilding = !session.isChannelReady &&
+                Date().timeIntervalSince(session.createdAt) > 30
+            if stuckBuilding {
+                DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild stuckBuilding=true")
+                stopPhoneTrustUnlock()
+            } else {
+                let quietMs = Date().timeIntervalSince(session.lastInboundAt) * 1000
+                if session.isChannelReady, quietMs > 45_000 {
+                    if quietMs > 75_000, castChannelProbeSentAt != .distantPast,
+                       Date().timeIntervalSince(castChannelProbeSentAt) > 15 {
+                        // Probe sent and still no inbound — the conn is dead.
+                        DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild silent=\(Int(quietMs))ms")
+                        castChannelProbeSentAt = .distantPast
+                        stopPhoneTrustUnlock()
+                    } else if castChannelProbeSentAt == .distantPast {
+                        // Quiet channel may be normal (the phone stops
+                        // keepalives after setup); probe before rebuilding.
+                        castChannelProbeSentAt = Date()
+                        session.probeLiveness()
+                        DiagnosticsLog.info("xiaomi.cast.channel_supervisor_probe quietMs=\(Int(quietMs))")
+                    }
+                }
+                return
+            }
+        }
+        _ = ensureCastTrustChannel(reason: "supervisor")
+    }
+
+    private var castChannelProbeSentAt = Date.distantPast
+
+    // Creates (or reuses) a trust session purely for its cast channel: the
+    // phone-side stock share flow silently no-ops startShare while the cast
+    // channel is missing, so the mirror start must hold startShare until the
+    // channel is negotiated. No biometric or unlock action is involved here.
+    @discardableResult
+    func ensureCastTrustChannel(reason: String) -> Bool {
+        if let existing = lyraCastTrustSession {
+            DiagnosticsLog.info(
+                "xiaomi.cast.channel_ensure reason=\(reason) existing=true ready=\(existing.isChannelReady)"
+            )
+            return existing.isChannelReady
+        }
         let endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
         guard !endpoints.isEmpty,
               let discoveredDeviceId = xiaomiMiShareDiscovery.localDeviceIdHex
         else {
-            xiaomiMiLinkCommandStatus = String(localized: "看不到手機，請確認手機已開啟妙享桌面")
-            DiagnosticsLog.warn("xiaomi.cast.trust_no_phone_endpoint")
-            return
+            DiagnosticsLog.warn("xiaomi.cast.channel_ensure_no_endpoint reason=\(reason)")
+            return false
+        }
+        let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let deviceIdHex = cloneId?.isEmpty == false ? cloneId! : discoveredDeviceId
+        let session = LyraCastTrustSession(
+            endpoints: endpoints,
+            deviceIdHex: deviceIdHex,
+            displayName: xiaomiMiShareDiscovery.localDisplayName,
+            trustManager: macTrustManager
+        )
+        session.retainPhysAfterAuth = true
+        session.duoScreenStatusEnabled = false
+        session.onFinish = { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session, self.lyraCastTrustSession === session else { return }
+                self.lyraCastTrustSession = nil
+            }
+        }
+        lyraCastTrustSession = session
+        session.start()
+        DiagnosticsLog.info(
+            "xiaomi.cast.channel_ensure reason=\(reason) existing=false endpoints=\(endpoints.count)"
+        )
+        return false
+    }
+
+    func startPhoneTrustUnlock() {
+        let existingSession = lyraCastTrustSession
+        if existingSession == nil {
+            let endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
+            guard !endpoints.isEmpty,
+                  xiaomiMiShareDiscovery.localDeviceIdHex != nil
+            else {
+                xiaomiMiLinkCommandStatus = String(localized: "看不到手機，請確認手機已開啟妙享桌面")
+                DiagnosticsLog.warn("xiaomi.cast.trust_no_phone_endpoint")
+                return
+            }
         }
         xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：Touch ID 驗證…")
         screenSession.phoneUnlockPhase = .verifyingTouchID
@@ -1230,6 +1369,24 @@ final class EdgeLinkRuntime: ObservableObject {
                 NSApp.activate(ignoringOtherApps: true)
                 self.screenSession.showActiveWindow()
             }
+            if let existingSession {
+                await MainActor.run {
+                    existingSession.retainPhysAfterAuth = true
+                    existingSession.duoScreenStatusEnabled = true
+                    self.macTrustManager.touchIdPreauthorized = true
+                    self.macTrustManager.autoUnlockOnReady = true
+                    if existingSession.isChannelReady {
+                        self.macTrustManager.start()
+                    }
+                    self.xiaomiMiLinkCommandStatus = String(localized: "跨裝置解鎖：連接手機…")
+                }
+                if existingSession.isChannelReady, macTrustManager.state != .idle {
+                    await macTrustManager.requestUnlock()
+                }
+                return
+            }
+            let endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
+            let discoveredDeviceId = xiaomiMiShareDiscovery.localDeviceIdHex ?? ""
             let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let deviceIdHex = cloneId?.isEmpty == false ? cloneId! : discoveredDeviceId
@@ -4389,6 +4546,40 @@ final class EdgeLinkRuntime: ObservableObject {
         case invalidBase64
     }
 
+    private var resumeScreenStartAfterTrustUnlockAt = Date.distantPast
+    private var mirrorLockStatePollingTask: Task<Void, Never>?
+
+    // The quick-auth shortcut unlocks the phone without a duo.screen auth
+    // event reaching us, so the gate cannot rely on TrustAuthEventMessage
+    // alone — poll the actual keyguard state via the Android bridge.
+    private func startMirrorLockStatePolling() {
+        mirrorLockStatePollingTask?.cancel()
+        mirrorLockStatePollingTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled, self.resumeScreenStartAfterTrustUnlock {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard self.resumeScreenStartAfterTrustUnlock else { break }
+                _ = self.sendMiLinkCommand(command: "xiaomi.mirror.lockState", args: [:])
+            }
+        }
+    }
+
+    private func handleMirrorLockStateResult(_ result: MiLinkCommandResultBody) {
+        guard resumeScreenStartAfterTrustUnlock else { return }
+        let locked = result.data["locked"] != "false"
+        DiagnosticsLog.info("xiaomi.mac.screen_lock_state_poll locked=\(locked)")
+        guard !locked else { return }
+        resumeScreenStartAfterTrustUnlock = false
+        mirrorLockStatePollingTask?.cancel()
+        mirrorLockStatePollingTask = nil
+        screenSession.phoneUnlockPhase = .succeeded
+        DiagnosticsLog.info("xiaomi.mac.screen_unlock_gate_resumed source=lockstate_poll")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_300_000_000)
+            guard !Task.isCancelled else { return }
+            self?.screenSession.phoneUnlockPhase = nil
+        }
+    }
+
     private func handleMiLinkCommandResult(_ result: MiLinkCommandResultBody) {
         // Route (a): intercept Xiaomi power topic results carrying battery data
         if result.data["electricQuantity"] != nil {
@@ -4396,16 +4587,27 @@ final class EdgeLinkRuntime: ObservableObject {
         } else if result.command.lowercased().contains("power") {
             DiagnosticsLog.info("battery.mac.milink_power_probe command=\(result.command) data=\(result.data)")
         }
+        if result.command == "xiaomi.mirror.lockState" {
+            handleMirrorLockStateResult(result)
+        }
         if result.command == "xiaomi.mirror.startMainDisplay", result.data["locked"] == "true" {
+            if resumeScreenStartAfterTrustUnlock,
+               Date().timeIntervalSince(resumeScreenStartAfterTrustUnlockAt) > 90 {
+                DiagnosticsLog.warn("xiaomi.mac.screen_locked_gate_stale_reset requestId=\(result.requestId)")
+                resumeScreenStartAfterTrustUnlock = false
+            }
             guard !resumeScreenStartAfterTrustUnlock else {
                 DiagnosticsLog.info("xiaomi.mac.screen_locked_gate_ignored reason=unlock_in_progress requestId=\(result.requestId)")
                 return
             }
             DiagnosticsLog.info("xiaomi.mac.screen_locked_gate requestId=\(result.requestId)")
             resumeScreenStartAfterTrustUnlock = true
+            resumeScreenStartAfterTrustUnlockAt = Date()
             xiaomiMiLinkCommandStatus = String(localized: "手機已鎖定，請先解鎖…")
-            stopPhoneTrustUnlock()
+            // Reuse the persistent cast channel session for the unlock flow
+            // instead of tearing it down and rebuilding from scratch.
             startPhoneTrustUnlock()
+            startMirrorLockStatePolling()
         }
         let isMirrorPending = Self.isPendingMiMirrorCommandResult(result)
         let updatesCommandStatus = !Self.isXiaomiMirrorKeyboardCommand(result.command)
@@ -5087,6 +5289,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let xiaomiScreenSessionRebuildTimeoutMs = 12_000
     private static let xiaomiScreenRebuildListenerReadyWaitSeconds: Double = 4
     private static let xiaomiScreenStartListenerReadyWaitSeconds: Double = 2
+    private static let xiaomiScreenCastChannelWaitSeconds: Double = 12
     private static let xiaomiScreenUserStopSettleSeconds: TimeInterval = 2
     private static let xiaomiScreenSourceIdleMinMediaStaleSeconds: Double = 5
     private static let xiaomiScreenControlHealthyMaxAgeSeconds: TimeInterval = 15

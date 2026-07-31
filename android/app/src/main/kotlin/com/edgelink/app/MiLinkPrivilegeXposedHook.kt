@@ -111,7 +111,8 @@ internal object MiLinkPrivilegeHookPolicy {
         "setMediaRelayVolume",
         "edgeLinkKeyboard",
         "edgeLinkPointer",
-        "edgeLinkGlobal"
+        "edgeLinkGlobal",
+        "edgeLinkCastChannel"
     )
 
     fun shouldHook(packageName: String?, processName: String?): Boolean =
@@ -503,6 +504,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             hookMirrorDeviceManagerAdmit(classLoader)
             hookMirrorUnlockIslandGate(classLoader)
             installXiaomiMirrorSynergyStatusGuard(classLoader, "install")
+            installMirrorCastChannelTracker(classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
             hookMiConnectNetworkingPermission(classLoader)
@@ -536,6 +538,33 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 log("trust quick auth shortcut disabled (official auth_token_A path test)")
             }
             installTrustBindBridge(classLoader)
+        }
+    }
+
+    private fun installMirrorCastChannelTracker(classLoader: ClassLoader) {
+        runCatching {
+            val listenerClass = findTargetClass(classLoader, "o2.F\$c")
+            installHook(
+                resolveMethod(
+                    listenerClass,
+                    "onChannelConfirm",
+                    String::class.java,
+                    findTargetClass(classLoader, "com.xiaomi.continuity.ServiceName"),
+                    Integer.TYPE,
+                    findTargetClass(classLoader, "com.xiaomi.continuity.channel.ConfirmInfo")
+                )
+            ) { chain ->
+                val deviceId = chain.args.getOrNull(0) as? String
+                val serviceName = chain.args.getOrNull(1)?.toString().orEmpty()
+                if (serviceName.contains("com.xiaomi.mirror") && serviceName.contains("cast")) {
+                    lastCastChannelConfirmAtMs = System.currentTimeMillis()
+                    lastCastChannelConfirmDevice = deviceId.orEmpty()
+                    log("mirror cast channel confirmed device=$deviceId service=$serviceName")
+                }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("mirror cast channel tracker hook failed: ${error.javaClass.simpleName}: ${error.message}")
         }
     }
 
@@ -2564,6 +2593,14 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 val extras = chain.args.getOrNull(4) as? Bundle
                 var localAnswer: Bundle? = null
                 if (extras != null) {
+                    if (method == "edgeLinkCastChannel") {
+                        return@installHook Bundle().apply {
+                            putLong("castChannelConfirmAtMs", lastCastChannelConfirmAtMs)
+                            putString("castChannelDevice", lastCastChannelConfirmDevice)
+                            putBoolean("enable", true)
+                            putInt("value", 0)
+                        }
+                    }
                     if (method == "edgeLinkKeyboard") {
                         return@installHook handleMirrorKeyboardProvider(classLoader, extras)
                     }
@@ -7709,6 +7746,10 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val TRUST_BIND_ACTION = "com.edgelink.mitrust.BIND"
         private const val TRUST_SHARED_AUTH_SERVICE = "vendor.xiaomi.hardware.misauth.IMiSharedAuth/default"
         private val TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS = setOf("721572C3")
+        @Volatile
+        private var lastCastChannelConfirmAtMs = 0L
+        @Volatile
+        private var lastCastChannelConfirmDevice = ""
         private const val MIRROR_DEVICE_MANAGER_CLASS = "o2.C"
         private const val MIRROR_DEVICE_ENTITY_CLASS = "o2.e"
         private const val MIRROR_DEVICE_STORE_CLASS = "o2.L"

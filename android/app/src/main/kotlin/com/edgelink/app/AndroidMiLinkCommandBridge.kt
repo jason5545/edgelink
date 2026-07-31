@@ -19,6 +19,7 @@ import com.xiaomi.mirror.RemoteDeviceInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.concurrent.thread
 
 data class AndroidMiLinkMirrorCloudBridgeRequest(
     val sessionId: String,
@@ -83,6 +85,7 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MI_CONNECT_NETWORKING_PROBE -> probeMiConnectNetworking(body, addServiceInfo = false)
                     COMMAND_MI_CONNECT_NETWORKING_REGISTER -> probeMiConnectNetworking(body, addServiceInfo = true)
                     COMMAND_MIRROR_QUERY_REMOTE_DEVICES -> queryMirrorRemoteDevices(body)
+                    COMMAND_MIRROR_LOCK_STATE -> queryMirrorLockState()
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
                     COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY -> requestMirrorSourceRecovery(body)
                     COMMAND_MIRROR_KEYBOARD_READY -> prepareMirrorKeyboard(body)
@@ -313,6 +316,17 @@ class AndroidMiLinkCommandBridge(
                 "count" to devices.size.toString(),
                 "sample" to devices.take(3).joinToString("|") { it.compactSummary() }
             )
+        )
+    }
+
+    private fun queryMirrorLockState(): CommandResult {
+        val keyguard = appContext.getSystemService(KeyguardManager::class.java)
+        val locked = keyguard?.isDeviceLocked == true
+        return CommandResult(
+            success = true,
+            route = "xiaomi.mirror.lockstate",
+            message = "locked=$locked",
+            data = mapOf("locked" to locked.toString())
         )
     }
 
@@ -996,6 +1010,37 @@ class AndroidMiLinkCommandBridge(
         )
     }
 
+    private suspend fun awaitMirrorCastChannelReady(
+        sinceMs: Long,
+        timeoutMs: Long = mirrorCastChannelReadyTimeoutMs
+    ): String {
+        // The Mac creates the cast channel before this command even arrives,
+        // so a confirmation slightly *before* arm is valid — what matters is
+        // that the mirror app holds a live channel now, not who came first.
+        val freshAfterMs = minOf(sinceMs, System.currentTimeMillis() - mirrorCastChannelFreshMs)
+        val deadlineMs = System.currentTimeMillis() + timeoutMs
+        var confirmAtMs = 0L
+        var device = ""
+        while (System.currentTimeMillis() < deadlineMs) {
+            val result = runCatching {
+                appContext.contentResolver.callMirrorProvider(
+                    "edgeLinkCastChannel",
+                    Bundle().apply {
+                        putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                        putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                    }
+                )
+            }.getOrNull()
+            confirmAtMs = result?.getLong("castChannelConfirmAtMs") ?: 0L
+            device = result?.getString("castChannelDevice").orEmpty()
+            if (confirmAtMs >= freshAfterMs) {
+                return "ready device=$device confirmAt=$confirmAtMs waitedMs=${System.currentTimeMillis() - sinceMs}"
+            }
+            delay(mirrorCastChannelPollIntervalMs)
+        }
+        return "timeout device=$device confirmAt=$confirmAtMs since=$sinceMs"
+    }
+
     private suspend fun startFakeMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
         val routeSelection = selectMirrorMediaRoute(body, reason = "start_main_display")
         val transport = routeSelection.transport
@@ -1010,6 +1055,7 @@ class AndroidMiLinkCommandBridge(
             body.args["peerHost"]
         }
         val armPeerPort = body.args["peerPort"]?.toIntOrNull()
+        val armStartedAtMs = System.currentTimeMillis()
         val armResult = runCatching {
             AndroidShizukuSupport.armMirrorScreenRemote(
                 context = appContext,
@@ -1029,6 +1075,16 @@ class AndroidMiLinkCommandBridge(
                 peerPort = armPeerPort
             )
         }
+        val castChannelWait = if (armResult.success) {
+            // The cast channel only exists a few seconds after arm (the
+            // phone's mirror stack connects back and negotiates it). Stock
+            // startShare silently no-ops while the channel is missing, so
+            // hold the share until the confirmation lands (bounded).
+            awaitMirrorCastChannelReady(armStartedAtMs)
+        } else {
+            "skipped arm_failed"
+        }
+        EdgeLinkLog.info("xiaomi.mirror.android.cast_channel_wait $castChannelWait")
         val fakeBody = body.copy(
             args = body.args + ("remoteDeviceId" to MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
         )
@@ -1872,6 +1928,29 @@ class AndroidMiLinkCommandBridge(
             call(mirrorCallProviderUri, method, null, extras)
         }
 
+    // User stop / RTSP teardown only pauses the source; stock closeMirror
+    // and the virtual display release otherwise wait for the *next*
+    // startShare to time out (~15s), which wedges quick re-triggers
+    // ("Display is opening" forever). Close the remote mirror immediately.
+    fun closeFakeMirrorNow(reason: String) {
+        thread(name = "EdgeLinkMiMirror-closeNow", isDaemon = true) {
+            runCatching {
+                val result = appContext.contentResolver.callMirrorProvider(
+                    "closeRemoteDeviceMirror",
+                    Bundle().apply {
+                        putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
+                        putInt("method_version", mirrorProviderMethodVersion)
+                    }
+                )
+                EdgeLinkLog.info(
+                    "xiaomi.mirror.android.close_now reason=$reason keys=${result?.keySet()?.joinToString(",") ?: "null"}"
+                )
+            }.onFailure { error ->
+                EdgeLinkLog.warn("xiaomi.mirror.android.close_now_failed reason=$reason", error)
+            }
+        }
+    }
+
     private fun Map<String, String>.toBundle(): Bundle =
         Bundle().also { bundle ->
             forEach { (key, value) -> bundle.putString(key, value) }
@@ -2094,6 +2173,7 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MI_CONNECT_NETWORKING_REGISTER = "xiaomi.mi_connect.registerLyraService"
         const val COMMAND_MIRROR_QUERY_REMOTE_DEVICES = "xiaomi.mirror.queryRemoteDevices"
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
+        const val COMMAND_MIRROR_LOCK_STATE = "xiaomi.mirror.lockState"
         const val COMMAND_MIRROR_REQUEST_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_KEYBOARD_READY = "xiaomi.mirror.keyboardReady"
         const val COMMAND_MIRROR_KEYBOARD_RELEASE = "xiaomi.mirror.keyboardRelease"
@@ -2127,6 +2207,9 @@ class AndroidMiLinkCommandBridge(
         const val mirrorBtMacFallbackDelayMs = 3_000L
         const val mirrorNativeShortcutProviderDeadlineMs = 8_000L
         const val mirrorFakeScreenProviderQuickDeadlineMs = 2_000L
+        const val mirrorCastChannelReadyTimeoutMs = 10_000L
+        const val mirrorCastChannelPollIntervalMs = 250L
+        const val mirrorCastChannelFreshMs = 30_000L
         const val mirrorSourceRecoveryProviderDeadlineMs = 1_500L
         const val mirrorKeyboardProviderDeadlineMs = 800L
         const val mirrorQueryProviderDeadlineMs = 3_000L

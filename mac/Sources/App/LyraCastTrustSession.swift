@@ -31,6 +31,8 @@ final class LyraCastTrustSession {
     private let socket = LyraMeshSocket()
     private var stage: Stage = .physSync
     private var lastProgress = Date()
+    var lastInboundAt: Date { lastProgress }
+    private(set) var createdAt = Date()
     private var watchdog: DispatchSourceTimer?
     private var cancelled = false
 
@@ -56,6 +58,16 @@ final class LyraCastTrustSession {
 
     private var channelSocket: LyraChannelSocket?
     private var channelReady = false
+    var isChannelReady: Bool { channelReady }
+    var onChannelReady: (() -> Void)?
+    // When true, the phys/logi conn is kept alive after auth completes so a
+    // follow-up mirror startShare finds the cast channel in place (the
+    // phone-side stock share flow no-ops without it).
+    var retainPhysAfterAuth = false
+    // Channel-only sessions (mirror start) skip the duo.screen status query
+    // so the mirror window never shows an unlock overlay when the phone is
+    // already unlocked. The unlock flow re-enables it on the same session.
+    var duoScreenStatusEnabled = true
 
     private var srvConnId: UInt32 = 0
     private var srvPeerNetId: UInt32 = 0
@@ -81,7 +93,10 @@ final class LyraCastTrustSession {
     private var mitrustPeerPortChannelId: UInt64 = 0
     private var mitrustPeerPort: UInt16?
     private var mitrustPeerPortResponseSent = false
-    private var mitrustResponseAcked = false
+    private var passkeyPair: LyraPasskeyPairServer?
+    var onPairingPasskey: ((String) -> Void)?
+    var onPairingCompareCode: ((String) -> Void)?
+    var onPairingCompleted: (() -> Void)?
 
     private static let serviceName = "com.xiaomi.mirror:cast"
     private static let servicePackage = "com.xiaomi.mirror"
@@ -172,7 +187,7 @@ final class LyraCastTrustSession {
 
     private func teardownPhysAfterAuth() {
         guard !cancelled else { return }
-        if Date().timeIntervalSince(mitrustActivityAt) < 45 {
+        if retainPhysAfterAuth || Date().timeIntervalSince(mitrustActivityAt) < 45 {
             queue.asyncAfter(deadline: .now() + 15) { [weak self] in
                 self?.teardownPhysAfterAuth()
             }
@@ -237,6 +252,25 @@ final class LyraCastTrustSession {
         queue.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.sendPhysSyncRequest(attempt: attempt + 1)
         }
+    }
+
+    // Sends a phys keep-alive request; the phone answers within a second or
+    // two when the conn is alive. Used by the supervisor to distinguish a
+    // legitimately quiet channel from a dead one before rebuilding.
+    func probeLiveness() {
+        queue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            var cookieData = Data()
+            LyraProtoWriter.appendVarintField(1, value: UInt64(Self.tickNow()), to: &cookieData)
+            LyraProtoWriter.appendVarintField(2, value: 1, to: &cookieData)
+            let physConn = PhysConnFrame(field2: 4, payload: .keepAliveRequest(cookieData))
+            let miFrame = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: physConn)
+            self.send(frame: LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized()), label: "liveness_probe")
+        }
+    }
+
+    private static func tickNow() -> UInt32 {
+        UInt32(DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
     private func sendCookie(phase: UInt64) {
@@ -562,8 +596,18 @@ final class LyraCastTrustSession {
         switch messageType {
         case 6:
             handleKeyAgreeUpgrade(handshakeFrame: handshakeFrame, handshakeId: handshakeId)
+        case 2:
+            handlePasskeyPairUpgrade(handshakeFrame: handshakeFrame, handshakeId: handshakeId)
         case 5:
-            handleAuthUpgrade(handshakeFrame: handshakeFrame, handshakeId: handshakeId)
+            handleAuthUpgrade(
+                handshakeFrame: handshakeFrame, handshakeId: handshakeId,
+                authField: 7, responseFamily: 4, responseType: 5
+            )
+        case 4:
+            handleAuthUpgrade(
+                handshakeFrame: handshakeFrame, handshakeId: handshakeId,
+                authField: 6, responseFamily: 2, responseType: 4
+            )
         case 1:
             let alert = upgradeLengthDelimited(3, in: handshakeFrame) ?? Data()
             let alertType = upgradeVarint(2, in: alert) ?? upgradeVarint(1, in: alert) ?? 0
@@ -571,7 +615,10 @@ final class LyraCastTrustSession {
                 .flatMap { String(data: $0, encoding: .utf8) } ?? ""
             DiagnosticsLog.warn("xiaomi.cast.mitrust_alert_rx type=\(alertType) desc=\(desc)")
         default:
-            DiagnosticsLog.warn("xiaomi.cast.mitrust_upgrade_unhandled_type messageType=\(messageType)")
+            DiagnosticsLog.warn(
+                "xiaomi.cast.mitrust_upgrade_unhandled_type messageType=\(messageType) " +
+                    "hex=\(data.prefix(200).map { String(format: "%02x", $0) }.joined())"
+            )
         }
     }
 
@@ -615,6 +662,15 @@ final class LyraCastTrustSession {
                 outputByteCount: 32
             )
             srvKeySC = srvKeyCS
+            let compareCode = LyraKeyAgreeCompareCode.generate(
+                z: secret, clientRandom: clientRandom, serverRandom: serverRandom
+            )
+            DiagnosticsLog.info("xiaomi.cast.mitrust_keyagree_compare code=\(compareCode)")
+            if let onPairingCompareCode {
+                onPairingCompareCode(compareCode)
+            } else {
+                LyraPairingPresenter.showCompareCode(compareCode)
+            }
         } catch {
             DiagnosticsLog.error("xiaomi.cast.mitrust_upgrade_ecdh_failed", error)
             return
@@ -645,8 +701,71 @@ final class LyraCastTrustSession {
         sendMitrustUpgradePayload(handshake: handshake, handshakeId: handshakeId, label: "mitrust_keyagree")
     }
 
-    private func handleAuthUpgrade(handshakeFrame: Data, handshakeId: UInt64) {
-        guard let authFrame = upgradeLengthDelimited(7, in: handshakeFrame),
+    private func handlePasskeyPairUpgrade(handshakeFrame: Data, handshakeId: UInt64) {
+        if passkeyPair == nil {
+            guard let identityKey = Self.p2pIdentityPrivateKey() else {
+                DiagnosticsLog.warn("xiaomi.cast.mitrust_passkeypair_no_identity")
+                return
+            }
+            let server = LyraPasskeyPairServer(identityPrivateKey: identityKey)
+            server.onSend = { [weak self] handshake in
+                self?.sendMitrustUpgradePayload(
+                    handshake: handshake, handshakeId: handshakeId, label: "mitrust_passkeypair"
+                )
+            }
+            server.onEvent = { [weak self] event in
+                guard let self else { return }
+                switch event {
+                case let .displayPasskey(code):
+                    DiagnosticsLog.info("xiaomi.cast.mitrust_passkeypair_passkey_displayed")
+                    if let onPairingPasskey {
+                        onPairingPasskey(code)
+                    } else {
+                        LyraPairingPresenter.showPasskey(code)
+                    }
+                case let .completed(peerIdentityPubKey):
+                    DiagnosticsLog.info("xiaomi.cast.mitrust_passkeypair_completed")
+                    UserDefaults.standard.set(
+                        peerIdentityPubKey.base64EncodedString(), forKey: "xiaomiTrustP2PPeerIdentityPubB64"
+                    )
+                    self.onPairingCompleted?()
+                case let .failed(code, message):
+                    DiagnosticsLog.warn("xiaomi.cast.mitrust_passkeypair_failed code=\(code) msg=\(message)")
+                    self.passkeyPair = nil
+                }
+            }
+            passkeyPair = server
+            server.begin()
+        }
+        passkeyPair?.handle(handshakeFrame: handshakeFrame)
+    }
+
+    // Dedicated "lyra-identity-p2p-pair-keypair": our OWN identity the phone
+    // stores as a type-2 cred after PasskeyPair. Persisted so re-auth keeps
+    // working across launches.
+    private static func p2pIdentityPrivateKey() -> P256.Signing.PrivateKey? {
+        let defaults = UserDefaults.standard
+        if let hex = defaults.string(forKey: "xiaomiTrustP2PIdentityPrivHex"),
+           let data = MiTrustTicketStore.data(fromHex: hex),
+           let key = try? P256.Signing.PrivateKey(rawRepresentation: data)
+        {
+            return key
+        }
+        let key = P256.Signing.PrivateKey()
+        let hex = key.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        defaults.set(hex, forKey: "xiaomiTrustP2PIdentityPrivHex")
+        DiagnosticsLog.info("xiaomi.cast.mitrust_p2p_identity_generated")
+        return key
+    }
+
+    private func handleAuthUpgrade(
+        handshakeFrame: Data,
+        handshakeId: UInt64,
+        authField: Int,
+        responseFamily: Int,
+        responseType: Int
+    ) {
+        guard let authFrame = upgradeLengthDelimited(authField, in: handshakeFrame),
               let frameType = upgradeVarint(1, in: authFrame)
         else {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_parse_failed")
@@ -654,15 +773,27 @@ final class LyraCastTrustSession {
         }
         switch frameType {
         case 1:
-            handleAuthClientNotify(authFrame: authFrame, handshakeId: handshakeId)
+            handleAuthClientNotify(
+                authFrame: authFrame, handshakeId: handshakeId,
+                responseFamily: responseFamily, responseType: responseType, responseField: authField
+            )
         case 3:
-            handleAuthClientFinished(authFrame: authFrame, handshakeId: handshakeId)
+            handleAuthClientFinished(
+                authFrame: authFrame, handshakeId: handshakeId,
+                responseFamily: responseFamily, responseType: responseType, responseField: authField
+            )
         default:
             DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_unhandled frameType=\(frameType)")
         }
     }
 
-    private func handleAuthClientNotify(authFrame: Data, handshakeId: UInt64) {
+    private func handleAuthClientNotify(
+        authFrame: Data,
+        handshakeId: UInt64,
+        responseFamily: Int,
+        responseType: Int,
+        responseField: Int
+    ) {
         guard let clientNotify = upgradeLengthDelimited(2, in: authFrame),
               let cipherSuite = upgradeLengthDelimited(1, in: clientNotify),
               let clientRandom = upgradeLengthDelimited(2, in: cipherSuite),
@@ -674,6 +805,8 @@ final class LyraCastTrustSession {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_notify_parse_failed")
             return
         }
+        let offeredP3 = upgradeVarint(3, in: cipherSuite)
+        let offeredP4 = upgradeVarint(4, in: cipherSuite)
         let ticketStore = MiTrustTicketStore.current()
         guard let identityKey = ticketStore.identityPrivateKey else {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_no_identity")
@@ -720,8 +853,8 @@ final class LyraCastTrustSession {
         var selected = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &selected)
         LyraProtoWriter.appendLengthDelimitedField(2, value: serverRandom, to: &selected)
-        LyraProtoWriter.appendVarintField(3, value: 0x40, to: &selected)
-        LyraProtoWriter.appendVarintField(4, value: 2, to: &selected)
+        LyraProtoWriter.appendVarintField(3, value: offeredP3 ?? 0x40, to: &selected)
+        LyraProtoWriter.appendVarintField(4, value: offeredP4 ?? 2, to: &selected)
         LyraProtoWriter.appendLengthDelimitedField(5, value: outPublicKeyMessage, to: &selected)
 
         var truth = Data()
@@ -738,13 +871,19 @@ final class LyraCastTrustSession {
         LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &outAuthFrame)
 
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: outAuthFrame, to: &handshake)
+        LyraProtoWriter.appendVarintField(1, value: UInt64(responseFamily), to: &handshake)
+        LyraProtoWriter.appendVarintField(2, value: UInt64(responseType), to: &handshake)
+        LyraProtoWriter.appendLengthDelimitedField(responseField, value: outAuthFrame, to: &handshake)
         sendMitrustUpgradePayload(handshake: handshake, handshakeId: handshakeId, label: "mitrust_auth_server_notify")
     }
 
-    private func handleAuthClientFinished(authFrame: Data, handshakeId: UInt64) {
+    private func handleAuthClientFinished(
+        authFrame: Data,
+        handshakeId: UInt64,
+        responseFamily: Int,
+        responseType: Int,
+        responseField: Int
+    ) {
         guard let clientFinished = upgradeLengthDelimited(4, in: authFrame),
               let encSigC = upgradeLengthDelimited(1, in: clientFinished),
               !encSigC.isEmpty
@@ -813,9 +952,9 @@ final class LyraCastTrustSession {
         LyraProtoWriter.appendLengthDelimitedField(5, value: serverFinished, to: &outAuthFrame)
 
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: outAuthFrame, to: &handshake)
+        LyraProtoWriter.appendVarintField(1, value: UInt64(responseFamily), to: &handshake)
+        LyraProtoWriter.appendVarintField(2, value: UInt64(responseType), to: &handshake)
+        LyraProtoWriter.appendLengthDelimitedField(responseField, value: outAuthFrame, to: &handshake)
         sendMitrustUpgradePayload(handshake: handshake, handshakeId: handshakeId, label: "mitrust_auth_server_finished")
         DiagnosticsLog.info("xiaomi.cast.mitrust_auth_completed")
     }
@@ -871,8 +1010,6 @@ final class LyraCastTrustSession {
             }
             if inner.frameType == 3 {
                 DiagnosticsLog.info("xiaomi.cast.mitrust_logi_response_ack_rx")
-                mitrustResponseAcked = true
-                sendMitrustPeerPortResponseIfReady()
                 return
             }
             let payloadData = inner.payload?.data ?? Data()
@@ -892,12 +1029,18 @@ final class LyraCastTrustSession {
         DiagnosticsLog.warn("xiaomi.cast.mitrust_decrypt_failed bytes=\(logiConn.inner.count)")
     }
 
-    private static let mitrustServerFingerprint = "C9:00:9D:01:EB:F9:F5:D0:30:2B:C7:1B:2F:E9:AA:9A:47:A4:32:BB:A1:73:08:A3:11:1B:75:D7:B2:14:90:25"
-    private static let mitrustSystemData = Data([
-        0x01, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x15, 0x00, 0x03,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0xff, 0x00,
-        0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01
-    ])
+    // Official servers send their OWN 32B node id (95-char colon-hex) in the
+    // response UserInfo f3. Echoing the phone's id trips the phone's
+    // channel-client guard and it never sends requestOfPeerPort.
+    private static var mitrustServerFingerprint: String {
+        let defaults = UserDefaults.standard
+        if let existing = defaults.string(forKey: "xiaomiTrustLocalNodeIdHex"), existing.count == 95 {
+            return existing
+        }
+        let generated = randomBytes(32).map { String(format: "%02X", $0) }.joined(separator: ":")
+        defaults.set(generated, forKey: "xiaomiTrustLocalNodeIdHex")
+        return generated
+    }
 
     private func handleMitrustLogiRequest(_ requestData: Data) {
         DiagnosticsLog.info(
@@ -908,15 +1051,11 @@ final class LyraCastTrustSession {
         let peerPortRequest = upgradeLengthDelimited(10, in: userInfo)
         DiagnosticsLog.info("xiaomi.cast.mitrust_logi_request_userinfo bytes=\(userInfo.count) hasPeerPort=\(peerPortRequest != nil)")
 
-        var serverInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &serverInfo)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: Data("com.xiaomi.trustservice".utf8), to: &serverInfo)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: Data(Self.mitrustServerFingerprint.utf8), to: &serverInfo)
-        LyraProtoWriter.appendLengthDelimitedField(5, value: Self.mitrustSystemData, to: &serverInfo)
-        LyraProtoWriter.appendVarintField(6, value: 1, to: &serverInfo)
-        var responseFrame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 0, to: &responseFrame)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: serverInfo, to: &responseFrame)
+        let serverInfo = LyraMitrustResponse.serverUserInfo(
+            package: "com.xiaomi.trustservice",
+            nodeIdColonHex: Self.mitrustServerFingerprint
+        )
+        let responseFrame = LyraMitrustResponse.logiConnResponse(userInfo: serverInfo)
         let response = LogiConnInnerFrame(frameType: 2, payload: .response(responseFrame))
         mitrustSendEncrypted(inner: response, label: "mitrust_logi_response")
 
@@ -995,35 +1134,27 @@ final class LyraCastTrustSession {
     }
 
     private func sendMitrustPeerPortResponseIfReady() {
-        guard mitrustResponseAcked,
-              !mitrustPeerPortResponseSent,
+        // Official servers fire responseOfPeerPort ~90ms after LOGI_CONN_RESPONSE
+        // without waiting for the response ack. Body is PLAINTEXT payload-v2
+        // (flag=0) with only f1/f3/f5/f7 (58B total including the 16B header).
+        guard !mitrustPeerPortResponseSent,
               mitrustPeerPortChannelId != 0,
               let port = mitrustPeerPort,
               srvChannelSocket != nil
         else { return }
         mitrustPeerPortResponseSent = true
-        var responseBody = Data()
-        LyraProtoWriter.appendVarintField(1, value: mitrustPeerPortChannelId, to: &responseBody)
-        LyraProtoWriter.appendVarintField(2, value: UInt64(srvChannelId), to: &responseBody)
-        LyraProtoWriter.appendVarintField(3, value: UInt64(port), to: &responseBody)
-        LyraProtoWriter.appendVarintField(5, value: 1, to: &responseBody)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: Self.randomBytes(32), to: &responseBody)
+        let responseBody = LyraMitrustResponse.peerPortResponseBody(
+            channelId: mitrustPeerPortChannelId,
+            port: port,
+            serverKey: Self.randomBytes(32)
+        )
         let command = LyraChannelProtocol.encode(type: .responseOfPeerPort, body: responseBody)
-        guard let srvKeySC else { return }
-        do {
-            let nonce = AES.GCM.Nonce()
-            let sealed = try AES.GCM.seal(command, using: srvKeySC, nonce: nonce)
-            var payload = Data()
-            payload.append(UInt8(srvPeerNetId & 0xFF))
-            payload.append(1)
-            payload.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
-            payload.append(sealed.ciphertext)
-            payload.append(sealed.tag)
-            send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "mitrust_peer_port_response")
-            DiagnosticsLog.info("xiaomi.cast.mitrust_peer_port_tx port=\(port) channelId=\(self.srvChannelId)")
-        } catch {
-            DiagnosticsLog.error("xiaomi.cast.mitrust_peer_port_failed", error)
-        }
+        var payload = Data()
+        payload.append(1) // netId = our conn localNet
+        payload.append(0) // flag=0: plaintext, no AES layer
+        payload.append(command)
+        send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "mitrust_peer_port_response")
+        DiagnosticsLog.info("xiaomi.cast.mitrust_peer_port_tx port=\(port) channelId=\(self.srvChannelId)")
     }
 
     private func sendMitrustChannelMessage(_ message: Data) {
@@ -1436,13 +1567,30 @@ final class LyraCastTrustSession {
 
     private func handlePayloadV2(frame: LyraMeshPack.Frame) {
         let body = frame.payload
-        guard body.count > 30 else {
+        guard body.count > 2 else {
             DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_short bytes=\(body.count)")
             return
         }
         let flag = body[body.index(body.startIndex, offsetBy: 1)]
-        guard flag == 1 else {
-            DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_flag flag=\(flag) bytes=\(body.count)")
+        if flag == 0 {
+            // Official phones send the explicit requestOfPeerPort as a PLAINTEXT
+            // payload-v2 frame: [netId][flag=0][16B ChannelProtocol header][body].
+            let command = body.subdata(in: body.index(body.startIndex, offsetBy: 2)..<body.endIndex)
+            guard let (header, commandBody) = try? LyraChannelProtocol.decode(command) else {
+                DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_plain_decode_failed bytes=\(command.count)")
+                return
+            }
+            mitrustActivityAt = Date()
+            DiagnosticsLog.info("xiaomi.cast.trust_payload_v2_plain type=\(header.type) bytes=\(command.count)")
+            if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue {
+                handleMitrustPeerPortRequest(commandBody)
+            } else if header.type == LyraChannelProtocol.CommandType.responseOfPeerPort.rawValue {
+                handlePeerPortResponse(commandBody)
+            }
+            return
+        }
+        guard body.count > 30 else {
+            DiagnosticsLog.warn("xiaomi.cast.trust_payload_v2_short bytes=\(body.count)")
             return
         }
         let nonce = body[body.index(body.startIndex, offsetBy: 2)..<body.index(body.startIndex, offsetBy: 14)]
@@ -1536,7 +1684,9 @@ final class LyraCastTrustSession {
             DiagnosticsLog.info("xiaomi.cast.trust_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
             self.channelReady = true
             self.progress(.ready, String(localized: "通道已建立"))
+            let readyHandler = self.onChannelReady
             DispatchQueue.main.async {
+                readyHandler?()
                 self.trustManager.sendFrame = { [weak self] frame in
                     self?.sendChannelMessage(frame)
                 }
@@ -1550,7 +1700,9 @@ final class LyraCastTrustSession {
                         self?.teardownPhysAfterAuth()
                     }
                 }
-                self.trustManager.start()
+                if self.duoScreenStatusEnabled {
+                    self.trustManager.start()
+                }
             }
         }
         socket.onMessage = { [weak self] message, _ in
