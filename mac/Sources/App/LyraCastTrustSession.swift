@@ -94,6 +94,11 @@ final class LyraCastTrustSession {
     private var mitrustPeerPort: UInt16?
     private var mitrustPeerPortResponseSent = false
     private var passkeyPair: LyraPasskeyPairServer?
+    // Set when the phone dialed our published mesh port directly (PIN-bind /
+    // pairing flow) and the responder handed the mitrustservice conn to us.
+    // Outbound frames then ride the responder's socket so the source port
+    // matches the phys conn the phone established.
+    private var adoptedSend: ((LyraMeshPack.Frame) -> Void)?
     var onPairingPasskey: ((String) -> Void)?
     var onPairingCompareCode: ((String) -> Void)?
     var onPairingCompleted: (() -> Void)?
@@ -134,6 +139,7 @@ final class LyraCastTrustSession {
                 self.fail(String(localized: "mesh socket 啟動失敗"))
                 return
             }
+            LyraMeshResponder.activeTrustSession = self
             self.startWatchdog()
             self.sendPhysSyncRequest()
         }
@@ -174,6 +180,9 @@ final class LyraCastTrustSession {
 
     private func finishLocked() {
         cancelled = true
+        if LyraMeshResponder.activeTrustSession === self {
+            LyraMeshResponder.activeTrustSession = nil
+        }
         watchdog?.cancel()
         watchdog = nil
         channelSocket?.stop()
@@ -205,12 +214,63 @@ final class LyraCastTrustSession {
     }
 
     private func send(frame: LyraMeshPack.Frame, label: String) {
+        if let adoptedSend {
+            adoptedSend(frame)
+            DiagnosticsLog.info("xiaomi.cast.trust_tx label=\(label) to=adopted:\(self.host):\(self.port)")
+            return
+        }
         do {
             try socket.send(frame: frame, to: host, port: port)
             DiagnosticsLog.info("xiaomi.cast.trust_tx label=\(label) to=\(self.host):\(self.port)")
         } catch {
             DiagnosticsLog.error("xiaomi.cast.trust_tx_failed label=\(label)", error)
         }
+    }
+
+    // Called by LyraMeshResponder when the phone opens a mitrustservice logi
+    // conn on the published mesh port (phone-initiated bind/pair flow).
+    func adoptMitrustSyncInfo(
+        syncInfoData: Data,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        send: @escaping (LyraMeshPack.Frame) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            if let parsed = LyraMeshResponder.parseEndpoint(endpoint.debugDescription) {
+                self.host = parsed.host
+                self.port = parsed.port
+                self.endpoints = [parsed]
+            }
+            self.adoptedSend = send
+            if self.stage == .physSync {
+                self.progress(.syncAuth, String(localized: "手機信任服務連線…"))
+            }
+            self.handleMitrustSyncInfo(syncInfoData, logiConn: logiConn)
+        }
+    }
+
+    // Called on the responder's queue. Returns true (and forwards) when the
+    // frame belongs to the adopted mitrustservice conn.
+    func handlesAdoptedMitrust(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) -> Bool {
+        guard adoptedSend != nil, srvConnId != 0,
+              let parsed = LyraMeshResponder.parseEndpoint(endpoint.debugDescription),
+              parsed.host == host
+        else { return false }
+        switch frame.packType {
+        case 5, 4:
+            break
+        case 2:
+            guard let miFrame = MiConnectFrame(parsing: frame.payload),
+                  miFrame.logiConnFrames.contains(where: { $0.logiConnId == srvConnId })
+            else { return false }
+        default:
+            return false
+        }
+        queue.async { [weak self] in
+            self?.handle(frame: frame, endpoint: endpoint, reply: { _ in })
+        }
+        return true
     }
 
     private func sendPhysSyncRequest(attempt: Int = 0) {
@@ -473,8 +533,42 @@ final class LyraCastTrustSession {
         }
     }
 
+    // Stable random uid (NOT the Xiaomi account uid) for the mitrustservice
+    // sync_info — keeps the phone on the PasskeyPair route.
+    private static func pairingUidFeatureInfo() -> Data {
+        let defaults = UserDefaults.standard
+        let uidRaw: Data
+        if let b64 = defaults.string(forKey: "xiaomiTrustPairUidHashB64"),
+           let stored = Data(base64Encoded: b64), stored.count == 32
+        {
+            uidRaw = stored
+        } else {
+            let generated = randomBytes(32)
+            defaults.set(generated.base64EncodedString(), forKey: "xiaomiTrustPairUidHashB64")
+            uidRaw = generated
+        }
+        let nonce = randomBytes(8)
+        var feature = Data(SHA256.hash(data: nonce + uidRaw))
+        var info = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &info)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: feature, to: &info)
+        return info
+    }
+
     private func handleMitrustSyncInfo(_ data: Data, logiConn: LogiConnFrame) {
         mitrustActivityAt = Date()
+        if srvConnId != 0, srvConnId != logiConn.logiConnId {
+            // The phone reopened the mitrustservice conn (retry/new phys).
+            // Its latest conn wins — drop the stale channel state so the new
+            // requestOfPeerPort isn't ignored.
+            srvChannelSocket?.stop()
+            srvChannelSocket = nil
+            mitrustAuth = nil
+            srvTransKey = Data()
+            mitrustPeerPortChannelId = 0
+            mitrustPeerPort = nil
+            mitrustPeerPortResponseSent = false
+        }
         srvConnId = logiConn.logiConnId
         srvPeerNetId = logiConn.localNetId
         let ticketStore = MiTrustTicketStore.current()
@@ -546,9 +640,13 @@ final class LyraCastTrustSession {
         LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
         if ticketStore.isEnabled {
             srvReuseKey = ticketStore.ticketKey
-            LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+            // Present as a NOT-same-account peer (TL 0x30 + non-matching uid):
+            // claiming the account uid (TL 0x10) makes the phone pick
+            // AccountPair, which we cannot satisfy (needs Xiaomi account
+            // certs). Stranger presentation routes it to PasskeyPair instead.
+            LyraProtoWriter.appendVarintField(2, value: 48, to: &syncInfo)
             LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
-            LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
+            LyraProtoWriter.appendLengthDelimitedField(5, value: Self.pairingUidFeatureInfo(), to: &syncInfo)
             if let ourEncCred = ticketStore.encryptLocalCred() {
                 LyraProtoWriter.appendLengthDelimitedField(6, value: ourEncCred, to: &syncInfo)
                 DiagnosticsLog.info("xiaomi.cast.mitrust_our_cred_tx bytes=\(ourEncCred.count)")
@@ -662,6 +760,11 @@ final class LyraCastTrustSession {
                 outputByteCount: 32
             )
             srvKeySC = srvKeyCS
+            // KeyAgree supersedes the ticket/reuse key: all frameType 1/2/3/7
+            // traffic after this point is encrypted with the fresh session
+            // key. Keeping the stale ticket key here makes the phone drop
+            // the conn with 15071 (decrypt failed).
+            srvReuseKey = srvKeyCS
             let compareCode = LyraKeyAgreeCompareCode.generate(
                 z: secret, clientRandom: clientRandom, serverRandom: serverRandom
             )
@@ -808,7 +911,9 @@ final class LyraCastTrustSession {
         let offeredP3 = upgradeVarint(3, in: cipherSuite)
         let offeredP4 = upgradeVarint(4, in: cipherSuite)
         let ticketStore = MiTrustTicketStore.current()
-        guard let identityKey = ticketStore.identityPrivateKey else {
+        let p2pPaired = UserDefaults.standard.string(forKey: "xiaomiTrustP2PPeerIdentityPubB64") != nil
+        let identityKey = p2pPaired ? Self.p2pIdentityPrivateKey() : ticketStore.identityPrivateKey
+        guard let identityKey else {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_no_identity")
             return
         }
@@ -904,7 +1009,9 @@ final class LyraCastTrustSession {
             return
         }
         do {
-            let peerIdentity = try P256.Signing.PublicKey(x963Representation: ticketStore.peerIdentityPubKey)
+            let p2pPeerB64 = UserDefaults.standard.string(forKey: "xiaomiTrustP2PPeerIdentityPubB64")
+            let peerPubData = p2pPeerB64.flatMap { Data(base64Encoded: $0) } ?? ticketStore.peerIdentityPubKey
+            let peerIdentity = try P256.Signing.PublicKey(x963Representation: peerPubData)
             let signature = try P256.Signing.ECDSASignature(derRepresentation: sigC)
             guard peerIdentity.isValidSignature(signature, for: SHA256.hash(data: mitAuthClientEphPub + serverEphPub)) else {
                 DiagnosticsLog.warn("xiaomi.cast.mitrust_auth_sig_invalid")
@@ -1144,13 +1251,17 @@ final class LyraCastTrustSession {
         else { return }
         mitrustPeerPortResponseSent = true
         let responseBody = LyraMitrustResponse.peerPortResponseBody(
-            channelId: mitrustPeerPortChannelId,
+            clientChannelId: mitrustPeerPortChannelId,
+            serverChannelId: UInt64(srvChannelId),
             port: port,
             serverKey: Self.randomBytes(32)
         )
         let command = LyraChannelProtocol.encode(type: .responseOfPeerPort, body: responseBody)
         var payload = Data()
-        payload.append(1) // netId = our conn localNet
+        // netId routes the command to the phone's channel handler — it must be
+        // the PHONE's localNet for this conn (official uses the same netId in
+        // both directions), otherwise the phone drops it with 52013.
+        payload.append(UInt8(srvPeerNetId & 0xFF))
         payload.append(0) // flag=0: plaintext, no AES layer
         payload.append(command)
         send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "mitrust_peer_port_response")
@@ -1281,6 +1392,10 @@ final class LyraCastTrustSession {
             if stage == .physSync {
                 if let separator = endpoint.debugDescription.lastIndex(of: ":") {
                     let replyHost = String(endpoint.debugDescription[endpoint.debugDescription.startIndex..<separator])
+                    if !LyraMeshResponder.isExpectedPhoneHost(replyHost) {
+                        DiagnosticsLog.info("xiaomi.cast.trust_endpoint_ignored host=\(replyHost) (not the EdgeLink phone)")
+                        return
+                    }
                     if let replyPort = UInt16(endpoint.debugDescription[endpoint.debugDescription.index(after: separator)...]),
                        !replyHost.isEmpty
                     {

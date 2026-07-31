@@ -41,11 +41,22 @@ public enum LyraMitrustResponse {
         return frame
     }
 
-    // responseOfPeerPort body: f1=channel_id echo, f3=port, f5=1, f7=32B key.
-    // Official body is exactly these four fields (42B for small channel ids).
-    public static func peerPortResponseBody(channelId: UInt64, port: UInt16, serverKey: Data) -> Data {
+    // responseOfPeerPort body: f1=client channel id (echo of the request's
+    // f1 — the phone's ChannelClientHandler compares this against its
+    // mChannelId and rejects with 52013 "channel invalid id" on mismatch),
+    // f2=server channel id (omitted when 0, like official), f3=port, f5=1,
+    // f7=32B key.
+    public static func peerPortResponseBody(
+        clientChannelId: UInt64,
+        serverChannelId: UInt64,
+        port: UInt16,
+        serverKey: Data
+    ) -> Data {
         var body = Data()
-        LyraProtoWriter.appendVarintField(1, value: channelId, to: &body)
+        LyraProtoWriter.appendVarintField(1, value: clientChannelId, to: &body)
+        if serverChannelId != 0 {
+            LyraProtoWriter.appendVarintField(2, value: serverChannelId, to: &body)
+        }
         LyraProtoWriter.appendVarintField(3, value: UInt64(port), to: &body)
         LyraProtoWriter.appendVarintField(5, value: 1, to: &body)
         LyraProtoWriter.appendLengthDelimitedField(7, value: serverKey, to: &body)

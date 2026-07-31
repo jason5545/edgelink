@@ -201,23 +201,34 @@ final class LyraPasskeyPairServerTests: XCTestCase {
     }
 
     func testPeerPortResponsePlaintextFraming() throws {
-        // Official: 16B ChannelProtocol header + 42B body = 58B, header
-        // `10 00 03 10 00 3a` + 10 zero bytes, body = f1/f3/f5/f7 only.
+        // Official: 16B ChannelProtocol header + body, header
+        // `10 00 03 10 00 <len>` + 10 zero bytes; body = f1(server channel
+        // id), f2(client channel id echo), f3(port), f5=1, f7=32B key.
         let key = Data((0..<32).map { UInt8($0) })
-        let body = LyraMitrustResponse.peerPortResponseBody(channelId: 2, port: 46186, serverKey: key)
-        XCTAssertEqual(body.count, 42)
+        let body = LyraMitrustResponse.peerPortResponseBody(
+            clientChannelId: 18, serverChannelId: 6, port: 46186, serverKey: key
+        )
+        XCTAssertEqual(body.count, 44)
         let command = LyraChannelProtocol.encode(type: .responseOfPeerPort, body: body)
-        XCTAssertEqual(command.count, 58)
-        XCTAssertEqual(Array(command.prefix(6)), [0x10, 0x00, 0x03, 0x10, 0x00, 0x3A])
+        XCTAssertEqual(command.count, 60)
+        XCTAssertEqual(Array(command.prefix(6)), [0x10, 0x00, 0x03, 0x10, 0x00, 0x3C])
         XCTAssertEqual(Array(command[6..<16]), [UInt8](repeating: 0, count: 10))
         let (header, decodedBody) = try LyraChannelProtocol.decode(command)
         XCTAssertEqual(header.type, LyraChannelProtocol.CommandType.responseOfPeerPort.rawValue)
         let fields = try LyraProtoReader.readFields(from: decodedBody)
-        XCTAssertEqual(fields.count, 4)
-        XCTAssertEqual(fields.first { $0.number == 1 }?.varintValue, 2)
+        XCTAssertEqual(fields.count, 5)
+        XCTAssertEqual(fields.first { $0.number == 1 }?.varintValue, 18)
+        XCTAssertEqual(fields.first { $0.number == 2 }?.varintValue, 6)
         XCTAssertEqual(fields.first { $0.number == 3 }?.varintValue, 46186)
         XCTAssertEqual(fields.first { $0.number == 5 }?.varintValue, 1)
         XCTAssertEqual(fields.first { $0.number == 7 }?.lengthDelimitedValue, key)
+
+        // Server channel id 0 → f2 elided (official RecentApps response, 58B).
+        let zeroBody = LyraMitrustResponse.peerPortResponseBody(
+            clientChannelId: 2, serverChannelId: 0, port: 46186, serverKey: key
+        )
+        XCTAssertEqual(zeroBody.count, 42)
+        XCTAssertEqual(LyraChannelProtocol.encode(type: .responseOfPeerPort, body: zeroBody).count, 58)
     }
 
     func testResponseUserInfoMatchesOfficialSchema() throws {

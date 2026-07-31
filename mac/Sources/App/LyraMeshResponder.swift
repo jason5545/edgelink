@@ -4,6 +4,23 @@ import Foundation
 import Network
 
 final class LyraMeshResponder {
+    // Phone-initiated mitrustservice conns arrive at this responder's socket
+    // (the published mesh port). The live trust session implements the
+    // mitrust server; we forward those frames to it instead of answering
+    // with the mishare sync-auth flow (which breaks the phone).
+    static weak var activeTrustSession: LyraCastTrustSession?
+
+    // The EdgeLink phone is the one whose app holds a LAN session with us
+    // (it reports lanLastPhoneIP). Other HyperConnect devices on the network
+    // (e.g. a coworker's phone) also answer phys sync and dial mitrustservice;
+    // when lanLastPhoneIP is known, only engage that host.
+    static func isExpectedPhoneHost(_ host: String) -> Bool {
+        guard let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty else {
+            return true
+        }
+        return host == lanIP
+    }
+
     static let officialMacUidFeature = Data([
         0x0A, 0x08, 0x26, 0xFB, 0x1C, 0x8E, 0xAC, 0x7C, 0xFC, 0x1F, 0x12, 0x20,
         0x57, 0x65, 0xD7, 0xBF, 0xBD, 0xC3, 0xCA, 0x3C, 0x8B, 0x99, 0xF2, 0xA5,
@@ -162,7 +179,12 @@ final class LyraMeshResponder {
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
         lastEndpointDescription = endpoint.debugDescription
-        Self.recordPhoneEndpoint(endpoint.debugDescription)
+        if let parsed = Self.parseEndpoint(endpoint.debugDescription), Self.isExpectedPhoneHost(parsed.host) {
+            Self.recordPhoneEndpoint(endpoint.debugDescription)
+        }
+        if let session = Self.activeTrustSession, session.handlesAdoptedMitrust(frame: frame, endpoint: endpoint) {
+            return
+        }
         if frame.packType == 5 {
             handlePayloadV2(frame: frame, endpoint: endpoint)
             return
@@ -1154,7 +1176,19 @@ final class LyraMeshResponder {
 
         if !serviceName.isEmpty {
             if serviceName == "com.xiaomi.trustservice:mitrustservice" {
-                DiagnosticsLog.info("xiaomi.mishare.mesh_mitrust_ignored service=\(serviceName)")
+                let isExpected = Self.parseEndpoint(endpoint.debugDescription)
+                    .map { Self.isExpectedPhoneHost($0.host) } ?? true
+                if let session = Self.activeTrustSession, isExpected {
+                    DiagnosticsLog.info("xiaomi.mishare.mesh_mitrust_adopt service=\(serviceName)")
+                    let socket = self.socket
+                    session.adoptMitrustSyncInfo(
+                        syncInfoData: syncInfoData, logiConn: logiConn, endpoint: endpoint
+                    ) { frame in
+                        socket.sendInboundAsync(frame: frame, toEndpointDescription: endpoint.debugDescription)
+                    }
+                } else {
+                    DiagnosticsLog.info("xiaomi.mishare.mesh_mitrust_ignored service=\(serviceName)")
+                }
                 return
             }
             resetChannelState()

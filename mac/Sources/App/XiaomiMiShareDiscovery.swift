@@ -225,8 +225,14 @@ final class XiaomiMiShareDiscovery: NSObject {
     }
 
     func currentPhoneMeshEndpoints() -> [(host: String, port: UInt16)] {
+        // When the EdgeLink phone's LAN-session IP is known, pin mesh traffic
+        // to it — other HyperConnect phones on the network also answer phys
+        // sync and must not win the endpoint race.
+        let pinnedHost = UserDefaults.standard.string(forKey: "lanLastPhoneIP")
+        let pinActive = pinnedHost?.isEmpty == false
+        func pinned(_ host: String) -> Bool { !pinActive || host == pinnedHost }
         var endpoints: [(host: String, port: UInt16)] = []
-        if let live = meshResponder?.currentPhoneEndpoint() {
+        if let live = meshResponder?.currentPhoneEndpoint(), pinned(live.host) {
             endpoints.append(live)
         }
         if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
@@ -241,13 +247,14 @@ final class XiaomiMiShareDiscovery: NSObject {
             guard let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:)),
                   appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
                   let meshPort = appData.meshPort, meshPort != 0,
-                  let host = peer.resolvedIPv4 ?? Self.parseDebugInfoIPv4(peer.debugInfo)
+                  let host = peer.resolvedIPv4 ?? Self.parseDebugInfoIPv4(peer.debugInfo),
+                  pinned(host)
             else {
                 continue
             }
             endpoints.append((host, meshPort))
         }
-        let history = meshResponder?.persistedPhoneEndpoints() ?? []
+        let history = (meshResponder?.persistedPhoneEndpoints() ?? []).filter { pinned($0.host) }
         endpoints.append(contentsOf: history)
         if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
             let lanTime = UserDefaults.standard.double(forKey: "lanLastPhoneIPTime")
