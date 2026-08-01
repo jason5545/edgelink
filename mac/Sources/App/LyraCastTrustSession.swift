@@ -68,6 +68,10 @@ final class LyraCastTrustSession {
     // so the mirror window never shows an unlock overlay when the phone is
     // already unlocked. The unlock flow re-enables it on the same session.
     var duoScreenStatusEnabled = true
+    // Non-DuoScreen channel frames (capabilities, simple events, screen
+    // actions) observed on the cast channel, delivered on the main queue as
+    // (messageType, payload) after MessageCodec deframing.
+    var onCastMessage: ((UInt8, Data) -> Void)?
 
     private var srvConnId: UInt32 = 0
     private var srvPeerNetId: UInt32 = 0
@@ -1897,6 +1901,19 @@ final class LyraCastTrustSession {
         }
     }
 
+    // Sends a MessageCodec-framed cast-channel message (screen action, simple
+    // event, capabilities) through the same channel path DuoScreen uses.
+    func sendCastMessage(type: UInt8, payload: Data) {
+        sendChannelMessage(LyraCastMessageCodec.encodeFrame(type: type, payload: payload))
+    }
+
+    func sendScreenAction(_ action: LyraCastScreenAction) {
+        sendCastMessage(type: LyraCastMessageType.screenAction, payload: action.encode())
+        DiagnosticsLog.info(
+            "xiaomi.cast.screen_action_tx action=\(action.action) sessionId=\(action.sessionId) screenId=\(action.screenId)"
+        )
+    }
+
     private func handleChannelMessage(_ message: Data) {
         lastProgress = Date()
         var frame = message
@@ -1905,7 +1922,7 @@ final class LyraCastTrustSession {
         {
             frame = payloadNode.payload
         }
-        guard let (type, _) = try? DuoScreenProtocolV1.decodeFrame(frame) else {
+        guard let (type, payload) = try? DuoScreenProtocolV1.decodeFrame(frame) else {
             DiagnosticsLog.warn(
                 "xiaomi.cast.trust_channel_rx_bad bytes=\(message.count) " +
                     "hex=\(message.prefix(24).map { String(format: "%02x", $0) }.joined())"
@@ -1913,8 +1930,14 @@ final class LyraCastTrustSession {
             return
         }
         DiagnosticsLog.info("xiaomi.cast.trust_channel_rx type=\(type) bytes=\(frame.count)")
-        DispatchQueue.main.async { [weak self] in
-            self?.trustManager.handleFrame(frame)
+        if type == DuoScreenProtocolV1.typeTrust {
+            DispatchQueue.main.async { [weak self] in
+                self?.trustManager.handleFrame(frame)
+            }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onCastMessage?(type, payload)
+            }
         }
     }
 }

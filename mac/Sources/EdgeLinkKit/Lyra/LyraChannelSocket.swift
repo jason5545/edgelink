@@ -405,7 +405,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
                 tag: 0xFFFF,
                 selectedTag: 4,
                 child: LyraExpressTLV.containerNode(tag: 4, children: [
-                    LyraExpressTLV.int32Node(tag: 0, value: serverChannelId),
+                    LyraExpressTLV.int32Node(tag: 0, value: peerChannelId),
                     LyraExpressTLV.int32Node(tag: 1, value: 0xFF00)
                 ])
             )

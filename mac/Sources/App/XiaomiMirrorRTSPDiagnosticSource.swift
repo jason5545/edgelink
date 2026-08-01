@@ -120,6 +120,10 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private var cloudflareMirrorHEVCParameterSets: XiaomiMirrorHEVCParameterSets?
     private var cloudflareMirrorPacketsReceived: UInt64 = 0
     private var turnMirrorDatagramsReceived: UInt64 = 0
+    private var officialMirrorReceiver: XiaomiMirrorRTPMediaSender?
+    private var officialMirrorHEVCParameterSets: XiaomiMirrorHEVCParameterSets?
+    private var officialMirrorFirstFrameNotified = false
+    var onOfficialMirrorFirstFrame: (() -> Void)?
 
     private let sourceRTPPort: UInt16 = 19_002
     private let officialMPTClientPort: UInt16 = 15_550
@@ -401,15 +405,91 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         turnMirrorDatagramsReceived = 0
     }
 
+    // Official PC-client route media receive: the phone dials UDP MPT to
+    // clientPort after our WFD SETUP. PES decryption is always on here — the
+    // phone encrypts with the constant SPKI-prefix key + per-PES IV.
+    func startOfficialMirrorMediaReceiver(peerHost: String, clientPort: UInt16, serverPort: UInt16) {
+        performOnQueue {
+            self.startOfficialMirrorMediaReceiverOnQueue(
+                peerHost: peerHost,
+                clientPort: clientPort,
+                serverPort: serverPort
+            )
+        }
+    }
+
+    func stopOfficialMirrorMediaReceiver(reason: String) {
+        performOnQueue {
+            self.stopOfficialMirrorMediaReceiverOnQueue(reason: reason)
+        }
+    }
+
+    private func startOfficialMirrorMediaReceiverOnQueue(
+        peerHost: String,
+        clientPort: UInt16,
+        serverPort: UInt16
+    ) {
+        stopOfficialMirrorMediaReceiverOnQueue(reason: "replace")
+        officialMirrorFirstFrameNotified = false
+        do {
+            let receiver = try XiaomiMirrorRTPMediaSender(
+                transportMode: .mpt,
+                destinationHost: peerHost,
+                destinationRTPPort: serverPort,
+                destinationRTCPPort: serverPort,
+                localRTPPort: clientPort,
+                localRTCPPort: clientPort,
+                sessionID: UUID(),
+                mptSinkOnly: true,
+                onDecodedFrame: { [weak self] pixelBuffer, width, height in
+                    self?.onDecodedFrame?(pixelBuffer, width, height)
+                    self?.queue.async {
+                        guard let self, !self.officialMirrorFirstFrameNotified else { return }
+                        self.officialMirrorFirstFrameNotified = true
+                        self.onOfficialMirrorFirstFrame?()
+                    }
+                },
+                onMPTMediaStalled: { stall in
+                    DiagnosticsLog.warn(
+                        "xiaomi.mirror.official.stalled session=\(stall.sessionID.uuidString) " +
+                            "reason=\(stall.reason) datagrams=\(stall.datagramsReceived) " +
+                            "decodedFrames=\(stall.decodedFrames)"
+                    )
+                },
+                initialHEVCParameterSets: officialMirrorHEVCParameterSets,
+                onMPTHEVCParameterSets: { [weak self] parameterSets in
+                    self?.queue.async {
+                        self?.officialMirrorHEVCParameterSets = parameterSets
+                    }
+                }
+            )
+            receiver.mptSinkPESDecryptionEnabled = true
+            officialMirrorReceiver = receiver
+            receiver.start()
+            DiagnosticsLog.info(
+                "xiaomi.mirror.official.receiver_start peer=\(peerHost) clientPort=\(clientPort) serverPort=\(serverPort)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.mirror.official.receiver_start_failed", error)
+        }
+    }
+
+    private func stopOfficialMirrorMediaReceiverOnQueue(reason: String) {
+        guard let receiver = officialMirrorReceiver else {
+            return
+        }
+        receiver.stop(reason: "official_\(reason)")
+        officialMirrorReceiver = nil
+        DiagnosticsLog.info("xiaomi.mirror.official.receiver_stop reason=\(reason)")
+    }
+
     private func handleCloudflareMirrorStalled(_ stall: XiaomiMirrorMPTStallSnapshot) {
         guard cloudflareMirrorReceiverID == stall.sessionID else {
             return
         }
         DiagnosticsLog.warn(
             "xiaomi.mirror.cloudflare.stalled sessionId=\(cloudflareMirrorSessionId ?? "none") " +
-                "reason=\(stall.reason) elapsedMediaSeconds=\(Self.formatSeconds(stall.elapsedMediaSeconds)) " +
-                "elapsedFrameSeconds=\(Self.formatOptionalSeconds(stall.elapsedFrameSeconds)) " +
-                "inboundRTP=\(stall.inboundRTP) decodedFrames=\(stall.decodedFrames)"
+                "reason=\(stall.reason)"
         )
         onRecoveryRequired?(
             XiaomiMirrorRTSPRecoveryEvent(
@@ -528,6 +608,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
             state.timerSyncClient?.stop(reason: "rtsp_listener_\(reason)")
         }
         stopCloudflareMirrorRTPReceiverOnQueue(reason: reason)
+        stopOfficialMirrorMediaReceiverOnQueue(reason: reason)
         for connection in connections.values {
             connection.cancel()
         }
@@ -2917,6 +2998,10 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptSinkTSCaptureBytes = 0
     private var mptSinkTSCaptureStartLogged = false
     private var mptSinkTSDemuxer: XiaomiMirrorMPEGTSHEVCDemuxer?
+    // Set for the official PC-client route (real cast channel → WFD): the
+    // phone's PES payloads are AES-128-CBC encrypted with the constant
+    // SPKI-prefix key and per-PES IVs from PES_private_data.
+    var mptSinkPESDecryptionEnabled = false
     private var mptSinkHEVCDecoder: XiaomiMirrorHEVCDecoder?
     private var mptSinkAudioPlayer: XiaomiMirrorMPTPrivateAudioPlayer?
     private var mptSinkDecodedFrames: UInt64 = 0
@@ -3018,6 +3103,7 @@ private final class XiaomiMirrorRTPMediaSender {
                     self?.lastMPTVideoPESUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
                 }
             )
+            self.mptSinkTSDemuxer?.pesDecryptionEnabled = mptSinkPESDecryptionEnabled
         }
         kcpTransport.onSendDatagram = { [weak self] packet in
             _ = self?.sendMPTDatagram(packet)
@@ -4647,13 +4733,20 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
     private let onAccessUnit: ([Data], UInt64?) -> Void
     private let onPrivateAudioPES: ((Data, UInt64?) -> Void)?
     private let onVideoPES: (() -> Void)?
+    // Official-route PES decryption (AES-128-CBC, constant key, per-PES IV
+    // from PES_private_data). Off for the fake-pad route, whose relayed
+    // stream is already plaintext.
+    var pesDecryptionEnabled = false
     private var pmtPID: UInt16?
     private var videoPID: UInt16?
     private var privateAudioPID: UInt16?
     private var currentPES = Data()
     private var currentPESPTS90k: UInt64?
+    private var currentPESIV: Data?
     private var currentAudioPES = Data()
     private var currentAudioPESPTS90k: UInt64?
+    private var currentAudioPESIV: Data?
+    private var didLogMissingIV = false
     private var accessUnitAssembler: XiaomiMirrorHEVCAccessUnitAssembler
     private var continuityCounters: [UInt16: UInt8] = [:]
     private var packetsParsed: UInt64 = 0
@@ -4900,8 +4993,13 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             guard let pes = parsePESStart(payload, fallbackPTS90k: UInt64(rtpTimestamp)) else {
                 return
             }
+            if pesDecryptionEnabled, MiplayPESCrypto.isKeyAnnouncementPayload(pes.payload) {
+                currentPESIV = nil
+                return
+            }
             currentPES = pes.payload
             currentPESPTS90k = pes.pts90k
+            currentPESIV = pesDecryptionEnabled ? MiplayPESCrypto.extractPrivateDataIV(fromPES: payload) : nil
         } else if !currentPES.isEmpty {
             currentPES.append(payload)
         }
@@ -4913,8 +5011,13 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             guard let pes = parsePESStart(payload, fallbackPTS90k: UInt64(rtpTimestamp)) else {
                 return
             }
+            if pesDecryptionEnabled, MiplayPESCrypto.isKeyAnnouncementPayload(pes.payload) {
+                currentAudioPESIV = nil
+                return
+            }
             currentAudioPES = pes.payload
             currentAudioPESPTS90k = pes.pts90k
+            currentAudioPESIV = pesDecryptionEnabled ? MiplayPESCrypto.extractPrivateDataIV(fromPES: payload) : nil
         } else if !currentAudioPES.isEmpty {
             currentAudioPES.append(payload)
         }
@@ -4926,7 +5029,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
         pesParsed += 1
         onVideoPES?()
-        accessUnitAssembler.pushPESPayload(currentPES, pts90k: currentPESPTS90k)
+        accessUnitAssembler.pushPESPayload(decryptPESIfNeeded(currentPES, iv: currentPESIV, label: "video"), pts90k: currentPESPTS90k)
         if pesParsed <= 5 || pesParsed % 100 == 0 {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.ts_pes session=\(sessionID.uuidString) pes=\(pesParsed) " +
@@ -4935,6 +5038,23 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
         currentPES.removeAll(keepingCapacity: true)
         currentPESPTS90k = nil
+        currentPESIV = nil
+    }
+
+    private func decryptPESIfNeeded(_ payload: Data, iv: Data?, label: String) -> Data {
+        guard pesDecryptionEnabled else {
+            return payload
+        }
+        guard let iv else {
+            if !didLogMissingIV {
+                didLogMissingIV = true
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.pes_decrypt_no_iv session=\(sessionID.uuidString) label=\(label)"
+                )
+            }
+            return payload
+        }
+        return MiplayPESCrypto.decrypt(payload, iv: iv)
     }
 
     private func flushCurrentAudioPES() {
@@ -4942,7 +5062,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             return
         }
         audioPESParsed += 1
-        onPrivateAudioPES?(currentAudioPES, currentAudioPESPTS90k)
+        onPrivateAudioPES?(decryptPESIfNeeded(currentAudioPES, iv: currentAudioPESIV, label: "audio"), currentAudioPESPTS90k)
         if audioPESParsed <= 5 || audioPESParsed % 100 == 0 {
             DiagnosticsLog.info(
                 "xiaomi.mirror.mpt.ts_audio_pes session=\(sessionID.uuidString) pes=\(audioPESParsed) " +
@@ -4952,6 +5072,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
         }
         currentAudioPES.removeAll(keepingCapacity: true)
         currentAudioPESPTS90k = nil
+        currentAudioPESIV = nil
     }
 
     private func parsePESStart(_ payload: Data, fallbackPTS90k: UInt64?) -> (payload: Data, pts90k: UInt64?)? {

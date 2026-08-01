@@ -322,6 +322,9 @@ final class EdgeLinkRuntime: ObservableObject {
                 self?.prepareXiaomiMirrorKeyboardIfNeeded(source: "decoded_frame")
             }
         }
+        xiaomiMirrorRTSPDiagnosticSource.onOfficialMirrorFirstFrame = { [weak self] in
+            self?.xiaomiMirrorWFDClient?.sendFirstRender()
+        }
         xiaomiMirrorRTSPDiagnosticSource.onRecoveryRequired = { [weak self] event in
             Task { @MainActor in
                 self?.handleXiaomiMirrorRTSPRecoveryRequired(event)
@@ -745,6 +748,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
                 return
             }
+            if UserDefaults.standard.bool(forKey: "xiaomiMirrorRealRemote") {
+                sendXiaomiMirrorOpenScreenViaCastChannel(startGeneration: startGeneration)
+                return
+            }
             if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
                 sendXiaomiMirrorStartMainDisplayCommand(
                     route: xiaomiScreenRoute,
@@ -791,6 +798,66 @@ final class EdgeLinkRuntime: ObservableObject {
             }
     }
 
+    // Official PC-client mirror start: instead of the milink startMainDisplay
+    // command (fake-pad route), ask the phone to open its mirror screen over
+    // the cast channel, exactly like the official Mac client does. The phone
+    // then brings up MirrorSourceCmdManager + the WFD source and waits for
+    // the RTSP session (Task 2 wires that side up).
+    private func sendXiaomiMirrorOpenScreenViaCastChannel(startGeneration: UInt64) {
+        guard let session = lyraCastTrustSession, session.isChannelReady else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_open_cast_channel_not_ready generation=\(startGeneration)"
+            )
+            return
+        }
+        guard let phoneHost = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints().first?.host else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_open_no_phone_host generation=\(startGeneration)"
+            )
+            return
+        }
+        let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
+        xiaomiMirrorCastSessionId = sessionId
+        session.sendScreenAction(.openMirrorScreen(sessionId: sessionId))
+        startXiaomiMirrorWFDClient(phoneHost: phoneHost)
+        DiagnosticsLog.info(
+            "xiaomi.mac.screen_open_sent sessionId=\(sessionId) generation=\(startGeneration)"
+        )
+    }
+
+    // Official PC-client route step 2: dial the phone's WFD RTSP server
+    // (created in response to OPEN_MIRROR_SCREEN) and run the M1-M8 dialog.
+    // When SETUP/PLAY completes the phone dials UDP MPT video to us.
+    private func startXiaomiMirrorWFDClient(phoneHost: String) {
+        xiaomiMirrorWFDClient?.stop(reason: "replace")
+        let client = XiaomiMirrorWFDClient()
+        client.onSessionEstablished = { [weak self] serverPort in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.xiaomiMirrorRTSPDiagnosticSource.startOfficialMirrorMediaReceiver(
+                    peerHost: phoneHost,
+                    clientPort: Self.xiaomiMirrorOfficialClientPort,
+                    serverPort: serverPort > 0 ? serverPort : 1
+                )
+                DiagnosticsLog.info(
+                    "xiaomi.mac.wfd_session_established host=\(phoneHost) serverPort=\(serverPort)"
+                )
+            }
+        }
+        client.onTeardown = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.xiaomiMirrorRTSPDiagnosticSource.stopOfficialMirrorMediaReceiver(reason: "peer_teardown")
+            }
+        }
+        client.onClosed = { reason in
+            DiagnosticsLog.info("xiaomi.mac.wfd_client_closed reason=\(reason)")
+        }
+        xiaomiMirrorWFDClient = client
+        client.start(host: phoneHost, rtspPort: 7236, clientRTPPort: Self.xiaomiMirrorOfficialClientPort)
+    }
+
+    private static let xiaomiMirrorOfficialClientPort: UInt16 = 15_550
+
     private func sendXiaomiMirrorStartMainDisplayCommand(
         route xiaomiScreenRoute: String?,
         peerHost: String?,
@@ -816,7 +883,7 @@ final class EdgeLinkRuntime: ObservableObject {
             args["peerHost"] = peerHost
         }
         args["peerPort"] = String(peerPort)
-        args["forceFakeRemote"] = "true"
+        applyXiaomiMirrorRemoteArgs(to: &args)
         addXiaomiMirrorLANProbeArgs(to: &args, peerHost: peerHost)
         addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudflareMirrorSessionId)
         let requestId = sendMiLinkCommand(
@@ -1293,6 +1360,43 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private var castChannelProbeSentAt = Date.distantPast
+    // Mirror session id from the official PC-client route: epochMs sent in
+    // ScreenActionMessage{OPEN_MIRROR_SCREEN} on the cast channel. Non-nil
+    // while a cast-channel mirror is active (xiaomiMirrorRealRemote route).
+    private var xiaomiMirrorCastSessionId: UInt64?
+    private var xiaomiMirrorWFDClient: XiaomiMirrorWFDClient?
+
+    private static func logCastChannelMessage(type: UInt8, payload: Data) {
+        switch type {
+        case LyraCastMessageType.capabilities:
+            let caps = (try? LyraCastCapabilities.decode(payload))?.entries
+                .map { "\($0.key)=\($0.value)" }.joined(separator: ",") ?? "undecodable"
+            DiagnosticsLog.info("xiaomi.cast.message_rx type=capabilities \(caps)")
+        case LyraCastMessageType.simpleEvent:
+            if let event = try? LyraCastSimpleEvent.decode(payload) {
+                let summary: String
+                switch event.event {
+                case LyraCastSimpleEvent.eventDeviceInfo:
+                    summary = event.stringValue ?? ""
+                case LyraCastSimpleEvent.eventMirrorCallKey:
+                    summary = "keyBytes=\(event.stringValue?.count ?? 0)chars"
+                case LyraCastSimpleEvent.eventMirrorCallStop:
+                    summary = "call_stop"
+                default:
+                    summary = "event=\(event.event) bytes=\(payload.count)"
+                }
+                DiagnosticsLog.info("xiaomi.cast.message_rx type=simple_event \(summary)")
+            }
+        case LyraCastMessageType.screenAction:
+            if let action = try? LyraCastScreenAction.decode(payload) {
+                DiagnosticsLog.info(
+                    "xiaomi.cast.message_rx type=screen_action action=\(action.action) sessionId=\(action.sessionId)"
+                )
+            }
+        default:
+            DiagnosticsLog.info("xiaomi.cast.message_rx type=\(type) bytes=\(payload.count)")
+        }
+    }
 
     // Creates (or reuses) a trust session purely for its cast channel: the
     // phone-side stock share flow silently no-ops startShare while the cast
@@ -1324,6 +1428,9 @@ final class EdgeLinkRuntime: ObservableObject {
         )
         session.retainPhysAfterAuth = true
         session.duoScreenStatusEnabled = false
+        session.onCastMessage = { type, payload in
+            Self.logCastChannelMessage(type: type, payload: payload)
+        }
         session.onFinish = { [weak self, weak session] in
             Task { @MainActor in
                 guard let self, let session, self.lyraCastTrustSession === session else { return }
@@ -1869,6 +1976,21 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    // Mirror remote-device selection. Default keeps the fake pad route
+    // (forceFakeRemote). With `xiaomiMirrorRealRemote` defaults flag on, we
+    // instead hand the phone our real lyra device id so the Android bridge
+    // uses the native mirror route against the real trusted device — viable
+    // now that the official trust path (TDIF bind + DuoScreen unlock) works.
+    private func applyXiaomiMirrorRemoteArgs(to args: inout [String: String]) {
+        guard UserDefaults.standard.bool(forKey: "xiaomiMirrorRealRemote") else {
+            args["forceFakeRemote"] = "true"
+            return
+        }
+        if let deviceId = xiaomiMiShareDiscovery.localDeviceIdHex, !deviceId.isEmpty {
+            args["remoteDeviceId"] = deviceId
+        }
+    }
+
     private func addXiaomiMirrorLANProbeArgs(to args: inout [String: String], peerHost: String?) {
         if isXiaomiMirrorLanDirectPenalized {
             DiagnosticsLog.warn(
@@ -2205,12 +2327,12 @@ final class EdgeLinkRuntime: ObservableObject {
         let command = "xiaomi.mirror.requestSourceRecovery"
         var args: [String: String] = [
             "peerPort": String(peerPort),
-            "forceFakeRemote": "true",
             "recovery": "true",
             "sourceRecoveryOnly": "true",
             "recoveryAttempt": String(attempt),
             "recoveryReason": event.reason
         ]
+        applyXiaomiMirrorRemoteArgs(to: &args)
         if let peerHost {
             args["peerHost"] = peerHost
         }
@@ -2291,12 +2413,12 @@ final class EdgeLinkRuntime: ObservableObject {
         let command = "xiaomi.mirror.startMainDisplay"
         var args: [String: String] = [
             "peerPort": String(peerPort),
-            "forceFakeRemote": "true",
             "recovery": "true",
             "sessionRecovery": "true",
             "recoveryAttempt": String(attempt),
             "recoveryReason": event.reason
         ]
+        applyXiaomiMirrorRemoteArgs(to: &args)
         if let peerHost {
             args["peerHost"] = peerHost
         }
@@ -2364,6 +2486,17 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenUserStopped = true
         xiaomiScreenLastUserStopAt = Date()
         xiaomiScreenStartGeneration &+= 1
+        if let castSessionId = xiaomiMirrorCastSessionId {
+            xiaomiMirrorCastSessionId = nil
+            if let session = lyraCastTrustSession, session.isChannelReady {
+                session.sendScreenAction(.closeScreen(sessionId: castSessionId))
+                DiagnosticsLog.info(
+                    "xiaomi.mac.screen_close_sent sessionId=\(castSessionId) reason=\(reason)"
+                )
+            }
+        }
+        xiaomiMirrorWFDClient?.stop(reason: reason)
+        xiaomiMirrorWFDClient = nil
         releaseXiaomiMirrorKeyboard(reason: reason)
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
