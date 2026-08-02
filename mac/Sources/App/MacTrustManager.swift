@@ -193,6 +193,15 @@ final class MacTrustManager: ObservableObject {
                 "trust.mac.status_no_info code=\(event.code) enable=\(event.auth?.enableStatus ?? -99)"
             )
             guard state == .queryingStatus else { return }
+            if let externalLocked = externalLockState?() {
+                DiagnosticsLog.info("trust.mac.status_external_shortcut locked=\(externalLocked)")
+                state = .ready(locked: externalLocked)
+                if autoUnlockOnReady {
+                    autoUnlockOnReady = false
+                    Task { await self.requestUnlock() }
+                }
+                return
+            }
             if statusRetryCount < maxStatusRetries {
                 statusRetryCount += 1
                 let epoch = statusQueryEpoch

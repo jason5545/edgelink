@@ -334,6 +334,27 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(biometricCallCount, 0, "unlocked phone must not require Touch ID")
     }
 
+    // A fresh KeyguardManager push from the Android app is truthful while
+    // duo.screen polls only ever yield placeholders on this device — resolve
+    // on the first placeholder instead of burning the full retry budget
+    // (~5s of black 正在連接 over an already-playing stream).
+    func testExternalLockReportShortcutsPlaceholderRetries() async throws {
+        try makeEnvironment(locked: false)
+        phone.conflictingStatus = true
+        trustManager.externalLockState = { false }
+        trustManager.statusRetryDelay = 30
+        session.start()
+        controller.start()
+
+        try await waitFor("resolved unlocked without waiting out retries", timeout: 5) { [self] in
+            if case .ready(let locked) = self.trustManager.state { return !locked }
+            return false
+        }
+        try await waitFor("streaming directly") { [self] in
+            self.controller.mask == nil && self.controller.stage == .streaming
+        }
+    }
+
     // Scenario 1 (2026-08-02 live): phone genuinely unlocked, but its first
     // status answers are the same placeholder sequence as the locked case
     // (disabledBySetting, then success with enable=0 + keyguard valid). Once
