@@ -532,11 +532,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             hookMiShareLyraTrustInjection(classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookTrustService(packageName, processName)) {
-            if (ENABLE_TRUST_QUICK_AUTH_SHORTCUT) {
-                hookTrustQuickAuthShortcut(classLoader)
-            } else {
-                log("trust quick auth shortcut disabled (official auth_token_A path test)")
-            }
             installTrustBindBridge(classLoader)
         }
     }
@@ -806,56 +801,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         ByteArray(value.length / 2) { index ->
             value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
         }
-
-    private fun hookTrustQuickAuthShortcut(classLoader: ClassLoader) {
-        runCatching {
-            val eventClass = findTargetClass(classLoader, TRUST_QUICK_AUTH_EVENT_CLASS)
-            val commClass = findTargetClass(classLoader, TRUST_QUICK_AUTH_COMM_CLASS)
-            installHook(
-                resolveMethod(eventClass, "l", commClass, Integer.TYPE, Integer.TYPE)
-            ) { chain ->
-                val thisObj = chain.thisObject ?: return@installHook chain.proceed()
-                val deviceId = runCatching {
-                    eventClass.getDeclaredField("i").apply { isAccessible = true }.get(thisObj) as? String
-                }.getOrNull()
-                if (deviceId !in TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS) {
-                    log("trust quick auth shortcut skipped device=$deviceId")
-                    return@installHook chain.proceed()
-                }
-                log("trust quick auth shortcut device=$deviceId")
-                runCatching {
-                    eventClass.getDeclaredMethod("r").apply { isAccessible = true }.invoke(thisObj)
-                }
-                runCatching {
-                    eventClass.getDeclaredField("F").apply { isAccessible = true }.setBoolean(thisObj, true)
-                }
-                val unlockField = eventClass.getDeclaredField("n").apply { isAccessible = true }
-                if (unlockField.getBoolean(thisObj)) {
-                    unlockField.setBoolean(thisObj, false)
-                    val callback = eventClass.getDeclaredField("m").apply { isAccessible = true }.get(thisObj)
-                    val onResult = callback?.javaClass?.methods?.firstOrNull {
-                        it.name == "onResult" && it.parameterTypes.size == 1
-                    }
-                    if (callback != null && onResult != null) {
-                        onResult.invoke(callback, 0)
-                        log("trust quick auth shortcut unlock delivered device=$deviceId")
-                    } else {
-                        log("trust quick auth shortcut callback missing device=$deviceId")
-                    }
-                } else {
-                    runCatching {
-                        eventClass.getDeclaredMethod("t", Integer.TYPE, Integer.TYPE)
-                            .apply { isAccessible = true }
-                            .invoke(thisObj, 0, 1)
-                    }
-                    log("trust quick auth shortcut result delivered device=$deviceId")
-                }
-                null
-            }
-        }.onFailure { error ->
-            log("failed to hook trust quick auth: ${error.javaClass.simpleName}: ${error.message}")
-        }
-    }
 
     private fun installHook(executable: Executable, hooker: XposedInterface.Hooker) {
         xposed.hook(executable)
@@ -7740,12 +7685,8 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val DIST_AUDIO_SOCKET_PORT = 19_307
         private const val DIST_AUDIO_PCM_SAMPLE_RATE = 16_000
         private const val DIST_AUDIO_PCM_CHUNK_BYTES = 1_280
-        private const val TRUST_QUICK_AUTH_EVENT_CLASS = "com.xiaomi.trustservice.remoteauthservice.k"
-        private const val TRUST_QUICK_AUTH_COMM_CLASS = "I0.c"
-        private const val ENABLE_TRUST_QUICK_AUTH_SHORTCUT = false
         private const val TRUST_BIND_ACTION = "com.edgelink.mitrust.BIND"
         private const val TRUST_SHARED_AUTH_SERVICE = "vendor.xiaomi.hardware.misauth.IMiSharedAuth/default"
-        private val TRUST_QUICK_AUTH_ALLOWED_DEVICE_IDS = setOf("721572C3")
         @Volatile
         private var lastCastChannelConfirmAtMs = 0L
         @Volatile
