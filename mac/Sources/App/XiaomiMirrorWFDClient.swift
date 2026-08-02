@@ -49,7 +49,7 @@ final class XiaomiMirrorWFDClient {
     private var lastProgress = Date()
     private var startArgs: (host: String, rtspPort: UInt16, clientRTPPort: UInt16)?
     private var connectRetryCount = 0
-    private static let maxConnectRetries = 12
+    private static let maxConnectRetries = 40
 
     private static let userAgent = "stagefright/1.1 (Linux;Android 4.1)"
     private static let libVersion = "miplaycast_os3_release1.7 3.2.6011403"
@@ -127,6 +127,10 @@ final class XiaomiMirrorWFDClient {
             lastProgress = Date()
             receive()
             DiagnosticsLog.info("xiaomi.wfd.connected host=\(host) port=\(port)")
+        case .waiting(let error):
+            if stage == .connecting {
+                fail("connect_waiting \(error.localizedDescription)", retryDelay: 0.25)
+            }
         case .failed(let error):
             fail("connect_failed \(error.localizedDescription)")
         case .cancelled:
@@ -435,7 +439,7 @@ final class XiaomiMirrorWFDClient {
         timer.resume()
     }
 
-    private func fail(_ reason: String) {
+    private func fail(_ reason: String, retryDelay: TimeInterval = 1) {
         // The phone opens its RTSP listener only after OPEN_MIRROR_SCREEN is
         // processed (and possibly after an on-phone permission tap), so early
         // connect attempts race the listener. A duplicate OPEN makes the
@@ -455,7 +459,7 @@ final class XiaomiMirrorWFDClient {
             connection?.cancel()
             connection = nil
             stage = .idle
-            queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            queue.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
                 guard let self, self.stage == .idle else { return }
                 self.beginConnection(
                     host: args.host,

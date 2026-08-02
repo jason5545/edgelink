@@ -41,6 +41,8 @@ final class FakeXiaomiPhone {
     // getSupportStatus resolving under the official-style retry.
     var truthfulAfterQueries: Int?
 
+    var wfdServerStartupDelay: TimeInterval = 0
+
     // Re-lock (or unlock) the phone mid-test, e.g. the user locking it again
     // after a successful Mac-driven unlock.
     func setLocked(_ value: Bool) {
@@ -472,12 +474,18 @@ final class FakeXiaomiPhone {
                         // rebinding immediately fails with EADDRINUSE. The
                         // real phone has a rebuild window too — the client's
                         // pre-established retry rides through it.
-                        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        queue.asyncAfter(deadline: .now() + 0.3 + wfdServerStartupDelay) { [weak self] in
                             self?.startWFDServer()
                         }
                         return
                     }
-                    startWFDServer()
+                    guard wfdServerStartupDelay > 0 else {
+                        startWFDServer()
+                        return
+                    }
+                    queue.asyncAfter(deadline: .now() + wfdServerStartupDelay) { [weak self] in
+                        self?.startWFDServer()
+                    }
                 } else if action.action == LyraCastScreenAction.Action.closeScreen.rawValue {
                     closeScreenCount += 1
                 }

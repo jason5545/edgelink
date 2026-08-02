@@ -176,6 +176,30 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Phone keeps its RTSP listener down for ~1s after OPEN (the real phone
+    // RSTs early dials; observed live 2026-08-02). NWConnection parks in
+    // .waiting on ECONNREFUSED, so the client must retry official-fast
+    // (~250ms) instead of waiting out the 6s watchdog.
+    func testWFDConnectRetriesFastWhenPhoneRTSPListenerStartsLate() async throws {
+        try makeEnvironment(locked: false)
+        phone.wfdServerStartupDelay = 1.0
+        session.start()
+        controller.start()
+
+        try await waitFor("OPEN_MIRROR_SCREEN sent") { [self] in
+            self.phone.openMirrorScreenCount >= 1
+        }
+        let openAt = Date()
+        try await waitFor("WFD session established") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        let elapsed = Date().timeIntervalSince(openAt)
+        XCTAssertLessThan(
+            elapsed, 3.5,
+            "OPEN→established took \(elapsed)s; the old 6s watchdog + 1s backoff budget is ~7s"
+        )
+    }
+
     // Phone locked: OPEN still goes out immediately (official behavior keeps
     // the channel alive), lock mask shows; 解除鎖定 runs Touch ID → 562 → the
     // phone drives 595/546/562 on the mitrustservice channel → auth event →
