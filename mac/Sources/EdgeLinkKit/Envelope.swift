@@ -71,6 +71,7 @@ public enum EnvelopeType {
     public static let phoneRelayEndpoint = "phone.relay.endpoint"
     public static let phoneRelayMedia = "phone.relay.media"
     public static let phoneCallStatus = "phone.call.status"
+    public static let phoneLockState = "phone.lockState"
     public static let miLinkStatus = "milink.status"
     public static let miLinkFrame = "milink.frame"
     public static let miLinkMirrorMedia = "milink.mirror.media"
@@ -999,6 +1000,21 @@ public struct BatteryStatusBody: Codable, Equatable, Sendable {
         self.charging = charging
         self.plugged = plugged
         self.temperature = temperature
+        self.ts = ts
+    }
+}
+
+// Truthful keyguard state reported by the EdgeLink Android app itself
+// (KeyguardManager.isDeviceLocked), pushed on lock/unlock transitions and on
+// session connect. duo.screen status polls on om1 are unreliable (they return
+// enable=0 placeholders that default to "unlocked"), so the mirror lock mask
+// falls back to this signal.
+public struct PhoneLockStateBody: Codable, Equatable, Sendable {
+    public let locked: Bool
+    public let ts: Int64
+
+    public init(locked: Bool, ts: Int64) {
+        self.locked = locked
         self.ts = ts
     }
 }

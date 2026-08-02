@@ -23,10 +23,30 @@ final class MacTrustManager: ObservableObject {
     // locked, after its shared-auth query times out), so the lock mask may
     // only be cleared by this confirmed signal.
     private(set) var unlockConfirmed = false
+    // Set when a status event arrives that actually carries keyguard
+    // information (success + authEnableStatus=enabled). The official client
+    // gets these reliably; our earlier authSettingFirst query made the phone
+    // answer with enable=0 placeholders that default keyguard to valid (the
+    // "unlocked" lie), so placeholders must not be trusted.
+    private(set) var keyguardInfoConfirmed = false
+
+    // Official LiveScreenTrustManager retries the auth-status query
+    // (retryQueryAuthStatusCount) when the phone returns placeholder
+    // answers. Same here: re-query while the phone's own getSupportStatus is
+    // still resolving, then fall back to the conservative locked state.
+    var statusRetryDelay: TimeInterval = 1.0
+    var maxStatusRetries = 5
+    private var statusRetryCount = 0
+    private var statusQueryEpoch: UInt64 = 0
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
     var touchIdPreauthorized = false
+    // Truthful keyguard state from the EdgeLink Android app (KeyguardManager
+    // via phone.lockState push), freshness-gated by the caller. Used when
+    // duo.screen polls only yield placeholders — they lie on om1.
+    var externalLockState: (() -> Bool?)?
+    var isExternallyUnlocked: Bool { externalLockState?() == false }
     var onAuthActionSent: (() -> Void)?
     var onAuthEventHandled: (() -> Void)?
     var onUnlockSucceeded: (() -> Void)?
@@ -52,11 +72,26 @@ final class MacTrustManager: ObservableObject {
     }
 
     func start() {
+        // The session's duoScreenStatusEnabled path and the mirror flow both
+        // start us on channel-ready — the official client sends exactly one
+        // status query, so collapse back-to-back starts into one.
+        guard state != .queryingStatus else { return }
         sessionID = UInt64.random(in: 1...UInt64.max)
+        statusQueryEpoch &+= 1
+        statusRetryCount = 0
+        keyguardInfoConfirmed = false
         state = .queryingStatus
+        sendStatusQuery()
+    }
+
+    private func sendStatusQuery() {
+        // Official wire format (live capture 2026-07-31, phone-side logcat):
+        // TrustStatusActionMessage{authFeatures=[1], eventMode=0,
+        // authMethods=[4, 5]}. Do NOT set eventMode=authSettingFirst — with
+        // it the phone answers disabledBySetting plus enable=0 placeholders.
         var action = TrustStatusAction()
         action.authFeatures = [DuoScreenTrustFeature.unlockDevice]
-        action.eventMode = DuoScreenTrustEventMode.authSettingFirst
+        action.authMethods = [UInt32(DuoScreenTrustAuthMethod.password), UInt32(DuoScreenTrustAuthMethod.fingerprint)]
         send(.statusAction(action))
         DiagnosticsLog.info("trust.mac.status_action_sent")
     }
@@ -67,6 +102,9 @@ final class MacTrustManager: ObservableObject {
         awaitingAuthEvent = false
         awaitingBindEvent = false
         unlockConfirmed = false
+        keyguardInfoConfirmed = false
+        statusQueryEpoch &+= 1
+        statusRetryCount = 0
     }
 
     func requestBind() {
@@ -141,23 +179,52 @@ final class MacTrustManager: ObservableObject {
 
     private func handleStatusEvent(_ event: TrustStatusEvent) {
         statusEvent = event
-        if event.code == DuoScreenTrustCode.disabledBySetting {
-            // disabledBySetting carries no keyguard information — after a
-            // confirmed unlock it must not flip the state back to locked.
-            state = .ready(locked: !unlockConfirmed)
+        // Only success + authEnableStatus=enabled carries real keyguard
+        // info. disabledBySetting and success+enable=unset are placeholders
+        // while the phone's own getSupportStatus is still resolving (on
+        // timeout it returns defaults — keyguard=valid while locked, the
+        // 2026-08-02 live "unlocked" lie). Official retries the query
+        // instead of acting on placeholders; do the same, then fall back to
+        // the conservative locked state so the unlock entry stays reachable.
+        let carriesKeyguardInfo = event.code == DuoScreenTrustCode.success
+            && event.auth?.enableStatus == DuoScreenTrustEnableStatus.enabled.rawValue
+        guard carriesKeyguardInfo else {
             DiagnosticsLog.info(
-                "trust.mac.status_setting_only assumed_ready enabled=\(event.auth?.enableStatus ?? -99) " +
-                    "bind=\(event.auth?.bindStatus ?? -99) localRisk=\(event.auth?.localRisk ?? -99) remoteRisk=\(event.auth?.remoteRisk ?? -99)"
+                "trust.mac.status_no_info code=\(event.code) enable=\(event.auth?.enableStatus ?? -99)"
             )
-            if autoUnlockOnReady {
-                autoUnlockOnReady = false
-                Task { await self.requestUnlock() }
+            guard state == .queryingStatus else { return }
+            if statusRetryCount < maxStatusRetries {
+                statusRetryCount += 1
+                let epoch = statusQueryEpoch
+                let delay = statusRetryDelay
+                DiagnosticsLog.info("trust.mac.status_query_retry count=\(statusRetryCount)")
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    guard let self,
+                          self.statusQueryEpoch == epoch,
+                          self.state == .queryingStatus else { return }
+                    self.sendStatusQuery()
+                }
+            } else {
+                // Placeholders exhausted the official-style retry budget.
+                // Fall back to the phone's own KeyguardManager report when we
+                // have one (duo.screen polls lie on om1); otherwise stay
+                // conservative (locked unless a confirmed unlock) so the
+                // unlock entry stays reachable.
+                let fallbackLocked = externalLockState?() ?? !unlockConfirmed
+                DiagnosticsLog.info(
+                    "trust.mac.status_query_fallback locked=\(fallbackLocked) source=\(self.externalLockState?() != nil ? "phone_lock_push" : "conservative")"
+                )
+                state = .ready(locked: fallbackLocked)
+                if autoUnlockOnReady {
+                    autoUnlockOnReady = false
+                    Task { await self.requestUnlock() }
+                }
             }
             return
         }
-        guard event.code == DuoScreenTrustCode.success else {
-            return
-        }
+        statusRetryCount = 0
+        keyguardInfoConfirmed = true
         guard let auth = event.auth else {
             state = .failed("手機不支援跨裝置解鎖")
             return
@@ -174,9 +241,9 @@ final class MacTrustManager: ObservableObject {
             state = .ready(locked: isRemoteLocked)
             if autoUnlockOnReady {
                 autoUnlockOnReady = false
-                if isRemoteLocked {
-                    Task { await self.requestUnlock() }
-                }
+                // A 562 on an already-unlocked phone is an instant success,
+                // so auto-unlock fires on any truthful ready, locked or not.
+                Task { await self.requestUnlock() }
             }
         case .notBound, .keyError, .passwordChanged, .certExpired, .none:
             state = .needsBind

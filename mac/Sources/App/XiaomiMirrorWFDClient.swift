@@ -438,8 +438,11 @@ final class XiaomiMirrorWFDClient {
     private func fail(_ reason: String) {
         // The phone opens its RTSP listener only after OPEN_MIRROR_SCREEN is
         // processed (and possibly after an on-phone permission tap), so early
-        // connect attempts race the listener. Retry through that window.
-        if stage == .connecting,
+        // connect attempts race the listener. A duplicate OPEN makes the
+        // phone tear down and rebuild its RTSP server, which can also reset
+        // an in-flight dialog ("Connection reset by peer"). Retry through
+        // both windows — anything before .established is safe to redo.
+        if stage != .established, stage != .closed,
            let args = startArgs,
            connectRetryCount + 1 < Self.maxConnectRetries {
             connectRetryCount += 1

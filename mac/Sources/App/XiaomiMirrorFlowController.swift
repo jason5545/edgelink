@@ -242,9 +242,14 @@ final class XiaomiMirrorFlowController {
                     mask = .locked
                 }
             } else {
-                // A polled "unlocked" must not clear the lock mask on this
-                // device — only a confirmed authEvent (or no mask at all).
-                if mask == .locked, !trustManager.unlockConfirmed {
+                // A placeholder "unlocked" (disabledBySetting / enable=0) must
+                // not clear the lock mask on this device — only a confirmed
+                // authEvent, a status event with real keyguard info (enable=1),
+                // or the Android app's own KeyguardManager report may.
+                // Placeholders never reach this branch as unlocked:
+                // MacTrustManager retries them instead.
+                if mask == .locked, !trustManager.unlockConfirmed,
+                   !trustManager.keyguardInfoConfirmed, !trustManager.isExternallyUnlocked {
                     break
                 }
                 if hasRemoteVideo() {

@@ -1409,7 +1409,12 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
             }
         default:
-            DiagnosticsLog.info("xiaomi.cast.message_rx type=\(type) bytes=\(payload.count)")
+            // Unknown types are candidates for the phone's DeviceStatusMessage
+            // pushes (keyguardLock / screenOff) — dump the payload hex so the
+            // format can be pinned against lock/unlock transitions.
+            DiagnosticsLog.info(
+                "xiaomi.cast.message_rx type=\(type) bytes=\(payload.count) hex=\(payload.map { String(format: "%02x", $0) }.joined())"
+            )
         }
     }
 
@@ -3743,6 +3748,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handleBatteryStatus(status, source: "edgelink")
                         }
                     },
+                    onPhoneLockState: { [weak self] body in
+                        Task { @MainActor in
+                            self?.handlePhoneLockState(body)
+                        }
+                    },
                     onTunnelEnvelope: { [weak self] type, plaintext in
                         Task { @MainActor in
                             self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
@@ -5131,6 +5141,22 @@ final class EdgeLinkRuntime: ObservableObject {
         phoneBatteryLevel = status.level
         phoneBatteryCharging = status.charging
         phoneBatterySource = source
+    }
+
+    // Truthful keyguard state pushed by the EdgeLink Android app
+    // (KeyguardManager) — duo.screen status polls lie on om1, so the mirror
+    // lock mask falls back to this. Freshness-gated: a stale report must not
+    // outvote the live duo.screen flow.
+    private var phoneLockStateReport: (locked: Bool, at: Date)?
+
+    private func handlePhoneLockState(_ body: PhoneLockStateBody) {
+        phoneLockStateReport = (body.locked, Date())
+        macTrustManager.externalLockState = { [weak self] in
+            guard let report = self?.phoneLockStateReport,
+                  Date().timeIntervalSince(report.at) < 120 else { return nil }
+            return report.locked
+        }
+        DiagnosticsLog.info("phone.mac.lock_state_rx locked=\(body.locked)")
     }
 
     private func handleMiLinkPowerTopic(data: [String: String]) {

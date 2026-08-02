@@ -22,15 +22,30 @@ final class FakeXiaomiPhone {
     private(set) var openMirrorScreenCount = 0
     private(set) var closeScreenCount = 0
     private(set) var wfdSessionEstablished = false
+    private(set) var wfdPlayCount = 0
     private(set) var videoDatagramsSent = 0
     private(set) var mitrustBindCompleted = false
     private(set) var mitrustUnlockCompleted = false
+    private(set) var mitrustUnlockCount = 0
     private(set) var lastAuthTokenA: Data?
 
     // The real phone answers a status query with disabledBySetting, then
     // (~0.5-2s later, when its shared-auth query times out) sends a success
-    // event with remoteKeyguardStatus=valid — while actually still locked.
+    // event with enableStatus=unset + remoteKeyguardStatus=valid — while
+    // actually still locked (live, 2026-08-02). When its internal query does
+    // resolve, the answer carries enableStatus=enabled and a TRUTHFUL
+    // keyguard (official captures, 2026-07-31).
     var conflictingStatus = false
+    // If set, the first N status queries get the placeholder (lie) treatment
+    // and later ones the truthful answer — models the phone's slow
+    // getSupportStatus resolving under the official-style retry.
+    var truthfulAfterQueries: Int?
+
+    // Re-lock (or unlock) the phone mid-test, e.g. the user locking it again
+    // after a successful Mac-driven unlock.
+    func setLocked(_ value: Bool) {
+        queue.async { self.locked = value }
+    }
 
     var log: (String) -> Void = { _ in }
 
@@ -451,7 +466,16 @@ final class FakeXiaomiPhone {
                         wfdSentGetParameter = false
                         wfdSentTrigger = false
                         videoTimer?.cancel()
+                        videoTimer = nil
                         videoConnection?.cancel()
+                        // The old listener releases the port asynchronously;
+                        // rebinding immediately fails with EADDRINUSE. The
+                        // real phone has a rebuild window too — the client's
+                        // pre-established retry rides through it.
+                        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                            self?.startWFDServer()
+                        }
+                        return
                     }
                     startWFDServer()
                 } else if action.action == LyraCastScreenAction.Action.closeScreen.rawValue {
@@ -469,10 +493,10 @@ final class FakeXiaomiPhone {
         sendChannel(packet)
     }
 
-    private func sendStatusEvent(sessionID: UInt64, keyguardOverride: Int32? = nil) {
+    private func sendStatusEvent(sessionID: UInt64, keyguardOverride: Int32? = nil, enableOverride: Int32? = nil) {
         var auth = TrustAuthStatus()
         auth.features = [DuoScreenTrustFeature.unlockDevice]
-        auth.enableStatus = DuoScreenTrustEnableStatus.enabled.rawValue
+        auth.enableStatus = enableOverride ?? DuoScreenTrustEnableStatus.enabled.rawValue
         auth.bindStatus = DuoScreenTrustBindStatus.bound.rawValue
         auth.remoteRisk = 0
         var event = TrustStatusEvent()
@@ -492,16 +516,23 @@ final class FakeXiaomiPhone {
         switch msg {
         case .statusAction:
             statusActionCount += 1
-            if conflictingStatus {
+            let lying = conflictingStatus
+                && (truthfulAfterQueries == nil || statusActionCount <= truthfulAfterQueries!)
+            if lying {
                 var denied = TrustStatusEvent()
                 denied.code = DuoScreenTrustCode.disabledBySetting
                 sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
                     DuoScreenTrust(sessionID: trust.sessionID, msg: .statusEvent(denied))
                 ))
                 queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    // The flaky follow-up: claims keyguard valid (unlocked)
-                    // even though the phone is still locked.
-                    self?.sendStatusEvent(sessionID: trust.sessionID, keyguardOverride: DuoScreenKeyguardStatus.valid)
+                    // The flaky follow-up: enableStatus=unset (no real
+                    // keyguard info) yet claims keyguard valid (unlocked)
+                    // even when the phone is still locked.
+                    self?.sendStatusEvent(
+                        sessionID: trust.sessionID,
+                        keyguardOverride: DuoScreenKeyguardStatus.valid,
+                        enableOverride: DuoScreenTrustEnableStatus.unset.rawValue
+                    )
                 }
             } else {
                 sendStatusEvent(sessionID: trust.sessionID)
@@ -531,6 +562,15 @@ final class FakeXiaomiPhone {
     private func startMitrustAdoption() {
         mitrustConnId = UInt32.random(in: 1...UInt32.max)
         mitrustPeerNetId = 2
+        // Each unlock run adopts a fresh mitrustservice conn and dials a fresh
+        // channel on it — drop the previous run's (now stale) connection and
+        // sequence state so a re-locked phone can unlock again.
+        mitrustConnection?.cancel()
+        mitrustConnection = nil
+        mitrustServerPort = 0
+        mitrustSendSn = 0
+        mitrustRecvUna = 0
+        mitrustPacketBuffer.removeAll()
         let phoneConnId = randomBytes(8)
         let phoneKey = Curve25519.KeyAgreement.PrivateKey()
         var cred = Data()
@@ -746,6 +786,7 @@ final class FakeXiaomiPhone {
                   let tokenA = Self.data(fromHex: tokenAHex) else { return }
             lastAuthTokenA = tokenA
             mitrustUnlockCompleted = true
+            mitrustUnlockCount += 1
             locked = false
             log("fakephone.mitrust_unlocked")
             let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
@@ -844,8 +885,10 @@ final class FakeXiaomiPhone {
     // Real-phone behavior (om1, i-frame-interval=10 + low-latency encoder):
     // VPS/SPS/PPS only ride with an IDR, so a sink joining a stale encoder
     // mid-GOP gets undecodable video until it asks for an IDR. Modelled as
-    // "no decodable datagrams until wfd_idr_request arrives".
+    // "no decodable datagrams until wfd_idr_request arrives", re-armed on
+    // every PLAY (each new RTSP session joins the still-running encoder).
     var withholdVideoUntilIDRRequest = false
+    private var videoWithheld = false
     private(set) var idrRequestCount = 0
     private(set) var lastIDRRequestLine: String?
 
@@ -878,18 +921,18 @@ final class FakeXiaomiPhone {
         case "PLAY":
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nSession: 87654321\r\n\r\n")
             wfdSessionEstablished = true
-            if !withholdVideoUntilIDRRequest {
-                startVideoSender()
+            wfdPlayCount += 1
+            if withholdVideoUntilIDRRequest {
+                videoWithheld = true
             }
+            startVideoSender()
         case "SET_PARAMETER":
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
             if bodyText.contains("wfd_idr_request") {
                 idrRequestCount += 1
                 lastIDRRequestLine = firstLine
+                videoWithheld = false
                 log("fakephone.wfd_idr_request_rx")
-                if withholdVideoUntilIDRRequest, videoDatagramsSent == 0 {
-                    startVideoSender()
-                }
             }
         default:
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
@@ -897,16 +940,19 @@ final class FakeXiaomiPhone {
     }
 
     private func startVideoSender() {
+        guard videoTimer == nil else { return }
         let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: clientVideoPort)!, using: .udp)
         videoConnection = connection
         connection.start(queue: queue)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.2, repeating: .milliseconds(50))
         timer.setEventHandler { [weak self] in
-            guard let self, !self.stopped, self.videoDatagramsSent < 200 else {
+            guard let self, !self.stopped, self.videoDatagramsSent < 2000 else {
                 self?.videoTimer?.cancel()
+                self?.videoTimer = nil
                 return
             }
+            guard !self.videoWithheld else { return }
             var packet = Data(count: 188)
             packet.withUnsafeMutableBytes { ptr in
                 if let base = ptr.baseAddress {

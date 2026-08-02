@@ -62,6 +62,7 @@ object EnvelopeTypes {
     const val PHONE_RELAY_ENDPOINT = "phone.relay.endpoint"
     const val PHONE_RELAY_MEDIA = "phone.relay.media"
     const val PHONE_CALL_STATUS = "phone.call.status"
+    const val PHONE_LOCK_STATE = "phone.lockState"
     const val MILINK_STATUS = "milink.status"
     const val MILINK_FRAME = "milink.frame"
     const val MILINK_MIRROR_MEDIA = "milink.mirror.media"
@@ -484,6 +485,15 @@ data class BatteryStatusBody(
     val charging: Boolean,
     val plugged: String? = null,
     val temperature: Double? = null,
+    val ts: Long
+)
+
+// Truthful keyguard state from this device (KeyguardManager.isDeviceLocked).
+// Pushed on lock/unlock transitions and on session connect; the Mac mirror
+// falls back to it because duo.screen status polls lie on om1.
+@Serializable
+data class PhoneLockStateBody(
+    val locked: Boolean,
     val ts: Long
 )
 

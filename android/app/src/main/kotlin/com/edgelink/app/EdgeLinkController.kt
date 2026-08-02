@@ -23,6 +23,7 @@ import com.edgelink.core.ClipboardSetBody
 import com.edgelink.core.StatusCapsBody
 import com.edgelink.core.StatusPingBody
 import com.edgelink.core.StatusPongBody
+import com.edgelink.core.PhoneLockStateBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
 import com.edgelink.core.CtrlPointerBody
@@ -220,6 +221,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
     private val batteryReporter = AndroidBatteryReporter(appContext) { status: BatteryStatusBody ->
         sendEnvelope(EnvelopeTypes.BATTERY_STATUS, status)
+    }
+    private val lockStateReporter = AndroidLockStateReporter(appContext) { body: PhoneLockStateBody ->
+        sendEnvelope(EnvelopeTypes.PHONE_LOCK_STATE, body)
     }
     private val xiaomiMirrorScreenConfigReporter = EdgeLinkXiaomiMirrorScreenConfigReporter(
         context = appContext,
@@ -441,6 +445,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
         micActivityMonitor.start()
         batteryReporter.start()
+        lockStateReporter.start()
         xiaomiMirrorScreenConfigReporter.start()
         runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -464,6 +469,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         EdgeLinkInCallService.setCallStatusListener(null)
         micActivityMonitor.stop()
         batteryReporter.stop()
+        lockStateReporter.stop()
         xiaomiMirrorScreenConfigReporter.stop()
         screenSession.shutdown()
         turnCredentialJob?.cancel()
@@ -1820,6 +1826,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 }
                 micActivityMonitor.sendCurrent("session_connected")
                 batteryReporter.sendCurrent("session_connected")
+                lockStateReporter.sendCurrent("session_connected")
                 sendStatusCapsAndRequestHistory(identity)
                 AndroidNotificationListenerService.requestActiveNotificationSync(appContext, "session_connected")
                 retryDelayMs = 1_000L
