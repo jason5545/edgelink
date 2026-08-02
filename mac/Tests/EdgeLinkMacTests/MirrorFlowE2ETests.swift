@@ -286,6 +286,54 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Regression (2026-08-02 live): with the fast WFD retry the first frame
+    // now lands BEFORE the duo.screen status resolves, and the old
+    // notifyVideoFrame cleared the .loading mask immediately — the phone's
+    // lock screen flashed on the Mac for ~0.5s before the 手機已鎖定 mask.
+    // The mask must stay up until the trust state resolves.
+    func testVideoFrameKeepsLoadingMaskUntilLockStatusResolves() async throws {
+        try makeEnvironment(locked: true)
+        phone.conflictingStatus = true
+        trustManager.statusRetryDelay = 1.0
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD session established while status unresolved") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        XCTAssertFalse(trustManager.keyguardInfoConfirmed)
+        XCTAssertNotNil(controller.mask, "first frame must not clear the mask before the lock status resolves")
+        try await waitFor("lock mask after retry-budget fallback") { [self] in
+            self.controller.mask == .locked
+        }
+    }
+
+    // Companion to the locked case above: an UNLOCKED phone whose status is
+    // also slow (placeholders first, truthful answer later) must keep the
+    // mask only until the truthful answer, then stream directly — no lock
+    // mask, no Touch ID.
+    func testVideoFrameClearsMaskWhenUnlockedStatusResolves() async throws {
+        try makeEnvironment(locked: false)
+        phone.conflictingStatus = true
+        phone.truthfulAfterQueries = 1
+        trustManager.statusRetryDelay = 1.0
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD established before status resolves") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        XCTAssertFalse(trustManager.keyguardInfoConfirmed)
+        XCTAssertNotNil(controller.mask, "mask must stay until the status resolves")
+        try await waitFor("truthful unlocked status") { [self] in
+            self.trustManager.keyguardInfoConfirmed
+        }
+        try await waitFor("mask cleared, streaming directly") { [self] in
+            self.controller.mask == nil && self.controller.stage == .streaming
+        }
+        XCTAssertEqual(biometricCallCount, 0, "unlocked phone must not require Touch ID")
+    }
+
     // Scenario 1 (2026-08-02 live): phone genuinely unlocked, but its first
     // status answers are the same placeholder sequence as the locked case
     // (disabledBySetting, then success with enable=0 + keyguard valid). Once

@@ -129,7 +129,9 @@ final class XiaomiMirrorFlowController {
         }
         if case .ready(let locked) = trustManager.state, locked {
             mask = .locked
-        } else if mask == .loading || mask == .connectFailed {
+        } else if mask == .connectFailed {
+            mask = nil
+        } else if mask == .loading, case .ready = trustManager.state {
             mask = nil
         }
     }

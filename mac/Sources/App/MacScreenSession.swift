@@ -347,9 +347,6 @@ final class MacScreenSession: NSObject, ObservableObject {
     func renderXiaomiMirrorFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
         setXiaomiMirrorRouteActive(true)
         isRenderingXiaomiMirror = true
-        if xiaomiMirrorMask == .loading || xiaomiMirrorMask == .connectFailed {
-            xiaomiMirrorMask = nil
-        }
         if !isScreenSessionActive {
             isScreenSessionActive = true
             onSessionActivityChanged?(true)
