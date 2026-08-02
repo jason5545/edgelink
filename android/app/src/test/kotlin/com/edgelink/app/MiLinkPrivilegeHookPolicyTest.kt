@@ -510,4 +510,15 @@ class MiLinkPrivilegeHookPolicyTest {
             )
         )
     }
+
+    @Test
+    fun keyboardProviderStackIsGoneButPointerAndGlobalStay() {
+        // Mirror keyboard moved to the official cast-channel route
+        // (duo.screen ProtoKeyboard), so the hook-side provider must not
+        // answer edgeLinkKeyboard anymore. Pointer/global still inject via
+        // the hook until their own official-route migration.
+        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkKeyboard"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkPointer"))
+        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkGlobal"))
+    }
 }

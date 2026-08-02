@@ -109,7 +109,6 @@ internal object MiLinkPrivilegeHookPolicy {
         "startMediaRelay",
         "stopMediaRelay",
         "setMediaRelayVolume",
-        "edgeLinkKeyboard",
         "edgeLinkPointer",
         "edgeLinkGlobal",
         "edgeLinkCastChannel"
@@ -384,13 +383,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
     private var fakeMirrorAudioStartProbeDepth: Int = 0
     private var telecomRelayFeaturesInstalled: Boolean = false
     private val hevcEncoderRecoveryInstalled = AtomicBoolean(false)
-    private val xiaomiMirrorKeyboardPressedKeys = LinkedHashMap<Int, Long>()
-    private var xiaomiMirrorKeyboardMetaMask: Int = 0
-    private val xiaomiMirrorKeyboardShareLock = Any()
-    private var xiaomiMirrorKeyboardShareManagerPrepared: Boolean = false
-    private var xiaomiMirrorKeyboardShareSocket: Any? = null
-    private var xiaomiMirrorAcceptInputCallback: Any? = null
-    private var xiaomiMirrorKeyboardSessionArmed: Boolean = false
     private val mirrorKeepAwakeLockGuard = Any()
     private var mirrorKeepAwakeLock: PowerManager.WakeLock? = null
     @Volatile
@@ -450,26 +442,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         val mirrorTarget = synchronized(installedTargets) {
             installedTargets.firstOrNull { it.packageName == MiLinkPrivilegeHookPolicy.XIAOMI_MIRROR_PACKAGE }
         } ?: return
-        val classLoader = mirrorTarget.classLoader
-        runCatching {
-            val socket = xiaomiMirrorKeyboardShareSocket
-            if (socket != null) {
-                val controllerClass = findFirstTargetClass(
-                    classLoader,
-                    XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER,
-                    XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER_JADX_NAME
-                )
-                val controller = controllerClass.getMethod("c").invoke(null)
-                writeReflectiveFieldAny(controller, null, "a", "f14975a")
-                xiaomiMirrorKeyboardShareSocket = null
-            }
-        }
-        runCatching {
-            val context = currentApplicationContext() ?: return@runCatching
-            val (_, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context) ?: return@runCatching
-            invokeMirrorManagerBoolean(mirrorManager, "unRegAcceptInputCallback", emptyArray())
-            xiaomiMirrorAcceptInputCallback = null
-        }
     }
 
     fun installForPackage(
@@ -2546,9 +2518,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                             putInt("value", 0)
                         }
                     }
-                    if (method == "edgeLinkKeyboard") {
-                        return@installHook handleMirrorKeyboardProvider(classLoader, extras)
-                    }
                     if (method == "edgeLinkPointer") {
                         return@installHook handleMirrorPointerProvider(classLoader, extras)
                     }
@@ -2706,37 +2675,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
     }
 
-    private fun handleMirrorKeyboardProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
-        if (extras.booleanCompat("releaseOnly")) {
-            return handleMirrorKeyboardReleaseProvider(classLoader, extras)
-        }
-        if (extras.booleanCompat("prepareOnly")) {
-            return handleMirrorKeyboardReadyProvider(classLoader, extras)
-        }
-        val keyCode = extras.intCompat("keyCode", -1)
-        val down = extras.booleanCompat("down")
-        val modifiers = extras.intCompat("modifiers", 0)
-        val characters = extras.getString("characters").orEmpty()
-        val requestId = extras.getString("requestId").orEmpty()
-        val injection = injectXiaomiMirrorKeyboardViaInputManager(classLoader, keyCode, down, modifiers, characters)
-        log(
-            "mirror keyboard provider requestId=$requestId keyCode=$keyCode down=$down " +
-                "modifiers=$modifiers accepted=${injection.accepted} route=${injection.route} " +
-                "message=${injection.message}"
-        )
-        return Bundle().apply {
-            putBoolean("edgelinkKeyboardAccepted", injection.accepted)
-            putBoolean("enable", injection.accepted)
-            putInt("value", if (injection.accepted) 0 else -1)
-            putString("route", injection.route)
-            putString("message", injection.message)
-            putString("requestId", requestId)
-            putInt("keyCode", keyCode)
-            putBoolean("down", down)
-            putInt("modifiers", modifiers)
-            putString("reportHex", "")
-        }
-    }
 
     private fun handleMirrorPointerProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
         val requestId = extras.getString("requestId").orEmpty()
@@ -2803,289 +2741,14 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
     }
 
-    private fun handleMirrorKeyboardReadyProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
-        val requestId = extras.getString("requestId").orEmpty()
-        val source = extras.getString("source").orEmpty()
-        val injection = prepareXiaomiMirrorKeyboard(classLoader, source.ifBlank { "provider" })
-        log(
-            "mirror keyboard ready provider requestId=$requestId source=$source " +
-                "accepted=${injection.accepted} route=${injection.route} message=${injection.message}"
-        )
-        return Bundle().apply {
-            putBoolean("edgelinkKeyboardAccepted", injection.accepted)
-            putBoolean("enable", injection.accepted)
-            putInt("value", if (injection.accepted) 0 else -1)
-            putString("route", injection.route)
-            putString("message", injection.message)
-            putString("requestId", requestId)
-            putString("source", source)
-            putBoolean("prepareOnly", true)
-        }
-    }
 
-    private fun handleMirrorKeyboardReleaseProvider(classLoader: ClassLoader, extras: Bundle): Bundle {
-        val requestId = extras.getString("requestId").orEmpty()
-        val source = extras.getString("source").orEmpty()
-        val release = releaseXiaomiMirrorKeyboard(classLoader, source.ifBlank { "provider" })
-        log(
-            "mirror keyboard release provider requestId=$requestId source=$source " +
-                "accepted=${release.accepted} route=${release.route} message=${release.message}"
-        )
-        return Bundle().apply {
-            putBoolean("edgelinkKeyboardAccepted", release.accepted)
-            putBoolean("edgelinkKeyboardReleased", release.accepted)
-            putBoolean("enable", release.accepted)
-            putInt("value", if (release.accepted) 0 else -1)
-            putString("route", release.route)
-            putString("message", release.message)
-            putString("requestId", requestId)
-            putString("source", source)
-            putBoolean("releaseOnly", true)
-        }
-    }
 
-    private fun releaseXiaomiMirrorKeyboard(
-        classLoader: ClassLoader,
-        source: String
-    ): XiaomiMirrorKeyboardInjectionResult {
-        return runCatching {
-            val steps = mutableListOf<String>()
-            val context = xiaomiMirrorApplicationContext(classLoader)
-            if (context != null && xiaomiMirrorKeyboardSessionArmed) {
-                restoreXiaomiMirrorKeyboardSettings(classLoader, context, source)
-                steps += "settings=restored"
-            } else {
-                steps += "settings=skipped:armed=$xiaomiMirrorKeyboardSessionArmed context=${context != null}"
-            }
-            releaseXiaomiMirrorTrackedKeys(classLoader, source)
-            steps += "trackedKeys=released"
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = true,
-                route = "edgelink.inputmanager.keyboard.release",
-                message = "keyboard released source=$source ${steps.joinToString(" ")}"
-            )
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.keyboard.release",
-                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-            )
-        }
-    }
 
-    private fun restoreXiaomiMirrorKeyboardSettings(
-        classLoader: ClassLoader,
-        context: Context,
-        source: String
-    ) {
-        closeXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
-        val mouseShare = notifyXiaomiMirrorMouseShareMode(classLoader, enabled = false)
-        xiaomiMirrorKeyboardSessionArmed = false
-        log("mirror keyboard state released source=$source mouseShare=$mouseShare")
-    }
 
-    private fun sendXiaomiMirrorText(
-        classLoader: ClassLoader,
-        text: String
-    ): XiaomiMirrorKeyboardInjectionResult {
-        val context = xiaomiMirrorApplicationContext(classLoader)
-            ?: return XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.text",
-                message = "context unavailable"
-            )
-        val (_, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context)
-            ?: return XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.text",
-                message = "mirror manager unavailable"
-            )
-        return runCatching {
-            mirrorManager.javaClass
-                .getMethod("sendChineseText", String::class.java)
-                .invoke(mirrorManager, text)
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = true,
-                route = "edgelink.inputmanager.text",
-                message = "committed text len=${text.length}"
-            )
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log("mirror keyboard text commit failed: ${cause.javaClass.simpleName}: ${cause.message}")
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.text",
-                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-            )
-        }
-    }
 
-    private fun xiaomiMirrorKeyCharForUsLayout(keyCode: Int, shift: Boolean): Char? = when (keyCode) {
-        in android.view.KeyEvent.KEYCODE_A..android.view.KeyEvent.KEYCODE_Z ->
-            ('a' + (keyCode - android.view.KeyEvent.KEYCODE_A)).let { if (shift) it.uppercaseChar() else it }
-        in android.view.KeyEvent.KEYCODE_0..android.view.KeyEvent.KEYCODE_9 -> {
-            val digit = keyCode - android.view.KeyEvent.KEYCODE_0
-            if (shift) ")!@#$%^&*("[digit] else '0' + digit
-        }
-        android.view.KeyEvent.KEYCODE_SPACE -> ' '
-        android.view.KeyEvent.KEYCODE_COMMA -> if (shift) '<' else ','
-        android.view.KeyEvent.KEYCODE_PERIOD -> if (shift) '>' else '.'
-        android.view.KeyEvent.KEYCODE_SLASH -> if (shift) '?' else '/'
-        android.view.KeyEvent.KEYCODE_SEMICOLON -> if (shift) ':' else ';'
-        android.view.KeyEvent.KEYCODE_APOSTROPHE -> if (shift) '"' else '\''
-        android.view.KeyEvent.KEYCODE_LEFT_BRACKET -> if (shift) '{' else '['
-        android.view.KeyEvent.KEYCODE_RIGHT_BRACKET -> if (shift) '}' else ']'
-        android.view.KeyEvent.KEYCODE_BACKSLASH -> if (shift) '|' else '\\'
-        android.view.KeyEvent.KEYCODE_MINUS -> if (shift) '_' else '-'
-        android.view.KeyEvent.KEYCODE_EQUALS -> if (shift) '+' else '='
-        android.view.KeyEvent.KEYCODE_GRAVE -> if (shift) '~' else '`'
-        else -> null
-    }
 
-    private fun notifyXiaomiMirrorMouseShareMode(classLoader: ClassLoader, enabled: Boolean): Boolean =
-        runCatching {
-            val managerClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER,
-                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER_JADX_NAME
-            )
-            val manager = managerClass.getMethod("m").invoke(null)
-            managerClass.getMethod("t", java.lang.Boolean.TYPE).invoke(manager, enabled)
-            true
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log("mirror keyboard release notifyMouseShareModeState failed: ${cause.javaClass.simpleName}: ${cause.message}")
-            false
-        }
 
-    private fun injectXiaomiMirrorKeyboardViaInputManager(
-        classLoader: ClassLoader,
-        keyCode: Int,
-        down: Boolean,
-        modifiers: Int,
-        characters: String = ""
-    ): XiaomiMirrorKeyboardInjectionResult {
-        if (keyCode <= 0) {
-            return XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.keyboard",
-                message = "invalid keyCode=$keyCode"
-            )
-        }
-        val printableCharacters = characters.filter { !it.isISOControl() }
-        if (printableCharacters.isNotEmpty()) {
-            if (!down) {
-                return XiaomiMirrorKeyboardInjectionResult(
-                    accepted = true,
-                    route = "edgelink.inputmanager.text",
-                    message = "text key-up skipped keyCode=$keyCode"
-                )
-            }
-            return sendXiaomiMirrorText(classLoader, printableCharacters)
-        }
-        if (androidKeyCodeToMetaState(keyCode) == 0) {
-            val shiftActive = synchronized(xiaomiMirrorKeyboardPressedKeys) {
-                (xiaomiMirrorKeyboardMetaMask or modifiers) and android.view.KeyEvent.META_SHIFT_ON != 0
-            }
-            val typedChar = xiaomiMirrorKeyCharForUsLayout(keyCode, shiftActive)
-            if (typedChar != null) {
-                if (!down) {
-                    return XiaomiMirrorKeyboardInjectionResult(
-                        accepted = true,
-                        route = "edgelink.inputmanager.text",
-                        message = "text key-up skipped keyCode=$keyCode"
-                    )
-                }
-                return sendXiaomiMirrorText(classLoader, typedChar.toString())
-            }
-        }
-        val resolved = resolveXiaomiMirrorInputManager(classLoader)
-            ?: return XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.keyboard",
-                message = "input manager unavailable"
-            )
-        val (inputManager, injectMethod) = resolved
-        return runCatching {
-            val metaState: Int
-            val nowMs = SystemClock.uptimeMillis()
-            val eventDownTimeMs: Long
-            synchronized(xiaomiMirrorKeyboardPressedKeys) {
-                val metaBit = androidKeyCodeToMetaState(keyCode)
-                xiaomiMirrorKeyboardMetaMask = if (down) {
-                    xiaomiMirrorKeyboardMetaMask or metaBit
-                } else {
-                    xiaomiMirrorKeyboardMetaMask and metaBit.inv()
-                }
-                eventDownTimeMs = if (down) {
-                    xiaomiMirrorKeyboardPressedKeys.put(keyCode, nowMs) ?: nowMs
-                } else {
-                    xiaomiMirrorKeyboardPressedKeys.remove(keyCode) ?: nowMs
-                }
-                metaState = xiaomiMirrorKeyboardMetaMask or modifiers
-            }
-            injectXiaomiMirrorKeyEvent(
-                inputManager = inputManager,
-                injectMethod = injectMethod,
-                keyCode = keyCode,
-                eventAction = if (down) android.view.KeyEvent.ACTION_DOWN else android.view.KeyEvent.ACTION_UP,
-                downTimeMs = eventDownTimeMs,
-                eventTimeMs = nowMs,
-                metaState = metaState
-            )
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = true,
-                route = "edgelink.inputmanager.keyboard",
-                message = "injected keyCode=$keyCode down=$down metaState=$metaState"
-            )
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log(
-                "mirror keyboard inputmanager injection failed keyCode=$keyCode down=$down " +
-                    "${cause.javaClass.simpleName}: ${cause.message}"
-            )
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.keyboard",
-                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-            )
-        }
-    }
 
-    private fun releaseXiaomiMirrorTrackedKeys(classLoader: ClassLoader, source: String) {
-        val pending: Map<Int, Long>
-        synchronized(xiaomiMirrorKeyboardPressedKeys) {
-            pending = xiaomiMirrorKeyboardPressedKeys.toMap()
-            xiaomiMirrorKeyboardPressedKeys.clear()
-            xiaomiMirrorKeyboardMetaMask = 0
-        }
-        if (pending.isEmpty()) {
-            return
-        }
-        val resolved = resolveXiaomiMirrorInputManager(classLoader) ?: return
-        val (inputManager, injectMethod) = resolved
-        val nowMs = SystemClock.uptimeMillis()
-        for ((pressedKeyCode, downTimeMs) in pending) {
-            runCatching {
-                injectXiaomiMirrorKeyEvent(
-                    inputManager = inputManager,
-                    injectMethod = injectMethod,
-                    keyCode = pressedKeyCode,
-                    eventAction = android.view.KeyEvent.ACTION_UP,
-                    downTimeMs = downTimeMs,
-                    eventTimeMs = nowMs,
-                    metaState = 0
-                )
-            }.onFailure { error ->
-                val cause = error.cause ?: error
-                log(
-                    "mirror keyboard release key-up failed keyCode=$pressedKeyCode source=$source " +
-                        "${cause.javaClass.simpleName}: ${cause.message}"
-                )
-            }
-        }
-    }
 
     private fun resolveXiaomiMirrorInputManager(
         classLoader: ClassLoader
@@ -3104,26 +2767,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         return inputManager to injectMethod
     }
 
-    private fun androidKeyCodeToMetaState(keyCode: Int): Int =
-        when (keyCode) {
-            android.view.KeyEvent.KEYCODE_SHIFT_LEFT ->
-                android.view.KeyEvent.META_SHIFT_LEFT_ON or android.view.KeyEvent.META_SHIFT_ON
-            android.view.KeyEvent.KEYCODE_SHIFT_RIGHT ->
-                android.view.KeyEvent.META_SHIFT_RIGHT_ON or android.view.KeyEvent.META_SHIFT_ON
-            android.view.KeyEvent.KEYCODE_CTRL_LEFT ->
-                android.view.KeyEvent.META_CTRL_LEFT_ON or android.view.KeyEvent.META_CTRL_ON
-            android.view.KeyEvent.KEYCODE_CTRL_RIGHT ->
-                android.view.KeyEvent.META_CTRL_RIGHT_ON or android.view.KeyEvent.META_CTRL_ON
-            android.view.KeyEvent.KEYCODE_ALT_LEFT ->
-                android.view.KeyEvent.META_ALT_LEFT_ON or android.view.KeyEvent.META_ALT_ON
-            android.view.KeyEvent.KEYCODE_ALT_RIGHT ->
-                android.view.KeyEvent.META_ALT_RIGHT_ON or android.view.KeyEvent.META_ALT_ON
-            android.view.KeyEvent.KEYCODE_META_LEFT ->
-                android.view.KeyEvent.META_META_LEFT_ON or android.view.KeyEvent.META_META_ON
-            android.view.KeyEvent.KEYCODE_META_RIGHT ->
-                android.view.KeyEvent.META_META_RIGHT_ON or android.view.KeyEvent.META_META_ON
-            else -> 0
-        }
 
     private fun injectXiaomiMirrorGlobalViaInputManager(
         classLoader: ClassLoader,
@@ -3545,335 +3188,20 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
     }
 
-    private fun prepareXiaomiMirrorKeyboard(
-        classLoader: ClassLoader,
-        source: String
-    ): XiaomiMirrorKeyboardInjectionResult {
-        return runCatching {
-            val shareSession = ensureXiaomiMirrorOfficialKeyboardShareSession(classLoader, source)
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = true,
-                route = "edgelink.inputmanager.keyboard.session",
-                message = "keyboard ready $shareSession"
-            )
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            XiaomiMirrorKeyboardInjectionResult(
-                accepted = false,
-                route = "edgelink.inputmanager.keyboard.session",
-                message = "${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-            )
-        }
-    }
-
-    private fun ensureXiaomiMirrorOfficialKeyboardShareSession(
-        classLoader: ClassLoader,
-        source: String
-    ): String {
-        val context = xiaomiMirrorApplicationContext(classLoader)
-            ?: return "officialShare=skipped:no_context"
-        val hardwareState = markXiaomiMirrorHardwareKeyboardOpen(
-            classLoader,
-            source
-        )
-        return synchronized(xiaomiMirrorKeyboardShareLock) {
-            val manager = prepareXiaomiMirrorShareManager(classLoader, context)
-            val socket = ensureXiaomiMirrorKeyboardShareSocket(classLoader)
-            "officialShare{$manager $socket $hardwareState}"
-        }
-    }
-
-    private fun prepareXiaomiMirrorShareManager(
-        classLoader: ClassLoader,
-        context: Context
-    ): String =
-        runCatching {
-            val managerClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER,
-                XIAOMI_MIRROR_SHARE_MIRROR_MANAGER_JADX_NAME
-            )
-            val manager = managerClass.getMethod("m").invoke(null)
-            val version = runCatching {
-                (managerClass.getMethod("j").invoke(manager) as? Number)?.toInt()
-            }.getOrNull()
-            val mouseShare = runCatching {
-                managerClass.getMethod("t", java.lang.Boolean.TYPE).invoke(manager, true)
-                true
-            }.getOrElse { error ->
-                log("mirror keyboard official share notifyMouseShareModeState failed: ${error.javaClass.simpleName}: ${error.message}")
-                false
-            }
-            val inputListener = if (xiaomiMirrorKeyboardShareManagerPrepared) {
-                "already"
-            } else {
-                runCatching {
-                    managerClass.getMethod("w", Context::class.java).invoke(manager, context)
-                    xiaomiMirrorKeyboardShareManagerPrepared = true
-                    "registered"
-                }.getOrElse { error ->
-                    log("mirror keyboard official share input listener failed: ${error.javaClass.simpleName}: ${error.message}")
-                    "failed:${error.javaClass.simpleName}"
-                }
-            }
-            "manager(version=${version ?: "?"} mouseShare=$mouseShare inputListener=$inputListener)"
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            "manager=failed:${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-        }
-
-    private fun ensureXiaomiMirrorKeyboardShareSocket(classLoader: ClassLoader): String {
-        val existing = xiaomiMirrorKeyboardShareSocket
-        if (existing != null) {
-            val before = xiaomiMirrorKeyboardShareSocketFlag(existing)
-            val flag = if ((before and XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG) == 0) {
-                setXiaomiMirrorKeyboardShareSocketFlag(existing, XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG)
-            } else {
-                "flagBefore=$before flagAfter=$before ok=true"
-            }
-            return "socket=existing $flag"
-        }
-
-        return runCatching {
-            val socketClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_SHARE_SOCKET,
-                XIAOMI_MIRROR_SHARE_SOCKET_JADX_NAME
-            )
-            val callbackClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK,
-                XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK_JADX_NAME
-            )
-            var connected = false
-            val callback = Proxy.newProxyInstance(
-                classLoader,
-                arrayOf(callbackClass)
-            ) { _, method, args ->
-                when (method?.name) {
-                    "b" -> log(
-                        "mirror keyboard official share socket hidData " +
-                            (args?.getOrNull(0) as? ByteArray)?.hexSummary().orEmpty()
-                    )
-                    "c" -> {
-                        connected = args?.getOrNull(0) as? Boolean == true
-                        log("mirror keyboard official share socket connected=$connected")
-                    }
-                    "e" -> log("mirror keyboard official share socket interrupt=${args?.getOrNull(0)}")
-                }
-                null
-            }
-            val socket = socketClass.getDeclaredConstructor().newInstance()
-            socketClass.getMethod("e", callbackClass).invoke(socket, callback)
-            xiaomiMirrorKeyboardShareSocket = socket
-            val flag = setXiaomiMirrorKeyboardShareSocketFlag(socket, XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG)
-            val controller = registerXiaomiMirrorKeyboardShareSocket(classLoader, socket)
-            "socket=created connected=$connected $flag $controller"
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            "socket=failed:${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-        }
-    }
-
-    private fun xiaomiMirrorKeyboardShareSocketFlag(socket: Any): Int =
-        runCatching {
-            (socket.javaClass.getMethod("g").invoke(socket) as? Number)?.toInt() ?: 0
-        }.getOrDefault(0)
-
-    private fun setXiaomiMirrorKeyboardShareSocketFlag(socket: Any, flag: Int): String {
-        val before = xiaomiMirrorKeyboardShareSocketFlag(socket)
-        val ok = runCatching {
-            socket.javaClass.getMethod("j", Integer.TYPE).invoke(socket, flag)
-            true
-        }.getOrElse { error ->
-            log("mirror keyboard official share set flag failed: ${error.javaClass.simpleName}: ${error.message}")
-            false
-        }
-        val after = xiaomiMirrorKeyboardShareSocketFlag(socket)
-        return "flagBefore=$before set=$flag ok=$ok flagAfter=$after"
-    }
-
-    private fun registerXiaomiMirrorKeyboardShareSocket(classLoader: ClassLoader, socket: Any): String =
-        runCatching {
-            val controllerClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER,
-                XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER_JADX_NAME
-            )
-            val controller = controllerClass.getMethod("c").invoke(null)
-            val byName = writeReflectiveFieldAny(controller, socket, "a", "f14975a")
-            val byType = if (byName) {
-                false
-            } else {
-                controllerClass.declaredFields.any { field ->
-                    if (!field.type.isAssignableFrom(socket.javaClass)) {
-                        return@any false
-                    }
-                    field.isAccessible = true
-                    field.set(controller, socket)
-                    true
-                }
-            }
-            "controllerRegistered=${byName || byType}"
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            "controllerRegister=failed:${cause.javaClass.simpleName}:${cause.message.orEmpty()}"
-        }
 
 
-    private fun markXiaomiMirrorHardwareKeyboardOpen(classLoader: ClassLoader, source: String): String {
-        val context = xiaomiMirrorApplicationContext(classLoader)
-            ?: return "settings=skipped:no_context"
-        xiaomiMirrorKeyboardSessionArmed = true
-        val officialIme = prepareXiaomiMirrorOfficialInputMethodSession(classLoader, context, source)
-        log("mirror keyboard state open source=$source $officialIme")
-        return officialIme
-    }
 
-    private fun prepareXiaomiMirrorOfficialInputMethodSession(
-        classLoader: ClassLoader,
-        context: Context,
-        source: String
-    ): String {
-        val (mirror, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context)
-            ?: return "officialIme=skipped:no_manager"
-        installXiaomiMirrorSynergyStatusGuard(classLoader, "prepare:$source")
-        val begin = false
-        val callbackClass = runCatching {
-            findTargetClass(classLoader, XIAOMI_MIRROR_ACCEPT_INPUT_CALLBACK)
-        }.getOrElse { error ->
-            log("mirror keyboard official ime callback class failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
-            return "officialIme=failed:callback_class"
-        }
-        val callback = ensureXiaomiMirrorAcceptInputCallback(classLoader, callbackClass)
-        val registered = if (callback != null) {
-            invokeMirrorManagerBoolean(
-                mirrorManager,
-                "regAcceptInputCallback",
-                arrayOf(callbackClass),
-                callback
-            )
-        } else {
-            false
-        }
-        val synergy = invokeMirrorManagerBoolean(
-            mirrorManager,
-            "sendSynergyOperate",
-            arrayOf(Integer.TYPE),
-            XIAOMI_MIRROR_SYNERGY_OPERATE_ON
-        )
-        val beginSynergy = runCatching {
-            mirrorManager.javaClass
-                .getMethod("beginSynergy", Context::class.java)
-                .invoke(mirrorManager, mirror)
-            true
-        }.getOrElse { error ->
-            log("mirror keyboard beginSynergy failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
-            false
-        }
-        val monitor = registerXiaomiMirrorSynergyMonitor()
-        val display = invokeMirrorManagerBoolean(
-            mirrorManager,
-            "setDisplayIdForInputMethod",
-            arrayOf(Integer.TYPE),
-            XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID
-        )
-        val acceptInputState = applyXiaomiMirrorAcceptInputStatus(
-            classLoader = classLoader,
-            status = XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED,
-            displayId = XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID,
-            source = "$source:prime"
-        )
-        val summary =
-            "officialIme{begin=$begin callback=${callback != null} registered=$registered " +
-                "synergy=$synergy beginSynergy=$beginSynergy monitor=$monitor display=$display displayId=$XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID " +
-                "$acceptInputState}"
-        log("mirror keyboard official ime session source=$source $summary")
-        return summary
-    }
 
-    private fun closeXiaomiMirrorOfficialInputMethodSession(
-        classLoader: ClassLoader,
-        context: Context,
-        source: String
-    ) {
-        val (_, mirrorManager) = xiaomiMirrorContextAndManager(classLoader, context) ?: return
-        resetXiaomiMirrorSynergyStatus(classLoader, "release:$source")
-        val monitorReleased = unregisterXiaomiMirrorSynergyMonitor()
-        val display = invokeMirrorManagerBoolean(
-            mirrorManager,
-            "setDisplayIdForInputMethod",
-            arrayOf(Integer.TYPE),
-            0
-        )
-        val synergy = invokeMirrorManagerBoolean(
-            mirrorManager,
-            "sendSynergyOperate",
-            arrayOf(Integer.TYPE),
-            XIAOMI_MIRROR_SYNERGY_OPERATE_OFF
-        )
-        val endSynergy = runCatching {
-            mirrorManager.javaClass
-                .getMethod("endSynergy", Context::class.java)
-                .invoke(mirrorManager, context)
-            true
-        }.getOrElse { error ->
-            log("mirror keyboard endSynergy failed source=$source: ${error.javaClass.simpleName}: ${error.message}")
-            false
-        }
-        val unregistered = invokeMirrorManagerBoolean(mirrorManager, "unRegAcceptInputCallback", emptyArray())
-        xiaomiMirrorAcceptInputCallback = null
-        log("mirror keyboard official ime closed source=$source monitor=$monitorReleased display=$display synergy=$synergy endSynergy=$endSynergy unregistered=$unregistered")
-    }
 
-    private var xiaomiMirrorSynergyMonitorBinder: android.os.Binder? = null
 
-    private fun transactXiaomiMirrorImms(code: Int, writePayload: ((android.os.Parcel) -> Unit)?): Boolean =
-        runCatching {
-            val service = Class.forName("android.os.ServiceManager")
-                .getMethod("getService", String::class.java)
-                .invoke(null, "input_method") as? android.os.IBinder ?: return@runCatching false
-            val data = android.os.Parcel.obtain()
-            val reply = android.os.Parcel.obtain()
-            try {
-                data.writeInterfaceToken(XIAOMI_MIRROR_IMMS_DESCRIPTOR)
-                writePayload?.invoke(data)
-                if (!service.transact(code, data, reply, 0)) {
-                    return@runCatching false
-                }
-                reply.readException()
-                true
-            } finally {
-                reply.recycle()
-                data.recycle()
-            }
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log(
-                "mirror imms transact $code failed: " +
-                    "${cause.javaClass.simpleName}: ${cause.message}"
-            )
-            false
-        }
 
-    private fun registerXiaomiMirrorSynergyMonitor(): Boolean {
-        if (xiaomiMirrorSynergyMonitorBinder == null) {
-            xiaomiMirrorSynergyMonitorBinder = object : android.os.Binder() {
-                override fun onTransact(
-                    code: Int,
-                    data: android.os.Parcel,
-                    reply: android.os.Parcel?,
-                    flags: Int
-                ): Boolean = true
-            }
-        }
-        return transactXiaomiMirrorImms(XIAOMI_MIRROR_IMMS_CODE_REGISTER_MONITOR) { data ->
-            data.writeStrongBinder(xiaomiMirrorSynergyMonitorBinder)
-        }
-    }
 
-    private fun unregisterXiaomiMirrorSynergyMonitor(): Boolean =
-        transactXiaomiMirrorImms(XIAOMI_MIRROR_IMMS_CODE_UNREGISTER_MONITOR, null)
+
+
+
+
+
+
 
     private var xiaomiMirrorSynergyGuardRegistered = false
     private var xiaomiMirrorSynergyGuardLastMode = -1
@@ -3996,93 +3324,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             mirror to mirrorManager
         }.getOrNull()
 
-    private fun ensureXiaomiMirrorAcceptInputCallback(classLoader: ClassLoader, callbackClass: Class<*>): Any? {
-        xiaomiMirrorAcceptInputCallback?.let { existing ->
-            if (callbackClass.isInstance(existing)) {
-                return existing
-            }
-        }
-        return runCatching {
-            Proxy.newProxyInstance(
-                classLoader,
-                arrayOf(callbackClass)
-            ) { proxy, method, args ->
-                when (method?.name) {
-                    "equals" -> proxy === args?.getOrNull(0)
-                    "hashCode" -> System.identityHashCode(proxy)
-                    "toString" -> "EdgeLinkMirrorAcceptInputCallback"
-                    "onAcceptInputStatus" -> {
-                        val status = (args?.getOrNull(0) as? Number)?.toInt() ?: 0
-                        val displayId =
-                            (args?.getOrNull(1) as? Number)?.toInt() ?: XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID
-                        val acceptInputState = applyXiaomiMirrorAcceptInputStatus(
-                            classLoader = classLoader,
-                            status = status,
-                            displayId = displayId,
-                            source = "callback"
-                        )
-                        log(
-                            "mirror keyboard official ime acceptInput " +
-                                "status=$status displayId=$displayId $acceptInputState"
-                        )
-                        null
-                    }
-                    else -> null
-                }
-            }.also { callback ->
-                xiaomiMirrorAcceptInputCallback = callback
-            }
-        }.getOrElse { error ->
-            log("mirror keyboard official ime callback create failed: ${error.javaClass.simpleName}: ${error.message}")
-            null
-        }
-    }
 
-    private fun applyXiaomiMirrorAcceptInputStatus(
-        classLoader: ClassLoader,
-        status: Int,
-        displayId: Int,
-        source: String
-    ): String {
-        val controller = runCatching {
-            val controllerClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_INPUT_CONTROLLER,
-                XIAOMI_MIRROR_INPUT_CONTROLLER_JADX_NAME
-            )
-            val controllerInstance = controllerClass.getMethod("f").invoke(null)
-            controllerInstance.javaClass.getMethod("s", Integer.TYPE).invoke(controllerInstance, displayId)
-            true
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log(
-                "mirror keyboard official ime acceptInput controller failed source=$source " +
-                    "status=$status displayId=$displayId: ${cause.javaClass.simpleName}: ${cause.message}"
-            )
-            false
-        }
-        val inputState = runCatching {
-            val inputStateClass = findFirstTargetClass(
-                classLoader,
-                XIAOMI_MIRROR_INPUT_STATE_MANAGER,
-                XIAOMI_MIRROR_INPUT_STATE_MANAGER_JADX_NAME
-            )
-            val inputStateManager = inputStateClass.getMethod("b").invoke(null)
-            inputStateManager.javaClass
-                .getMethod("g", java.lang.Boolean.TYPE)
-                .invoke(inputStateManager, status == XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED)
-            inputStateManager.javaClass.getMethod("e", Integer.TYPE).invoke(inputStateManager, displayId)
-            true
-        }.getOrElse { error ->
-            val cause = error.cause ?: error
-            log(
-                "mirror keyboard official ime acceptInput state failed source=$source " +
-                    "status=$status displayId=$displayId: ${cause.javaClass.simpleName}: ${cause.message}"
-            )
-            false
-        }
-        return "acceptInputState{controller=$controller input=$inputState status=$status displayId=$displayId}"
-    }
 
     private fun invokeMirrorManagerBoolean(
         mirrorManager: Any,
@@ -7741,31 +6983,13 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_CONTROL = "com.xiaomi.mirrorcontrol.MirrorControl"
         private const val XIAOMI_MIRROR_CONTROL_SINK = "com.xiaomi.mirrorcontrol.MirrorControlSink"
         private const val XIAOMI_MIRROR_CONTROL_SOURCE = "com.xiaomi.mirrorcontrol.MirrorControlSource"
-        private const val XIAOMI_MIRROR_ACCEPT_INPUT_CALLBACK =
-            "com.xiaomi.mirror.IMirrorManager\$AcceptInputCallback"
         private const val XIAOMI_MIRROR_INPUT_CONTROLLER = "o3.a"
         private const val XIAOMI_MIRROR_INPUT_CONTROLLER_JADX_NAME = "o3.C1223a"
         private const val XIAOMI_MIRROR_INPUT_STATE_MANAGER = "com.xiaomi.mirror.y"
         private const val XIAOMI_MIRROR_INPUT_STATE_MANAGER_JADX_NAME = "com.xiaomi.mirror.C0792y"
-        private const val XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER = "j4.x0"
-        private const val XIAOMI_MIRROR_KEYBOARD_SHARE_CONTROLLER_JADX_NAME = "j4.C1039x0"
-        private const val XIAOMI_MIRROR_SHARE_MIRROR_MANAGER = "a4.t"
-        private const val XIAOMI_MIRROR_SHARE_MIRROR_MANAGER_JADX_NAME = "a4.C0506t"
-        private const val XIAOMI_MIRROR_SHARE_SOCKET = "a4.G"
-        private const val XIAOMI_MIRROR_SHARE_SOCKET_JADX_NAME = "a4.C0486G"
-        private const val XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK = "a4.i"
-        private const val XIAOMI_MIRROR_SHARE_SOCKET_CALLBACK_JADX_NAME = "a4.InterfaceC0495i"
-        private const val XIAOMI_MIRROR_KEYBOARD_SHARE_FLAG = 32
-        private const val XIAOMI_MIRROR_ACCEPT_INPUT_STATUS_ACCEPTED = 1
-        private const val XIAOMI_MIRROR_SYNERGY_OPERATE_ON = 1
-        private const val XIAOMI_MIRROR_SYNERGY_OPERATE_OFF = 0
-        private const val XIAOMI_MIRROR_VIRTUAL_DISPLAY_ID = -100
         private const val XIAOMI_MIRROR_WHEEL_AXIS_DIVISOR = 16f
         private const val XIAOMI_MIRROR_WHEEL_AXIS_MAX = 8f
         private const val XIAOMI_MIRROR_INPUT_DEVICE_ID = -100
-        private const val XIAOMI_MIRROR_IMMS_DESCRIPTOR = "com.android.internal.view.IInputMethodManager"
-        private const val XIAOMI_MIRROR_IMMS_CODE_UNREGISTER_MONITOR = 16777212
-        private const val XIAOMI_MIRROR_IMMS_CODE_REGISTER_MONITOR = 16777213
         private const val XIAOMI_MIRROR_SYNERGY_RESET_DEVICE_ID = 0
         private const val XIAOMI_MIRROR_SYNERGY_RESET_X = 500f
         private const val XIAOMI_MIRROR_SYNERGY_RESET_Y = 300f

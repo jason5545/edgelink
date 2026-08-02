@@ -1233,50 +1233,9 @@ private fun KeyboardPanel(
             Text(stringResource(R.string.action_send))
         }
 
-        DebugPhysicalKeyboardToggle()
     }
 }
 
-@Composable
-private fun DebugPhysicalKeyboardToggle() {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var enabled by rememberSaveable { mutableStateOf(false) }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text("硬體鍵盤模式 (debug)")
-        Switch(
-            checked = enabled,
-            onCheckedChange = { target ->
-                scope.launch {
-                    val accepted = withContext(Dispatchers.IO) {
-                        runCatching {
-                            context.contentResolver.call(
-                                "com.xiaomi.mirror.callprovider",
-                                "edgeLinkKeyboard",
-                                null,
-                                Bundle().apply {
-                                    if (target) {
-                                        putBoolean("prepareOnly", true)
-                                    } else {
-                                        putBoolean("releaseOnly", true)
-                                    }
-                                    putString("source", "debug_toggle")
-                                }
-                            )?.getBoolean("edgelinkKeyboardAccepted", false) == true
-                        }.getOrDefault(false)
-                    }
-                    if (accepted) {
-                        enabled = target
-                    }
-                }
-            }
-        )
-    }
-}
 
 @Composable
 private fun PairingScreen(
