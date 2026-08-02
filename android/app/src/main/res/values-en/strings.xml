@@ -31,7 +31,10 @@
   <string name="action_open_settings">Open settings</string>
   <string name="action_fix">Fix</string>
   <string name="action_authorize">Authorize</string>
-  <string name="action_test_milink">Test MiLink</string>
+  <string name="xiaomi_trust_pairing_label">Xiaomi HyperConnect pairing</string>
+  <string name="xiaomi_trust_pairing_paired">Paired</string>
+  <string name="xiaomi_trust_pairing_unpaired">Not paired</string>
+  <string name="xiaomi_trust_pairing_action">Pair</string>
   <string name="action_send">Send</string>
   <string name="action_confirm">Confirm</string>
   <string name="action_start_pairing">Start pairing</string>
@@ -91,7 +94,6 @@
   <string name="shizuku_status_can_authorize">Ready to authorize</string>
   <string name="milink_status_format">MiLink: %1$s</string>
   <string name="milink_probe_not_tested">Not tested yet</string>
-  <string name="milink_probe_requires_shizuku_root">Requires Shizuku root</string>
 
   <string name="pairing_prompt_enter_id">Enter the 9-digit ID shown on your Mac</string>
   <string name="pairing_prompt_confirm">Make sure both numbers match, then tap Confirm</string>

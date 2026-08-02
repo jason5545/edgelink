@@ -41,6 +41,10 @@ final class MacTrustManager: ObservableObject {
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
+    // Set by a phone-initiated pair request: the next truthful notBound
+    // status immediately kicks the official bind flow (the phone shows its
+    // own verification UI) instead of just surfacing the bind mask.
+    var autoBindOnNeedsBind = false
     var touchIdPreauthorized = false
     // Truthful keyguard state from the EdgeLink Android app (KeyguardManager
     // via phone.lockState push), freshness-gated by the caller. Used when
@@ -256,6 +260,10 @@ final class MacTrustManager: ObservableObject {
             }
         case .notBound, .keyError, .passwordChanged, .certExpired, .none:
             state = .needsBind
+            if autoBindOnNeedsBind {
+                autoBindOnNeedsBind = false
+                requestBind()
+            }
         }
         DiagnosticsLog.info("trust.mac.status_event bind=\(auth.bindStatus) enable=\(auth.enableStatus) remoteLocked=\(self.isRemoteLocked)")
     }

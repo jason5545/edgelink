@@ -85,6 +85,8 @@ object EnvelopeTypes {
     const val PHOTO_ACK = "photo.ack"
     const val PHOTO_SYNC_REQUEST = "photo.sync.request"
     const val PHOTO_STATUS = "photo.status"
+    const val XIAOMI_TRUST_STATUS = "xiaomi.trustStatus"
+    const val XIAOMI_TRUST_BIND = "xiaomi.trustBind"
 }
 
 object EnvelopeCodec {
@@ -494,6 +496,15 @@ data class BatteryStatusBody(
 @Serializable
 data class PhoneLockStateBody(
     val locked: Boolean,
+    val ts: Long
+)
+
+// Mac-reported TDIF (小米互聯) pairing state, pushed when the duo.screen
+// trust state resolves. The phone itself cannot cheaply query the TA bind
+// slot, so the Mac (which gets the truthful bindStatus) is the source.
+@Serializable
+data class XiaomiTrustStatusBody(
+    val paired: Boolean,
     val ts: Long
 )
 

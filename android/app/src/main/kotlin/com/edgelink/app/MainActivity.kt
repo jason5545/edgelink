@@ -182,7 +182,7 @@ private class EdgeLinkActivityActions(
     override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
     override fun onRequestShizukuPermission() = delegate.onRequestShizukuPermission()
-    override fun onProbeMiLink() = delegate.onProbeMiLink()
+    override fun onXiaomiTrustPair() = delegate.onXiaomiTrustPair()
     override fun onClipboardHistoryRefresh() = delegate.onClipboardHistoryRefresh()
     override fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody) =
         delegate.onClipboardHistoryItemClick(item)

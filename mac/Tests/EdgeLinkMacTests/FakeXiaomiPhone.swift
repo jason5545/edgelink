@@ -19,6 +19,7 @@ final class FakeXiaomiPhone {
     // Assertion surface
     private(set) var statusActionCount = 0
     private(set) var authActionCount = 0
+    private(set) var bindActionCount = 0
     private(set) var openMirrorScreenCount = 0
     private(set) var closeScreenCount = 0
     private(set) var wfdSessionEstablished = false
@@ -42,6 +43,12 @@ final class FakeXiaomiPhone {
     var truthfulAfterQueries: Int?
 
     var wfdServerStartupDelay: TimeInterval = 0
+
+    // TDIF bind state reported in duo.screen status events. When false the
+    // phone answers bindStatus=notBound; a bindAction flips it to true (the
+    // official phone-side verification + TA registration) and a bindEvent
+    // success plus a fresh truthful status event go out.
+    var bound = true
 
     // Re-lock (or unlock) the phone mid-test, e.g. the user locking it again
     // after a successful Mac-driven unlock.
@@ -505,7 +512,7 @@ final class FakeXiaomiPhone {
         var auth = TrustAuthStatus()
         auth.features = [DuoScreenTrustFeature.unlockDevice]
         auth.enableStatus = enableOverride ?? DuoScreenTrustEnableStatus.enabled.rawValue
-        auth.bindStatus = DuoScreenTrustBindStatus.bound.rawValue
+        auth.bindStatus = (bound ? DuoScreenTrustBindStatus.bound : DuoScreenTrustBindStatus.notBound).rawValue
         auth.remoteRisk = 0
         var event = TrustStatusEvent()
         event.code = DuoScreenTrustCode.success
@@ -545,6 +552,20 @@ final class FakeXiaomiPhone {
             } else {
                 sendStatusEvent(sessionID: trust.sessionID)
             }
+        case .bindAction(let action):
+            guard action.feature == DuoScreenTrustFeature.unlockDevice else { return }
+            bindActionCount += 1
+            log("fakephone.bind_action")
+            // The user completed the phone-side verification: TA registration
+            // done, bind event success, then a fresh truthful status event.
+            bound = true
+            var event = TrustBindEvent()
+            event.feature = DuoScreenTrustFeature.unlockDevice
+            event.code = DuoScreenTrustCode.success
+            sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                DuoScreenTrust(sessionID: trust.sessionID, msg: .bindEvent(event))
+            ))
+            sendStatusEvent(sessionID: trust.sessionID)
         case .authAction(let action):
             guard action.feature == DuoScreenTrustFeature.unlockDevice else { return }
             authActionCount += 1

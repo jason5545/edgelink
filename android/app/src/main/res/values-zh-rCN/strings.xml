@@ -31,7 +31,10 @@
   <string name="action_open_settings">打开设置</string>
   <string name="action_fix">修复</string>
   <string name="action_authorize">授权</string>
-  <string name="action_test_milink">测试 MiLink</string>
+  <string name="xiaomi_trust_pairing_label">小米互联配对</string>
+  <string name="xiaomi_trust_pairing_paired">已配对</string>
+  <string name="xiaomi_trust_pairing_unpaired">尚未配对</string>
+  <string name="xiaomi_trust_pairing_action">配对</string>
   <string name="action_send">发送</string>
   <string name="action_confirm">Confirm</string>
   <string name="action_start_pairing">开始配对</string>
@@ -91,7 +94,6 @@
   <string name="shizuku_status_can_authorize">可授权</string>
   <string name="milink_status_format">MiLink：%1$s</string>
   <string name="milink_probe_not_tested">尚未测试</string>
-  <string name="milink_probe_requires_shizuku_root">需要 Shizuku root</string>
 
   <string name="pairing_prompt_enter_id">输入 Mac 上显示的 9 位 ID</string>
   <string name="pairing_prompt_confirm">确认两边数字相同后按 Confirm</string>

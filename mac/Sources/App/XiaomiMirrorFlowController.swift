@@ -9,6 +9,7 @@ enum XiaomiMirrorMask: Equatable {
     case permission
     case risk
     case bind
+    case binding
 }
 
 // Official PC-client mirror flow, extracted for end-to-end testing.
@@ -47,6 +48,7 @@ final class XiaomiMirrorFlowController {
     var activateUI: () -> Void = {}
     var hasRemoteVideo: () -> Bool = { false }
     var onChanged: ((_ stage: Stage, _ mask: XiaomiMirrorMask?) -> Void)?
+    var onTrustState: ((MacTrustManager.State) -> Void)?
     var log: (String) -> Void = { _ in }
 
     private var flowGeneration: UInt64 = 0
@@ -189,6 +191,15 @@ final class XiaomiMirrorFlowController {
         }
     }
 
+    // Bind mask button (開始配對): the phone reported notBound, so kick the
+    // official duo.screen bind flow — the phone shows its own verification UI
+    // and drives the 595/546 TDIF rebind on the mitrust channel. A successful
+    // bind event lands in .ready and the flow auto-resumes (open / unlock).
+    func bindRequested() {
+        guard trustManager.state == .needsBind else { return }
+        trustManager.requestBind()
+    }
+
     // Mirror stopped (window closed / peer stop / disconnect).
     func stop() {
         flowGeneration &+= 1
@@ -229,6 +240,7 @@ final class XiaomiMirrorFlowController {
     }
 
     private func handleTrustState(_ state: MacTrustManager.State) {
+        onTrustState?(state)
         guard stage != .idle else { return }
         switch state {
         case .queryingStatus:
@@ -260,10 +272,16 @@ final class XiaomiMirrorFlowController {
                 } else if stage != .opening {
                     mask = .loading
                     openMirrorScreenNow()
+                } else {
+                    // Bind just succeeded mid-open: drop the bind/binding mask
+                    // and wait for the video that's already on its way.
+                    mask = .loading
                 }
             }
         case .needsBind:
             mask = .bind
+        case .binding:
+            mask = .binding
         case .riskBlocked:
             mask = .risk
         case .failed:

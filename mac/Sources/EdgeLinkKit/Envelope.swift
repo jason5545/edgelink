@@ -94,6 +94,8 @@ public enum EnvelopeType {
     public static let photoAck = "photo.ack"
     public static let photoSyncRequest = "photo.sync.request"
     public static let photoStatus = "photo.status"
+    public static let xiaomiTrustStatus = "xiaomi.trustStatus"
+    public static let xiaomiTrustBind = "xiaomi.trustBind"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -1015,6 +1017,19 @@ public struct PhoneLockStateBody: Codable, Equatable, Sendable {
 
     public init(locked: Bool, ts: Int64) {
         self.locked = locked
+        self.ts = ts
+    }
+}
+
+// TDIF (小米互聯) pairing state pushed to the phone: the phone cannot
+// cheaply query its own TA bind slot, so the Mac — which receives the
+// truthful duo.screen bindStatus — is the source of truth.
+public struct XiaomiTrustStatusBody: Codable, Equatable, Sendable {
+    public let paired: Bool
+    public let ts: Int64
+
+    public init(paired: Bool, ts: Int64) {
+        self.paired = paired
         self.ts = ts
     }
 }

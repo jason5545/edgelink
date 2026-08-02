@@ -5,6 +5,12 @@ import EdgeLinkKit
 import Foundation
 import IOKit.pwr_mgt
 
+enum XiaomiTrustPairing {
+    case unknown
+    case paired
+    case unpaired
+}
+
 @MainActor
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
@@ -53,6 +59,7 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var isPhoneCallActive = false
     @Published private(set) var phoneRelayEchoCancellationEnabled: Bool
     @Published private(set) var latestMiLinkStatus: MiLinkStatusBody?
+    @Published private(set) var xiaomiTrustPairing: XiaomiTrustPairing = .unknown
     @Published private(set) var latestMiLinkFrame: MiLinkFrameBody?
     @Published private(set) var xiaomiMiLinkCommandStatus = ""
     @Published private(set) var xiaomiHyperConnectAvailable = XiaomiHyperConnectBridge.isInstalled
@@ -285,6 +292,19 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiMirrorFlow.onChanged = { [weak self] _, mask in
             self?.screenSession.xiaomiMirrorMask = mask
         }
+        xiaomiMirrorFlow.onTrustState = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .ready:
+                    self?.xiaomiTrustPairing = .paired
+                case .needsBind, .binding:
+                    self?.xiaomiTrustPairing = .unpaired
+                default:
+                    break
+                }
+                self?.sendXiaomiTrustStatusToPhone()
+            }
+        }
         xiaomiMirrorFlow.log = { message in
             DiagnosticsLog.info(message)
         }
@@ -301,6 +321,11 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.onXiaomiMirrorRetryRequest = { [weak self] in
             Task { @MainActor in
                 self?.xiaomiMirrorFlow.retryRequested()
+            }
+        }
+        screenSession.onXiaomiMirrorBindRequest = { [weak self] in
+            Task { @MainActor in
+                self?.xiaomiMirrorFlow.bindRequested()
             }
         }
         screenSession.onXiaomiMirrorExit = { [weak self] in
@@ -1480,6 +1505,48 @@ final class EdgeLinkRuntime: ObservableObject {
 
     func requestPhoneTrustBind() {
         macTrustManager.requestBind()
+    }
+
+    // Menu-bar 配對 entry: if a trust session is already reporting needsBind,
+    // kick the bind directly; otherwise open the mirror flow, whose status
+    // query lands on the bind mask when the phone is unpaired.
+    func requestXiaomiTrustPairing() {
+        if macTrustManager.state == .needsBind {
+            macTrustManager.requestBind()
+        } else {
+            viewPhoneScreen()
+        }
+    }
+
+    // Phone-initiated pair request (xiaomi.trustBind): arm auto-bind so the
+    // next truthful notBound status immediately starts the official bind
+    // flow, then make sure the trust channel + status query are running.
+    private func handleXiaomiTrustBindRequest() {
+        DiagnosticsLog.info("xiaomi.trust.bind_request_rx")
+        macTrustManager.autoBindOnNeedsBind = true
+        if macTrustManager.state == .needsBind {
+            macTrustManager.requestBind()
+        } else {
+            _ = ensureCastTrustChannel(reason: "phone_bind_request")
+        }
+    }
+
+    private func sendXiaomiTrustStatusToPhone() {
+        guard let session = currentSession, isConnected,
+              xiaomiTrustPairing != .unknown else { return }
+        let body = XiaomiTrustStatusBody(
+            paired: xiaomiTrustPairing == .paired,
+            ts: Int64(Date().timeIntervalSince1970)
+        )
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.xiaomiTrustStatus, b: body))
+                try await session.sendPlaintext(data)
+                DiagnosticsLog.info("xiaomi.trust.status_tx paired=\(body.paired)")
+            } catch {
+                DiagnosticsLog.warn("xiaomi.trust.status_tx_failed error=\(error.localizedDescription)")
+            }
+        }
     }
 
     func requestPhoneUnlock() async {
@@ -3753,6 +3820,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handlePhoneLockState(body)
                         }
                     },
+                    onXiaomiTrustBind: { [weak self] in
+                        Task { @MainActor in
+                            self?.handleXiaomiTrustBindRequest()
+                        }
+                    },
                     onTunnelEnvelope: { [weak self] type, plaintext in
                         Task { @MainActor in
                             self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
@@ -3840,6 +3912,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 hostSessionDidConnect = true
                 resumeXiaomiMirrorAfterReconnectIfNeeded()
                 reportPresence(.awake, reason: "connected")
+                sendXiaomiTrustStatusToPhone()
                 if pendingAwakeNotification {
                     pendingAwakeNotification = false
                     if let data = try? encoder.encode(Envelope(t: EnvelopeType.macAwake, b: EmptyBody())) {

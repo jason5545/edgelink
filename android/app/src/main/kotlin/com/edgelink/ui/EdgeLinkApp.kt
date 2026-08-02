@@ -224,6 +224,7 @@ data class EdgeLinkUiState(
     val shizukuPermissionRequestBlocked: Boolean = false,
     val shizukuUid: Int? = null,
     val xiaomiMiLinkProbeStatus: String? = null,
+    val xiaomiTrustPaired: Boolean? = null,
     val clipboardHistoryItems: List<ClipboardHistoryItemBody> = emptyList(),
     val clipboardBlobStatus: String = "",
     val peerClipboardBlob: Boolean = false
@@ -251,7 +252,7 @@ interface EdgeLinkActions {
     fun onOpenScreenDimmingSettings()
     fun onOpenSmsSettings()
     fun onRequestShizukuPermission()
-    fun onProbeMiLink()
+    fun onXiaomiTrustPair()
     fun onClipboardHistoryRefresh()
     fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody)
 
@@ -277,7 +278,7 @@ interface EdgeLinkActions {
         override fun onOpenScreenDimmingSettings() = Unit
         override fun onOpenSmsSettings() = Unit
         override fun onRequestShizukuPermission() = Unit
-        override fun onProbeMiLink() = Unit
+        override fun onXiaomiTrustPair() = Unit
         override fun onClipboardHistoryRefresh() = Unit
         override fun onClipboardHistoryItemClick(item: ClipboardHistoryItemBody) = Unit
     }
@@ -872,6 +873,27 @@ private fun SettingsScreen(
 
             item {
                 SettingsSection(title = stringResource(R.string.section_screen_share)) {
+                    if (state.isConnected) {
+                        state.xiaomiTrustPaired?.let { paired ->
+                            ListItem(
+                                headlineContent = { Text(stringResource(R.string.xiaomi_trust_pairing_label)) },
+                                supportingContent = {
+                                    Text(
+                                        if (paired) stringResource(R.string.xiaomi_trust_pairing_paired)
+                                        else stringResource(R.string.xiaomi_trust_pairing_unpaired)
+                                    )
+                                },
+                                trailingContent = {
+                                    if (!paired) {
+                                        FilledTonalButton(onClick = actions::onXiaomiTrustPair) {
+                                            Text(stringResource(R.string.xiaomi_trust_pairing_action))
+                                        }
+                                    }
+                                },
+                                colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                            )
+                        }
+                    }
                     SettingsToggleRow(
                         label = stringResource(R.string.toggle_screen_share_privacy),
                         supportingText = if (state.screenSharePrivacyEnabled) {
@@ -1006,10 +1028,6 @@ private fun ShizukuStatusRow(state: EdgeLinkUiState, actions: EdgeLinkActions) {
             if (state.shizukuAvailable && state.shizukuSupported && !state.shizukuPermissionGranted && !state.shizukuPermissionRequestBlocked) {
                 FilledTonalButton(onClick = actions::onRequestShizukuPermission) {
                     Text(stringResource(R.string.action_authorize))
-                }
-            } else if (state.shizukuUid == 0) {
-                FilledTonalButton(onClick = actions::onProbeMiLink) {
-                    Text(stringResource(R.string.action_test_milink))
                 }
             }
         },

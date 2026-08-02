@@ -476,6 +476,74 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Unpaired phone: the status event reports bindStatus=notBound, so the
+    // flow surfaces the bind mask instead of streaming; 開始配對 sends the
+    // duo.screen bindAction, the phone completes its verification (bindEvent
+    // success + truthful bound status), and the flow auto-resumes all the
+    // way to streaming without any further user action.
+    func testUnpairedPhoneBindsThenAutoResumesStreaming() async throws {
+        try makeEnvironment(locked: false)
+        phone.bound = false
+        session.start()
+        controller.start()
+
+        try await waitFor("bind mask on notBound status") { [self] in
+            self.session.isChannelReady && self.controller.mask == .bind
+        }
+        try await waitFor("OPEN still sent (official keeps channel alive)") { [self] in
+            self.phone.openMirrorScreenCount >= 1
+        }
+
+        controller.bindRequested()
+
+        try await waitFor("phone received duo.screen bindAction") { [self] in
+            self.phone.bindActionCount >= 1
+        }
+        try await waitFor("flow auto-resumed to streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        try await waitFor("video datagrams flowing") { [self] in
+            self.videoDatagramsReceived >= 3
+        }
+        XCTAssertEqual(phone.openMirrorScreenCount, 1, "bind must not re-send OPEN_MIRROR_SCREEN")
+        XCTAssertEqual(biometricCallCount, 0, "bind flow must not trigger Touch ID")
+    }
+
+    // 開始配對 on an already-bound phone must be a no-op — only a truthful
+    // notBound status (state == .needsBind) may trigger the bind action.
+    func testBindRequestIgnoredWhenAlreadyBound() async throws {
+        try makeEnvironment(locked: false)
+        session.start()
+        controller.start()
+
+        try await waitFor("streaming on bound phone") { [self] in
+            self.controller.stage == .streaming
+        }
+        controller.bindRequested()
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(phone.bindActionCount, 0)
+    }
+
+    // Phone-initiated pair request (xiaomi.trustBind): with auto-bind armed,
+    // the first truthful notBound status immediately starts the official
+    // bind flow — no Mac-side button press — and the flow resumes to
+    // streaming once the phone completes its verification.
+    func testPhoneInitiatedBindAutoStartsOnNotBound() async throws {
+        try makeEnvironment(locked: false)
+        phone.bound = false
+        trustManager.autoBindOnNeedsBind = true
+        session.start()
+        controller.start()
+
+        try await waitFor("phone received bindAction without Mac button") { [self] in
+            self.phone.bindActionCount >= 1
+        }
+        try await waitFor("flow auto-resumed to streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(biometricCallCount, 0)
+    }
+
     // The Android app's own KeyguardManager report (phone.lockState push) is
     // the fallback truth when duo.screen polls only produce placeholders:
     // an external "unlocked" clears the mask without Touch ID…

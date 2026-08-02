@@ -194,6 +194,24 @@ private struct PhoneSection: View {
             } label: {
                 Label("剪貼簿歷史…", systemImage: "list.clipboard")
             }
+
+            switch runtime.xiaomiTrustPairing {
+            case .paired:
+                Label("已配對（小米互聯）", systemImage: "checkmark.shield")
+                    .foregroundStyle(.secondary)
+            case .unpaired:
+                Button {
+                    runtime.requestXiaomiTrustPairing()
+                } label: {
+                    Label("配對手機（小米互聯）", systemImage: "person.badge.key")
+                }
+            case .unknown:
+                Button {
+                    runtime.requestXiaomiTrustPairing()
+                } label: {
+                    Label("小米互聯配對…", systemImage: "person.badge.key.questionmark")
+                }
+            }
         }
     }
 }

@@ -189,6 +189,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     @Published var xiaomiMirrorMask: XiaomiMirrorMask?
     var onXiaomiMirrorUnlockRequest: (() -> Void)?
     var onXiaomiMirrorRetryRequest: (() -> Void)?
+    var onXiaomiMirrorBindRequest: (() -> Void)?
     var onXiaomiMirrorExit: (() -> Void)?
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
@@ -1925,7 +1926,15 @@ struct PhoneScreenView: View {
                     maskSubtitle(String(localized: "辨識到裝置有安全風險，需在手機上輸入密碼進行驗證"))
                 case .bind:
                     maskIcon("person.badge.key")
-                    maskTitle(String(localized: "在手機上授權此操作"))
+                    maskTitle(String(localized: "尚未與手機配對"))
+                    maskSubtitle(String(localized: "配對時請留意手機上的驗證畫面"))
+                    maskButton(String(localized: "開始配對")) {
+                        session.onXiaomiMirrorBindRequest?()
+                    }
+                case .binding:
+                    ConnectingSpinnerView()
+                    maskTitle(String(localized: "正在配對…"))
+                    maskSubtitle(String(localized: "請在手機上完成驗證"))
                 }
             }
             .padding(24)

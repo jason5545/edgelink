@@ -30,6 +30,7 @@ import com.edgelink.core.CtrlPointerBody
 import com.edgelink.core.CtrlTextBody
 import com.edgelink.core.DeviceId
 import com.edgelink.core.EmptyBody
+import com.edgelink.core.XiaomiTrustStatusBody
 import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.EnvelopeTypes
 import com.edgelink.core.InputKeyBody
@@ -349,6 +350,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onPhotoSyncRequest = {
             launchPhotoSync("manual_remote")
+        },
+        onXiaomiTrustStatus = { body ->
+            stateFlow.update { it.copy(xiaomiTrustPaired = body.paired) }
         }
     )
 
@@ -1062,13 +1066,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         refreshNotificationAccess()
     }
 
-    override fun onProbeMiLink() {
-        miLinkRootProbeAttempted = false
-        if (!tryRunOrRequestShizuku(PendingShizukuAction.MiLinkProbe)) {
-            stateFlow.update {
-                it.copy(xiaomiMiLinkProbeStatus = appContext.getString(R.string.milink_probe_requires_shizuku_root))
-            }
-        }
+    override fun onXiaomiTrustPair() {
+        sendEnvelope(EnvelopeTypes.XIAOMI_TRUST_BIND, EmptyBody)
     }
 
     fun tryHandleNotificationAccessWithShizuku(): Boolean =
@@ -2855,7 +2854,8 @@ private class AndroidCommandDispatcher(
     private val onClipboardSetApplied: () -> Unit = {},
     private val onPhotoRequest: (PhotoRequestBody) -> Unit = {},
     private val onPhotoAck: (PhotoAckBody) -> Unit = {},
-    private val onPhotoSyncRequest: () -> Unit = {}
+    private val onPhotoSyncRequest: () -> Unit = {},
+    private val onXiaomiTrustStatus: (XiaomiTrustStatusBody) -> Unit = {}
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2884,6 +2884,12 @@ private class AndroidCommandDispatcher(
             }
             EnvelopeTypes.MAC_SLEEP -> {
                 onMacSleep()
+                null
+            }
+            EnvelopeTypes.XIAOMI_TRUST_STATUS -> {
+                runCatching { EnvelopeCodec.decode<XiaomiTrustStatusBody>(plaintext).b }
+                    .getOrNull()
+                    ?.let(onXiaomiTrustStatus)
                 null
             }
             EnvelopeTypes.MAC_AWAKE -> {

@@ -31,7 +31,10 @@
   <string name="action_open_settings">設定を開く</string>
   <string name="action_fix">修復</string>
   <string name="action_authorize">許可</string>
-  <string name="action_test_milink">MiLink をテスト</string>
+  <string name="xiaomi_trust_pairing_label">Xiaomi HyperConnect ペアリング</string>
+  <string name="xiaomi_trust_pairing_paired">ペアリング済み</string>
+  <string name="xiaomi_trust_pairing_unpaired">未ペアリング</string>
+  <string name="xiaomi_trust_pairing_action">ペアリング</string>
   <string name="action_send">送信</string>
   <string name="action_confirm">Confirm</string>
   <string name="action_start_pairing">ペアリングを開始</string>
@@ -91,7 +94,6 @@
   <string name="shizuku_status_can_authorize">許可可能</string>
   <string name="milink_status_format">MiLink：%1$s</string>
   <string name="milink_probe_not_tested">未テスト</string>
-  <string name="milink_probe_requires_shizuku_root">Shizuku root が必要です</string>
 
   <string name="pairing_prompt_enter_id">Mac に表示されている 9 桁の ID を入力してください</string>
   <string name="pairing_prompt_confirm">両方の数字が同じことを確認して Confirm を押してください</string>
