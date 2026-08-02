@@ -227,15 +227,31 @@ final class XiaomiMiShareDiscovery: NSObject {
     func currentPhoneMeshEndpoints() -> [(host: String, port: UInt16)] {
         // When the EdgeLink phone's LAN-session IP is known, pin mesh traffic
         // to it — other HyperConnect phones on the network also answer phys
-        // sync and must not win the endpoint race.
-        let pinnedHost = UserDefaults.standard.string(forKey: "lanLastPhoneIP")
+        // sync and must not win the endpoint race. The pin is a hotspot
+        // fallback (no mDNS there): a live mDNS phone peer at a different IP
+        // means the phone moved networks and the pin is stale, so drop it.
+        let livePhoneHosts: Set<String> = Set(peersByServiceName.values.compactMap { peer in
+            guard let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:)),
+                  appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone
+            else {
+                return nil
+            }
+            return peer.resolvedIPv4 ?? Self.parseDebugInfoIPv4(peer.debugInfo)
+        })
+        var pinnedHost = UserDefaults.standard.string(forKey: "lanLastPhoneIP")
+        if let pinned = pinnedHost, !pinned.isEmpty, !livePhoneHosts.isEmpty, !livePhoneHosts.contains(pinned) {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.stale_pin_ignored pinned=\(pinned) live=\(livePhoneHosts.joined(separator: ","))"
+            )
+            pinnedHost = nil
+        }
         let pinActive = pinnedHost?.isEmpty == false
         func pinned(_ host: String) -> Bool { !pinActive || host == pinnedHost }
         var endpoints: [(host: String, port: UInt16)] = []
         if let live = meshResponder?.currentPhoneEndpoint(), pinned(live.host) {
             endpoints.append(live)
         }
-        if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
+        if let lanIP = pinnedHost, !lanIP.isEmpty {
             let reported = (UserDefaults.standard.array(forKey: "lyraReportedPhoneMeshPorts") as? [Int]) ?? []
             for port in reported {
                 if let value = UInt16(exactly: port) {
@@ -256,7 +272,7 @@ final class XiaomiMiShareDiscovery: NSObject {
         }
         let history = (meshResponder?.persistedPhoneEndpoints() ?? []).filter { pinned($0.host) }
         endpoints.append(contentsOf: history)
-        if let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty {
+        if let lanIP = pinnedHost, !lanIP.isEmpty {
             let lanTime = UserDefaults.standard.double(forKey: "lanLastPhoneIPTime")
             if Date().timeIntervalSince1970 - lanTime < 86_400 {
                 var ports = Set(history.map(\.port))

@@ -8,8 +8,7 @@ final class LyraMeshResponder {
     // (the published mesh port). The live trust session implements the
     // mitrust server; we forward those frames to it instead of answering
     // with the mishare sync-auth flow (which breaks the phone).
-    static weak var activeTrustSession: LyraCastTrustSession?
-
+    
     // The EdgeLink phone is the one whose app holds a LAN session with us
     // (it reports lanLastPhoneIP). Other HyperConnect devices on the network
     // (e.g. a coworker's phone) also answer phys sync and dial mitrustservice;
@@ -38,20 +37,7 @@ final class LyraMeshResponder {
         0x32, 0xD9, 0x34, 0x9A, 0xED, 0x05, 0x3C, 0x67, 0x61, 0x1B, 0x15, 0x2F,
         0xFA, 0x8F, 0x17, 0x29, 0x18, 0x52, 0x9E, 0x68, 0xA0, 0xD9, 0x3
     ])
-    static let officialMacSyncInfoSignature = Data([
-        0x33, 0x85, 0xFB, 0xAA, 0x02, 0xFD, 0x4E, 0x2C, 0xE1, 0x95, 0x74, 0x3A,
-        0xA8, 0xDD, 0x50, 0xDB, 0xC6, 0xB7, 0xA4, 0xEC, 0x36, 0x6F, 0x0B, 0xAA,
-        0x98, 0xA7, 0x6C, 0xDA, 0x11, 0x7F, 0x94, 0x25, 0x9B, 0xD8, 0x32, 0xCE,
-        0xB6, 0x73, 0x80, 0xB1, 0x3D, 0xFF, 0x13, 0x9A, 0xBE, 0x94, 0x55, 0x22,
-        0x44, 0x88, 0xD4, 0x12, 0x70, 0x94, 0x1A, 0xB3, 0x3F, 0x9D, 0xCF, 0x5C,
-        0x6D, 0xBA, 0xEF, 0x7A, 0x30, 0xB8, 0x8F, 0x28, 0x26, 0x16, 0x0E, 0xB4,
-        0x61, 0xFA, 0x06, 0xB3, 0xB2, 0xB9, 0x4A, 0xB9, 0x6F, 0x8C, 0x7E, 0x9F,
-        0x6A, 0x98, 0x05, 0x17, 0xF2, 0xA6, 0xE3, 0x3C, 0x8F, 0xE3, 0xE4, 0xC8,
-        0xE2, 0x92, 0xF7, 0xB0, 0x02, 0x5D, 0x4A, 0x89, 0x37, 0xC3, 0x63, 0x9A,
-        0xB9, 0xA6, 0xB1, 0x42, 0x7C, 0xC1, 0xFC, 0x65, 0xD3, 0xB2, 0x9C, 0x2F,
-        0x3D, 0x5A, 0x76, 0xF6, 0xBC, 0xF0, 0x90, 0x20, 0x59, 0x1E, 0x47, 0xC5,
-        0xDF, 0x82, 0xED, 0xC3, 0x9C, 0x9A, 0xBE, 0x30, 0xA1, 0x71, 0x60, 0x64
-    ])
+    static let officialMacSyncInfoSignature = LyraCastTrustSession.officialMacSyncInfoSignature
 
     private let socket: LyraMeshSocket
     private let deviceIdHexProvider: () -> String?
@@ -97,12 +83,7 @@ final class LyraMeshResponder {
         var received: Int64
     }
 
-    static let hkdfSalt = Data([
-        0x5E, 0xD5, 0xA3, 0xF8, 0x36, 0xF6, 0xB5, 0x4F,
-        0x7B, 0x1E, 0xFA, 0xD0, 0x27, 0x14, 0xD5, 0x17,
-        0x7B, 0x8A, 0x1F, 0x0F, 0x19, 0xE3, 0x69, 0xCC,
-        0x0B, 0xE8, 0xD9, 0x8B, 0xA6, 0x29, 0x73, 0x17
-    ])
+    static let hkdfSalt = LyraMeshHkdf.salt
 
     init(
         socket: LyraMeshSocket,
@@ -182,7 +163,7 @@ final class LyraMeshResponder {
         if let parsed = Self.parseEndpoint(endpoint.debugDescription), Self.isExpectedPhoneHost(parsed.host) {
             Self.recordPhoneEndpoint(endpoint.debugDescription)
         }
-        if let session = Self.activeTrustSession, session.handlesAdoptedMitrust(frame: frame, endpoint: endpoint) {
+        if let session = LyraCastTrustSession.activeTrustSession, session.handlesAdoptedMitrust(frame: frame, endpoint: endpoint) {
             return
         }
         if frame.packType == 5 {
@@ -632,7 +613,7 @@ final class LyraMeshResponder {
         guard channelSocket == nil, !channelNegotiationStarted else {
             return
         }
-        if let session = Self.activeTrustSession, session.mitrustConnActive() {
+        if let session = LyraCastTrustSession.activeTrustSession, session.mitrustConnActive() {
             return
         }
         guard let deviceIdHex = deviceIdHexProvider() else {
@@ -1181,7 +1162,7 @@ final class LyraMeshResponder {
             if serviceName == "com.xiaomi.trustservice:mitrustservice" {
                 let isExpected = Self.parseEndpoint(endpoint.debugDescription)
                     .map { Self.isExpectedPhoneHost($0.host) } ?? true
-                if let session = Self.activeTrustSession, isExpected {
+                if let session = LyraCastTrustSession.activeTrustSession, isExpected {
                     DiagnosticsLog.info("xiaomi.mishare.mesh_mitrust_adopt service=\(serviceName)")
                     let socket = self.socket
                     session.adoptMitrustSyncInfo(

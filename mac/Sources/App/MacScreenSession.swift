@@ -8,15 +8,8 @@ import WebRTC
 private enum PhoneScreenChromeMetrics {
     static let topHotZoneHeight: CGFloat = 88
     static let bottomHotZoneHeight: CGFloat = 104
-    static let topBarHeight: CGFloat = 46
-    static let bottomBarHeight: CGFloat = 58
-    static let horizontalControlInset: CGFloat = 18
     static let hideDelaySeconds: TimeInterval = 1.15
     static let initialHideDelaySeconds: TimeInterval = 1.6
-
-    static var expandedHeight: CGFloat {
-        topBarHeight + bottomBarHeight
-    }
 
     static func effectiveHotZoneHeight(_ baseHeight: CGFloat, for viewHeight: CGFloat) -> CGFloat {
         min(baseHeight, max(36, viewHeight * 0.24), viewHeight / 2)
@@ -193,9 +186,10 @@ struct XiaomiMirrorScreenConfiguration: Equatable {
 
 final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var status = "Idle"
-    @Published var phoneUnlockPhase: PhoneUnlockPhase?
-    var onPhoneUnlockRetry: (() -> Void)?
-    var onPhoneUnlockDismiss: (() -> Void)?
+    @Published var xiaomiMirrorMask: XiaomiMirrorMask?
+    var onXiaomiMirrorUnlockRequest: (() -> Void)?
+    var onXiaomiMirrorRetryRequest: (() -> Void)?
+    var onXiaomiMirrorExit: (() -> Void)?
     @Published private(set) var screenMeta: ScreenMetaBody?
     @Published private(set) var hasRemoteVideo = false
     @Published private(set) var hasRemoteAudio = false
@@ -244,7 +238,6 @@ final class MacScreenSession: NSObject, ObservableObject {
     private var screenControlHoverRegion: PhoneScreenControlRegion = .outside
     private var screenControlHideWorkItem: DispatchWorkItem?
     private var screenControlEventMonitor: Any?
-    private var areScreenControlsExpandingWindow = false
     private var windowVideoOrientation: PhoneScreenOrientation?
     private var xiaomiScreenConfiguration: XiaomiMirrorScreenConfiguration?
 
@@ -354,6 +347,9 @@ final class MacScreenSession: NSObject, ObservableObject {
     func renderXiaomiMirrorFrame(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
         setXiaomiMirrorRouteActive(true)
         isRenderingXiaomiMirror = true
+        if xiaomiMirrorMask == .loading || xiaomiMirrorMask == .connectFailed {
+            xiaomiMirrorMask = nil
+        }
         if !isScreenSessionActive {
             isScreenSessionActive = true
             onSessionActivityChanged?(true)
@@ -653,6 +649,14 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
     }
 
+    func requestClose() {
+        if isUsingXiaomiMirrorRoute, let onXiaomiMirrorExit {
+            onXiaomiMirrorExit()
+            return
+        }
+        closeWindow()
+    }
+
     func closeWindow(sendRemoteStop: Bool = true) {
         if let window {
             self.window = nil
@@ -756,11 +760,16 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: initialContentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = String(localized: "手機")
+        window.title = String(localized: "妙享桌面")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.minSize = NSSize(width: 260, height: 360)
         window.contentView = NSHostingView(rootView: content)
         window.center()
@@ -794,9 +803,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
 
-        let chromeHeight = areScreenControlsExpandingWindow
-            ? PhoneScreenChromeMetrics.expandedHeight
-            : 0
+        let chromeHeight: CGFloat = 0
         let currentStageSize = NSSize(
             width: contentView.bounds.width,
             height: max(1, contentView.bounds.height - chromeHeight)
@@ -935,7 +942,6 @@ final class MacScreenSession: NSObject, ObservableObject {
         screenControlHideWorkItem?.cancel()
         screenControlHideWorkItem = nil
         if !areScreenControlsVisible {
-            setScreenControlsExpanded(true)
             areScreenControlsVisible = true
         }
     }
@@ -970,7 +976,6 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
         if areScreenControlsVisible {
             areScreenControlsVisible = false
-            setScreenControlsExpanded(false)
         }
     }
 
@@ -979,30 +984,6 @@ final class MacScreenSession: NSObject, ObservableObject {
         screenControlHideWorkItem = nil
         screenControlHoverRegion = .outside
         areScreenControlsVisible = false
-        setScreenControlsExpanded(false)
-    }
-
-    private func setScreenControlsExpanded(_ expanded: Bool) {
-        guard areScreenControlsExpandingWindow != expanded else {
-            return
-        }
-        guard let window else {
-            areScreenControlsExpandingWindow = expanded
-            return
-        }
-
-        let delta = PhoneScreenChromeMetrics.expandedHeight
-        var frame = window.frame
-        if expanded {
-            frame.origin.y -= PhoneScreenChromeMetrics.bottomBarHeight
-            frame.size.height += delta
-        } else {
-            frame.origin.y += PhoneScreenChromeMetrics.bottomBarHeight
-            frame.size.height = max(window.minSize.height, frame.size.height - delta)
-        }
-
-        areScreenControlsExpandingWindow = expanded
-        window.setFrame(frame, display: true, animate: false)
     }
 
     private func applyPinnedWindowState() {
@@ -1755,29 +1736,43 @@ extension MacScreenSession: RTCDataChannelDelegate {
 struct PhoneScreenView: View {
     @ObservedObject var session: MacScreenSession
 
+    private static let cornerRadius: CGFloat = 12
+
     var body: some View {
-        VStack(spacing: 0) {
-            if session.areScreenControlsVisible {
-                topControls
-                    .transition(.move(edge: .top).combined(with: .opacity))
+        videoStage
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
+            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
             }
-
-            videoStage
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
-
-            if session.areScreenControlsVisible {
-                bottomControls
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            .overlay(alignment: .top) {
+                if session.areScreenControlsVisible {
+                    topBar
+                        .padding(.top, 10)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
-        }
-        .background(Color.black)
-        .clipped()
-        .animation(.easeOut(duration: 0.18), value: session.areScreenControlsVisible)
-        .frame(minWidth: 260, minHeight: 360)
-        .onHover { hovered in
-            session.setScreenControlWindowHovered(hovered)
-        }
+            .overlay(alignment: .bottom) {
+                if session.areScreenControlsVisible {
+                    bottomBar
+                        .padding(.bottom, 12)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .overlay {
+                if let mask = session.xiaomiMirrorMask {
+                    maskView(for: mask)
+                        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: session.areScreenControlsVisible)
+            .animation(.easeOut(duration: 0.18), value: session.xiaomiMirrorMask)
+            .frame(minWidth: 260, minHeight: 360)
+            .onHover { hovered in
+                session.setScreenControlWindowHovered(hovered)
+            }
     }
 
     private var aspectRatio: CGFloat? {
@@ -1789,32 +1784,14 @@ struct PhoneScreenView: View {
 
     @ViewBuilder
     private var connectingOverlay: some View {
-        if let phase = session.phoneUnlockPhase {
-            PhoneUnlockPhaseView(
-                phase: phase,
-                onRetry: { session.onPhoneUnlockRetry?() },
-                onDismiss: { session.onPhoneUnlockDismiss?() }
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.black)
-        } else {
-            let content = VStack(spacing: 14) {
-                ConnectingSpinnerView()
-                Text(session.status)
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
-            }
-            if #available(macOS 26.0, *) {
-                content
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .glassEffect(.regular, in: .rect)
-            } else {
-                ZStack {
-                    VisualEffectBlurView(material: .hudWindow, blendingMode: .withinWindow)
-                    content
-                }
-            }
+        VStack(spacing: 14) {
+            ConnectingSpinnerView()
+            Text(String(localized: "正在連接"))
+                .foregroundStyle(.secondary)
+                .font(.callout)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
     }
 
     private var videoStage: some View {
@@ -1827,7 +1804,7 @@ struct PhoneScreenView: View {
                     .frame(width: videoFrame.width, height: videoFrame.height)
                     .position(x: videoFrame.midX, y: videoFrame.midY)
 
-                if session.phoneUnlockPhase != nil || !session.hasRemoteVideo {
+                if session.xiaomiMirrorMask == nil && !session.hasRemoteVideo {
                     connectingOverlay
                 }
             }
@@ -1862,45 +1839,45 @@ struct PhoneScreenView: View {
         )
     }
 
-    private var topControls: some View {
-        HStack {
-            Spacer()
-            pinButton
+    private var topBar: some View {
+        HStack(spacing: 6) {
+            chromeButton(systemName: "xmark", help: String(localized: "關閉")) {
+                session.requestClose()
+            }
+            chromeButton(
+                systemName: session.isPinned ? "pin.fill" : "pin",
+                help: session.isPinned ? String(localized: "取消置頂") : String(localized: "視窗置頂")
+            ) {
+                session.togglePinned()
+            }
         }
-        .padding(.horizontal, PhoneScreenChromeMetrics.horizontalControlInset)
-        .frame(height: PhoneScreenChromeMetrics.topBarHeight)
-        .frame(maxWidth: .infinity)
-        .background(.regularMaterial)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.25), radius: 8, y: 2)
     }
 
-    private var pinButton: some View {
-        Button {
-            session.togglePinned()
-        } label: {
-            Image(systemName: session.isPinned ? "pin.fill" : "pin")
-                .font(.system(size: 15, weight: .semibold))
-                .frame(width: 34, height: 34)
+    private func chromeButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 28, height: 28)
                 .contentShape(Circle())
         }
         .buttonStyle(.borderless)
-        .help(session.isPinned ? "Unpin" : "Keep on Top")
-        .accessibilityLabel(Text(session.isPinned ? "Unpin Phone Window" : "Pin Phone Window"))
-        .background(.regularMaterial, in: Circle())
+        .help(help)
     }
 
-    private var bottomControls: some View {
+    private var bottomBar: some View {
         HStack(spacing: 14) {
-            globalButton(systemName: "rectangle.stack", action: "recents", help: String(localized: "Recents"))
+            globalButton(systemName: "rectangle.stack", action: "recents", help: String(localized: "進入最近任務"))
             globalButton(systemName: "circle", action: "home", help: String(localized: "Home"))
             globalButton(systemName: "chevron.backward", action: "back", help: String(localized: "Back"))
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 9)
-        .background(.regularMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
-        .frame(height: PhoneScreenChromeMetrics.bottomBarHeight)
-        .frame(maxWidth: .infinity)
-        .background(Color.black)
+        .background(.ultraThinMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
     }
 
     private func globalButton(systemName: String, action: String, help: String) -> some View {
@@ -1914,6 +1891,75 @@ struct PhoneScreenView: View {
         }
         .buttonStyle(.borderless)
         .help(help)
+    }
+
+    @ViewBuilder
+    private func maskView(for mask: XiaomiMirrorMask) -> some View {
+        ZStack {
+            Color.black.opacity(0.94)
+            VStack(spacing: 12) {
+                switch mask {
+                case .loading:
+                    ConnectingSpinnerView()
+                    maskTitle(String(localized: "正在連接"))
+                case .locked:
+                    maskIcon("lock.fill")
+                    maskTitle(String(localized: "手機已鎖定螢幕"))
+                    maskSubtitle(String(localized: "請在手機上解鎖螢幕"))
+                    maskButton(String(localized: "解除鎖定")) {
+                        session.onXiaomiMirrorUnlockRequest?()
+                    }
+                case .unlocking:
+                    ConnectingSpinnerView()
+                    maskTitle(String(localized: "正在解鎖…"))
+                case .connectFailed:
+                    maskIcon("exclamationmark.triangle.fill")
+                    maskTitle(String(localized: "連接失敗"))
+                    maskSubtitle(String(localized: "請確保手機在附近，並與本機連接相同 Wi-Fi 或熱點"))
+                    maskButton(String(localized: "重試")) {
+                        session.onXiaomiMirrorRetryRequest?()
+                    }
+                case .permission:
+                    maskIcon("iphone")
+                    maskTitle(String(localized: "請在「手機」上允許使用螢幕內容"))
+                case .risk:
+                    maskIcon("lock.shield")
+                    maskTitle(String(localized: "在小米手機上解鎖"))
+                    maskSubtitle(String(localized: "辨識到裝置有安全風險，需在手機上輸入密碼進行驗證"))
+                case .bind:
+                    maskIcon("person.badge.key")
+                    maskTitle(String(localized: "在手機上授權此操作"))
+                }
+            }
+            .padding(24)
+        }
+    }
+
+    private func maskIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 30, weight: .regular))
+            .foregroundStyle(.secondary)
+            .padding(.bottom, 4)
+    }
+
+    private func maskTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.headline)
+            .multilineTextAlignment(.center)
+    }
+
+    private func maskSubtitle(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+    }
+
+    private func maskButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .padding(.top, 6)
     }
 }
 

@@ -17,6 +17,12 @@ final class MacTrustManager: ObservableObject {
         didSet { onStateChanged?(state) }
     }
     @Published private(set) var statusEvent: TrustStatusEvent?
+    // Set only by a successful duo.screen authEvent (562/563). Status polls
+    // on this device are unreliable (the phone answers disabledBySetting and
+    // then a success event with remoteKeyguardStatus=valid while still
+    // locked, after its shared-auth query times out), so the lock mask may
+    // only be cleared by this confirmed signal.
+    private(set) var unlockConfirmed = false
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
@@ -60,6 +66,7 @@ final class MacTrustManager: ObservableObject {
         statusEvent = nil
         awaitingAuthEvent = false
         awaitingBindEvent = false
+        unlockConfirmed = false
     }
 
     func requestBind() {
@@ -135,7 +142,9 @@ final class MacTrustManager: ObservableObject {
     private func handleStatusEvent(_ event: TrustStatusEvent) {
         statusEvent = event
         if event.code == DuoScreenTrustCode.disabledBySetting {
-            state = .ready(locked: true)
+            // disabledBySetting carries no keyguard information — after a
+            // confirmed unlock it must not flip the state back to locked.
+            state = .ready(locked: !unlockConfirmed)
             DiagnosticsLog.info(
                 "trust.mac.status_setting_only assumed_ready enabled=\(event.auth?.enableStatus ?? -99) " +
                     "bind=\(event.auth?.bindStatus ?? -99) localRisk=\(event.auth?.localRisk ?? -99) remoteRisk=\(event.auth?.remoteRisk ?? -99)"
@@ -159,7 +168,16 @@ final class MacTrustManager: ObservableObject {
         }
         switch DuoScreenTrustBindStatus(rawValue: auth.bindStatus) {
         case .bound:
+            if isRemoteLocked {
+                unlockConfirmed = false
+            }
             state = .ready(locked: isRemoteLocked)
+            if autoUnlockOnReady {
+                autoUnlockOnReady = false
+                if isRemoteLocked {
+                    Task { await self.requestUnlock() }
+                }
+            }
         case .notBound, .keyError, .passwordChanged, .certExpired, .none:
             state = .needsBind
         }
@@ -188,6 +206,7 @@ final class MacTrustManager: ObservableObject {
         defer { onAuthEventHandled?() }
         switch event.code {
         case DuoScreenTrustCode.success:
+            unlockConfirmed = true
             state = .ready(locked: false)
             DiagnosticsLog.info("trust.mac.unlock_success")
             onUnlockSucceeded?()

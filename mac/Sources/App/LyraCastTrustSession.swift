@@ -4,6 +4,36 @@ import Foundation
 import Network
 
 final class LyraCastTrustSession {
+    static weak var activeTrustSession: LyraCastTrustSession?
+
+    // Wiring hooks so the session stays free of responder/UI dependencies
+    // (assigned by the app at startup; defaults keep it unit-testable).
+    static var parseEndpoint: (String) -> (host: String, port: UInt16)? = { description in
+        guard let separator = description.lastIndex(of: ":") else { return nil }
+        let host = String(description[description.startIndex..<separator])
+        guard let port = UInt16(description[description.index(after: separator)...]), !host.isEmpty else {
+            return nil
+        }
+        return (host, port)
+    }
+    static var isExpectedPhoneHost: (String) -> Bool = { _ in true }
+    static var recordPhoneEndpoint: (String) -> Void = { _ in }
+    static var onPasskeyCompare: ((String) -> Void)?
+    static let officialMacSyncInfoSignature = Data([
+        0x33, 0x85, 0xFB, 0xAA, 0x02, 0xFD, 0x4E, 0x2C, 0xE1, 0x95, 0x74, 0x3A,
+        0xA8, 0xDD, 0x50, 0xDB, 0xC6, 0xB7, 0xA4, 0xEC, 0x36, 0x6F, 0x0B, 0xAA,
+        0x98, 0xA7, 0x6C, 0xDA, 0x11, 0x7F, 0x94, 0x25, 0x9B, 0xD8, 0x32, 0xCE,
+        0xB6, 0x73, 0x80, 0xB1, 0x3D, 0xFF, 0x13, 0x9A, 0xBE, 0x94, 0x55, 0x22,
+        0x44, 0x88, 0xD4, 0x12, 0x70, 0x94, 0x1A, 0xB3, 0x3F, 0x9D, 0xCF, 0x5C,
+        0x6D, 0xBA, 0xEF, 0x7A, 0x30, 0xB8, 0x8F, 0x28, 0x26, 0x16, 0x0E, 0xB4,
+        0x61, 0xFA, 0x06, 0xB3, 0xB2, 0xB9, 0x4A, 0xB9, 0x6F, 0x8C, 0x7E, 0x9F,
+        0x6A, 0x98, 0x05, 0x17, 0xF2, 0xA6, 0xE3, 0x3C, 0x8F, 0xE3, 0xE4, 0xC8,
+        0xE2, 0x92, 0xF7, 0xB0, 0x02, 0x5D, 0x4A, 0x89, 0x37, 0xC3, 0x63, 0x9A,
+        0xB9, 0xA6, 0xB1, 0x42, 0x7C, 0xC1, 0xFC, 0x65, 0xD3, 0xB2, 0x9C, 0x2F,
+        0x3D, 0x5A, 0x76, 0xF6, 0xBC, 0xF0, 0x90, 0x20, 0x59, 0x1E, 0x47, 0xC5,
+        0xDF, 0x82, 0xED, 0xC3, 0x9C, 0x9A, 0xBE, 0x30, 0xA1, 0x71, 0x60, 0x64
+    ])
+
     enum Stage: Equatable {
         case physSync
         case cookie
@@ -148,7 +178,7 @@ final class LyraCastTrustSession {
                 self.fail(String(localized: "mesh socket 啟動失敗"))
                 return
             }
-            LyraMeshResponder.activeTrustSession = self
+            LyraCastTrustSession.activeTrustSession = self
             self.startWatchdog()
             self.sendPhysSyncRequest()
         }
@@ -189,13 +219,15 @@ final class LyraCastTrustSession {
 
     private func finishLocked() {
         cancelled = true
-        if LyraMeshResponder.activeTrustSession === self {
-            LyraMeshResponder.activeTrustSession = nil
+        if LyraCastTrustSession.activeTrustSession === self {
+            LyraCastTrustSession.activeTrustSession = nil
         }
         watchdog?.cancel()
         watchdog = nil
         channelSocket?.stop()
         channelSocket = nil
+        srvChannelSocket?.stop()
+        srvChannelSocket = nil
         socket.stop()
         DispatchQueue.main.async { [weak self] in
             self?.trustManager.stop()
@@ -258,7 +290,7 @@ final class LyraCastTrustSession {
     ) {
         queue.async { [weak self] in
             guard let self, !self.cancelled else { return }
-            if let parsed = LyraMeshResponder.parseEndpoint(endpoint.debugDescription) {
+            if let parsed = Self.parseEndpoint(endpoint.debugDescription) {
                 self.host = parsed.host
                 self.port = parsed.port
                 self.endpoints = [parsed]
@@ -275,7 +307,7 @@ final class LyraCastTrustSession {
     // frame belongs to the adopted mitrustservice conn.
     func handlesAdoptedMitrust(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) -> Bool {
         guard adoptedSend != nil, srvConnId != 0,
-              let parsed = LyraMeshResponder.parseEndpoint(endpoint.debugDescription),
+              let parsed = Self.parseEndpoint(endpoint.debugDescription),
               parsed.host == host
         else { return false }
         switch frame.packType {
@@ -386,7 +418,7 @@ final class LyraCastTrustSession {
         LyraProtoWriter.appendLengthDelimitedField(4, value: Data(Self.serviceName.utf8), to: &syncInfo)
         LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
         LyraProtoWriter.appendLengthDelimitedField(
-            6, value: LyraMeshResponder.officialMacSyncInfoSignature, to: &syncInfo
+            6, value: Self.officialMacSyncInfoSignature, to: &syncInfo
         )
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
         let logiConn = LogiConnFrame(logiConnId: logiConnId, localNetId: 1, remoteNetId: peerNetId, inner: inner.serialized())
@@ -480,13 +512,13 @@ final class LyraCastTrustSession {
             let secret = sharedSecret.withUnsafeBytes { Data($0) }
             channelKeyCS = HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: SymmetricKey(data: secret),
-                salt: LyraMeshResponder.hkdfSalt,
+                salt: LyraMeshHkdf.salt,
                 info: authClientRandom + authServerRandom,
                 outputByteCount: 32
             )
             channelKeySC = HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: SymmetricKey(data: secret),
-                salt: LyraMeshResponder.hkdfSalt,
+                salt: LyraMeshHkdf.salt,
                 info: authServerRandom + authClientRandom,
                 outputByteCount: 32
             )
@@ -497,6 +529,21 @@ final class LyraCastTrustSession {
             }
         } catch {
             fail(String(localized: "ECDH 失敗"))
+        }
+    }
+
+    // Re-dials the cast logi conn on the still-alive phys conn after the
+    // phone released it. Crucially this keeps the adopted mitrustservice
+    // server socket alive: the phone drives the real 546/562 auth on the
+    // channel it already has to us, and killing it strands the unlock.
+    func redialCastChannel() {
+        queue.async { [weak self] in
+            guard let self, !self.cancelled, self.channelKeyCS != nil else {
+                DiagnosticsLog.warn("xiaomi.cast.trust_channel_redial_impossible")
+                return
+            }
+            DiagnosticsLog.info("xiaomi.cast.trust_channel_redial")
+            self.sendLogiConnRequest()
         }
     }
 
@@ -652,7 +699,7 @@ final class LyraCastTrustSession {
             srvKeyCandidates = infos.map {
                 HKDF<SHA256>.deriveKey(
                     inputKeyMaterial: SymmetricKey(data: secret),
-                    salt: LyraMeshResponder.hkdfSalt,
+                    salt: LyraMeshHkdf.salt,
                     info: $0,
                     outputByteCount: 32
                 )
@@ -682,7 +729,7 @@ final class LyraCastTrustSession {
             LyraProtoWriter.appendLengthDelimitedField(4, value: Data(Self.mitrustServiceName.utf8), to: &syncInfo)
             LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
             LyraProtoWriter.appendLengthDelimitedField(
-                6, value: LyraMeshResponder.officialMacSyncInfoSignature, to: &syncInfo
+                6, value: Self.officialMacSyncInfoSignature, to: &syncInfo
             )
         }
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
@@ -846,7 +893,7 @@ final class LyraCastTrustSession {
                     if let onPairingPasskey {
                         onPairingPasskey(code)
                     } else {
-                        LyraPairingPresenter.showPasskey(code)
+                        Self.onPasskeyCompare?(code)
                     }
                 case let .completed(peerIdentityPubKey):
                     DiagnosticsLog.info("xiaomi.cast.mitrust_passkeypair_completed")
@@ -1420,7 +1467,7 @@ final class LyraCastTrustSession {
             if stage == .physSync {
                 if let separator = endpoint.debugDescription.lastIndex(of: ":") {
                     let replyHost = String(endpoint.debugDescription[endpoint.debugDescription.startIndex..<separator])
-                    if !LyraMeshResponder.isExpectedPhoneHost(replyHost) {
+                    if !Self.isExpectedPhoneHost(replyHost) {
                         DiagnosticsLog.info("xiaomi.cast.trust_endpoint_ignored host=\(replyHost) (not the EdgeLink phone)")
                         return
                     }
@@ -1430,7 +1477,7 @@ final class LyraCastTrustSession {
                         host = replyHost
                         port = replyPort
                         endpoints = [(replyHost, replyPort)]
-                        LyraMeshResponder.recordPhoneEndpoint("\(replyHost):\(replyPort)")
+                        Self.recordPhoneEndpoint("\(replyHost):\(replyPort)")
                         DiagnosticsLog.info("xiaomi.cast.trust_endpoint_locked host=\(replyHost) port=\(replyPort)")
                     }
                 }
@@ -1519,12 +1566,17 @@ final class LyraCastTrustSession {
                 // The phone released our cast channel (52011 "channel peer
                 // sdk release" after idle). Mark it dead — writing into it
                 // silently goes nowhere (UDP) and leaves the unlock UI stuck
-                // at queryingStatus. Without an adopted mitrust conn, finish
-                // so the next unlock attempt re-dials a fresh session.
+                // at queryingStatus.
                 channelReady = false
                 channelSocket?.stop()
                 channelSocket = nil
                 DiagnosticsLog.info("xiaomi.cast.trust_channel_released_by_peer")
+                // The phone releases the cast logi conn right after the trust
+                // exchange but keeps the adopted mitrustservice conn to run
+                // the actual 595/546/562 auth on it — finishing here would
+                // kill the unlock mid-flight. Only finish when no mitrust
+                // conn was adopted; the mirror flow force-rebuilds stale
+                // sessions on demand, so this never wedges the next start.
                 if srvConnId == 0 {
                     finishLocked()
                 }
@@ -1666,7 +1718,7 @@ final class LyraCastTrustSession {
         syncKeyCandidates = infos.map {
             HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: SymmetricKey(data: secret),
-                salt: LyraMeshResponder.hkdfSalt,
+                salt: LyraMeshHkdf.salt,
                 info: $0,
                 outputByteCount: 32
             )
