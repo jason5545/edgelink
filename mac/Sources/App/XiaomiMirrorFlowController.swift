@@ -124,6 +124,21 @@ final class XiaomiMirrorFlowController {
         }
     }
 
+    // Phone released the cast channel mid-stream (reboot / sdk release):
+    // the mirror is dead regardless of what the video watchdog thinks, so
+    // restart the whole flow — redial the channel, then re-OPEN the mirror
+    // screen once notifyChannelReady fires.
+    func notifyChannelReleased() {
+        switch stage {
+        case .opening, .streaming:
+            stopMirrorMedia()
+            openSent = false
+            start()
+        default:
+            break
+        }
+    }
+
     // First decoded video frame arrived.
     func notifyVideoFrame() {
         if stage == .opening || stage == .unlocking {

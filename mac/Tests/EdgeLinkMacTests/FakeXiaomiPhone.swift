@@ -347,6 +347,18 @@ final class FakeXiaomiPhone {
         sendMesh(packType: 2, payload: miFrame.serialized())
     }
 
+    // Simulates the phone releasing the cast logi conn mid-stream (observed
+    // live on phone reboot: unencrypted inner disconnect payload {1: 52011}).
+    func releaseCastChannel() {
+        guard logiConnId != 0 else { return }
+        let payload = Data([0x08, 0xAB, 0x96, 0x03])
+        let inner = LogiConnInnerFrame(frameType: 4, payload: .disconnect(payload))
+        let frame = LogiConnFrame(logiConnId: logiConnId, localNetId: phoneNetId, remoteNetId: 1, flag: false, inner: inner.serialized())
+        let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
+        sendMesh(packType: 2, payload: miFrame.serialized())
+        openMirrorScreenCount = 0
+    }
+
     // MARK: - Peer-port command exchange (packType 5)
 
     private func handleMeshCommand(_ payload: Data) {

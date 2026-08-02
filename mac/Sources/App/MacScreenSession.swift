@@ -201,6 +201,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     var onWindowVisibilityChanged: ((Bool) -> Void)?
     var onSessionActivityChanged: ((Bool) -> Void)?
     var onXiaomiMirrorKey: ((NSEvent, Bool) -> Bool)?
+    var onXiaomiMirrorText: ((String) -> Bool)?
     var onXiaomiMirrorPointer: ((CtrlPointerBody) -> Bool)?
     var onXiaomiMirrorGlobal: ((String) -> Bool)?
     var isUsingXiaomiMirrorRoute: Bool {
@@ -249,6 +250,10 @@ final class MacScreenSession: NSObject, ObservableObject {
         }
         videoView.keyHandler = { [weak self] event, isDown in
             self?.handleKey(event, isDown: isDown) ?? false
+        }
+        videoView.textCommitHandler = { [weak self] text in
+            guard let self, self.isXiaomiMirrorRouteActive || self.isRenderingXiaomiMirror else { return }
+            _ = self.onXiaomiMirrorText?(text)
         }
     }
 
@@ -1212,6 +1217,22 @@ final class MacScreenSession: NSObject, ObservableObject {
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
         if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+            // Official-style routing: while an IME composition is active, or
+            // for printable keys outside command chords, let the macOS text
+            // input system have the event (interpretKeyEvents). Committed
+            // text reaches the phone as ProtoKeyboard.text via insertText —
+            // this is what makes CJK IMEs work on the mirror. Only special
+            // keys travel as ProtoKeyboard key_event messages.
+            if videoView.isComposingMarkedText {
+                return false
+            }
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isCommandChord = modifiers.contains(.command) || modifiers.contains(.control)
+            if !isCommandChord,
+               let characters = event.characters,
+               characters.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) }) {
+                return false
+            }
             let handled = onXiaomiMirrorKey?(event, isDown) ?? false
             if !handled {
                 DiagnosticsLog.warn(
@@ -2396,6 +2417,26 @@ private final class MacScreenStatsLogger {
 final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
     var pointerHandler: ((String, NSEvent, Int?) -> Void)?
     var keyHandler: ((NSEvent, Bool) -> Bool)?
+    // Official-style text input: printable key events are passed through to
+    // the macOS text input system (interpretKeyEvents), so IMEs (rime etc.)
+    // compose locally and only committed text travels to the phone — exactly
+    // like the official client's ProtoKeyboard.text messages.
+    var textCommitHandler: ((String) -> Void)?
+    var isComposingMarkedText = false
+
+    override func keyDown(with event: NSEvent) {
+        if keyHandler?(event, true) != true {
+            // Route through the text input system so IMEs compose locally
+            // and committed text arrives via insertText.
+            interpretKeyEvents([event])
+        }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if keyHandler?(event, false) != true {
+            super.keyUp(with: event)
+        }
+    }
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let statsLock = NSLock()
@@ -2467,18 +2508,6 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
 
     override func mouseMoved(with event: NSEvent) {
         pointerHandler?("hover", event, nil)
-    }
-
-    override func keyDown(with event: NSEvent) {
-        if keyHandler?(event, true) != true {
-            super.keyDown(with: event)
-        }
-    }
-
-    override func keyUp(with event: NSEvent) {
-        if keyHandler?(event, false) != true {
-            super.keyUp(with: event)
-        }
     }
 
     func setSize(_ size: CGSize) {
@@ -2797,4 +2826,82 @@ private func formatKbps(_ value: Double?) -> String {
         return "-"
     }
     return String(format: "%.0f", value / 1000.0)
+}
+
+// Text input client so IME composition (rime etc.) works when the mirror
+// view is first responder. Marked text is tracked only for its composing
+// state (key routing uses it); committed strings are forwarded to the phone
+// as ProtoKeyboard.text messages, mirroring the official client.
+extension PhoneVideoRendererView: NSTextInputClient {
+    private static var markedTextKey: UInt8 = 0
+
+    private var markedTextStorage: NSMutableAttributedString {
+        if let existing = objc_getAssociatedObject(self, &Self.markedTextKey) as? NSMutableAttributedString {
+            return existing
+        }
+        let created = NSMutableAttributedString()
+        objc_setAssociatedObject(self, &Self.markedTextKey, created, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return created
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
+        markedTextStorage.mutableString.setString("")
+        isComposingMarkedText = false
+        guard !text.isEmpty else { return }
+        textCommitHandler?(text)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if let attributed = string as? NSAttributedString {
+            markedTextStorage.setAttributedString(attributed)
+        } else if let plain = string as? String {
+            markedTextStorage.setAttributedString(NSAttributedString(string: plain))
+        } else {
+            markedTextStorage.mutableString.setString("")
+        }
+        isComposingMarkedText = markedTextStorage.length > 0
+    }
+
+    func unmarkText() {
+        markedTextStorage.mutableString.setString("")
+        isComposingMarkedText = false
+    }
+
+    func selectedRange() -> NSRange {
+        NSRange(location: NSNotFound, length: 0)
+    }
+
+    func markedRange() -> NSRange {
+        isComposingMarkedText ? NSRange(location: 0, length: markedTextStorage.length) : NSRange(location: NSNotFound, length: 0)
+    }
+
+    func hasMarkedText() -> Bool {
+        isComposingMarkedText
+    }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        nil
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+        []
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        let local = NSRect(x: bounds.midX, y: bounds.midY, width: 0, height: 0)
+        guard let window else { return local }
+        let inWindow = convert(local, to: nil)
+        return window.convertToScreen(inWindow)
+    }
+
+    func characterIndex(for point: NSPoint) -> Int {
+        0
+    }
+
+    override func doCommand(by selector: Selector) {
+        // Editing commands from the text input system (insertNewline etc.)
+        // are intentionally not performed here; special keys travel as
+        // ProtoKeyboard key_event messages instead.
+    }
 }

@@ -90,6 +90,7 @@ final class LyraCastTrustSession {
     private var channelReady = false
     var isChannelReady: Bool { channelReady }
     var onChannelReady: (() -> Void)?
+    var onChannelReleased: (() -> Void)?
     // When true, the phys/logi conn is kept alive after auth completes so a
     // follow-up mirror startShare finds the cast channel in place (the
     // phone-side stock share flow no-ops without it).
@@ -1571,6 +1572,10 @@ final class LyraCastTrustSession {
                 channelSocket?.stop()
                 channelSocket = nil
                 DiagnosticsLog.info("xiaomi.cast.trust_channel_released_by_peer")
+                let releasedHandler = onChannelReleased
+                DispatchQueue.main.async {
+                    releasedHandler?()
+                }
                 // The phone releases the cast logi conn right after the trust
                 // exchange but keeps the adopted mitrustservice conn to run
                 // the actual 595/546/562 auth on it — finishing here would

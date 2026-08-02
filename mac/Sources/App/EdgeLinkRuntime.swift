@@ -334,6 +334,9 @@ final class EdgeLinkRuntime: ObservableObject {
         screenSession.onXiaomiMirrorKey = { [weak self] event, isDown in
             self?.sendXiaomiMirrorKeyboardEvent(event, isDown: isDown) ?? false
         }
+        screenSession.onXiaomiMirrorText = { [weak self] text in
+            self?.sendXiaomiMirrorKeyboardText(text) ?? false
+        }
         screenSession.onXiaomiMirrorPointer = { [weak self] body in
             self?.sendXiaomiMirrorPointer(body) ?? false
         }
@@ -1459,6 +1462,13 @@ final class EdgeLinkRuntime: ObservableObject {
                 // Channel (re)negotiated while a mirror flow is waiting:
                 // open the screen immediately, like the official client.
                 self?.xiaomiMirrorFlow.notifyChannelReady()
+            }
+        }
+        session.onChannelReleased = { [weak self] in
+            Task { @MainActor in
+                // Phone released the cast channel mid-stream (e.g. reboot):
+                // restart the mirror flow so it redials and re-OPENs.
+                self?.xiaomiMirrorFlow.notifyChannelReleased()
             }
         }
         session.onFinish = { [weak self, weak session] in
@@ -2781,27 +2791,18 @@ final class EdgeLinkRuntime: ObservableObject {
     @discardableResult
     private func sendXiaomiMirrorKeyboardEvent(_ event: NSEvent, isDown: Bool) -> Bool {
         // Official route: ProtoKeyboard on the cast channel, exactly like the
-        // official Mac client (wire type 4). Verified against the official
-        // client on 2026-08-02: printable characters (including IME commits)
-        // ride the `text` oneof as a single message; only special keys
-        // (DEL/ENTER/arrows/modifiers) ride key_event down/up pairs. Sending
-        // letters as key_event leaves them swallowed whenever the phone's
-        // IME window is suppressed — text goes through commitText instead.
+        // official Mac client (wire type 4). Only special keys arrive here
+        // (DEL/ENTER/arrows/modifiers); printable text is committed through
+        // the macOS text input system and sent via
+        // sendXiaomiMirrorKeyboardText — verified against the official
+        // client on 2026-08-02: letters as key_event get swallowed whenever
+        // the phone's IME window is suppressed, text goes through commitText.
         guard let session = lyraCastTrustSession, session.isChannelReady,
               let sessionId = xiaomiMirrorCastSessionId else {
             DiagnosticsLog.warn(
                 "xiaomi.mac.keyboard_ignored reason=no_cast_channel macKeyCode=\(event.keyCode) down=\(isDown)"
             )
             return false
-        }
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let isCommandChord = modifiers.contains(.command) || modifiers.contains(.control)
-        if isDown, !isCommandChord,
-           let characters = event.characters, !characters.isEmpty,
-           characters.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) }) {
-            session.sendKeyboard(.committedText(sessionId: sessionId, text: characters))
-            DiagnosticsLog.info("xiaomi.mac.keyboard_text len=\(characters.count)")
-            return true
         }
         guard let androidKeyCode = Self.androidKeyCode(forMacKeyCode: event.keyCode, characters: event.charactersIgnoringModifiers) else {
             DiagnosticsLog.warn(
@@ -2824,6 +2825,17 @@ final class EdgeLinkRuntime: ObservableObject {
             "xiaomi.mac.keyboard_sent macKeyCode=\(event.keyCode) androidKeyCode=\(androidKeyCode) " +
                 "down=\(isDown) modifiers=\(meta)"
         )
+        return true
+    }
+
+    @discardableResult
+    private func sendXiaomiMirrorKeyboardText(_ text: String) -> Bool {
+        guard let session = lyraCastTrustSession, session.isChannelReady,
+              let sessionId = xiaomiMirrorCastSessionId else {
+            return false
+        }
+        session.sendKeyboard(.committedText(sessionId: sessionId, text: text))
+        DiagnosticsLog.info("xiaomi.mac.keyboard_text len=\(text.count)")
         return true
     }
 
