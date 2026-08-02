@@ -1966,6 +1966,14 @@ final class LyraCastTrustSession {
         )
     }
 
+    func sendKeyboard(_ message: LyraCastKeyboard) {
+        sendCastMessage(type: LyraCastMessageType.keyboard, payload: message.encode())
+    }
+
+    func sendMouse(_ message: LyraCastMouse) {
+        sendCastMessage(type: LyraCastMessageType.mouse, payload: message.encode())
+    }
+
     private func handleChannelMessage(_ message: Data) {
         lastProgress = Date()
         var frame = message

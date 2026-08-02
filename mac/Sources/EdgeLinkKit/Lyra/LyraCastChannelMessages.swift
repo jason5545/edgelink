@@ -1,7 +1,10 @@
 import Foundation
 
 public enum LyraCastMessageType {
+    public static let mouse: UInt8 = 3
+    public static let keyboard: UInt8 = 4
     public static let screenConfigurationChanged: UInt8 = 5
+    public static let command: UInt8 = 9
     public static let screenAction: UInt8 = 12
     public static let simpleEvent: UInt8 = 18
     public static let capabilities: UInt8 = 64
@@ -148,8 +151,170 @@ public struct LyraCastScreenAction: Equatable, Sendable {
     }
 }
 
-public struct LyraCastSimpleEvent: Equatable, Sendable {
-    public static let eventMirrorCallKey: UInt32 = 23
+// duo.screen ProtoKeyboard (keyboard.proto): key events and committed text
+// from the PC. Field layout recovered from the phone-side descriptor
+// (com.xiaomi.mirror.message.proto.Keyboard): wire type 4 on the cast
+// channel, decoded by MessageConvert case 4 → KeyMessage.
+public struct LyraCastKeyboard: Equatable, Sendable {
+    public struct KeyEvent: Equatable, Sendable {
+        // With isAndroidKey=true these are Android keyCode + Android meta
+        // state; the phone passes them through untouched. With
+        // isAndroidKey=false the phone maps Windows VK codes and the Mac
+        // meta bits (shift=256, ctrl=512, option=1024, command=2048,
+        // capsLock=4096) itself.
+        public var code: UInt32 = 0
+        public var metaInfo: UInt32 = 0
+        public var down: Bool = false
+
+        public init(code: UInt32, metaInfo: UInt32, down: Bool) {
+            self.code = code
+            self.metaInfo = metaInfo
+            self.down = down
+        }
+    }
+
+    public var sessionId: UInt64 = 0
+    public var screenId: UInt32 = 0
+    public var keyEvent: KeyEvent?
+    public var text: String?
+    public var isAndroidKey: Bool = false
+
+    public init() {}
+
+    public static func key(sessionId: UInt64, screenId: UInt32 = 0, androidKeyCode: UInt32, metaInfo: UInt32, down: Bool) -> LyraCastKeyboard {
+        var message = LyraCastKeyboard()
+        message.sessionId = sessionId
+        message.screenId = screenId
+        message.keyEvent = KeyEvent(code: androidKeyCode, metaInfo: metaInfo, down: down)
+        message.isAndroidKey = true
+        return message
+    }
+
+    public static func committedText(sessionId: UInt64, screenId: UInt32 = 0, text: String) -> LyraCastKeyboard {
+        var message = LyraCastKeyboard()
+        message.sessionId = sessionId
+        message.screenId = screenId
+        message.text = text
+        return message
+    }
+
+    public func encode() -> Data {
+        var data = Data()
+        if sessionId != 0 { LyraProtoWriter.appendVarintField(1, value: sessionId, to: &data) }
+        if screenId != 0 { LyraProtoWriter.appendVarintField(2, value: UInt64(screenId), to: &data) }
+        if let keyEvent {
+            var node = Data()
+            if keyEvent.code != 0 { LyraProtoWriter.appendVarintField(1, value: UInt64(keyEvent.code), to: &node) }
+            if keyEvent.metaInfo != 0 { LyraProtoWriter.appendVarintField(2, value: UInt64(keyEvent.metaInfo), to: &node) }
+            if keyEvent.down { LyraProtoWriter.appendBoolField(3, value: true, to: &node) }
+            LyraProtoWriter.appendLengthDelimitedField(3, value: node, to: &data)
+        }
+        if let text, !text.isEmpty { LyraProtoWriter.appendLengthDelimitedField(4, value: Data(text.utf8), to: &data) }
+        if isAndroidKey { LyraProtoWriter.appendBoolField(5, value: true, to: &data) }
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> LyraCastKeyboard {
+        var message = LyraCastKeyboard()
+        for field in try LyraProtoReader.readFields(from: data) {
+            switch field.number {
+            case 1: message.sessionId = field.varintValue ?? 0
+            case 2: message.screenId = UInt32(field.varintValue ?? 0)
+            case 3:
+                guard let node = field.lengthDelimitedValue else { break }
+                var keyEvent = KeyEvent(code: 0, metaInfo: 0, down: false)
+                for sub in try LyraProtoReader.readFields(from: node) {
+                    switch sub.number {
+                    case 1: keyEvent.code = UInt32(sub.varintValue ?? 0)
+                    case 2: keyEvent.metaInfo = UInt32(sub.varintValue ?? 0)
+                    case 3: keyEvent.down = (sub.varintValue ?? 0) != 0
+                    default: break
+                    }
+                }
+                message.keyEvent = keyEvent
+            case 4: message.text = field.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) }
+            case 5: message.isAndroidKey = (field.varintValue ?? 0) != 0
+            default: break
+            }
+        }
+        return message
+    }
+}
+
+// duo.screen ProtoMouse (mouse.proto): pointer events from the PC, wire
+// type 3 on the cast channel, decoded by MessageConvert case 3 →
+// MouseMessage. The phone injects them natively as deviceId=-100 events;
+// these -100 MotionEvents are also what keeps the dispatcher's
+// mSynergyStatus at 1 (IME stays suppressed) — hover moves matter even
+// without clicks.
+public struct LyraCastMouse: Equatable, Sendable {
+    public enum Action: UInt32, Sendable {
+        case leftDown = 0
+        case leftUp = 1
+        case rightDown = 2
+        case rightUp = 3
+        case leftDoubleClick = 4
+        case move = 5
+        case wheelForward = 6
+        case wheelBackward = 7
+        case wheelLeft = 8
+        case wheelRight = 9
+    }
+
+    // state bitmask (ProtoMouseMeta)
+    public static let stateLeftHold: UInt32 = 1
+    public static let stateRightHold: UInt32 = 2
+    public static let stateMacShift: UInt32 = 16
+    public static let stateMacCtrl: UInt32 = 32
+    public static let stateMacCommand: UInt32 = 64
+
+    public var sessionId: UInt64 = 0
+    public var screenId: UInt32 = 0
+    // proto3 zero value: absent action field decodes as LEFT_DOWN.
+    public var action: Action = .leftDown
+    public var state: UInt32 = 0
+    public var x: Int32 = 0
+    public var y: Int32 = 0
+    // Thousandths of a scroll axis unit; the phone multiplies by 0.01 and
+    // clamps to ±1 (AXIS_VSCROLL/HSCROLL).
+    public var scrollDelta: Int32 = 0
+    public var eventTime: UInt64 = 0
+
+    public init() {}
+
+    public func encode() -> Data {
+        var data = Data()
+        if sessionId != 0 { LyraProtoWriter.appendVarintField(1, value: sessionId, to: &data) }
+        if screenId != 0 { LyraProtoWriter.appendVarintField(2, value: UInt64(screenId), to: &data) }
+        if action != .leftDown { LyraProtoWriter.appendVarintField(3, value: UInt64(action.rawValue), to: &data) }
+        if state != 0 { LyraProtoWriter.appendVarintField(4, value: UInt64(state), to: &data) }
+        if x != 0 { LyraProtoWriter.appendVarintField(5, value: UInt64(bitPattern: Int64(x)), to: &data) }
+        if y != 0 { LyraProtoWriter.appendVarintField(6, value: UInt64(bitPattern: Int64(y)), to: &data) }
+        if scrollDelta != 0 { LyraProtoWriter.appendVarintField(7, value: UInt64(bitPattern: Int64(scrollDelta)), to: &data) }
+        if eventTime != 0 { LyraProtoWriter.appendVarintField(8, value: eventTime, to: &data) }
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> LyraCastMouse {
+        var message = LyraCastMouse()
+        for field in try LyraProtoReader.readFields(from: data) {
+            switch field.number {
+            case 1: message.sessionId = field.varintValue ?? 0
+            case 2: message.screenId = UInt32(field.varintValue ?? 0)
+            case 3: message.action = Action(rawValue: UInt32(field.varintValue ?? 0)) ?? .move
+            case 4: message.state = UInt32(field.varintValue ?? 0)
+            case 5: message.x = Int32(truncatingIfNeeded: field.varintValue ?? 0)
+            case 6: message.y = Int32(truncatingIfNeeded: field.varintValue ?? 0)
+            case 7: message.scrollDelta = Int32(truncatingIfNeeded: field.varintValue ?? 0)
+            case 8: message.eventTime = field.varintValue ?? 0
+            default: break
+            }
+        }
+        return message
+    }
+}
+
+public struct LyraCastSimpleEvent: Equatable, Sendable {    public static let eventMirrorCallKey: UInt32 = 23
     public static let eventMirrorCallStop: UInt32 = 25
     public static let eventDeviceInfo: UInt32 = 38
 

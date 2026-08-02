@@ -22,6 +22,8 @@ final class FakeXiaomiPhone {
     private(set) var bindActionCount = 0
     private(set) var openMirrorScreenCount = 0
     private(set) var closeScreenCount = 0
+    private(set) var keyboardMessages: [LyraCastKeyboard] = []
+    private(set) var mouseMessages: [LyraCastMouse] = []
     private(set) var wfdSessionEstablished = false
     private(set) var wfdPlayCount = 0
     private(set) var videoDatagramsSent = 0
@@ -457,6 +459,19 @@ final class FakeXiaomiPhone {
         switch type {
         case LyraCastMessageType.trust:
             handleTrustFrame(framePayload)
+        case LyraCastMessageType.keyboard:
+            if let keyboard = try? LyraCastKeyboard.decode(framePayload) {
+                log("fakephone.keyboard sessionId=\(keyboard.sessionId) screenId=\(keyboard.screenId) " +
+                    "code=\(keyboard.keyEvent?.code ?? 0) meta=\(keyboard.keyEvent?.metaInfo ?? 0) " +
+                    "down=\(keyboard.keyEvent?.down ?? false) text=\(keyboard.text ?? "-") isAndroidKey=\(keyboard.isAndroidKey)")
+                keyboardMessages.append(keyboard)
+            }
+        case LyraCastMessageType.mouse:
+            if let mouse = try? LyraCastMouse.decode(framePayload) {
+                log("fakephone.mouse sessionId=\(mouse.sessionId) action=\(mouse.action) x=\(mouse.x) y=\(mouse.y) " +
+                    "state=\(mouse.state) scrollDelta=\(mouse.scrollDelta)")
+                mouseMessages.append(mouse)
+            }
         case LyraCastMessageType.screenAction:
             if let action = try? LyraCastScreenAction.decode(framePayload) {
                 log("fakephone.screen_action action=\(action.action) sessionId=\(action.sessionId)")

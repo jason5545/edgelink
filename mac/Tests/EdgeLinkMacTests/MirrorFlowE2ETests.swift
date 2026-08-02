@@ -631,4 +631,104 @@ final class MirrorFlowE2ETests: XCTestCase {
             self.controller.stage == .streaming && self.controller.mask == nil
         }
     }
+
+    // Keyboard rides the same cast channel as OPEN_MIRROR_SCREEN (official
+    // route, wire type 4 = duo.screen ProtoKeyboard): once the mirror session
+    // is established, key events must reach the phone as well-formed
+    // ProtoKeyboard frames carrying the mirror sessionId and Android
+    // keyCode/meta. Verified live 2026-08-02 that the phone decodes this
+    // natively for a paired PC (no Android-app hook round trip).
+    func testKeyboardEventsFlowOnCastChannelAfterMirrorOpens() async throws {
+        try makeEnvironment(locked: false)
+        session.start()
+        controller.start()
+
+        try await waitFor("controller streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
+        session.sendKeyboard(.key(sessionId: sessionId, androidKeyCode: 29, metaInfo: 0, down: true))
+        session.sendKeyboard(.key(sessionId: sessionId, androidKeyCode: 29, metaInfo: 0, down: false))
+        session.sendKeyboard(.key(sessionId: sessionId, androidKeyCode: 66, metaInfo: 0, down: true))
+        session.sendKeyboard(.key(sessionId: sessionId, androidKeyCode: 67, metaInfo: 0, down: true))
+        session.sendKeyboard(.key(sessionId: sessionId, androidKeyCode: 29, metaInfo: 1, down: true))
+        session.sendKeyboard(.committedText(sessionId: sessionId, text: "你好"))
+
+        try await waitFor("phone received keyboard frames") { [self] in
+            self.phone.keyboardMessages.count >= 6
+        }
+        let messages = phone.keyboardMessages
+        XCTAssertEqual(messages[0], .key(sessionId: sessionId, androidKeyCode: 29, metaInfo: 0, down: true))
+        XCTAssertEqual(messages[1], .key(sessionId: sessionId, androidKeyCode: 29, metaInfo: 0, down: false))
+        XCTAssertEqual(messages[2].keyEvent?.code, 66, "ENTER keyCode")
+        XCTAssertEqual(messages[3].keyEvent?.code, 67, "DEL keyCode")
+        XCTAssertEqual(messages[4].keyEvent?.metaInfo, 1, "shift meta passes through")
+        XCTAssertTrue(messages[0].isAndroidKey)
+        XCTAssertEqual(messages[5].text, "你好")
+        XCTAssertNil(messages[5].keyEvent)
+        for message in messages {
+            XCTAssertEqual(message.sessionId, sessionId)
+            XCTAssertEqual(message.screenId, 0)
+        }
+    }
+
+    // Pointer rides the same cast channel (wire type 3 = duo.screen
+    // ProtoMouse). Hover MOVE events with no button state are what the
+    // official client uses to keep the phone's synergy input state alive
+    // (mSynergyStatus=1 → IME stays suppressed), so they must flow even
+    // without clicks.
+    func testMouseEventsFlowOnCastChannelAfterMirrorOpens() async throws {
+        try makeEnvironment(locked: false)
+        session.start()
+        controller.start()
+
+        try await waitFor("controller streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
+        func mouse(_ action: LyraCastMouse.Action, x: Int32, y: Int32, state: UInt32 = 0, scroll: Int32 = 0) -> LyraCastMouse {
+            var message = LyraCastMouse()
+            message.sessionId = sessionId
+            message.action = action
+            message.x = x
+            message.y = y
+            message.state = state
+            message.scrollDelta = scroll
+            return message
+        }
+        session.sendMouse(mouse(.move, x: 500, y: 300))
+        session.sendMouse(mouse(.leftDown, x: 500, y: 300, state: LyraCastMouse.stateLeftHold))
+        session.sendMouse(mouse(.move, x: 520, y: 320, state: LyraCastMouse.stateLeftHold))
+        session.sendMouse(mouse(.leftUp, x: 520, y: 320))
+        session.sendMouse(mouse(.rightDown, x: 100, y: 100, state: LyraCastMouse.stateRightHold))
+        session.sendMouse(mouse(.rightUp, x: 100, y: 100))
+        session.sendMouse(mouse(.wheelForward, x: 500, y: 300, scroll: 30))
+        session.sendMouse(mouse(.wheelBackward, x: 500, y: 300, scroll: 30))
+
+        try await waitFor("phone received mouse frames") { [self] in
+            self.phone.mouseMessages.count >= 8
+        }
+        let messages = phone.mouseMessages
+        XCTAssertEqual(messages[0].action, .move)
+        XCTAssertEqual(messages[0].state, 0, "hover move carries no button state")
+        XCTAssertEqual(messages[1].action, .leftDown)
+        XCTAssertEqual(messages[1].state, LyraCastMouse.stateLeftHold)
+        XCTAssertEqual(messages[2].action, .move)
+        XCTAssertEqual(messages[2].state, LyraCastMouse.stateLeftHold, "drag move keeps left hold")
+        XCTAssertEqual(messages[2].x, 520)
+        XCTAssertEqual(messages[2].y, 320)
+        XCTAssertEqual(messages[3].action, .leftUp)
+        XCTAssertEqual(messages[3].state, 0)
+        XCTAssertEqual(messages[4].action, .rightDown)
+        XCTAssertEqual(messages[5].action, .rightUp)
+        XCTAssertEqual(messages[6].action, .wheelForward)
+        XCTAssertEqual(messages[6].scrollDelta, 30)
+        XCTAssertEqual(messages[7].action, .wheelBackward)
+        for message in messages {
+            XCTAssertEqual(message.sessionId, sessionId)
+            XCTAssertEqual(message.screenId, 0)
+        }
+    }
 }

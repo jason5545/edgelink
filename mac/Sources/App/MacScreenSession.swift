@@ -1184,22 +1184,30 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func sendPointer(action: String, event: NSEvent, wheelDy: Int? = nil) {
+        // Hover moves exist to feed the official Xiaomi mirror input channel
+        // (ProtoMouse MOVE with no buttons = hover; keeps the phone's
+        // synergy input state alive). The legacy envelope route has no hover
+        // concept — a bare "move" there would look like a touch drag.
+        if action == "hover" {
+            guard isXiaomiMirrorRouteActive || isRenderingXiaomiMirror else { return }
+        }
+        let wireAction = action == "hover" ? "move" : action
         guard let coordinate = screenCoordinate(for: event) else {
             DiagnosticsLog.warn("screen.mac.pointer_ignored no_screen_meta action=\(action)")
             return
         }
-        let body = CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: action, wheelDy: wheelDy)
-        if action == "wheel" {
+        let body = CtrlPointerBody(x: coordinate.x, y: coordinate.y, action: wireAction, wheelDy: wheelDy)
+        if wireAction == "wheel" {
             sendCoalescedWheel(body)
             return
         }
         flushPendingWheel()
-        if action == "move" {
+        if wireAction == "move" {
             sendCoalescedPointerMove(body)
             return
         }
         flushPendingPointerMove()
-        sendPointerBody(body, kind: "pointer:\(action)", shouldLog: true)
+        sendPointerBody(body, kind: "pointer:\(wireAction)", shouldLog: true)
     }
 
     private func handleKey(_ event: NSEvent, isDown: Bool) -> Bool {
@@ -2444,6 +2452,21 @@ final class PhoneVideoRendererView: NSView, RTCVideoRenderer {
         window?.makeFirstResponder(self)
         let wheelDy = Int(event.scrollingDeltaY.rounded())
         pointerHandler?("wheel", event, wheelDy == 0 ? nil : wheelDy)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        pointerHandler?("hover", event, nil)
     }
 
     override func keyDown(with event: NSEvent) {

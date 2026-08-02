@@ -161,4 +161,58 @@ final class LyraCastChannelMessagesTests: XCTestCase {
         XCTAssertEqual(decoded.action, LyraCastScreenAction.Action.closeScreen.rawValue)
         XCTAssertEqual(decoded.sessionId, 42)
     }
+
+    // Wire layout checked against the phone-side descriptor
+    // (com.xiaomi.mirror.message.proto.Keyboard, Mirror.apk): session_id=1,
+    // screen_id=2, key_event=3{code=1, meta_info=2, down=3}, text=4,
+    // is_android_key=5.
+    func testKeyboardKeyEventWireLayout() throws {
+        let message = LyraCastKeyboard.key(
+            sessionId: 1785501613039,
+            androidKeyCode: 29,
+            metaInfo: 1,
+            down: true
+        )
+        let encoded = message.encode()
+        // field 1 (session_id varint)
+        XCTAssertEqual(encoded[encoded.startIndex], 0x08)
+        // must contain field 3 (key_event, length-delimited): tag 0x1A
+        XCTAssertTrue(encoded.contains(0x1A))
+        // field 5 (is_android_key bool true): tag 0x28 value 0x01
+        XCTAssertEqual(encoded.suffix(2), [0x28, 0x01])
+        let decoded = try LyraCastKeyboard.decode(encoded)
+        XCTAssertEqual(decoded, message)
+        XCTAssertEqual(decoded.keyEvent?.code, 29)
+        XCTAssertEqual(decoded.keyEvent?.metaInfo, 1)
+        XCTAssertEqual(decoded.keyEvent?.down, true)
+        XCTAssertTrue(decoded.isAndroidKey)
+        XCTAssertNil(decoded.text)
+    }
+
+    func testKeyboardKeyUpOmitsDownFlag() throws {
+        let message = LyraCastKeyboard.key(
+            sessionId: 42,
+            androidKeyCode: 66,
+            metaInfo: 0,
+            down: false
+        )
+        let decoded = try LyraCastKeyboard.decode(message.encode())
+        XCTAssertEqual(decoded.keyEvent?.down, false)
+        XCTAssertEqual(decoded.keyEvent?.code, 66)
+    }
+
+    func testKeyboardCommittedTextRoundTrip() throws {
+        let message = LyraCastKeyboard.committedText(sessionId: 42, text: "你好")
+        let frame = LyraCastMessageCodec.encodeFrame(
+            type: LyraCastMessageType.keyboard,
+            payload: message.encode()
+        )
+        let (type, payload) = try LyraCastMessageCodec.decodeFrame(frame)
+        XCTAssertEqual(type, LyraCastMessageType.keyboard)
+        XCTAssertEqual(type, 4)
+        let decoded = try LyraCastKeyboard.decode(payload)
+        XCTAssertEqual(decoded.text, "你好")
+        XCTAssertNil(decoded.keyEvent)
+        XCTAssertFalse(decoded.isAndroidKey)
+    }
 }

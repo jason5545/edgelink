@@ -2805,60 +2805,124 @@ final class EdgeLinkRuntime: ObservableObject {
 
     @discardableResult
     private func sendXiaomiMirrorKeyboardEvent(_ event: NSEvent, isDown: Bool) -> Bool {
-        prepareXiaomiMirrorKeyboardIfNeeded(source: "key_event")
+        // Official route: ProtoKeyboard on the cast channel, exactly like the
+        // official Mac client (wire type 4). Verified against the official
+        // client on 2026-08-02: printable characters (including IME commits)
+        // ride the `text` oneof as a single message; only special keys
+        // (DEL/ENTER/arrows/modifiers) ride key_event down/up pairs. Sending
+        // letters as key_event leaves them swallowed whenever the phone's
+        // IME window is suppressed — text goes through commitText instead.
+        guard let session = lyraCastTrustSession, session.isChannelReady,
+              let sessionId = xiaomiMirrorCastSessionId else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.keyboard_ignored reason=no_cast_channel macKeyCode=\(event.keyCode) down=\(isDown)"
+            )
+            return false
+        }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isCommandChord = modifiers.contains(.command) || modifiers.contains(.control)
+        if isDown, !isCommandChord,
+           let characters = event.characters, !characters.isEmpty,
+           characters.unicodeScalars.contains(where: { !CharacterSet.controlCharacters.contains($0) }) {
+            session.sendKeyboard(.committedText(sessionId: sessionId, text: characters))
+            DiagnosticsLog.info("xiaomi.mac.keyboard_text len=\(characters.count)")
+            return true
+        }
         guard let androidKeyCode = Self.androidKeyCode(forMacKeyCode: event.keyCode, characters: event.charactersIgnoringModifiers) else {
             DiagnosticsLog.warn(
                 "xiaomi.mac.keyboard_ignored reason=unmapped macKeyCode=\(event.keyCode) down=\(isDown)"
             )
             return false
         }
-        let args = Self.xiaomiMirrorKeyboardArgs(
-            androidKeyCode: androidKeyCode,
-            event: event,
+        let meta = Self.androidMetaState(
+            from: event.modifierFlags,
+            macKeyCode: event.keyCode,
             isDown: isDown
         )
-        _ = sendMiLinkCommand(
-            command: Self.xiaomiMirrorKeyboardCommand,
-            args: args,
-            updatesStatus: false
-        )
+        session.sendKeyboard(.key(
+            sessionId: sessionId,
+            androidKeyCode: UInt32(androidKeyCode),
+            metaInfo: UInt32(clamping: meta),
+            down: isDown
+        ))
         DiagnosticsLog.info(
             "xiaomi.mac.keyboard_sent macKeyCode=\(event.keyCode) androidKeyCode=\(androidKeyCode) " +
-                "down=\(isDown) modifiers=\(args["modifiers"] ?? "-")"
+                "down=\(isDown) modifiers=\(meta)"
         )
         return true
     }
 
     @discardableResult
     private func sendXiaomiMirrorPointer(_ body: CtrlPointerBody) -> Bool {
-        let meta = screenSession.screenMeta
-        var args = [
-            "action": body.action,
-            "x": "\(body.x)",
-            "y": "\(body.y)",
-            "screenWidth": "\(meta?.w ?? 0)",
-            "screenHeight": "\(meta?.h ?? 0)"
-        ]
-        if let wheelDy = body.wheelDy {
-            args["wheelDy"] = "\(wheelDy)"
-        }
-        let requestId = sendMiLinkCommand(
-            command: Self.xiaomiMirrorPointerCommand,
-            args: args,
-            updatesStatus: false
-        )
-        if let requestId {
-            DiagnosticsLog.info(
-                "xiaomi.mac.pointer_sent requestId=\(requestId) action=\(body.action) " +
-                    "x=\(body.x) y=\(body.y) wheelDy=\(body.wheelDy ?? 0) " +
-                    "screen=\(meta?.w ?? 0)x\(meta?.h ?? 0)"
+        // Official route: ProtoMouse on the cast channel (wire type 3). The
+        // phone injects these natively as deviceId=-100 MotionEvents, which
+        // is also what maintains mSynergyStatus=1 (IME suppressed) — hover
+        // moves included, exactly like the official Mac client.
+        guard let session = lyraCastTrustSession, session.isChannelReady,
+              let sessionId = xiaomiMirrorCastSessionId else {
+            DiagnosticsLog.warn(
+                "xiaomi.mac.pointer_ignored reason=no_cast_channel action=\(body.action) x=\(body.x) y=\(body.y)"
             )
-            return true
+            return false
         }
-        DiagnosticsLog.warn(
-            "xiaomi.mac.pointer_ignored action=\(body.action) x=\(body.x) y=\(body.y) not_sent"
+        var messages: [LyraCastMouse] = []
+        switch body.action {
+        case "down":
+            xiaomiMirrorPointerLeftHeld = true
+            var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            message.action = .leftDown
+            messages.append(message)
+        case "up":
+            xiaomiMirrorPointerLeftHeld = false
+            var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            message.action = .leftUp
+            messages.append(message)
+        case "move":
+            var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            message.action = .move
+            messages.append(message)
+        case "rightUp":
+            xiaomiMirrorPointerRightHeld = true
+            var down = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            down.action = .rightDown
+            xiaomiMirrorPointerRightHeld = false
+            var up = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            up.action = .rightUp
+            messages.append(down)
+            messages.append(up)
+        case "wheel":
+            guard let wheelDy = body.wheelDy, wheelDy != 0 else { return true }
+            var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
+            message.action = wheelDy > 0 ? .wheelForward : .wheelBackward
+            message.scrollDelta = Int32(clamping: abs(wheelDy) * 10)
+            messages.append(message)
+        default:
+            DiagnosticsLog.warn("xiaomi.mac.pointer_ignored reason=unknown_action action=\(body.action)")
+            return false
+        }
+        for message in messages {
+            session.sendMouse(message)
+        }
+        DiagnosticsLog.info(
+            "xiaomi.mac.pointer_sent action=\(body.action) x=\(body.x) y=\(body.y) wheelDy=\(body.wheelDy ?? 0)"
         )
-        return false
+        return true
+    }
+
+    private var xiaomiMirrorPointerLeftHeld = false
+    private var xiaomiMirrorPointerRightHeld = false
+
+    private func xiaomiMirrorMouseMessage(sessionId: UInt64, body: CtrlPointerBody) -> LyraCastMouse {
+        var message = LyraCastMouse()
+        message.sessionId = sessionId
+        message.screenId = 0
+        message.x = Int32(clamping: body.x)
+        message.y = Int32(clamping: body.y)
+        var state: UInt32 = 0
+        if xiaomiMirrorPointerLeftHeld { state |= LyraCastMouse.stateLeftHold }
+        if xiaomiMirrorPointerRightHeld { state |= LyraCastMouse.stateRightHold }
+        message.state = state
+        return message
     }
 
     @discardableResult
@@ -2879,46 +2943,13 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private func prepareXiaomiMirrorKeyboardIfNeeded(source: String) {
-        guard !didPrepareXiaomiMirrorKeyboard else {
-            return
-        }
-        let now = Date()
-        guard now.timeIntervalSince(xiaomiMirrorKeyboardReadyLastAttemptAt) >= Self.xiaomiMirrorKeyboardReadyRetryInterval else {
-            return
-        }
-        xiaomiMirrorKeyboardReadyLastAttemptAt = now
-        guard isConnected else {
-            DiagnosticsLog.warn("xiaomi.mac.keyboard_ready_ignored source=\(source) not_connected")
-            return
-        }
-        let requestId = sendMiLinkCommand(
-            command: Self.xiaomiMirrorKeyboardReadyCommand,
-            args: [
-                "source": source,
-                "prepareOnly": "true"
-            ],
-            updatesStatus: false
-        )
-        if let requestId {
-            DiagnosticsLog.info("xiaomi.mac.keyboard_ready_sent source=\(source) requestId=\(requestId)")
-        }
+        // Official route: the phone handles PC keyboard input natively on the
+        // cast channel; no hook-side keyboard session to arm.
     }
 
     private func releaseXiaomiMirrorKeyboard(reason: String) {
         didPrepareXiaomiMirrorKeyboard = false
         xiaomiMirrorKeyboardReadyLastAttemptAt = .distantPast
-        guard isConnected else {
-            DiagnosticsLog.warn("xiaomi.mac.keyboard_release_ignored reason=\(reason) not_connected")
-            return
-        }
-        let requestId = sendMiLinkCommand(
-            command: Self.xiaomiMirrorKeyboardReleaseCommand,
-            args: ["source": reason],
-            updatesStatus: false
-        )
-        if let requestId {
-            DiagnosticsLog.info("xiaomi.mac.keyboard_release_sent reason=\(reason) requestId=\(requestId)")
-        }
     }
 
     private static func xiaomiMirrorKeyboardArgs(
