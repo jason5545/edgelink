@@ -841,6 +841,14 @@ final class FakeXiaomiPhone {
     private var wfdSentGetParameter = false
     private var wfdSentTrigger = false
 
+    // Real-phone behavior (om1, i-frame-interval=10 + low-latency encoder):
+    // VPS/SPS/PPS only ride with an IDR, so a sink joining a stale encoder
+    // mid-GOP gets undecodable video until it asks for an IDR. Modelled as
+    // "no decodable datagrams until wfd_idr_request arrives".
+    var withholdVideoUntilIDRRequest = false
+    private(set) var idrRequestCount = 0
+    private(set) var lastIDRRequestLine: String?
+
     private func handleWFDMessage(firstLine: String, headers: [String: String], body: Data) {
         let bodyText = String(data: body, encoding: .utf8) ?? ""
         if firstLine.hasPrefix("RTSP/") {
@@ -870,7 +878,19 @@ final class FakeXiaomiPhone {
         case "PLAY":
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nSession: 87654321\r\n\r\n")
             wfdSessionEstablished = true
-            startVideoSender()
+            if !withholdVideoUntilIDRRequest {
+                startVideoSender()
+            }
+        case "SET_PARAMETER":
+            sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
+            if bodyText.contains("wfd_idr_request") {
+                idrRequestCount += 1
+                lastIDRRequestLine = firstLine
+                log("fakephone.wfd_idr_request_rx")
+                if withholdVideoUntilIDRRequest, videoDatagramsSent == 0 {
+                    startVideoSender()
+                }
+            }
         default:
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
         }

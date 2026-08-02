@@ -20,6 +20,11 @@ final class MirrorFlowE2ETests: XCTestCase {
     private var videoDatagramsReceived = 0
     private var videoConnection: NWConnection?
     private var biometricCallCount = 0
+    // Tests default to the official 20s IDR one-shot; the mid-GOP test
+    // shortens it. The established→notifyVideoFrame shortcut stays on for the
+    // happy-path tests but is disabled when video starvation is the point.
+    private var wfdIDRRequestDelay: TimeInterval = 20
+    private var establishedNotifiesVideoFrame = true
 
     private let meshPort: UInt16 = 29_101
     private let castChannelPort: UInt16 = 29_102
@@ -91,9 +96,11 @@ final class MirrorFlowE2ETests: XCTestCase {
     private func startWFDClient() {
         wfdClient?.stop(reason: "replace")
         let client = XiaomiMirrorWFDClient()
+        client.idrRequestDelay = wfdIDRRequestDelay
         client.onSessionEstablished = { [weak self] _ in
             Task { @MainActor in
-                self?.controller.notifyVideoFrame()
+                guard let self, self.establishedNotifiesVideoFrame else { return }
+                self.controller.notifyVideoFrame()
             }
         }
         wfdClient = client
@@ -280,6 +287,49 @@ final class MirrorFlowE2ETests: XCTestCase {
         let received = videoDatagramsReceived
         try await waitFor("video still flowing after unlock") { [self] in
             self.videoDatagramsReceived >= received + 2
+        }
+    }
+
+    // Regression (2026-08-02 live, scenario 3): fresh app, phone's stale
+    // encoder outlived the previous app instance, so our PLAY joined mid-GOP.
+    // The low-latency HEVC encoder only emits VPS/SPS/PPS with an IDR, so
+    // datagrams flowed but nothing decoded — the mask sat at 正在連線
+    // forever. The official sink sends a one-shot SET_PARAMETER
+    // wfd_idr_request exactly 20s after PLAY (five live captures,
+    // 2026-07-31); the phone answers with an IDR and the stream becomes
+    // decodable. Modelled here as the phone withholding decodable video
+    // until the IDR request arrives.
+    func testIDRRequestRescuesMidGOPJoin() async throws {
+        wfdIDRRequestDelay = 1.0
+        establishedNotifiesVideoFrame = false
+        try makeEnvironment(locked: false)
+        phone.withholdVideoUntilIDRRequest = true
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD session established") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        // Before the IDR one-shot fires: no decodable video, mask stays at
+        // 正在連線 (loading), no IDR request sent early.
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(videoDatagramsReceived, 0, "mid-GOP join must not yield decodable video")
+        XCTAssertEqual(phone.idrRequestCount, 0, "IDR request must not fire before the official delay")
+        XCTAssertEqual(controller.mask, .loading)
+
+        try await waitFor("Mac sent wfd_idr_request (official PLAY+delay one-shot)") { [self] in
+            self.phone.idrRequestCount >= 1
+        }
+        XCTAssertEqual(
+            phone.lastIDRRequestLine,
+            "SET_PARAMETER rtsp://localhost/wfd1.0/streamid=0 RTSP/1.0",
+            "IDR request must match the official target verbatim"
+        )
+        try await waitFor("video flows after phone serves IDR") { [self] in
+            self.videoDatagramsReceived >= 3
+        }
+        try await waitFor("controller streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
         }
     }
 }

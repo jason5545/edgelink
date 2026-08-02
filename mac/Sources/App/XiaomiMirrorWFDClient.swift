@@ -24,6 +24,15 @@ final class XiaomiMirrorWFDClient {
     var onTeardown: (() -> Void)?
     var onClosed: ((String) -> Void)?
 
+    // Official sink behavior (verified across five live captures on
+    // 2026-07-31, memory key edgelink-wfd-idr-request-play-plus-20s): exactly
+    // 20.0s after PLAY the client sends a one-shot SET_PARAMETER with body
+    // "wfd_idr_request". The phone's low-latency HEVC encoder only emits
+    // VPS/SPS/PPS with an IDR, so a sink that joined mid-GOP (e.g. the phone
+    // kept a stale encoder running after we quit without TEARDOWN) never
+    // decodes a frame without this.
+    var idrRequestDelay: TimeInterval = 20
+
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorWFDClient")
     private var connection: NWConnection?
     private var stage: Stage = .idle
@@ -35,6 +44,7 @@ final class XiaomiMirrorWFDClient {
     private var userID: UInt32 = 0
     private var ourAuthMsg = ""
     private var firstRenderSent = false
+    private var idrRequestWork: DispatchWorkItem?
     private var watchdog: DispatchSourceTimer?
     private var lastProgress = Date()
     private var startArgs: (host: String, rtspPort: UInt16, clientRTPPort: UInt16)?
@@ -47,6 +57,7 @@ final class XiaomiMirrorWFDClient {
 
     deinit {
         watchdog?.cancel()
+        idrRequestWork?.cancel()
         connection?.cancel()
     }
 
@@ -69,6 +80,8 @@ final class XiaomiMirrorWFDClient {
         self.session = nil
         self.serverRTPPort = nil
         self.firstRenderSent = false
+        self.idrRequestWork?.cancel()
+        self.idrRequestWork = nil
         self.buffer.removeAll()
         guard let port = NWEndpoint.Port(rawValue: rtspPort) else {
             self.fail("invalid_rtsp_port")
@@ -275,6 +288,7 @@ final class XiaomiMirrorWFDClient {
             DiagnosticsLog.info(
                 "xiaomi.wfd.established session=\(session ?? "none") serverRTPPort=\(port)"
             )
+            scheduleIDRRequest()
             onSessionEstablished?(port)
         default:
             break
@@ -320,15 +334,38 @@ final class XiaomiMirrorWFDClient {
         sendRaw(Self.serialize(status: "200 OK", headers: headers, body: body))
     }
 
-    private func sendRequest(method: String, target: String, extraHeaders: [String]) {
+    // One-shot IDR request at PLAY + idrRequestDelay (official: exactly 20s,
+    // target rtsp://localhost/wfd1.0/streamid=0, body "wfd_idr_request").
+    private func scheduleIDRRequest() {
+        idrRequestWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.stage == .established else { return }
+            self.ourCSeq += 1
+            self.sendRequest(
+                method: "SET_PARAMETER",
+                target: "rtsp://localhost/wfd1.0/streamid=0",
+                extraHeaders: self.sessionHeaders(),
+                body: "wfd_idr_request\r\n"
+            )
+            DiagnosticsLog.info("xiaomi.wfd.idr_request_sent")
+        }
+        idrRequestWork = work
+        queue.asyncAfter(deadline: .now() + idrRequestDelay, execute: work)
+    }
+
+    private func sendRequest(method: String, target: String, extraHeaders: [String], body: String = "") {
         var headers = [
             "CSeq: \(ourCSeq)",
             "Date: \(Self.rtspDate())",
             "User-Agent: \(Self.userAgent)"
         ]
         headers.append(contentsOf: extraHeaders)
+        if !body.isEmpty {
+            headers.append("Content-Type: text/parameters")
+            headers.append("Content-Length: \(body.utf8.count)")
+        }
         let text = ([method, target, "RTSP/1.0"].joined(separator: " ") + "\r\n" +
-            headers.joined(separator: "\r\n") + "\r\n\r\n")
+            headers.joined(separator: "\r\n") + "\r\n\r\n" + body)
         sendRaw(text)
         DiagnosticsLog.info("xiaomi.wfd.tx_request method=\(method) cseq=\(ourCSeq)")
     }
@@ -434,6 +471,8 @@ final class XiaomiMirrorWFDClient {
         stage = .closed
         watchdog?.cancel()
         watchdog = nil
+        idrRequestWork?.cancel()
+        idrRequestWork = nil
         connection?.cancel()
         connection = nil
         DiagnosticsLog.info("xiaomi.wfd.closed reason=\(reason)")
