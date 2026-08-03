@@ -241,7 +241,13 @@ final class MiTrustAuthService {
 
     private func handleStatusRequest(_ message: [String: Any]) {
         let saidB = message["shared_auth_id_B"] as? String ?? ""
-        if !saidB.isEmpty, rsaPrivateKey(said: saidB) == nil {
+        if !saidB.isEmpty, let existing = rsaPrivateKey(said: saidB) {
+            // One-off migration: protect an already phone-bound key that
+            // predates the backup mechanism.
+            if let url = rsaKeyBackupURL(said: saidB), !FileManager.default.fileExists(atPath: url.path) {
+                backupRSAKeypair(existing, said: saidB)
+            }
+        } else if !saidB.isEmpty {
             _ = generateRSAKeypair(said: saidB)
         }
         let hasKey = saidB.isEmpty ? false : (rsaPrivateKey(said: saidB) != nil)
@@ -401,7 +407,71 @@ final class MiTrustAuthService {
         return (result as! SecKey)
     }
 
+    // The phone binds this pubkey into its TA at TDIF bind time. Regenerating
+    // on a transient keychain miss (rebuild/reinstall changing the item's
+    // effective ACL) silently changes the pubkey and the phone starts killing
+    // the mirror ~1s after OPEN (2026-08-03 incident). Keep an exported copy
+    // in the app container and restore it instead of rolling the key.
+    private func rsaKeyBackupURL(said: String) -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return base
+            .appendingPathComponent("EdgeLink/trust-keys", isDirectory: true)
+            .appendingPathComponent("\(rsaKeyLabel(said: said, isPrivate: true)).key")
+    }
+
+    private func restoreRSAKeypairFromBackup(said: String) -> SecKey? {
+        guard let url = rsaKeyBackupURL(said: said),
+              let data = try? Data(contentsOf: url)
+        else { return nil }
+        for isPrivate in [true, false] {
+            let delete: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: isPrivate)
+            ]
+            SecItemDelete(delete as CFDictionary)
+        }
+        let add: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrKeySizeInBits as String: 2048,
+            kSecAttrIsPermanent as String: true,
+            kSecAttrLabel as String: rsaKeyLabel(said: said, isPrivate: true),
+            kSecValueData as String: data
+        ]
+        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess,
+              let restored = rsaPrivateKey(said: said)
+        else { return nil }
+        DiagnosticsLog.info("xiaomi.mitrust.rsa_key_restored_from_backup said_prefix=\(said.prefix(8))")
+        return restored
+    }
+
+    private func backupRSAKeypair(_ key: SecKey, said: String) {
+        guard let url = rsaKeyBackupURL(said: said) else { return }
+        var error: Unmanaged<CFError>?
+        guard let data = SecKeyCopyExternalRepresentation(key, &error) as? Data else {
+            DiagnosticsLog.error("xiaomi.mitrust.rsa_key_backup_export_failed", error?.takeRetainedValue())
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            DiagnosticsLog.error("xiaomi.mitrust.rsa_key_backup_write_failed", error)
+        }
+    }
+
     private func generateRSAKeypair(said: String) -> SecKey? {
+        if rsaPrivateKey(said: said) == nil,
+           let restored = restoreRSAKeypairFromBackup(said: said)
+        {
+            return restored
+        }
         for isPrivate in [true, false] {
             let delete: [String: Any] = [
                 kSecClass as String: kSecClassKey,
@@ -430,6 +500,7 @@ final class MiTrustAuthService {
         }
         var signError: Unmanaged<CFError>?
         _ = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, Data("warmup".utf8) as CFData, &signError)
+        backupRSAKeypair(key, said: said)
         return key
     }
 
