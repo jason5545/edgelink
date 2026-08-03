@@ -342,7 +342,15 @@ final class XiaomiMiShareDiscovery: NSObject {
         startMeshAnnouncer(host: host, port: port)
     }
 
+    private static var meshAnnouncerEnabled: Bool {
+        // Off by default: the revived announcer's parallel logi conn makes the
+        // phone's Mirror app destroy the cast channel ~1.5s after OPEN
+        // (regression from f7a9466bc; opt-in while call-relay is groundwork).
+        UserDefaults.standard.bool(forKey: "xiaomiMeshAnnouncerEnabled")
+    }
+
     private func startMeshAnnouncer(host: String, port: UInt16) {
+        guard Self.meshAnnouncerEnabled else { return }
         if meshAnnouncer == nil {
             meshAnnouncer = LyraMeshAnnouncer(
                 deviceIdHexProvider: { [weak self] in self?.publishedDeviceIdHex },

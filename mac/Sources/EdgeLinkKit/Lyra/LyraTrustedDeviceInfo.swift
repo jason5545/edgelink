@@ -32,7 +32,8 @@ public enum LyraTrustedDeviceInfo {
         lyraVersion: String,
         services: [Service],
         ipAddress: String?,
-        osVersion: String?
+        osVersion: String?,
+        region: String = "cn"
     ) -> Data {
         var data = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: Data(deviceName.utf8), to: &data)
@@ -46,6 +47,7 @@ public enum LyraTrustedDeviceInfo {
             LyraProtoWriter.appendLengthDelimitedField(14, value: serviceInfoFrame(service), to: &data)
         }
         LyraProtoWriter.appendVarintField(18, value: 0x3FFF, to: &data)
+        LyraProtoWriter.appendLengthDelimitedField(19, value: Data(region.utf8), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(20, value: Data(deviceName.utf8), to: &data)
         if let osVersion {
             LyraProtoWriter.appendLengthDelimitedField(34, value: Data(osVersion.utf8), to: &data)
