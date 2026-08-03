@@ -320,7 +320,37 @@ final class XiaomiMiShareDiscovery: NSObject {
         debugInfo: String?,
         resolvedIPv4: String?
     ) {
-        return
+        guard payload?.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone,
+              let meshPort = payload?.meshPort, meshPort != 0,
+              let host = resolvedIPv4 ?? Self.parseDebugInfoIPv4(debugInfo)
+        else {
+            return
+        }
+        if let pinned = UserDefaults.standard.string(forKey: "lanLastPhoneIP"),
+           !pinned.isEmpty, host != pinned {
+            return
+        }
+        startMeshAnnouncer(host: host, port: meshPort)
+    }
+
+    func startMeshAnnouncerOnKnownPhoneEndpoint() {
+        guard let host = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !host.isEmpty else { return }
+        let reported = (UserDefaults.standard.array(forKey: "lyraReportedPhoneMeshPorts") as? [Int]) ?? []
+        let ports = reported.compactMap { UInt16(exactly: $0) }
+        let port: UInt16? = ports.first(where: { $0 == 43495 }) ?? ports.first
+        guard let port else { return }
+        startMeshAnnouncer(host: host, port: port)
+    }
+
+    private func startMeshAnnouncer(host: String, port: UInt16) {
+        if meshAnnouncer == nil {
+            meshAnnouncer = LyraMeshAnnouncer(
+                deviceIdHexProvider: { [weak self] in self?.publishedDeviceIdHex },
+                displayNameProvider: { [weak self] in self?.publishedDisplayName ?? "EdgeLink Mac" }
+            )
+        }
+        DiagnosticsLog.info("xiaomi.mishare.announcer_start host=\(host) port=\(port)")
+        meshAnnouncer?.start(host: host, port: port)
     }
 
     private static func parseDebugInfoIPv4(_ debugInfo: String?) -> String? {

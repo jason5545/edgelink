@@ -30,6 +30,30 @@ final class LyraMeshAnnouncer {
     private let deviceIdHexProvider: () -> String?
     private let displayNameProvider: () -> String
 
+    private static var announcedDeviceType: UInt32 {
+        let override = UserDefaults.standard.integer(forKey: "xiaomiDeviceTypeOverride")
+        return override > 0 ? UInt32(override) : 14
+    }
+
+    private static var announcedServices: [LyraTrustedDeviceInfo.Service] {
+        var services = [
+            LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
+            LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
+            LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
+        ]
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? true
+        if relayCallEnabled {
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "relayCall",
+                    package: "com.ios.phone",
+                    data: Data([0x03, 0x01, 0x01, 0x01])
+                )
+            )
+        }
+        return services
+    }
+
     init(
         deviceIdHexProvider: @escaping () -> String?,
         displayNameProvider: @escaping () -> String
@@ -100,7 +124,7 @@ final class LyraMeshAnnouncer {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: 14,
+            deviceType: Self.announcedDeviceType,
             uidHash: "61F2",
             displayName: displayNameProvider(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
@@ -199,22 +223,21 @@ final class LyraMeshAnnouncer {
     }
 
     private func sendAnnounce() {
+        guard !UserDefaults.standard.bool(forKey: "xiaomiMeshAnnounceDisabled") else {
+            return
+        }
         guard let deviceIdHex = deviceIdHexProvider(), !syncKeyCandidates.isEmpty else {
             return
         }
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
             deviceName: displayNameProvider(),
-            deviceType: 14,
+            deviceType: Self.announcedDeviceType,
             deviceId: deviceIdHex,
             uidHash: "61F2",
             hwModel: Self.hardwareModel(),
             lyraVersion: "5.1.208.10.fullCnRelease.0512164",
-            services: [
-                LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
-            ],
+            services: Self.announcedServices,
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
         )

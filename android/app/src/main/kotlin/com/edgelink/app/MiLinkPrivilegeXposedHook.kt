@@ -67,6 +67,9 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
     const val XIAOMI_MIRROR_CAST_FRAME_EXTRA = "frame"
     const val MIRROR_FAKE_REMOTE_PROPERTY = "debug.edgelink.mirror_fake_remote"
+    const val RELAY_FILTER_ACCEPT_ALL_PROPERTY = "debug.edgelink.relay_filter_accept_all"
+    const val RELAY_DIAL_TEST_PROPERTY = "debug.edgelink.relay_dial_test"
+    const val RELAY_INJECT_DEVICE_PROPERTY = "debug.edgelink.relay_inject_device"
     const val MIRROR_FAKE_REMOTE_ATTACH_PROPERTY = "debug.edgelink.mirror_fake_remote_attach"
     const val MIRROR_FAKE_REMOTE_KEY_PROPERTY = "debug.edgelink.mirror_fake_remote_key"
     const val MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY = "debug.edgelink.mirror_fake_remote_using_pad"
@@ -487,6 +490,7 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAndroidPhone(packageName, processName)) {
             hookAndroidPhoneRelayServices(classLoader)
+            startRelayDialTestWatcher(classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAndroidSystem(packageName, processName)) {
             hookXiaomiMirrorSystemPackageGids(classLoader)
@@ -1572,6 +1576,175 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             label = "RelayStateService"
         )
         hookAndroidPhoneRelayCallState(classLoader)
+        hookAndroidPhoneRelayFilter(classLoader)
+        hookAndroidPhoneRelayDeviceService(classLoader)
+    }
+
+    private fun hookAndroidPhoneRelayDeviceService(classLoader: ClassLoader) {
+        runCatching {
+            installHook(
+                resolveMethod(
+                    findTargetClass(
+                        classLoader,
+                        "com.android.services.telephony.relay.phonecall.PhoneContinuityController"
+                    ),
+                    "isRelayDeviceService",
+                    findTargetClass(classLoader, "com.xiaomi.continuity.networking.TrustedDeviceInfo")
+                )
+            ) { chain ->
+                if (relayFilterAcceptAll()) {
+                    log("Android phone relay device service forced true")
+                    return@installHook true
+                }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("failed to hook Android phone relay device service: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookAndroidPhoneRelayFilter(classLoader: ClassLoader) {
+        runCatching {
+            val mapClass = Map::class.java
+            installHook(
+                resolveMethod(
+                    findTargetClass(
+                        classLoader,
+                        "com.android.services.telephony.relay.phonecall.RelayServiceFilterUtils"
+                    ),
+                    "updateFilteredServiceInfo",
+                    mapClass,
+                    mapClass
+                )
+            ) { chain ->
+                if (!relayFilterAcceptAll()) {
+                    chain.proceed()
+                    return@installHook null
+                }
+                val filtered = chain.args.getOrNull(0) as? MutableMap<Any?, Any?>
+                val all = chain.args.getOrNull(1) as? Map<Any?, Any?>
+                if (filtered == null || all == null) {
+                    chain.proceed()
+                    return@installHook null
+                }
+                filtered.clear()
+                for (entry in all.entries) {
+                    if (filtered.size >= 2) {
+                        break
+                    }
+                    filtered[entry.key] = entry.value
+                }
+                log("Android phone relay filter forced open devices=${filtered.size}")
+                null
+            }
+        }.onFailure { error ->
+            log("failed to hook Android phone relay filter: ${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun injectRelayServiceInfo(classLoader: ClassLoader, deviceId: String) {
+        runCatching {
+            val controllerClass = findTargetClass(
+                classLoader,
+                "com.android.services.telephony.relay.phonecall.PhoneContinuityController"
+            )
+            val controller = controllerClass.getMethod("getInstance").invoke(null)
+            val runtimeClass = controller.javaClass
+            val updateMethod = runtimeClass.declaredMethods.firstOrNull { method ->
+                method.name == "updateRelayService" && method.parameterTypes.size == 2
+            }?.apply { isAccessible = true } ?: throw NoSuchMethodException(
+                "updateRelayService in ${runtimeClass.name}: " +
+                    runtimeClass.declaredMethods
+                        .filter { it.name.contains("elay") }
+                        .joinToString(",") { m -> m.name + "/" + m.parameterTypes.size }
+            )
+            val serviceInfoClass = updateMethod.parameterTypes[0]
+            val deviceInfoClass = updateMethod.parameterTypes[1]
+            val serviceInfo = serviceInfoClass.getConstructor().newInstance()
+            serviceInfoClass.getMethod("setServiceName", String::class.java)
+                .invoke(serviceInfo, "relayCall")
+            serviceInfoClass.getMethod("setPackageName", String::class.java)
+                .invoke(serviceInfo, "com.ios.phone")
+            serviceInfoClass.getMethod("setServiceData", ByteArray::class.java)
+                .invoke(serviceInfo, byteArrayOf(3, 1, 1, 1))
+            val deviceInfo = deviceInfoClass.getConstructor().newInstance()
+            deviceInfoClass.getMethod("setDeviceId", String::class.java)
+                .invoke(deviceInfo, deviceId)
+            deviceInfoClass.getMethod("setDeviceName", String::class.java)
+                .invoke(deviceInfo, "EdgeLink Mac")
+            deviceInfoClass.getMethod("setDeviceType", Integer.TYPE)
+                .invoke(deviceInfo, 4)
+            deviceInfoClass.getMethod("setMediumTypes", Integer.TYPE)
+                .invoke(deviceInfo, 128)
+            deviceInfoClass.getMethod("setTrustedTypes", Integer.TYPE)
+                .invoke(deviceInfo, 1)
+            updateMethod.invoke(controller, serviceInfo, deviceInfo)
+            log("relay inject service info deviceId=$deviceId")
+        }.onFailure { error ->
+            log("relay inject service info failed: ${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            Class.forName("android.os.SystemProperties")
+                .getMethod("set", String::class.java, String::class.java)
+                .invoke(null, MiLinkPrivilegeHookPolicy.RELAY_INJECT_DEVICE_PROPERTY, "")
+        }
+    }
+
+    private fun relayFilterAcceptAll(): Boolean =
+        readSystemProperty(MiLinkPrivilegeHookPolicy.RELAY_FILTER_ACCEPT_ALL_PROPERTY) == "1"
+
+    private val relayDialTestStarted = AtomicBoolean(false)
+
+    private fun startRelayDialTestWatcher(classLoader: ClassLoader) {
+        if (!relayDialTestStarted.compareAndSet(false, true)) {
+            return
+        }
+        thread(name = "EdgeLinkRelayDialTest") {
+            while (generationActive) {
+                runCatching {
+                    val injectDeviceId = readSystemProperty(MiLinkPrivilegeHookPolicy.RELAY_INJECT_DEVICE_PROPERTY).trim()
+                    if (injectDeviceId.isNotEmpty()) {
+                        injectRelayServiceInfo(classLoader, injectDeviceId)
+                    }
+                    val deviceId = readSystemProperty(MiLinkPrivilegeHookPolicy.RELAY_DIAL_TEST_PROPERTY).trim()
+                    if (deviceId.isNotEmpty()) {
+                        log("relay dial test start deviceId=$deviceId")
+                        val controllerClass = findTargetClass(
+                            classLoader,
+                            "com.android.services.telephony.relay.phonecall.PhoneContinuityController"
+                        )
+                        val controller = controllerClass.getMethod("getInstance").invoke(null)
+                        controllerClass.getMethod(
+                            "createRelayChannel",
+                            String::class.java,
+                            String::class.java,
+                            findTargetClass(
+                                classLoader,
+                                "com.android.services.telephony.relay.phonecall.ChannelCreateCallback"
+                            )
+                        ).invoke(controller, "relay_dial_test", deviceId, null)
+                        log("relay dial test invoked deviceId=$deviceId")
+                        runCatching {
+                            Class.forName("android.os.SystemProperties")
+                                .getMethod("set", String::class.java, String::class.java)
+                                .invoke(null, MiLinkPrivilegeHookPolicy.RELAY_DIAL_TEST_PROPERTY, "")
+                        }
+                    }
+                }.onFailure { error ->
+                    log("relay dial test failed: ${error.javaClass.simpleName}: ${error.message}")
+                    runCatching {
+                        Class.forName("android.os.SystemProperties")
+                            .getMethod("set", String::class.java, String::class.java)
+                            .invoke(null, MiLinkPrivilegeHookPolicy.RELAY_DIAL_TEST_PROPERTY, "")
+                    }
+                }
+                try {
+                    Thread.sleep(1000)
+                } catch (_: InterruptedException) {
+                    return@thread
+                }
+            }
+        }
     }
 
     private fun hookAndroidPhoneRelayDeviceList(

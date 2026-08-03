@@ -4502,6 +4502,7 @@ final class EdgeLinkRuntime: ObservableObject {
         if let ports = status.lyraMeshPorts, !ports.isEmpty {
             UserDefaults.standard.set(ports, forKey: "lyraReportedPhoneMeshPorts")
             DiagnosticsLog.info("milink.mac.lyra_mesh_ports ports=\(ports)")
+            xiaomiMiShareDiscovery.startMeshAnnouncerOnKnownPhoneEndpoint()
         }
         autoWarmXiaomiServicesIfNeeded(status)
         reconcileOrphanXiaomiMirrorIfNeeded(status)

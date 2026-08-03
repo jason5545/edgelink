@@ -627,12 +627,7 @@ final class LyraMeshResponder {
             uidHash: "61F2",
             hwModel: Self.hardwareModel(),
             lyraVersion: "5.1.208.10.fullCnRelease.0512164",
-            services: [
-                LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
-            ],
+            services: Self.announcedServices,
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
         )
@@ -642,6 +637,26 @@ final class LyraMeshResponder {
         DiagnosticsLog.info(
             "xiaomi.mishare.announce_sent to=\(endpointDescription) bytes=\(payload.count)"
         )
+    }
+
+    private static var announcedServices: [LyraTrustedDeviceInfo.Service] {
+        var services = [
+            LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
+            LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
+            LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
+            LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
+        ]
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? true
+        if relayCallEnabled {
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "relayCall",
+                    package: "com.ios.phone",
+                    data: Data([0x03, 0x01, 0x01, 0x01])
+                )
+            )
+        }
+        return services
     }
 
     private static func hardwareModel() -> String {
@@ -1617,12 +1632,7 @@ final class LyraMeshResponder {
             uidHash: "61F2",
             hwModel: Self.hardwareModel(),
             lyraVersion: "5.1.208.10.fullCnRelease.0512164",
-            services: [
-                LyraTrustedDeviceInfo.Service(name: "miLyraShare", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
-                LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
-            ],
+            services: Self.announcedServices,
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
         )
