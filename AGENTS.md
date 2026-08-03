@@ -1,5 +1,26 @@
 # EdgeLink Agent Notes
 
+## Common paths & commands
+
+- Phone is USB-connected (`adb devices`, adb root available). EdgeLink Android logs:
+  `adb shell "run-as com.edgelink.app tail -60 files/diagnostics.log"`
+- Mac app logs: `~/Library/Application Support/EdgeLink/diagnostics.log`
+- TeleService relay logs (`RelayLog`, call-relay flow) are in the **radio** buffer:
+  `adb logcat -b radio -d`
+- Debug probe (kills live mirror sessions — reconnect after):
+  `adb shell am broadcast -a com.edgelink.app.DEBUG_PROBE_MILINK -p com.edgelink.app [--es command xiaomi.mi_connect.networkingProbe]`
+- Call-relay debug props (all inert when empty): `debug.edgelink.relay_filter_accept_all=1`,
+  `debug.edgelink.relay_dial_test=<deviceId>`, `debug.edgelink.relay_inject_device=<deviceId>`
+- lyra-debug CLI (pcap/parse/keys): build with
+  `xcodebuild -project mac/EdgeLink.xcodeproj -scheme LyraDebug -configuration Debug build`,
+  binary under `~/Library/Developer/Xcode/DerivedData/EdgeLink-*/Build/Products/Debug/lyra-debug`
+- Phone-side APKs for jadx research: `/system/priv-app/TeleService/TeleService.apk` (call relay),
+  `/product/priv-app/Mirror/Mirror.apk` (mirror/call provider); existing decompiles under
+  `captures/` (e.g. `captures/xiaomi-mirror-device/jadx/`, `captures/mi-connect-service/jadx/`)
+- tcpdump on phone: `adb shell "nohup tcpdump -i wlan0 -s 0 -w /sdcard/x.pcap host <mac-ip> >/dev/null 2>&1 &"`,
+  then `adb shell pkill tcpdump` and `adb pull`
+
+
 - **Xiaomi mirror: dim is NOT the issue — do NOT touch dim/power/Hangup-related code** (`AndroidScreenPowerGuard`, dim/brightness logic, MIUI Hangup/synergy power-key paths). Verified 2026-07-28: video keeps flowing with virtual display at brightness 2.44E-4, DIM, even screen_off (official Hangup behavior); static screen → zero frames is normal encoder behavior, not a stall. These areas were painstakingly tuned; changing them historically causes regressions.
 - When building the macOS app for local install, use Apple Development Team ID `MW4GWYGX56`.
 - Keep `mac/project.yml` as the source of truth for Xcode signing settings, then run `xcodegen generate` from `mac/` after editing it.
