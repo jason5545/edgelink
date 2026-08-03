@@ -793,6 +793,8 @@ final class MacScreenSession: NSObject, ObservableObject {
         window.title = String(localized: "妙享桌面")
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
         window.isMovableByWindowBackground = true
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -1725,10 +1727,7 @@ extension MacScreenSession: NSWindowDelegate {
         guard !isClosingWindow else {
             return true
         }
-        sender.orderOut(nil)
-        resetScreenControls()
-        reportWindowVisibility(false, reason: "windowShouldClose")
-        DiagnosticsLog.info("screen.mac.window_hidden keep_projection=true")
+        requestClose()
         return false
     }
 
@@ -1960,9 +1959,6 @@ struct PhoneScreenView: View {
 
     private var topBar: some View {
         HStack(spacing: 6) {
-            chromeButton(systemName: "xmark", help: String(localized: "關閉")) {
-                session.requestClose()
-            }
             Spacer()
             chromeButton(
                 systemName: session.isPinned ? "pin.fill" : "pin",
