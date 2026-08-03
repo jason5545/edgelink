@@ -1,5 +1,11 @@
 # EdgeLink Agent Notes
 
+## Definition of done
+
+- Every completed change must pass the full test suite before it is considered done:
+  `cd mac && xcodebuild -project EdgeLink.xcodeproj -scheme EdgeLinkMacTests -configuration Debug -derivedDataPath /private/tmp/edgelink-test-dd test`
+  New test files need `xcodegen generate` (from `mac/`) before the suite picks them up.
+
 ## Common paths & commands
 
 - Phone is USB-connected (`adb devices`, adb root available). EdgeLink Android logs:
