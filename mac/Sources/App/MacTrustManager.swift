@@ -59,6 +59,11 @@ final class MacTrustManager: ObservableObject {
     private var sessionID: UInt64 = 0
     private var awaitingAuthEvent = false
     private var awaitingBindEvent = false
+    private var awaitingVerifyEvent = false
+    // True when the risk was hit mid-unlock (authEvent code 11): after a
+    // successful phone-side password verify, the quick auth retries
+    // immediately (the user already passed Touch ID for this attempt).
+    private var retryUnlockAfterVerify = false
     private let biometric: BiometricAuthManager
 
     init(biometric: BiometricAuthManager = .shared) {
@@ -73,6 +78,16 @@ final class MacTrustManager: ObservableObject {
     var isRemoteLocked: Bool {
         guard let event = statusEvent else { return true }
         return event.remoteKeyguardStatus != DuoScreenKeyguardStatus.valid
+    }
+
+    // The phone reports its own risk in localRisk (its perspective);
+    // remoteRisk is the risk of the Mac side and stays 0 on the wire
+    // (live 2026-08-03: phone sendMsg localRisk=3, remoteRisk=0 while the
+    // TA demanded risk auth). The official client's "remote risk" handling
+    // reads the phone's localRisk.
+    static func phoneRisk(_ auth: TrustAuthStatus) -> DuoScreenTrustRisk {
+        let raw = auth.localRisk != 0 ? auth.localRisk : auth.remoteRisk
+        return DuoScreenTrustRisk(rawValue: raw) ?? .none
     }
 
     func start() {
@@ -105,6 +120,8 @@ final class MacTrustManager: ObservableObject {
         statusEvent = nil
         awaitingAuthEvent = false
         awaitingBindEvent = false
+        awaitingVerifyEvent = false
+        retryUnlockAfterVerify = false
         unlockConfirmed = false
         keyguardInfoConfirmed = false
         statusQueryEpoch &+= 1
@@ -125,10 +142,13 @@ final class MacTrustManager: ObservableObject {
 
     func requestUnlock() async {
         guard case .ready = state else { return }
-        if let auth = statusEvent?.auth, auth.remoteRisk > DuoScreenTrustRisk.none.rawValue {
-            state = .riskBlocked(DuoScreenTrustRisk(rawValue: auth.remoteRisk) ?? .none)
-            DiagnosticsLog.warn("trust.mac.unlock_blocked remoteRisk=\(auth.remoteRisk)")
-            return
+        if let auth = statusEvent?.auth {
+            let risk = Self.phoneRisk(auth)
+            if risk != .none {
+                enterRiskBlocked(risk)
+                DiagnosticsLog.warn("trust.mac.unlock_blocked risk=\(risk.rawValue)")
+                return
+            }
         }
         state = .authenticating
         if touchIdPreauthorized {
@@ -171,7 +191,7 @@ final class MacTrustManager: ObservableObject {
         case .authEvent(let event):
             handleAuthEvent(event)
         case .verifyEvent(let event):
-            DiagnosticsLog.info("trust.mac.verify_event code=\(event.code)")
+            handleVerifyEvent(event)
         case .passwordEvent(let event):
             DiagnosticsLog.info("trust.mac.password_event code=\(event.code)")
         case .misc(let misc):
@@ -196,6 +216,27 @@ final class MacTrustManager: ObservableObject {
             DiagnosticsLog.info(
                 "trust.mac.status_no_info code=\(event.code) enable=\(event.auth?.enableStatus ?? -99)"
             )
+            // Placeholders lie about keyguard, but their auth payload still
+            // comes from the phone's real getSupportStatus TA query — a
+            // notBound bindStatus or a nonzero risk inside a placeholder is
+            // trustworthy (myron only ever reports these inside enable=0
+            // placeholders, live 2026-08-03).
+            if let auth = event.auth {
+                if let bind = DuoScreenTrustBindStatus(rawValue: auth.bindStatus), bind != .bound {
+                    state = .needsBind
+                    DiagnosticsLog.info("trust.mac.status_placeholder_needs_bind bind=\(auth.bindStatus)")
+                    if autoBindOnNeedsBind {
+                        autoBindOnNeedsBind = false
+                        requestBind()
+                    }
+                    return
+                }
+                let risk = Self.phoneRisk(auth)
+                if risk != .none {
+                    enterRiskBlocked(risk)
+                    return
+                }
+            }
             guard state == .queryingStatus else { return }
             if let externalLocked = externalLockState?() {
                 DiagnosticsLog.info("trust.mac.status_external_shortcut locked=\(externalLocked)")
@@ -242,8 +283,9 @@ final class MacTrustManager: ObservableObject {
             state = .failed("手機不支援跨裝置解鎖")
             return
         }
-        if auth.remoteRisk != DuoScreenTrustRisk.none.rawValue {
-            state = .riskBlocked(DuoScreenTrustRisk(rawValue: auth.remoteRisk) ?? .none)
+        let phoneRisk = Self.phoneRisk(auth)
+        if phoneRisk != .none {
+            enterRiskBlocked(phoneRisk)
             return
         }
         switch DuoScreenTrustBindStatus(rawValue: auth.bindStatus) {
@@ -300,9 +342,61 @@ final class MacTrustManager: ObservableObject {
         case DuoScreenTrustCode.retryWithFingerprint:
             state = .ready(locked: true)
             DiagnosticsLog.info("trust.mac.unlock_retry_requested")
+        case DuoScreenTrustCode.riskAuthRequired:
+            // The phone's quick-auth TA demands one on-phone password
+            // verification (matches localRisk=deviceReboot in the shared
+            // auth status). Surface the risk mask and kick the official
+            // verify flow — the phone shows its own password UI, no rebind
+            // needed.
+            retryUnlockAfterVerify = true
+            enterRiskBlocked(.deviceReboot)
+            DiagnosticsLog.info("trust.mac.unlock_risk_auth_required code=\(event.code)")
         default:
             state = .failed("解鎖失敗 (\(event.code))")
             DiagnosticsLog.warn("trust.mac.unlock_failed code=\(event.code)")
+        }
+    }
+
+    // Official risk handling (LiveScreenTrustManager "handle remote risk" →
+    // "trust service veriry"): on a risk report the Mac sends a
+    // verifyAction and the PHONE shows its own lock-screen password UI
+    // (.remoteservice.locksettings.LockScreenUIActivity). Entering the
+    // password re-provisions the per-boot TA auth token — no rebind needed.
+    private func enterRiskBlocked(_ risk: DuoScreenTrustRisk) {
+        state = .riskBlocked(risk)
+        guard !awaitingVerifyEvent else { return }
+        awaitingVerifyEvent = true
+        var action = TrustVerifyAction()
+        action.feature = DuoScreenTrustFeature.unlockDevice
+        action.unlockUi = true
+        action.risk = risk.rawValue
+        action.notCheckSetting = true
+        send(.verifyAction(action))
+        DiagnosticsLog.info("trust.mac.verify_action_sent risk=\(risk.rawValue)")
+    }
+
+    private func handleVerifyEvent(_ event: TrustVerifyEvent) {
+        guard awaitingVerifyEvent, event.feature == DuoScreenTrustFeature.unlockDevice else { return }
+        awaitingVerifyEvent = false
+        switch event.code {
+        case DuoScreenTrustCode.success:
+            DiagnosticsLog.info("trust.mac.verify_success")
+            let retry = retryUnlockAfterVerify
+            retryUnlockAfterVerify = false
+            state = .ready(locked: true)
+            if retry {
+                // Touch ID already passed for this attempt and the phone
+                // verify re-provisioned the TA token — the quick-auth retry
+                // should fly through without a second prompt.
+                touchIdPreauthorized = true
+                Task { await self.requestUnlock() }
+            }
+        case DuoScreenTrustCode.userCancel, DuoScreenTrustCode.timeoutCancel:
+            retryUnlockAfterVerify = false
+            DiagnosticsLog.info("trust.mac.verify_cancelled code=\(event.code)")
+        default:
+            retryUnlockAfterVerify = false
+            DiagnosticsLog.warn("trust.mac.verify_failed code=\(event.code)")
         }
     }
 

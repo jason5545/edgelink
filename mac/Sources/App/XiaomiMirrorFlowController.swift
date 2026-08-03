@@ -281,6 +281,15 @@ final class XiaomiMirrorFlowController {
                    !trustManager.keyguardInfoConfirmed, !trustManager.isExternallyUnlocked {
                     break
                 }
+                if mask == .risk {
+                    // Risk cleared on the phone (password verified): the
+                    // phone tore down its RTSP server when quick-auth was
+                    // refused, so the mirror pipeline must be reopened, not
+                    // just awaited.
+                    mask = .loading
+                    retryRequested()
+                    break
+                }
                 if hasRemoteVideo() {
                     stage = .streaming
                     mask = nil

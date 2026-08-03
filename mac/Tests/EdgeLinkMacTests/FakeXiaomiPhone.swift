@@ -19,6 +19,7 @@ final class FakeXiaomiPhone {
     // Assertion surface
     private(set) var statusActionCount = 0
     private(set) var authActionCount = 0
+    private(set) var verifyActionCount = 0
     private(set) var bindActionCount = 0
     private(set) var openMirrorScreenCount = 0
     private(set) var closeScreenCount = 0
@@ -56,6 +57,41 @@ final class FakeXiaomiPhone {
     // after a successful Mac-driven unlock.
     func setLocked(_ value: Bool) {
         queue.async { self.locked = value }
+    }
+
+    // Models the phone-side quick-auth TA demanding one on-phone lock-screen
+    // password verification (live 2026-08-03: logcat quickAuthEventHandle
+    // "device reboot, need risk auth" → authEvent code 11, mrmd "first boot,
+    // please auth!"). While armed, an authAction gets the code-11 refusal
+    // instead of the mitrust unlock run.
+    var quickAuthRiskArmed = false
+
+    // The user typed the lock-screen password on the phone: the risk clears,
+    // the phone unlocks, and a fresh truthful status event goes out.
+    func clearQuickAuthRisk() {
+        queue.async {
+            self.quickAuthRiskArmed = false
+            self.locked = false
+            self.sendStatusEvent(sessionID: 0)
+        }
+    }
+
+    // myron reports notBound only inside enable=0 placeholders (live
+    // 2026-08-03): the status answer has no usable keyguard info but the
+    // bindStatus comes from the phone's real TA query.
+    var notBoundViaPlaceholder = false
+
+    // The user entered the lock-screen password in the phone's
+    // LockScreenUIActivity (the official verify flow): the TA re-provisions
+    // its per-boot auth token and the pending verifyAction is answered.
+    func completeVerify() {
+        queue.async {
+            self.quickAuthRiskArmed = false
+            let event = TrustVerifyEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
+            self.sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                DuoScreenTrust(sessionID: 0, msg: .verifyEvent(event))
+            ))
+        }
     }
 
     var log: (String) -> Void = { _ in }
@@ -535,11 +571,12 @@ final class FakeXiaomiPhone {
         sendChannel(packet)
     }
 
-    private func sendStatusEvent(sessionID: UInt64, keyguardOverride: Int32? = nil, enableOverride: Int32? = nil) {
+    private func sendStatusEvent(sessionID: UInt64, keyguardOverride: Int32? = nil, enableOverride: Int32? = nil, bindOverride: Int32? = nil, localRiskOverride: Int32 = 0) {
         var auth = TrustAuthStatus()
         auth.features = [DuoScreenTrustFeature.unlockDevice]
         auth.enableStatus = enableOverride ?? DuoScreenTrustEnableStatus.enabled.rawValue
-        auth.bindStatus = (bound ? DuoScreenTrustBindStatus.bound : DuoScreenTrustBindStatus.notBound).rawValue
+        auth.bindStatus = bindOverride ?? (bound ? DuoScreenTrustBindStatus.bound : DuoScreenTrustBindStatus.notBound).rawValue
+        auth.localRisk = localRiskOverride
         auth.remoteRisk = 0
         var event = TrustStatusEvent()
         event.code = DuoScreenTrustCode.success
@@ -558,6 +595,14 @@ final class FakeXiaomiPhone {
         switch msg {
         case .statusAction:
             statusActionCount += 1
+            if notBoundViaPlaceholder {
+                sendStatusEvent(
+                    sessionID: trust.sessionID,
+                    enableOverride: DuoScreenTrustEnableStatus.unset.rawValue,
+                    bindOverride: DuoScreenTrustBindStatus.notBound.rawValue
+                )
+                return
+            }
             let lying = conflictingStatus
                 && (truthfulAfterQueries == nil || statusActionCount <= truthfulAfterQueries!)
             if lying {
@@ -586,6 +631,7 @@ final class FakeXiaomiPhone {
             // The user completed the phone-side verification: TA registration
             // done, bind event success, then a fresh truthful status event.
             bound = true
+            notBoundViaPlaceholder = false
             var event = TrustBindEvent()
             event.feature = DuoScreenTrustFeature.unlockDevice
             event.code = DuoScreenTrustCode.success
@@ -593,11 +639,29 @@ final class FakeXiaomiPhone {
                 DuoScreenTrust(sessionID: trust.sessionID, msg: .bindEvent(event))
             ))
             sendStatusEvent(sessionID: trust.sessionID)
+        case .verifyAction(let action):
+            guard action.feature == DuoScreenTrustFeature.unlockDevice else { return }
+            verifyActionCount += 1
+            log("fakephone.verify_action risk=\(action.risk) unlockUi=\(action.unlockUi)")
+            // While the risk is armed the phone shows LockScreenUIActivity
+            // and waits for the password — the test drives that via
+            // completeVerify(). Without a risk it answers instantly.
+            if !quickAuthRiskArmed {
+                let event = TrustVerifyEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
+                sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                    DuoScreenTrust(sessionID: trust.sessionID, msg: .verifyEvent(event))
+                ))
+            }
         case .authAction(let action):
             guard action.feature == DuoScreenTrustFeature.unlockDevice else { return }
             authActionCount += 1
-            log("fakephone.auth_action locked=\(self.locked)")
-            if locked {
+            log("fakephone.auth_action locked=\(self.locked) riskArmed=\(self.quickAuthRiskArmed)")
+            if quickAuthRiskArmed {
+                let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.riskAuthRequired)
+                sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                    DuoScreenTrust(sessionID: trust.sessionID, msg: .authEvent(event))
+                ))
+            } else if locked {
                 runMitrustUnlock()
             } else {
                 let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)

@@ -29,6 +29,12 @@ public enum DuoScreenTrustCode {
     public static let timeoutCancel: Int32 = 20
     public static let retryWithFingerprint: Int32 = 21
     public static let serviceNotReady: Int32 = 256
+    // Phone-side quick auth refused because the shared-auth TA demands one
+    // on-phone lock-screen password verification first (phone logcat:
+    // quickAuthEventHandle "device reboot, need risk auth" → returnErrorCode
+    // 11, mrmd/misauth "first boot, please auth!"). The TA can re-arm this
+    // flag hours after boot even while quick auth worked earlier.
+    public static let riskAuthRequired: Int32 = 11
     public static let disabledBySetting: Int32 = -2000
 }
 

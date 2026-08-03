@@ -447,6 +447,94 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(phone.openMirrorScreenCount, 2, "OPEN must be sent exactly once per flow")
     }
 
+    // Regression (2026-08-03 live): the phone's quick-auth TA lost its
+    // per-boot auth token after a reboot; the unlock authAction got
+    // authEvent code 11 (logcat "device reboot, need risk auth" / mrmd
+    // "first boot, please auth!"). The official recovery is NOT a rebind:
+    // the Mac sends a verifyAction, the phone shows its own lock-screen
+    // password UI (LockScreenUIActivity), and the password re-provisions
+    // the TA token. Code 11 must show the risk mask, auto-send the
+    // verifyAction, and a successful verify must retry the quick auth
+    // without a second Touch ID prompt.
+    func testRiskAuthRequiredVerifiesThenRetriesUnlock() async throws {
+        try makeEnvironment(locked: true)
+        phone.quickAuthRiskArmed = true
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask + OPEN sent + WFD up") { [self] in
+            self.controller.mask == .locked
+                && self.phone.openMirrorScreenCount == 1
+                && self.phone.wfdSessionEstablished
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("risk mask + verifyAction sent after code 11") { [self] in
+            self.controller.mask == .risk && self.phone.verifyActionCount == 1
+        }
+        XCTAssertEqual(phone.mitrustUnlockCount, 0, "risk-refused auth must not run the mitrust unlock")
+
+        // User types the lock-screen password in the phone's
+        // LockScreenUIActivity.
+        phone.completeVerify()
+
+        try await waitFor("quick auth retried and streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(phone.mitrustUnlockCount, 1, "verify success must retry the quick auth")
+        XCTAssertEqual(biometricCallCount, 1, "verify resume must not re-prompt Touch ID")
+        XCTAssertEqual(phone.openMirrorScreenCount, 1, "verify resume must not re-send OPEN")
+    }
+
+    // myron reports notBound only inside enable=0 placeholder statuses (live
+    // 2026-08-03): the bindStatus there comes from the phone's real
+    // getSupportStatus TA query, so it must still drive the bind flow —
+    // otherwise the Mac can never notice the phone dropped the pairing.
+    func testPlaceholderNotBoundShowsBindMaskThenBinds() async throws {
+        try makeEnvironment(locked: false)
+        phone.notBoundViaPlaceholder = true
+        session.start()
+        controller.start()
+
+        try await waitFor("bind mask from placeholder notBound") { [self] in
+            self.session.isChannelReady && self.controller.mask == .bind
+        }
+
+        controller.bindRequested()
+
+        try await waitFor("phone received duo.screen bindAction") { [self] in
+            self.phone.bindActionCount >= 1
+        }
+        try await waitFor("flow auto-resumed to streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
+    // Regression (2026-08-02 live): after the unlock authEvent the controller
+
+    // The phone's RTSP listener is only up while a mirror session is alive.
+    // When the phone tears its server down (e.g. risk-refused auth), every
+    // dial gets ECONNREFUSED — the client must fail fast instead of burning
+    // the whole 40-attempt budget against a dead port (live 2026-08-03: 38
+    // refused retries, 13s of spinner before the failure mask).
+    func testWFDClientFailsFastOnPersistentConnectionRefused() async throws {
+        let client = XiaomiMirrorWFDClient()
+        wfdClient = client
+        let closed = expectation(description: "wfd client closed")
+        var closeReason = ""
+        client.onClosed = { reason in
+            closeReason = reason
+            closed.fulfill()
+        }
+        client.start(host: "127.0.0.1", rtspPort: 29_199, clientRTPPort: clientVideoPort)
+        await fulfillment(of: [closed], timeout: 15)
+        XCTAssertTrue(
+            closeReason.contains("Connection refused") || closeReason.contains("61"),
+            "expected refusal-driven close, got: \(closeReason)"
+        )
+    }
+
     // Regression (2026-08-02 live): after the unlock authEvent the controller
     // re-sent OPEN_MIRROR_SCREEN (stage was .unlocking, slipping past the dup
     // guard) — the phone tore down its RTSP server mid-dialog ("Connection

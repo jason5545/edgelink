@@ -50,6 +50,13 @@ final class XiaomiMirrorWFDClient {
     private var startArgs: (host: String, rtspPort: UInt16, clientRTPPort: UInt16)?
     private var connectRetryCount = 0
     private static let maxConnectRetries = 40
+    // ECONNREFUSED means the phone's RTSP listener is gone, not merely not
+    // yet up (the post-OPEN listener appears within ~1s). Burn-through of
+    // the full retry budget against a dead server (live, 2026-08-03: 38
+    // refused retries after the phone tore its server down) only delays the
+    // failure UI, so persistent refusals fail fast.
+    private var consecutiveRefusals = 0
+    private static let maxConsecutiveRefusals = 8
 
     private static let userAgent = "stagefright/1.1 (Linux;Android 4.1)"
     private static let libVersion = "miplaycast_os3_release1.7 3.2.6011403"
@@ -68,6 +75,7 @@ final class XiaomiMirrorWFDClient {
             }
             self.startArgs = (host, rtspPort, clientRTPPort)
             self.connectRetryCount = 0
+            self.consecutiveRefusals = 0
             self.beginConnection(host: host, rtspPort: rtspPort, clientRTPPort: clientRTPPort)
         }
     }
@@ -125,14 +133,19 @@ final class XiaomiMirrorWFDClient {
         case .ready:
             stage = .negotiating
             lastProgress = Date()
+            consecutiveRefusals = 0
             receive()
             DiagnosticsLog.info("xiaomi.wfd.connected host=\(host) port=\(port)")
         case .waiting(let error):
             if stage == .connecting {
-                fail("connect_waiting \(error.localizedDescription)", retryDelay: 0.25)
+                fail(
+                    "connect_waiting \(error.localizedDescription)",
+                    retryDelay: 0.25,
+                    refused: Self.isConnectionRefused(error)
+                )
             }
         case .failed(let error):
-            fail("connect_failed \(error.localizedDescription)")
+            fail("connect_failed \(error.localizedDescription)", refused: Self.isConnectionRefused(error))
         case .cancelled:
             if stage != .closed, stage != .idle {
                 close(reason: "connection_cancelled")
@@ -439,16 +452,25 @@ final class XiaomiMirrorWFDClient {
         timer.resume()
     }
 
-    private func fail(_ reason: String, retryDelay: TimeInterval = 1) {
+    private static func isConnectionRefused(_ error: NWError) -> Bool {
+        if case .posix(let code) = error {
+            return code == .ECONNREFUSED
+        }
+        return false
+    }
+
+    private func fail(_ reason: String, retryDelay: TimeInterval = 1, refused: Bool = false) {
         // The phone opens its RTSP listener only after OPEN_MIRROR_SCREEN is
         // processed (and possibly after an on-phone permission tap), so early
         // connect attempts race the listener. A duplicate OPEN makes the
         // phone tear down and rebuild its RTSP server, which can also reset
         // an in-flight dialog ("Connection reset by peer"). Retry through
         // both windows — anything before .established is safe to redo.
+        consecutiveRefusals = refused ? consecutiveRefusals + 1 : 0
         if stage != .established, stage != .closed,
            let args = startArgs,
-           connectRetryCount + 1 < Self.maxConnectRetries {
+           connectRetryCount + 1 < Self.maxConnectRetries,
+           consecutiveRefusals < Self.maxConsecutiveRefusals {
             connectRetryCount += 1
             DiagnosticsLog.info(
                 "xiaomi.wfd.connect_retry attempt=\(connectRetryCount) reason=\(reason)"
