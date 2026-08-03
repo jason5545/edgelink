@@ -26,17 +26,30 @@ final class MirrorFlowE2ETests: XCTestCase {
     private var wfdIDRRequestDelay: TimeInterval = 20
     private var establishedNotifiesVideoFrame = true
 
-    private let meshPort: UInt16 = 29_101
-    private let castChannelPort: UInt16 = 29_102
-    private let wfdPort: UInt16 = 29_103
-    private let clientVideoPort: UInt16 = 29_104
+    // Each test gets its own port block: UDP/TCP listener sockets from the
+    // previous test release asynchronously after cancel(), and a next test
+    // binding the same ports immediately would hit EADDRINUSE (observed as
+    // the fake phone's WFD server failing to start right after the
+    // mid-stream recovery test).
+    private static var portBlockIndex: UInt16 = 0
+    private var meshPort: UInt16!
+    private var castChannelPort: UInt16!
+    private var wfdPort: UInt16!
+    private var clientVideoPort: UInt16!
 
     override func setUp() {
         super.setUp()
+        Self.portBlockIndex += 1
+        let base = 29_101 + Self.portBlockIndex * 10
+        meshPort = base
+        castChannelPort = base + 1
+        wfdPort = base + 2
+        clientVideoPort = base + 3
         continueAfterFailure = false
     }
 
     override func tearDown() {
+        controller?.stop()
         wfdClient?.stop(reason: "teardown")
         videoListener?.cancel()
         videoConnection?.cancel()
@@ -63,18 +76,19 @@ final class MirrorFlowE2ETests: XCTestCase {
         trustManager = MacTrustManager()
         trustManager.statusRetryDelay = 0.1
         trustManager.maxStatusRetries = 3
-        session = LyraCastTrustSession(
-            endpoints: [("127.0.0.1", meshPort)],
-            deviceIdHex: "721572C3",
-            displayName: "EdgeLinkMacTests",
-            trustManager: trustManager
-        )
-        session.retainPhysAfterAuth = true
-        session.duoScreenStatusEnabled = true
+        attachSession()
 
         controller = XiaomiMirrorFlowController(trustManager: trustManager)
         controller.sessionProvider = { [weak self] in self?.session }
-        controller.sessionFactory = { _ in }
+        // Mirrors production: when the session finishes (peer released the
+        // channel with no adopted mitrust conn), the runtime drops it and
+        // the flow builds a fresh one on demand.
+        controller.sessionFactory = { [weak self] _ in
+            self?.session?.cancel()
+            self?.session = nil
+            self?.attachSession()
+            self?.session.start()
+        }
         controller.biometricEvaluate = { [weak self] in
             self?.biometricCallCount += 1
         }
@@ -87,6 +101,18 @@ final class MirrorFlowE2ETests: XCTestCase {
         controller.hasRemoteVideo = { [weak self] in
             (self?.videoDatagramsReceived ?? 0) > 0
         }
+        startVideoListener()
+    }
+
+    private func attachSession() {
+        let session = LyraCastTrustSession(
+            endpoints: [("127.0.0.1", meshPort)],
+            deviceIdHex: "721572C3",
+            displayName: "EdgeLinkMacTests",
+            trustManager: trustManager
+        )
+        session.retainPhysAfterAuth = true
+        session.duoScreenStatusEnabled = true
         session.onChannelReady = { [weak self] in
             Task { @MainActor in
                 self?.controller.notifyChannelReady()
@@ -97,7 +123,13 @@ final class MirrorFlowE2ETests: XCTestCase {
                 self?.controller.notifyChannelReleased()
             }
         }
-        startVideoListener()
+        session.onFinish = { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session, self.session === session else { return }
+                self.session = nil
+            }
+        }
+        self.session = session
     }
 
     private func startWFDClient() {
@@ -831,10 +863,6 @@ final class MirrorFlowE2ETests: XCTestCase {
     // video recovery — it must redial the cast channel and re-send
     // OPEN_MIRROR_SCREEN once the channel is back, returning to streaming.
     func testMirrorFlowRestartsWhenPhoneReleasesCastChannelMidStream() async throws {
-        // WIP 2026-08-02: the redial dies at trust_channel_redial_impossible
-        // because the session drops channelKeyCS when the adopted
-        // mitrustservice conn owns the auth. Fix tomorrow, then re-enable.
-        throw XCTSkip("redial impossible with adopted mitrust conn — WIP")
         try makeEnvironment(locked: false)
         session.start()
         controller.start()

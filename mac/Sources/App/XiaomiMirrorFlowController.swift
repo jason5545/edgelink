@@ -94,6 +94,11 @@ final class XiaomiMirrorFlowController {
             guard let self else { return }
             let deadline = Date().addingTimeInterval(15)
             while Date() < deadline {
+                // A stopped/superseded flow must not keep rebuilding
+                // sessions in the background (post-reboot recovery, test
+                // teardown, or a user stop would leak ghost sessions that
+                // steal the phone's negotiation from the next flow).
+                if generation != self.flowGeneration { return }
                 if self.sessionProvider()?.isChannelReady == true { break }
                 if self.sessionProvider() == nil {
                     self.sessionFactory("mirror_flow_rebuild")

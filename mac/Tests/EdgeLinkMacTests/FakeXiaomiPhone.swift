@@ -118,6 +118,10 @@ final class FakeXiaomiPhone {
             self?.queue.async {
                 self?.meshConnection?.cancel()
                 self?.meshConnection = connection
+                // Fresh KCP state per connection — the real phone does the
+                // same (a redialed/rebooted session restarts sn at 0).
+                self?.meshSendSn = 0
+                self?.meshRecvUna = 0
                 connection.start(queue: self!.queue)
                 self?.receiveMesh(on: connection)
             }
@@ -445,6 +449,10 @@ final class FakeXiaomiPhone {
             self?.queue.async {
                 self?.channelConnection?.cancel()
                 self?.channelConnection = connection
+                // Fresh KCP state per channel connection (same reasoning as
+                // the mesh: a redialed session restarts sn at 0).
+                self?.channelSendSn = 0
+                self?.channelRecvUna = 0
                 connection.start(queue: self!.queue)
                 self?.receiveChannel(on: connection)
             }
