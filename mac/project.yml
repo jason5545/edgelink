@@ -131,6 +131,7 @@ targets:
       - path: Sources/App/LyraCastTrustSession.swift
       - path: Sources/App/XiaomiMirrorWFDClient.swift
       - path: Sources/App/XiaomiMirrorFlowController.swift
+      - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift
     dependencies:
       - target: EdgeLinkKit
     settings:

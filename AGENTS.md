@@ -5,6 +5,7 @@
 - Every completed change must pass the full test suite before it is considered done:
   `cd mac && xcodebuild -project EdgeLink.xcodeproj -scheme EdgeLinkMacTests -configuration Debug -derivedDataPath /private/tmp/edgelink-test-dd test`
   New test files need `xcodegen generate` (from `mac/`) before the suite picks them up.
+- Never deploy (`ditto` into `/Applications`) before the full suite is green; deploy only after all tests pass.
 
 ## Common paths & commands
 

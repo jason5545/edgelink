@@ -4264,7 +4264,7 @@ private struct MPEGTSFirstPacket {
     let continuityCounter: UInt8
 }
 
-private struct XiaomiMirrorMPTPrivateAudioFormat: Equatable {
+struct XiaomiMirrorMPTPrivateAudioFormat: Equatable {
     let sampleRate: Double
     let channels: AVAudioChannelCount
     let bitsPerSample: Int
@@ -4280,7 +4280,7 @@ private struct XiaomiMirrorMPTPrivateAudioFormat: Equatable {
     )
 }
 
-private struct XiaomiMirrorMPTPrivateAudioPayload {
+struct XiaomiMirrorMPTPrivateAudioPayload {
     let kind: String
     let format: XiaomiMirrorMPTPrivateAudioFormat
     let declaredFrames: Int?
@@ -4289,7 +4289,7 @@ private struct XiaomiMirrorMPTPrivateAudioPayload {
     let pcmPayload: Data
 }
 
-private final class XiaomiMirrorMPTPrivateAudioPlayer {
+final class XiaomiMirrorMPTPrivateAudioPlayer {
     var onFirstAudioRendered: (() -> Void)?
     private let sessionID: UUID
     private var audioEngine: AVAudioEngine?
@@ -4305,7 +4305,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
     private var validPCMReported = false
     private var firstRenderedReported = false
     private var unsupportedFormatLogged = false
-    private var privateAudioFormatPrimed = false
+    var privateAudioFormatPrimed = false
     private var ff02SelfPrimeStreak = 0
     private var parseFailureCount: UInt64 = 0
     private var scheduleFailureCount: UInt64 = 0
@@ -4404,7 +4404,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
         schedulePCM(pcmPayload, format: parsed.format)
     }
 
-    private func isPrivateAudioPayloadSafe(
+    func isPrivateAudioPayloadSafe(
         _ parsed: XiaomiMirrorMPTPrivateAudioPayload,
         stats: (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int),
         allowUnprimedFF02: Bool = false
@@ -4439,6 +4439,14 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
         guard stats.samples > 0 else {
             return true
         }
+        // ff02 streams prove themselves via the self-prime streak, so after
+        // priming the framing is known-good: loud dense PCM (podcast/music,
+        // full-scale with ~100% nonzero samples) is legitimate content, not
+        // misparsed garbage. Until primed, and for all other kinds, the
+        // garbage filter below still applies.
+        if parsed.kind == "ff02", privateAudioFormatPrimed {
+            return true
+        }
         let nonzeroRatio = Double(stats.nonzeroSamples) / Double(stats.samples)
         if stats.maxAbs >= Self.suspiciousPCMMaxAbsThreshold,
            stats.averageAbs >= Self.suspiciousPCMAverageAbsThreshold,
@@ -4468,7 +4476,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
         }
     }
 
-    private func parsePrivatePayload(_ payload: Data) -> XiaomiMirrorMPTPrivateAudioPayload? {
+    func parsePrivatePayload(_ payload: Data) -> XiaomiMirrorMPTPrivateAudioPayload? {
         guard payload.count >= 18,
               payload[0] == 0xff else {
             return nil
@@ -4688,7 +4696,7 @@ private final class XiaomiMirrorMPTPrivateAudioPlayer {
         }
     }
 
-    private func pcmS16LEStats(_ data: Data) -> (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int) {
+    func pcmS16LEStats(_ data: Data) -> (samples: Int, nonzeroSamples: Int, maxAbs: Int, averageAbs: Int) {
         var samples = 0
         var nonzeroSamples = 0
         var maxAbs = 0
