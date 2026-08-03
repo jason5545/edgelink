@@ -53,6 +53,25 @@ final class XiaomiMirrorFlowController {
 
     private var flowGeneration: UInt64 = 0
 
+    // After a user stop (CLOSE_SCREEN) the phone unwinds its mirror
+    // lifecycle asynchronously; a re-OPEN that lands mid-teardown gets the
+    // channel killed (live 2026-08-03: logi disconnect 52011 right after
+    // OPEN) and starts a kill/re-open storm. start() waits out this settle
+    // window after stop() before re-OPENing.
+    var userStopSettle: TimeInterval = 1.5
+    private var lastStopAt: Date = .distantPast
+
+    // Storm guard: a channel release that arrives right after our OPEN is a
+    // reaction to the OPEN (phone mid-teardown or trust re-check), so an
+    // immediate redial + re-OPEN just re-triggers it. Rapid releases get a
+    // linear backoff, and past the budget the flow gives up to the
+    // retryable connect-failed mask instead of looping 正在連接 forever.
+    var channelReleaseBackoff: TimeInterval = 1
+    var channelReleaseMaxRapidRetries = 3
+    private static let channelReleaseRapidWindow: TimeInterval = 20
+    private var rapidChannelReleases = 0
+    private var lastChannelReleaseAt: Date = .distantPast
+
     init(trustManager: MacTrustManager) {
         self.trustManager = trustManager
         trustManager.onStateChanged = { [weak self] state in
@@ -77,6 +96,21 @@ final class XiaomiMirrorFlowController {
             stage = .connecting
             mask = .loading
         }
+        let settleRemaining = userStopSettle - Date().timeIntervalSince(lastStopAt)
+        if settleRemaining > 0 {
+            let generation = flowGeneration
+            log("xiaomi.mac.mirror_flow_start_settle settleMs=\(Int(settleRemaining * 1000)) generation=\(generation)")
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(settleRemaining * 1_000_000_000))
+                guard let self, generation == self.flowGeneration else { return }
+                self.beginStart()
+            }
+            return
+        }
+        beginStart()
+    }
+
+    private func beginStart() {
         if let existing = sessionProvider(), !existing.isChannelReady {
             // The phone released the cast channel; re-dial just the cast logi
             // conn on the same phys conn, keeping the adopted mitrustservice
@@ -132,13 +166,40 @@ final class XiaomiMirrorFlowController {
     // Phone released the cast channel mid-stream (reboot / sdk release):
     // the mirror is dead regardless of what the video watchdog thinks, so
     // restart the whole flow — redial the channel, then re-OPEN the mirror
-    // screen once notifyChannelReady fires.
+    // screen once notifyChannelReady fires. Rapid-fire releases (the phone
+    // killing the channel in reaction to each re-OPEN) back off linearly
+    // and eventually give up to the retryable connect-failed mask.
     func notifyChannelReleased() {
         switch stage {
         case .opening, .streaming:
             stopMirrorMedia()
             openSent = false
-            start()
+            let now = Date()
+            if now.timeIntervalSince(lastChannelReleaseAt) < Self.channelReleaseRapidWindow {
+                rapidChannelReleases += 1
+            } else {
+                rapidChannelReleases = 1
+            }
+            lastChannelReleaseAt = now
+            guard rapidChannelReleases <= channelReleaseMaxRapidRetries else {
+                stage = .failed
+                mask = .connectFailed
+                log("xiaomi.mac.mirror_flow_release_storm releases=\(rapidChannelReleases)")
+                return
+            }
+            mask = .loading
+            let backoff = channelReleaseBackoff * TimeInterval(rapidChannelReleases - 1)
+            guard backoff > 0 else {
+                start()
+                return
+            }
+            let generation = flowGeneration
+            log("xiaomi.mac.mirror_flow_release_backoff releases=\(rapidChannelReleases) backoffMs=\(Int(backoff * 1000))")
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                guard let self, generation == self.flowGeneration else { return }
+                self.start()
+            }
         default:
             break
         }
@@ -148,6 +209,9 @@ final class XiaomiMirrorFlowController {
     func notifyVideoFrame() {
         if stage == .opening || stage == .unlocking {
             stage = .streaming
+        }
+        if stage == .streaming {
+            rapidChannelReleases = 0
         }
         if case .ready(let locked) = trustManager.state, locked {
             mask = .locked
@@ -224,6 +288,8 @@ final class XiaomiMirrorFlowController {
     func stop() {
         flowGeneration &+= 1
         openSent = false
+        lastStopAt = Date()
+        rapidChannelReleases = 0
         stage = .idle
         mask = nil
     }
@@ -241,6 +307,11 @@ final class XiaomiMirrorFlowController {
               stage != .opening, stage != .streaming else { return }
         openSent = true
         stage = .opening
+        // Re-opening from a failed state must re-arm the open timeout,
+        // which only fires under the loading/no mask.
+        if mask == .connectFailed {
+            mask = .loading
+        }
         openMirrorScreen(session)
         trustManager.start()
         let generation = flowGeneration

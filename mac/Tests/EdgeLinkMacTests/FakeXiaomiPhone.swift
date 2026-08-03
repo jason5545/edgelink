@@ -22,6 +22,9 @@ final class FakeXiaomiPhone {
     private(set) var verifyActionCount = 0
     private(set) var bindActionCount = 0
     private(set) var openMirrorScreenCount = 0
+    // Total OPENs received, never reset by releaseCastChannel — storm tests
+    // assert the Mac stops re-OPENing instead of looping forever.
+    private(set) var openMirrorScreenTotal = 0
     private(set) var closeScreenCount = 0
     private(set) var keyboardMessages: [LyraCastKeyboard] = []
     private(set) var mouseMessages: [LyraCastMouse] = []
@@ -387,6 +390,13 @@ final class FakeXiaomiPhone {
         sendMesh(packType: 2, payload: miFrame.serialized())
     }
 
+    // Models the phone killing the cast logi conn shortly after each OPEN
+    // (live 2026-08-03: unencrypted logi disconnect reason 52011 ~1s after
+    // OPEN when the re-OPEN lands mid-teardown). Each consumed count kills
+    // the channel once; without a backoff the Mac would storm re-OPENs.
+    var releaseChannelAfterOpenCount = 0
+    var releaseChannelAfterOpenDelay: TimeInterval = 0.2
+
     // Simulates the phone releasing the cast logi conn mid-stream (observed
     // live on phone reboot: unencrypted inner disconnect payload {1: 52011}).
     func releaseCastChannel() {
@@ -533,21 +543,18 @@ final class FakeXiaomiPhone {
                 log("fakephone.screen_action action=\(action.action) sessionId=\(action.sessionId)")
                 if action.action == LyraCastScreenAction.Action.openMirrorScreen.rawValue {
                     openMirrorScreenCount += 1
+                    openMirrorScreenTotal += 1
+                    if releaseChannelAfterOpenCount > 0 {
+                        releaseChannelAfterOpenCount -= 1
+                        queue.asyncAfter(deadline: .now() + releaseChannelAfterOpenDelay) { [weak self] in
+                            self?.releaseCastChannel()
+                        }
+                    }
                     if wfdListener != nil {
                         // The real phone tears down its RTSP server when a
                         // duplicate OPEN arrives (observed 2026-08-02 as
                         // "Connection reset by peer" mid-dialog).
-                        wfdConnection?.cancel()
-                        wfdConnection = nil
-                        wfdListener?.cancel()
-                        wfdListener = nil
-                        wfdBuffer.removeAll()
-                        wfdSessionEstablished = false
-                        wfdSentGetParameter = false
-                        wfdSentTrigger = false
-                        videoTimer?.cancel()
-                        videoTimer = nil
-                        videoConnection?.cancel()
+                        tearDownWFDServer()
                         // The old listener releases the port asynchronously;
                         // rebinding immediately fails with EADDRINUSE. The
                         // real phone has a rebuild window too — the client's
@@ -566,6 +573,10 @@ final class FakeXiaomiPhone {
                     }
                 } else if action.action == LyraCastScreenAction.Action.closeScreen.rawValue {
                     closeScreenCount += 1
+                    // The real phone tears down its RTSP server and encoder
+                    // when the mirror screen closes (user stop); the next
+                    // OPEN rebuilds both.
+                    tearDownWFDServer()
                 }
             }
         default:
@@ -933,6 +944,21 @@ final class FakeXiaomiPhone {
     private var wfdBuffer = Data()
     private var videoConnection: NWConnection?
     private var videoTimer: DispatchSourceTimer?
+
+    private func tearDownWFDServer() {
+        wfdConnection?.cancel()
+        wfdConnection = nil
+        wfdListener?.cancel()
+        wfdListener = nil
+        wfdBuffer.removeAll()
+        wfdSessionEstablished = false
+        wfdSentGetParameter = false
+        wfdSentTrigger = false
+        videoTimer?.cancel()
+        videoTimer = nil
+        videoConnection?.cancel()
+        videoConnection = nil
+    }
 
     private func startWFDServer() {
         guard wfdListener == nil, let port = NWEndpoint.Port(rawValue: wfdPort) else { return }

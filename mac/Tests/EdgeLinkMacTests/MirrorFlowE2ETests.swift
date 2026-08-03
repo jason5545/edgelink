@@ -479,6 +479,126 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(phone.openMirrorScreenCount, 2, "OPEN must be sent exactly once per flow")
     }
 
+    // User stop (close mirror window / 停止投放) then reopen: the phone
+    // tears down its RTSP server on CLOSE_SCREEN, the flow controller goes
+    // back to idle, and the next start() must re-OPEN on the surviving cast
+    // channel and return to streaming — never sit on 正在連接 until an app
+    // restart.
+    func testUserStopThenRestartReturnsToStreaming() async throws {
+        try makeEnvironment(locked: false)
+        session.start()
+        controller.start()
+
+        try await waitFor("flow A streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        // stopXiaomiScreenRouteForUser: CLOSE_SCREEN on the channel, WFD
+        // client stopped, flow back to idle. The cast session itself
+        // survives (it is not tied to the mirror lifetime).
+        session.sendScreenAction(.closeScreen(sessionId: 1))
+        wfdClient?.stop(reason: "user_stop")
+        controller.stop()
+
+        try await waitFor("phone tore down its RTSP server") { [self] in
+            self.phone.closeScreenCount == 1 && !self.phone.wfdSessionEstablished
+        }
+        XCTAssertEqual(controller.stage, .idle)
+        XCTAssertNil(controller.mask)
+
+        // User reopens the mirror window.
+        controller.start()
+
+        try await waitFor("OPEN re-sent on the same channel") { [self] in
+            self.phone.openMirrorScreenCount >= 2
+        }
+        try await waitFor("WFD re-established") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        try await waitFor("streaming again, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
+    // A re-OPEN right after a user stop must wait out the settle window:
+    // the phone unwinds its mirror lifecycle asynchronously after
+    // CLOSE_SCREEN, and an OPEN landing mid-teardown gets the channel
+    // killed (live 2026-08-03, logi disconnect 52011).
+    func testRestartAfterUserStopSettlesBeforeReopen() async throws {
+        try makeEnvironment(locked: false)
+        controller.userStopSettle = 0.8
+        session.start()
+        controller.start()
+
+        try await waitFor("flow A streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        session.sendScreenAction(.closeScreen(sessionId: 1))
+        wfdClient?.stop(reason: "user_stop")
+        controller.stop()
+        controller.start()
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(
+            phone.openMirrorScreenTotal, 1,
+            "re-OPEN must wait out the post-stop settle window"
+        )
+        XCTAssertEqual(controller.stage, .connecting)
+        XCTAssertEqual(controller.mask, .loading)
+
+        try await waitFor("OPEN sent after the settle window") { [self] in
+            self.phone.openMirrorScreenTotal == 2
+        }
+        try await waitFor("streaming again") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
+    // Live 2026-08-03: after a stop/restart the phone killed the cast
+    // channel ~1s after every re-OPEN (logi disconnect 52011, mid-teardown
+    // reaction) and the Mac looped redial → OPEN → kill for ~1 minute,
+    // pinned at 正在連接 until the whole app was restarted. Rapid releases
+    // must back off, give up to the retryable connect-failed mask, and a
+    // later 重試 must recover once the phone has settled.
+    func testChannelReleaseStormBacksOffThenRecoversViaRetry() async throws {
+        try makeEnvironment(locked: false)
+        controller.channelReleaseBackoff = 0.2
+        session.start()
+        controller.start()
+
+        try await waitFor("flow A streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        // Every re-OPEN gets the channel killed — more times than the storm
+        // budget allows.
+        phone.releaseChannelAfterOpenCount = 10
+        phone.releaseCastChannel()
+
+        try await waitFor("flow gave up to connect-failed") { [self] in
+            self.controller.stage == .failed && self.controller.mask == .connectFailed
+        }
+        let opensAtGiveUp = phone.openMirrorScreenTotal
+        XCTAssertLessThanOrEqual(
+            opensAtGiveUp, controller.channelReleaseMaxRapidRetries + 2,
+            "storm must be bounded, not one OPEN per kill forever"
+        )
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        XCTAssertEqual(
+            phone.openMirrorScreenTotal, opensAtGiveUp,
+            "no further OPENs after the flow gave up"
+        )
+
+        // Phone settled (teardown finished): 重試 must recover fully.
+        phone.releaseChannelAfterOpenCount = 0
+        controller.retryRequested()
+
+        try await waitFor("streaming after retry") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
     // Regression (2026-08-03 live): the phone's quick-auth TA lost its
     // per-boot auth token after a reboot; the unlock authAction got
     // authEvent code 11 (logcat "device reboot, need risk auth" / mrmd
