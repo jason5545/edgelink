@@ -6,8 +6,11 @@ import SwiftUI
 import WebRTC
 
 private enum PhoneScreenChromeMetrics {
-    static let topHotZoneHeight: CGFloat = 88
-    static let bottomHotZoneHeight: CGFloat = 104
+    static let topHotZoneHeight: CGFloat = 48
+    static let bottomHotZoneHeight: CGFloat = 68
+    static let topBarHeight: CGFloat = 36
+    static let bottomBarHeight: CGFloat = 56
+    static var totalBarHeight: CGFloat { topBarHeight + bottomBarHeight }
     static let hideDelaySeconds: TimeInterval = 1.15
     static let initialHideDelaySeconds: TimeInterval = 1.6
 
@@ -195,7 +198,17 @@ final class MacScreenSession: NSObject, ObservableObject {
     @Published private(set) var hasRemoteVideo = false
     @Published private(set) var hasRemoteAudio = false
     @Published private(set) var isPinned = false
-    @Published private(set) var areScreenControlsVisible = false
+    @Published private(set) var areScreenControlsVisible = false {
+        didSet {
+            guard oldValue != areScreenControlsVisible else {
+                return
+            }
+            let visible = areScreenControlsVisible
+            DispatchQueue.main.async { [weak self] in
+                self?.adjustWindowFrameForControls(visible: visible)
+            }
+        }
+    }
 
     let videoView = PhoneVideoRendererView()
     var onWindowVisibilityChanged: ((Bool) -> Void)?
@@ -347,6 +360,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         screenMeta = body
         status = "Connecting"
         showWindow()
+        applyWindowAspectLock()
         DiagnosticsLog.info("screen.mac.meta w=\(body.w) h=\(body.h) scale=\(body.scale) dpi=\(body.dpi)")
     }
 
@@ -362,6 +376,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         let nextMeta = ScreenMetaBody(w: presentationWidth, h: presentationHeight, scale: 1, dpi: 0)
         if screenMeta != nextMeta {
             screenMeta = nextMeta
+            applyWindowAspectLock()
         }
         hasRemoteVideo = true
         status = "Xiaomi Mirror"
@@ -402,6 +417,7 @@ final class MacScreenSession: NSObject, ObservableObject {
         )
         if screenMeta != nextMeta {
             screenMeta = nextMeta
+            applyWindowAspectLock()
         }
         if window?.isVisible == true {
             updateWindowForVideoOrientation(
@@ -736,6 +752,7 @@ final class MacScreenSession: NSObject, ObservableObject {
     private func showWindow() {
         if let window {
             applyPinnedWindowState()
+            applyWindowAspectLock()
             installScreenControlEventMonitor(for: window)
             if window.isMiniaturized {
                 window.deminiaturize(nil)
@@ -754,6 +771,12 @@ final class MacScreenSession: NSObject, ObservableObject {
         let initialContentSize: NSSize
         if initialOrientation == .landscape, let meta = screenMeta, meta.w > 0, meta.h > 0 {
             let width: CGFloat = 820
+            initialContentSize = NSSize(
+                width: width,
+                height: max(360, width * CGFloat(meta.h) / CGFloat(meta.w))
+            )
+        } else if let meta = screenMeta, meta.w > 0, meta.h > 0 {
+            let width: CGFloat = 420
             initialContentSize = NSSize(
                 width: width,
                 height: max(360, width * CGFloat(meta.h) / CGFloat(meta.w))
@@ -780,11 +803,91 @@ final class MacScreenSession: NSObject, ObservableObject {
         self.window = window
         windowVideoOrientation = initialOrientation
         applyPinnedWindowState()
+        applyWindowAspectLock()
         installScreenControlEventMonitor(for: window)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         reportWindowVisibility(true, reason: "showWindow")
+    }
+
+    private func applyWindowAspectLock() {
+        guard
+            let window,
+            let meta = screenMeta,
+            meta.w > 0,
+            meta.h > 0
+        else {
+            return
+        }
+
+        let videoAspect = CGFloat(meta.w) / CGFloat(meta.h)
+        let chrome: CGFloat = areScreenControlsVisible ? PhoneScreenChromeMetrics.totalBarHeight : 0
+        let contentWidth = max(1, window.contentView?.bounds.width ?? CGFloat(meta.w))
+        let contentHeight = contentWidth / videoAspect + chrome
+        window.contentAspectRatio = NSSize(width: contentWidth, height: contentHeight)
+        window.contentResizeIncrements = NSSize(width: 1, height: 1)
+        window.minSize = NSSize(
+            width: max(160, 360 * videoAspect),
+            height: 360 + chrome
+        )
+
+        guard
+            !window.styleMask.contains(.fullScreen),
+            let contentView = window.contentView
+        else {
+            return
+        }
+        let currentContentSize = contentView.bounds.size
+        let currentVideoHeight = currentContentSize.height - chrome
+        let expectedVideoHeight = currentContentSize.width / videoAspect
+        let delta = expectedVideoHeight - currentVideoHeight
+        guard abs(delta) > 2 else {
+            return
+        }
+        var frame = window.frame
+        frame.size.height += delta
+        frame.origin.y -= delta
+        if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame.origin.y = min(
+                max(frame.origin.y, visibleFrame.minY),
+                visibleFrame.maxY - frame.height
+            )
+        }
+        window.setFrame(frame, display: true, animate: false)
+    }
+    private func adjustWindowFrameForControls(visible: Bool) {
+        guard
+            let window,
+            !window.styleMask.contains(.fullScreen),
+            window.contentView != nil
+        else {
+            return
+        }
+
+        let delta = PhoneScreenChromeMetrics.totalBarHeight
+        var frame = window.frame
+        if visible {
+            frame.size.height += delta
+            frame.origin.y -= PhoneScreenChromeMetrics.bottomBarHeight
+        } else {
+            frame.size.height -= delta
+            frame.origin.y += PhoneScreenChromeMetrics.bottomBarHeight
+        }
+
+        if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame.origin.x = min(
+                max(frame.origin.x, visibleFrame.minX),
+                visibleFrame.maxX - frame.width
+            )
+            frame.origin.y = min(
+                max(frame.origin.y, visibleFrame.minY),
+                visibleFrame.maxY - frame.height
+            )
+        }
+
+        window.setFrame(frame, display: true, animate: true)
+        applyWindowAspectLock()
     }
 
     private func updateWindowForVideoOrientation(
@@ -806,7 +909,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             return
         }
 
-        let chromeHeight: CGFloat = 0
+        let chromeHeight: CGFloat = areScreenControlsVisible ? PhoneScreenChromeMetrics.totalBarHeight : 0
         let currentStageSize = NSSize(
             width: contentView.bounds.width,
             height: max(1, contentView.bounds.height - chromeHeight)
@@ -1587,6 +1690,37 @@ final class MacScreenSession: NSObject, ObservableObject {
 }
 
 extension MacScreenSession: NSWindowDelegate {
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        guard
+            sender === window,
+            !sender.styleMask.contains(.fullScreen),
+            let meta = screenMeta,
+            meta.w > 0,
+            meta.h > 0
+        else {
+            return frameSize
+        }
+
+        let aspect = CGFloat(meta.w) / CGFloat(meta.h)
+        let chrome: CGFloat = areScreenControlsVisible ? PhoneScreenChromeMetrics.totalBarHeight : 0
+        let contentSize = sender.contentRect(forFrameRect: NSRect(origin: .zero, size: frameSize)).size
+        let currentContentSize = sender.contentView?.bounds.size ?? contentSize
+
+        let widthDelta = abs(contentSize.width - currentContentSize.width)
+        let heightDelta = abs(contentSize.height - currentContentSize.height)
+
+        var targetContentSize = contentSize
+        if widthDelta >= heightDelta * aspect {
+            targetContentSize.height = contentSize.width / aspect + chrome
+        } else {
+            targetContentSize.width = (contentSize.height - chrome) * aspect
+        }
+
+        return sender.frameRect(
+            forContentRect: NSRect(origin: .zero, size: targetContentSize)
+        ).size
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard !isClosingWindow else {
             return true
@@ -1763,50 +1897,42 @@ extension MacScreenSession: RTCDataChannelDelegate {
 struct PhoneScreenView: View {
     @ObservedObject var session: MacScreenSession
 
-    private static let cornerRadius: CGFloat = 12
+    private static let cornerRadius: CGFloat = 24
 
     var body: some View {
-        videoStage
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
-            }
-            .overlay(alignment: .top) {
-                if session.areScreenControlsVisible {
-                    topBar
-                        .padding(.top, 10)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+        VStack(spacing: 0) {
+            topBar
+                .frame(height: session.areScreenControlsVisible ? PhoneScreenChromeMetrics.topBarHeight : 0)
+                .clipped()
+                .opacity(session.areScreenControlsVisible ? 1 : 0)
+                .allowsHitTesting(session.areScreenControlsVisible)
+            videoStage
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
                 }
-            }
-            .overlay(alignment: .bottom) {
-                if session.areScreenControlsVisible {
-                    bottomBar
-                        .padding(.bottom, 12)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                .overlay {
+                    if let mask = session.xiaomiMirrorMask {
+                        maskView(for: mask)
+                            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+                    }
                 }
-            }
-            .overlay {
-                if let mask = session.xiaomiMirrorMask {
-                    maskView(for: mask)
-                        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
-                }
-            }
-            .animation(.easeOut(duration: 0.18), value: session.areScreenControlsVisible)
-            .animation(.easeOut(duration: 0.18), value: session.xiaomiMirrorMask)
-            .frame(minWidth: 260, minHeight: 360)
-            .onHover { hovered in
-                session.setScreenControlWindowHovered(hovered)
-            }
-    }
-
-    private var aspectRatio: CGFloat? {
-        guard let meta = session.screenMeta, meta.h > 0 else {
-            return nil
+            bottomBar
+                .frame(height: session.areScreenControlsVisible ? PhoneScreenChromeMetrics.bottomBarHeight : 0)
+                .clipped()
+                .opacity(session.areScreenControlsVisible ? 1 : 0)
+                .allowsHitTesting(session.areScreenControlsVisible)
         }
-        return CGFloat(meta.w) / CGFloat(meta.h)
+        .animation(.easeOut(duration: 0.18), value: session.areScreenControlsVisible)
+        .animation(.easeOut(duration: 0.18), value: session.xiaomiMirrorMask)
+        .ignoresSafeArea()
+        .frame(minWidth: 260, minHeight: 360)
+        .onHover { hovered in
+            session.setScreenControlWindowHovered(hovered)
+        }
     }
 
     @ViewBuilder
@@ -1822,48 +1948,14 @@ struct PhoneScreenView: View {
     }
 
     private var videoStage: some View {
-        GeometryReader { geometry in
-            let videoFrame = fittedVideoFrame(in: geometry.size)
+        ZStack {
+            Color.black
+            PhoneVideoView(videoView: session.videoView)
 
-            ZStack {
-                Color.black
-                PhoneVideoView(videoView: session.videoView)
-                    .frame(width: videoFrame.width, height: videoFrame.height)
-                    .position(x: videoFrame.midX, y: videoFrame.midY)
-
-                if session.xiaomiMirrorMask == nil && !session.hasRemoteVideo {
-                    connectingOverlay
-                }
+            if session.xiaomiMirrorMask == nil && !session.hasRemoteVideo {
+                connectingOverlay
             }
         }
-    }
-
-    private func fittedVideoFrame(in containerSize: CGSize) -> CGRect {
-        guard
-            let aspectRatio,
-            aspectRatio > 0,
-            containerSize.width > 0,
-            containerSize.height > 0
-        else {
-            return CGRect(origin: .zero, size: containerSize)
-        }
-
-        let containerAspectRatio = containerSize.width / containerSize.height
-        let size: CGSize
-        if containerAspectRatio > aspectRatio {
-            let height = containerSize.height
-            size = CGSize(width: height * aspectRatio, height: height)
-        } else {
-            let width = containerSize.width
-            size = CGSize(width: width, height: width / aspectRatio)
-        }
-
-        return CGRect(
-            x: (containerSize.width - size.width) / 2,
-            y: (containerSize.height - size.height) / 2,
-            width: size.width,
-            height: size.height
-        )
     }
 
     private var topBar: some View {
@@ -1871,6 +1963,7 @@ struct PhoneScreenView: View {
             chromeButton(systemName: "xmark", help: String(localized: "關閉")) {
                 session.requestClose()
             }
+            Spacer()
             chromeButton(
                 systemName: session.isPinned ? "pin.fill" : "pin",
                 help: session.isPinned ? String(localized: "取消置頂") : String(localized: "視窗置頂")
@@ -1878,17 +1971,17 @@ struct PhoneScreenView: View {
                 session.togglePinned()
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(.ultraThinMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.25), radius: 8, y: 2)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 8)
     }
 
     private func chromeButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
                 .frame(width: 28, height: 28)
+                .background(.black.opacity(0.55), in: Circle())
                 .contentShape(Circle())
         }
         .buttonStyle(.borderless)
@@ -1896,15 +1989,13 @@ struct PhoneScreenView: View {
     }
 
     private var bottomBar: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 28) {
             globalButton(systemName: "rectangle.stack", action: "recents", help: String(localized: "進入最近任務"))
             globalButton(systemName: "circle", action: "home", help: String(localized: "Home"))
             globalButton(systemName: "chevron.backward", action: "back", help: String(localized: "Back"))
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
     }
 
     private func globalButton(systemName: String, action: String, help: String) -> some View {
@@ -1913,7 +2004,9 @@ struct PhoneScreenView: View {
         } label: {
             Image(systemName: systemName)
                 .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.white)
                 .frame(width: 32, height: 32)
+                .background(.black.opacity(0.55), in: Circle())
                 .contentShape(Circle())
         }
         .buttonStyle(.borderless)

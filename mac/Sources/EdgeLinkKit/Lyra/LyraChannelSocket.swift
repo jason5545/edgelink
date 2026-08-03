@@ -30,6 +30,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "edgelink.lyra.channel", qos: .userInitiated)
+    private let stateLock = NSRecursiveLock()
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var sessions: [ObjectIdentifier: SessionState] = [:]
@@ -64,6 +65,8 @@ public final class LyraChannelSocket: @unchecked Sendable {
     }
 
     public func stop() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         listener?.stateUpdateHandler = nil
         listener?.newConnectionHandler = nil
         listener?.cancel()
@@ -91,14 +94,18 @@ public final class LyraChannelSocket: @unchecked Sendable {
         }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
         let id = ObjectIdentifier(connection)
+        stateLock.lock()
         connections[id] = connection
         sessions[id] = SessionState()
+        stateLock.unlock()
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .cancelled, .failed:
+                self.stateLock.lock()
                 self.connections[id] = nil
                 self.sessions[id] = nil
+                self.stateLock.unlock()
             default:
                 break
             }
@@ -159,6 +166,8 @@ public final class LyraChannelSocket: @unchecked Sendable {
     }
 
     private func sendDatagram(_ payload: Data) throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         for (id, connection) in connections {
             var state = sessions[id] ?? SessionState()
             debugHandler?("channel_send sn=\(state.nextSendSn) una=\(state.recvUna) conns=\(connections.count) bytes=\(payload.count)")
@@ -178,13 +187,17 @@ public final class LyraChannelSocket: @unchecked Sendable {
 
     private func accept(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
+        stateLock.lock()
         connections[id] = connection
+        stateLock.unlock()
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .cancelled, .failed:
+                self.stateLock.lock()
                 self.connections[id] = nil
                 self.sessions[id] = nil
+                self.stateLock.unlock()
             default:
                 break
             }
@@ -196,6 +209,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
     private func receive(on connection: NWConnection, id: ObjectIdentifier) {
         connection.receiveMessage { [weak self] content, _, _, error in
             guard let self else { return }
+            self.stateLock.lock()
             if let content, !content.isEmpty {
                 let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
                 self.onRawDatagram?(content, endpoint)
@@ -246,6 +260,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
                     }
                 }
             }
+            self.stateLock.unlock()
             if error == nil {
                 self.receive(on: connection, id: id)
             }
