@@ -206,6 +206,7 @@ final class MacScreenSession: NSObject, ObservableObject {
             let visible = areScreenControlsVisible
             DispatchQueue.main.async { [weak self] in
                 self?.adjustWindowFrameForControls(visible: visible)
+                self?.applyTrafficLightVisibility()
             }
         }
     }
@@ -806,11 +807,20 @@ final class MacScreenSession: NSObject, ObservableObject {
         windowVideoOrientation = initialOrientation
         applyPinnedWindowState()
         applyWindowAspectLock()
+        applyTrafficLightVisibility()
         installScreenControlEventMonitor(for: window)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(videoView)
         NSApp.activate(ignoringOtherApps: true)
         reportWindowVisibility(true, reason: "showWindow")
+    }
+
+    private func applyTrafficLightVisibility() {
+        guard let closeButton = window?.standardWindowButton(.closeButton) else {
+            return
+        }
+        closeButton.animator().alphaValue = areScreenControlsVisible ? 1 : 0
+        closeButton.isEnabled = areScreenControlsVisible
     }
 
     private func applyWindowAspectLock() {
