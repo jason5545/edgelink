@@ -53,11 +53,16 @@ struct MiTrustTicketStore {
     }
 
     static func recordAuthSession(sessionKey: Data, ticket: Data) {
+        lastAuthSessionKeyData = sessionKey
         let defaults = UserDefaults.standard
         defaults.set(sessionKey.map { String(format: "%02x", $0) }.joined(), forKey: "xiaomiTrustSessionKeyHex")
         defaults.set(ticket.map { String(format: "%02x", $0) }.joined(), forKey: "xiaomiTrustTicketHex")
         DiagnosticsLog.info("xiaomi.cast.mitrust_auth_session_saved")
     }
+
+    // Most recent AuthHandshake session key, shared in-process so the mesh
+    // responder can decrypt quick-conn private_data addressed to us.
+    static var lastAuthSessionKeyData: Data?
 
     func uidFeatureInfo() -> Data {
         var nonce = Data(count: 8)

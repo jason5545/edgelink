@@ -17,6 +17,7 @@ final class LyraMeshAnnouncer {
     private let socket = LyraMeshSocket()
     private var host: String?
     private var port: UInt16 = 0
+    private var candidatePorts: [UInt16] = []
     private var state: State = .idle
     private var physConnId: UInt32 = 0
     private var logiConnId: UInt32 = 0
@@ -83,13 +84,18 @@ final class LyraMeshAnnouncer {
     }
 
     func start(host: String, port: UInt16) {
+        start(host: host, ports: [port])
+    }
+
+    func start(host: String, ports: [UInt16]) {
         queue.async { [weak self] in
-            guard let self else { return }
-            if self.host == host, self.port == port, self.state == .logiSynced,
+            guard let self, !ports.isEmpty else { return }
+            let ports = Array(ports.prefix(8))
+            if self.host == host, self.candidatePorts == ports, self.state == .logiSynced,
                Date().timeIntervalSince(self.lastActivity) < Self.staleTimeout {
                 return
             }
-            if self.host == host, self.port == port, self.state != .idle {
+            if self.host == host, self.state != .idle {
                 DiagnosticsLog.info(
                     "xiaomi.mishare.announcer_resync state=\(self.state) " +
                         "idleSeconds=\(Int(Date().timeIntervalSince(self.lastActivity)))"
@@ -97,7 +103,7 @@ final class LyraMeshAnnouncer {
             }
             self.stopLocked()
             self.host = host
-            self.port = port
+            self.candidatePorts = ports
             self.state = .idle
             self.socket.onFrame = { [weak self] frame, endpoint, reply in
                 self?.handle(frame: frame, endpoint: endpoint, reply: reply)
@@ -125,6 +131,7 @@ final class LyraMeshAnnouncer {
         state = .idle
         host = nil
         port = 0
+        candidatePorts = []
         peerNetId = 0
         ourCookie = 0
         handshakeId = 0
@@ -165,7 +172,9 @@ final class LyraMeshAnnouncer {
             payload: .syncDeviceInfoRequest(request)
         )
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [], physConnFrame: physConn)
-        send(frame: LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized()), label: "phys_sync")
+        for targetPort in port != 0 ? [port] : candidatePorts {
+            send(frame: LyraMeshPack.Frame(packType: 1, payload: miFrame.serialized()), label: "phys_sync", toPort: targetPort)
+        }
     }
 
     private func sendCookie(phase: UInt64) {
@@ -332,9 +341,13 @@ final class LyraMeshAnnouncer {
             outputByteCount: 32
         )
         meshSessionKey = sessionKey
+        let sessionKeyData = sessionKey.withUnsafeBytes { Data($0) }
         MiTrustTicketStore.recordAuthSession(
-            sessionKey: sessionKey.withUnsafeBytes { Data($0) },
+            sessionKey: sessionKeyData,
             ticket: ticket.withUnsafeBytes { Data($0) }
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mishare.announcer_session_key hex=\(sessionKeyData.map { String(format: "%02x", $0) }.joined())"
         )
         guard let identityKey = ticketStore.identityPrivateKey,
               let signature = try? identityKey.signature(for: SHA256.hash(data: clientPub + serverPub))
@@ -513,11 +526,18 @@ final class LyraMeshAnnouncer {
         return address
     }
 
-    private func send(frame: LyraMeshPack.Frame, label: String) {
-        guard let host, port != 0 else { return }
+    private static func endpointPort(_ endpoint: NWEndpoint) -> UInt16? {
+        let description = endpoint.debugDescription
+        guard let colon = description.lastIndex(of: ":") else { return nil }
+        return UInt16(description[description.index(after: colon)...])
+    }
+
+    private func send(frame: LyraMeshPack.Frame, label: String, toPort: UInt16? = nil) {
+        let targetPort = toPort ?? port
+        guard let host, targetPort != 0 else { return }
         do {
-            try socket.send(frame: frame, to: host, port: port)
-            DiagnosticsLog.info("xiaomi.mishare.announcer_tx label=\(label) to=\(host):\(port)")
+            try socket.send(frame: frame, to: host, port: targetPort)
+            DiagnosticsLog.info("xiaomi.mishare.announcer_tx label=\(label) to=\(host):\(targetPort)")
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.announcer_tx_failed", error)
         }
@@ -547,6 +567,11 @@ final class LyraMeshAnnouncer {
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
         lastActivity = Date()
+        if port == 0, let endpointPort = Self.endpointPort(endpoint), candidatePorts.contains(endpointPort) {
+            port = endpointPort
+            candidatePorts = [endpointPort]
+            DiagnosticsLog.info("xiaomi.mishare.announcer_port_pinned port=\(endpointPort)")
+        }
         if frame.packType == 5 {
             var detail = ""
             if let sessionKey = meshSessionKey, frame.payload.count > 30 {
@@ -621,6 +646,34 @@ final class LyraMeshAnnouncer {
             }
         }
         for logiConn in miFrame.logiConnFrames {
+            if logiConn.logiConnId != logiConnId {
+                if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraRelayCallSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.announcer_relaycall_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraRelayCallSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraRelayCallSession.activeRelaySession {
+                    session.handleFrame(logiConn)
+                } else {
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.announcer_stray_conn connId=\(logiConn.logiConnId) " +
+                            "bytes=\(logiConn.inner.count)"
+                    )
+                }
+                continue
+            }
             var inner = LogiConnInnerFrame(parsing: logiConn.inner)
             if inner == nil, logiConn.flag {
                 inner = decryptInner(logiConn)
