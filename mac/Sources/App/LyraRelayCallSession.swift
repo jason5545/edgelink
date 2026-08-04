@@ -470,15 +470,17 @@ final class LyraRelayCallSession {
             DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_decrypt_failed")
             return
         }
-        do {
-            let peerIdentity = try P256.Signing.PublicKey(x963Representation: ticketStore.peerIdentityPubKey)
-            let signature = try P256.Signing.ECDSASignature(derRepresentation: sigC)
-            guard peerIdentity.isValidSignature(signature, for: SHA256.hash(data: authClientEphPub + serverEphPub)) else {
-                DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_invalid")
-                return
-            }
-        } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.auth_sig_verify_failed", error)
+        let digest = SHA256.hash(data: authClientEphPub + serverEphPub)
+        guard let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigC) else {
+            DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_parse_failed")
+            return
+        }
+        let verified = ticketStore.peerSigningPubKeys.contains { keyData in
+            guard let key = try? P256.Signing.PublicKey(x963Representation: keyData) else { return false }
+            return key.isValidSignature(signature, for: digest)
+        }
+        guard verified else {
+            DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_invalid")
             return
         }
         let newSessionKey = HKDF<SHA256>.deriveKey(

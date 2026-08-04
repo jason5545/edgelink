@@ -319,11 +319,13 @@ final class LyraMeshAnnouncer {
         let clientPub = ephemeral.publicKey.x963Representation
         let ticketStore = MiTrustTicketStore.current()
         if let sigDer = ticketStore.decrypt(encSig, with: SymmetricKey(data: secret)),
-           !ticketStore.peerIdentityPubKey.isEmpty,
-           let phoneIdentity = try? P256.Signing.PublicKey(x963Representation: ticketStore.peerIdentityPubKey),
            let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer)
         {
-            let valid = phoneIdentity.isValidSignature(signature, for: SHA256.hash(data: serverPub + clientPub))
+            let digest = SHA256.hash(data: serverPub + clientPub)
+            let valid = ticketStore.peerSigningPubKeys.contains { keyData in
+                guard let key = try? P256.Signing.PublicKey(x963Representation: keyData) else { return false }
+                return key.isValidSignature(signature, for: digest)
+            }
             DiagnosticsLog.info("xiaomi.mishare.announcer_auth_server_sig valid=\(valid)")
         } else {
             DiagnosticsLog.warn("xiaomi.mishare.announcer_auth_server_sig_unchecked")
@@ -465,6 +467,7 @@ final class LyraMeshAnnouncer {
             "xiaomi.mishare.announcer_sync_payload decrypted=\(plaintext.count) " +
                 "head=\(plaintext.map { String(format: "%02x", $0) }.joined())"
         )
+        MiTrustTicketStore.harvestPeerAccountPubKey(fromSyncPayload: plaintext)
         guard Date().timeIntervalSince(lastSyncPayloadReplyAt) > 5 else { return }
         lastSyncPayloadReplyAt = Date()
         sendSyncReply()

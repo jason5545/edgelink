@@ -13,6 +13,7 @@ final class LyraSyncTaskServerTests: XCTestCase {
         "xiaomiTrustIdentityPrivHex",
         "xiaomiTrustIdentityPubB64",
         "xiaomiTrustPeerIdentityPubB64",
+        "xiaomiTrustPeerAccountPubB64",
         "xiaomiTrustSessionKeyHex",
         "xiaomiTrustTicketHex",
     ]
@@ -225,9 +226,10 @@ final class LyraSyncTaskServerTests: XCTestCase {
     }
 
     private func makeClientFinishedFrame(
-        client: ClientSide, notify: ServerNotify
+        client: ClientSide, notify: ServerNotify, signingKey: P256.Signing.PrivateKey? = nil
     ) throws -> LogiConnFrame {
-        let signature = try phoneIdentity.signature(
+        let signer = signingKey ?? phoneIdentity
+        let signature = try signer.signature(
             for: SHA256.hash(data: client.ephKey.publicKey.x963Representation + notify.serverPub)
         )
         let nonce = AES.GCM.Nonce()
@@ -345,6 +347,37 @@ final class LyraSyncTaskServerTests: XCTestCase {
         XCTAssertEqual(varint(3, in: responseData), 1)
 
         XCTAssertTrue(server.handleLogiConn(encryptedRequest).isEmpty)
+    }
+
+    // Live 2026-08-05: auth_type 4 dials sign client_finished with the phone's
+    // account identity key (Mijia cert), not the pairing key. With the account
+    // key registered, the handshake must complete even when the pairing key is
+    // different.
+    func testClientFinishedSignedWithAccountKeyCompletes() throws {
+        let accountIdentity = P256.Signing.PrivateKey()
+        let defaults = UserDefaults.standard
+        defaults.set(
+            accountIdentity.publicKey.x963Representation.base64EncodedString(),
+            forKey: "xiaomiTrustPeerAccountPubB64"
+        )
+        defaults.set(
+            P256.Signing.PrivateKey().publicKey.x963Representation.base64EncodedString(),
+            forKey: "xiaomiTrustPeerIdentityPubB64"
+        )
+
+        let server = LyraSyncTaskServer()
+        let client = makeClient()
+        let privateData = try XCTUnwrap(
+            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)?.privateData
+        )
+        let (_, notify) = try unwrapServerNotify(privateData, client: client)
+
+        let clientFinished = try makeClientFinishedFrame(
+            client: client, notify: notify, signingKey: accountIdentity
+        )
+        let replies = server.handleLogiConn(clientFinished)
+        XCTAssertEqual(replies.count, 1, "account-key client_finished must complete the handshake")
+        XCTAssertEqual(server.sessionKeys.count, 1)
     }
 
     func testBadClientFinishedSignatureYieldsNoReply() throws {

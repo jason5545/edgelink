@@ -120,4 +120,46 @@ final class MiTrustTicketStoreTests: XCTestCase {
             first?.map { String(format: "%02x", $0) }.joined()
         )
     }
+
+    // Live 2026-08-05: the phone's client_finished verifies as
+    // ECDSA-SHA256(clientEph||serverEph) under the ACCOUNT identity key from
+    // its Mijia cert (auth_type 4), not the pairing identity key. The account
+    // key is harvested from the cert in the phone's own sync payload.
+    private static let phoneAccountCertHex = "308201a53082014ca0030201020209010000019fceee7662300a06082a8648ce3d040302302331143012060355040a0c0b4d696a696120436c6f7564310b300906035504061302434e301e170d3236303830333232333932325a170d3237303230323130333932325a30693167306506035504030c5e6c7972612e5746346e4567784137665334356e4b6b7a6254523872766b456f4b4b5a674c495f4f5635706f655a4867302e535a555750327a546768376c6c6c596258307355445376766e52635f394656394f725a642d4c5872484b512e313059301306072a8648ce3d020106082a8648ce3d03010703420004a22c96ecb177a1cc3e037c85972bd048214ad442c1b5204ee6ec4cd5e605fb107db69fd3ed962cbf877f9c5e6f85df573103d0cc42eebbcc0bd7cfd024a4461ba3233021301f0603551d230418301680145a29bffb2fb7500ce9c420f23d899b6fe0803293300a06082a8648ce3d040302034700304402205a6ab8ff2a52a970d31d18ca502722aedcd177e7a69204bb4df79fcf9caf6f3a02205e135d42de94f7739f89d33b73ac3669843746eeae07cedcc1c1bc4aad5c7ba8"
+    private static let phoneAccountPubB64 = "BKIsluyxd6HMPgN8hZcr0EghStRCwbUgTubsTNXmBfsQfbaf0+2WLL+Hf5xeb4XfVzED0MxC7rvMC9fP0CSkRhs="
+
+    func testIdentityCertExtractorFindsAccountPubKeyInPayload() throws {
+        let cert = try XCTUnwrap(MiTrustTicketStore.data(fromHex: Self.phoneAccountCertHex))
+        var payload = Data([0x00, 0x08, 0x01, 0x2a])
+        payload.append(cert)
+        payload.append(Data([0x80, 0x01, 0x02]))
+
+        let pub = try XCTUnwrap(LyraIdentityCert.pubKey(fromSyncPayload: payload))
+        XCTAssertEqual(pub.count, 65)
+        XCTAssertEqual(pub.base64EncodedString(), Self.phoneAccountPubB64)
+    }
+
+    func testIdentityCertExtractorIgnoresGarbage() {
+        XCTAssertNil(LyraIdentityCert.pubKey(fromSyncPayload: Data()))
+        XCTAssertNil(LyraIdentityCert.pubKey(fromSyncPayload: Data([0x30, 0x82, 0xFF, 0xFF, 0x00])))
+        XCTAssertNil(LyraIdentityCert.pubKey(fromSyncPayload: Data(repeating: 0xAB, count: 512)))
+    }
+
+    func testHarvestPeerAccountPubKeyPersistsExtractedKey() throws {
+        let defaults = UserDefaults.standard
+        let saved = defaults.string(forKey: "xiaomiTrustPeerAccountPubB64")
+        defer { restore(saved, forKey: "xiaomiTrustPeerAccountPubB64") }
+        // Seed a stale value (the default equals the harvested key, which
+        // would make the harvest a no-op).
+        defaults.set(Data(repeating: 7, count: 65).base64EncodedString(), forKey: "xiaomiTrustPeerAccountPubB64")
+
+        let cert = try XCTUnwrap(MiTrustTicketStore.data(fromHex: Self.phoneAccountCertHex))
+        XCTAssertTrue(MiTrustTicketStore.harvestPeerAccountPubKey(fromSyncPayload: cert))
+        XCTAssertEqual(defaults.string(forKey: "xiaomiTrustPeerAccountPubB64"), Self.phoneAccountPubB64)
+        // Same payload again: no rewrite.
+        XCTAssertFalse(MiTrustTicketStore.harvestPeerAccountPubKey(fromSyncPayload: cert))
+        XCTAssertTrue(MiTrustTicketStore.current().peerSigningPubKeys.contains(
+            Data(base64Encoded: Self.phoneAccountPubB64)!
+        ))
+    }
 }

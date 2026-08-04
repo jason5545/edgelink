@@ -454,22 +454,25 @@ final class LyraSyncTaskServer {
             DiagnosticsLog.warn("xiaomi.synctask.auth_sig_decrypt_failed connId=\(conn.connId)")
             return []
         }
-        do {
-            let peerIdentity = try P256.Signing.PublicKey(x963Representation: ticketStore.peerIdentityPubKey)
-            let signature = try P256.Signing.ECDSASignature(derRepresentation: sigC)
-            guard peerIdentity.isValidSignature(
-                signature, for: SHA256.hash(data: conn.clientEphPub + serverEphPub)
-            ) else {
-                DiagnosticsLog.warn(
-                    "xiaomi.synctask.auth_sig_invalid connId=\(conn.connId) " +
-                        "clientEphPub=\(conn.clientEphPub.map { String(format: "%02x", $0) }.joined()) " +
-                        "serverEphPub=\(serverEphPub.map { String(format: "%02x", $0) }.joined()) " +
-                        "sig=\(sigC.map { String(format: "%02x", $0) }.joined())"
-                )
-                return []
-            }
-        } catch {
-            DiagnosticsLog.error("xiaomi.synctask.auth_sig_verify_failed", error)
+        // The phone signs client_finished with its account identity key (from
+        // its Mijia cert) on auth_type 4 dials, not the pairing identity key —
+        // accept any known peer signing key.
+        let digest = SHA256.hash(data: conn.clientEphPub + serverEphPub)
+        guard let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigC) else {
+            DiagnosticsLog.warn("xiaomi.synctask.auth_sig_parse_failed connId=\(conn.connId)")
+            return []
+        }
+        let verified = ticketStore.peerSigningPubKeys.contains { keyData in
+            guard let key = try? P256.Signing.PublicKey(x963Representation: keyData) else { return false }
+            return key.isValidSignature(signature, for: digest)
+        }
+        guard verified else {
+            DiagnosticsLog.warn(
+                "xiaomi.synctask.auth_sig_invalid connId=\(conn.connId) " +
+                    "clientEphPub=\(conn.clientEphPub.map { String(format: "%02x", $0) }.joined()) " +
+                    "serverEphPub=\(serverEphPub.map { String(format: "%02x", $0) }.joined()) " +
+                    "sig=\(sigC.map { String(format: "%02x", $0) }.joined())"
+            )
             return []
         }
         let newSessionKey = HKDF<SHA256>.deriveKey(
@@ -594,6 +597,7 @@ final class LyraSyncTaskServer {
             "xiaomi.synctask.payload_push connId=\(conn.connId) bytes=\(payloadData.count) " +
                 "head=\(payloadData.prefix(24).map { String(format: "%02x", $0) }.joined())"
         )
+        MiTrustTicketStore.harvestPeerAccountPubKey(fromSyncPayload: payloadData)
         guard let reply = syncPayloadProvider?() else { return [] }
         let replyInner = LogiConnInnerFrame(frameType: 7, payload: .data(reply))
         do {

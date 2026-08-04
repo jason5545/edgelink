@@ -1,6 +1,7 @@
 import CryptoKit
 import EdgeLinkKit
 import Foundation
+import Security
 
 struct MiTrustTicketStore {
     var ticketKey: SymmetricKey?
@@ -8,9 +9,23 @@ struct MiTrustTicketStore {
     var identityPrivateKey: P256.Signing.PrivateKey?
     var identityPubKey: Data
     var peerIdentityPubKey: Data
+    var peerAccountPubKey: Data
     var uidHashRaw: Data
     var myKeyIndex: UInt64
     var deviceKeyData: Data?
+
+    // Identity keys the phone signs AuthHandshake messages with, account
+    // identity (from its Mijia cert, auth_type 4 flows) first, then the
+    // pairing identity. Live 2026-08-05: the sync task's client_finished
+    // verifies as ECDSA-SHA256(clientEph||serverEph) under the account key,
+    // not the pairing key.
+    var peerSigningPubKeys: [Data] {
+        var keys: [Data] = []
+        for key in [peerAccountPubKey, peerIdentityPubKey] where !key.isEmpty && !keys.contains(key) {
+            keys.append(key)
+        }
+        return keys
+    }
 
     var deviceKey: SymmetricKey? {
         guard let deviceKeyData, deviceKeyData.count == 32 else { return nil }
@@ -23,6 +38,7 @@ struct MiTrustTicketStore {
     private static let defaultIdentityPrivHex = "3c223f0237c0cdc80a273821f388bf4d9f12c05d30246baece2dbe35ec8d66ac"
     private static let defaultIdentityPubB64 = "BL/434ltP50le6fDe3X0Q3iXPo4fcf0+7H9c3P87N06fseKWnSjnsq12p22w5oZV/nLrtQyeRenyVOOdVUQqxh4="
     private static let defaultPeerIdentityPubB64 = "BOMwUyQxPI0I8U3hu4lgsVuriQYrGzfHOraILCbIEJh+KxmzF60/FF7Eby8T96F0xJTOFE8b1aLirmUTGsOcq6I="
+    private static let defaultPeerAccountPubB64 = "BKIsluyxd6HMPgN8hZcr0EghStRCwbUgTubsTNXmBfsQfbaf0+2WLL+Hf5xeb4XfVzED0MxC7rvMC9fP0CSkRhs="
     private static let defaultUidHashB64 = "YfJQtjvnAuNXhZmXZ8IhFjr3I4mVdX9ZgDS3U+OvBzM="
 
     static func current() -> MiTrustTicketStore {
@@ -32,6 +48,7 @@ struct MiTrustTicketStore {
         let privHex = defaults.string(forKey: "xiaomiTrustIdentityPrivHex") ?? defaultIdentityPrivHex
         let pubB64 = defaults.string(forKey: "xiaomiTrustIdentityPubB64") ?? defaultIdentityPubB64
         let peerPubB64 = defaults.string(forKey: "xiaomiTrustPeerIdentityPubB64") ?? defaultPeerIdentityPubB64
+        let peerAccountB64 = defaults.string(forKey: "xiaomiTrustPeerAccountPubB64") ?? defaultPeerAccountPubB64
         let uidB64 = defaults.string(forKey: "xiaomiTrustUidHashB64") ?? defaultUidHashB64
         let storedIndex = defaults.object(forKey: "xiaomiTrustLyraKeyIndex") as? Int ?? 1
 
@@ -53,10 +70,24 @@ struct MiTrustTicketStore {
             identityPrivateKey: privateKey,
             identityPubKey: Data(base64Encoded: pubB64) ?? Data(),
             peerIdentityPubKey: Data(base64Encoded: peerPubB64) ?? Data(),
+            peerAccountPubKey: Data(base64Encoded: peerAccountB64) ?? Data(),
             uidHashRaw: Data(base64Encoded: uidB64) ?? Data(),
             myKeyIndex: UInt64(max(1, storedIndex)),
             deviceKeyData: deviceKeyData(defaults: defaults)
         )
+    }
+
+    // Harvests the phone's account identity pubkey from an inbound sync
+    // payload (its TrustedDeviceInfo f15 cert cred carries the Mijia-issued
+    // identity cert). Persisted under xiaomiTrustPeerAccountPubB64.
+    @discardableResult
+    static func harvestPeerAccountPubKey(fromSyncPayload payload: Data) -> Bool {
+        guard let pub = LyraIdentityCert.pubKey(fromSyncPayload: payload),
+              pub != current().peerAccountPubKey
+        else { return false }
+        UserDefaults.standard.set(pub.base64EncodedString(), forKey: "xiaomiTrustPeerAccountPubB64")
+        DiagnosticsLog.info("xiaomi.trust.peer_account_pub_harvested bytes=\(pub.count)")
+        return true
     }
 
     // Persistent 32-byte device key, advertised as TrustedDeviceInfo f13 (the
@@ -204,5 +235,29 @@ struct MiTrustTicketStore {
             index = next
         }
         return data
+    }
+}
+
+// Extracts the device identity cert's P-256 public key from a sync payload:
+// scans for DER-encoded X.509 certs (30 82 <len16>) and returns the first
+// cert's key in x9.63 form (65 bytes, 0x04 prefix).
+enum LyraIdentityCert {
+    static func pubKey(fromSyncPayload payload: Data) -> Data? {
+        var index = payload.startIndex
+        while index + 4 <= payload.endIndex {
+            defer { index += 1 }
+            guard payload[index] == 0x30, payload[index + 1] == 0x82 else { continue }
+            let length = (Int(payload[index + 2]) << 8) | Int(payload[index + 3])
+            let end = index + 4 + length
+            guard length > 0, end <= payload.endIndex else { continue }
+            let der = payload[index..<end]
+            guard let cert = SecCertificateCreateWithData(nil, Data(der) as CFData),
+                  let key = SecCertificateCopyKey(cert),
+                  let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+                  rep.count == 65, rep.first == 0x04
+            else { continue }
+            return rep
+        }
+        return nil
     }
 }
