@@ -186,17 +186,16 @@ public enum LyraTrustedDeviceInfo {
     // Device-initiated sync push: same 0x00 prefix with the type-1 sync frame
     // the phone itself sends. Only this shape routes through the phone's
     // HandleSyncDevMsg, which runs the cred checks (CheckSharedCred /
-    // CheckCertCred) that stamp the conn's trusted type — replies never do.
-    // groupInfo rides the sync inner's f3 (FrameParse::PickGroupInfo feeds it
-    // to DeviceGroupManagerImpl::IsDeviceCredExist): a TrustedGroupInfoFrame
-    // {f1:1, f3:CredFeature} carrying our cert creds.
+    // CheckCertCred) that stamp the conn trusted type — replies never do.
+    // The cred carrier (TrustedGroupInfoFrame) rides TrustedDeviceInfoFrame.f15
+    // inside deviceInfo, NOT a sync-inner sibling: SyncFrame fields 2 (dev) and
+    // 3 (adv_key) are a oneof, and writing f3 makes the phone's SyncFrame parser
+    // delete the dev frame outright. groupInfo is accepted only for source
+    // compatibility and is never written to the wire.
     public static func syncPushPayload(deviceInfo: Data, groupInfo: Data? = nil) -> Data {
         var sync = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &sync)
         LyraProtoWriter.appendLengthDelimitedField(2, value: deviceInfo, to: &sync)
-        if let groupInfo {
-            LyraProtoWriter.appendLengthDelimitedField(3, value: groupInfo, to: &sync)
-        }
         var frame = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
         LyraProtoWriter.appendLengthDelimitedField(5, value: sync, to: &frame)

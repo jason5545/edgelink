@@ -87,9 +87,13 @@ final class LyraSyncReplyPayloadTests: XCTestCase {
 
     // The device-initiated push uses the type-1 sync frame (same shape the
     // phone pushes) — the only route into the phone's HandleSyncDevMsg cred
-    // checks that stamp the conn trusted type.
+    // checks that stamp the conn trusted type. The cred carrier rides
+    // TrustedDeviceInfoFrame.f15; SyncFrame.f3 must stay empty because it is a
+    // oneof with f2 (dev) on the phone and would delete the device info.
     func testSyncPushPayloadShape() throws {
-        let deviceInfo = LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(            deviceName: "MacBook Pro",
+        let credBlock = Data([0x08, 0x09, 0x1A, 0x02, 0xAA, 0xBB])
+        let deviceInfo = LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
+            deviceName: "MacBook Pro",
             deviceType: 4,
             fullDeviceIdHex: "721572C384AE0AE9FB38162882E4FFF7D1BE0199B22F1CBCA7D018B5B71AEA59",
             shortDeviceIdHex: "721572C3",
@@ -101,7 +105,8 @@ final class LyraSyncReplyPayloadTests: XCTestCase {
             ipAddress: "10.5.48.51",
             osVersion: "26.6.0",
             accountNumericId: "32717118",
-            syncUuid: "3c688e8c-c5df-4f9d-a163-4c193bd30582"
+            syncUuid: "3c688e8c-c5df-4f9d-a163-4c193bd30582",
+            credBlock: credBlock
         )
         var groupInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &groupInfo)
@@ -118,6 +123,8 @@ final class LyraSyncReplyPayloadTests: XCTestCase {
             lengthDelimited(3, in: info).flatMap { String(data: $0, encoding: .utf8) },
             "721572C384AE0AE9FB38162882E4FFF7D1BE0199B22F1CBCA7D018B5B71AEA59"
         )
-        XCTAssertEqual(lengthDelimited(3, in: sync), groupInfo)
+        // group_info must NOT occupy SyncFrame.f3 (oneof with dev f2); it rides tdi.f15.
+        XCTAssertNil(lengthDelimited(3, in: sync))
+        XCTAssertEqual(lengthDelimited(15, in: info), credBlock)
     }
 }
