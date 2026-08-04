@@ -106,6 +106,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
 import kotlin.coroutines.coroutineContext
@@ -1800,10 +1801,18 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         )
                     }
                 }
-                val handshakeEstablished = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
-                    nextSession.connect()
-                    true
-                } == true
+                val handshakeEstablished = coroutineScope {
+                    val handshake = async { nextSession.connect() }
+                    val completed = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                        handshake.await()
+                        true
+                    } == true
+                    if (!completed) {
+                        nextSession.close()
+                        handshake.cancelAndJoin()
+                    }
+                    completed
+                }
                 if (!handshakeEstablished) {
                     EdgeLinkLog.warn(
                         "relay.android.handshake_timeout hostId=${peer.deviceId} clientId=${identity.deviceId} timeoutMs=$HANDSHAKE_TIMEOUT_MS"

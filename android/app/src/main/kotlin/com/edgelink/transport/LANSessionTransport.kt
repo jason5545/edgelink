@@ -1,6 +1,8 @@
 package com.edgelink.transport
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import com.edgelink.app.EdgeLinkLog
@@ -14,8 +16,18 @@ import java.net.Socket
 class LANSessionTransport(context: Context) {
     data class Endpoint(val host: String, val port: Int, val resolvedAtMs: Long)
 
+    private val endpointCache = LanEndpointCache()
+    private val connectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
     @Volatile
-    private var endpoint: Endpoint? = null
+    private var activeNetworkKey: String? = null
+
+    @Volatile
+    private var discoveryStarted = false
+
+    @Volatile
+    private var networkCallbackRegistered = false
 
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
     private val discoveryListener = object : NsdManager.DiscoveryListener {
@@ -39,7 +51,7 @@ class LANSessionTransport(context: Context) {
 
                 override fun onServiceResolved(info: NsdServiceInfo) {
                     val host = info.host?.hostAddress ?: return
-                    endpoint = Endpoint(host, info.port, System.currentTimeMillis())
+                    endpointCache.put(host, info.port, currentNetworkKey())
                     EdgeLinkLog.info("lan.android.endpoint_found host=$host port=${info.port} name=${info.serviceName}")
                 }
             })
@@ -47,35 +59,93 @@ class LANSessionTransport(context: Context) {
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo) {
             EdgeLinkLog.info("lan.android.endpoint_lost name=${serviceInfo.serviceName}")
-            endpoint = null
+            endpointCache.invalidate()
+        }
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            handleNetworkChange(network.toString(), "available")
+        }
+
+        override fun onLost(network: Network) {
+            handleNetworkChange(null, "lost")
         }
     }
 
     fun startDiscovery() {
-        runCatching {
-            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-        }.onFailure { error ->
-            EdgeLinkLog.warn("lan.android.discovery_start_failed error=${error.message}")
-        }
+        registerNetworkCallbackOnce()
+        restartDiscovery()
     }
 
-    fun currentEndpoint(): Endpoint? = endpoint
+    fun currentEndpoint(): Endpoint? = cachedEndpoint()
 
     suspend fun awaitEndpoint(timeoutMs: Long): Endpoint? {
         val deadlineMs = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadlineMs) {
-            endpoint?.let { return it }
+            cachedEndpoint()?.let { return it }
             kotlinx.coroutines.delay(50)
         }
-        return endpoint
+        return cachedEndpoint()
     }
 
     suspend fun connect(host: String, port: Int): ByteChannel = withContext(Dispatchers.IO) {
         val socket = Socket()
-        socket.tcpNoDelay = true
-        socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        try {
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        } catch (error: Throwable) {
+            endpointCache.invalidateIfMatches(host, port)
+            EdgeLinkLog.warn("lan.android.connect_failed_endpoint_invalidated host=$host port=$port")
+            runCatching { socket.close() }
+            throw error
+        }
         EdgeLinkLog.info("lan.android.transport_connected host=$host port=$port")
         LANTCPByteChannel(socket, host, port)
+    }
+
+    private fun cachedEndpoint(): Endpoint? =
+        endpointCache.get(currentNetworkKey())?.let { Endpoint(it.host, it.port, it.resolvedAtMs) }
+
+    private fun currentNetworkKey(): String? =
+        activeNetworkKey ?: connectivityManager.activeNetwork?.toString()
+
+    private fun registerNetworkCallbackOnce() {
+        if (networkCallbackRegistered) {
+            return
+        }
+        networkCallbackRegistered = true
+        activeNetworkKey = connectivityManager.activeNetwork?.toString()
+        runCatching {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        }.onFailure { error ->
+            EdgeLinkLog.warn("lan.android.network_callback_failed error=${error.message}")
+        }
+    }
+
+    private fun handleNetworkChange(networkKey: String?, reason: String) {
+        val previous = activeNetworkKey
+        if (reason == "available" && previous != null && previous == networkKey) {
+            return
+        }
+        activeNetworkKey = networkKey
+        endpointCache.invalidate()
+        EdgeLinkLog.info("lan.android.network_changed reason=$reason from=${previous ?: "-"} to=${networkKey ?: "-"}")
+        if (discoveryStarted) {
+            restartDiscovery()
+        }
+    }
+
+    private fun restartDiscovery() {
+        if (discoveryStarted) {
+            runCatching { nsdManager.stopServiceDiscovery(discoveryListener) }
+        }
+        runCatching {
+            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+            discoveryStarted = true
+        }.onFailure { error ->
+            EdgeLinkLog.warn("lan.android.discovery_start_failed error=${error.message}")
+        }
     }
 
     private class LANTCPByteChannel(
@@ -89,12 +159,7 @@ class LANSessionTransport(context: Context) {
 
         override suspend fun send(bytes: ByteArray) = withContext(Dispatchers.IO) {
             synchronized(sendLock) {
-                output.write(bytes.size shr 24 and 0xFF)
-                output.write(bytes.size shr 16 and 0xFF)
-                output.write(bytes.size shr 8 and 0xFF)
-                output.write(bytes.size and 0xFF)
-                output.write(bytes)
-                output.flush()
+                LanFraming.writeFrame(output, bytes)
             }
         }
 

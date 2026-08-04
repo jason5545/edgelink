@@ -66,8 +66,7 @@ final class LANSessionListener: @unchecked Sendable {
                 if case .hostPort(let host, _) = connection.endpoint {
                     let ip = "\(host)".trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
                     if !ip.isEmpty {
-                        UserDefaults.standard.set(ip, forKey: "lanLastPhoneIP")
-                        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lanLastPhoneIPTime")
+                        LANPinnedPhoneIP.record(ip)
                     }
                 }
                 self.onAccept(LANTCPByteChannel(connection: connection, queue: self.queue))

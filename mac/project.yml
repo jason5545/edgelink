@@ -145,6 +145,7 @@ targets:
     sources:
       - Tests/EdgeLinkMacTests
       - path: Sources/App/DiagnosticsLog.swift
+      - path: Sources/App/LANPinnedPhoneIP.swift
       - path: Sources/App/BiometricAuthManager.swift
       - path: Sources/App/MacTrustManager.swift
       - path: Sources/App/MiTrustAuthService.swift

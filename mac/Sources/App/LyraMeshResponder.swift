@@ -12,9 +12,10 @@ final class LyraMeshResponder {
     // The EdgeLink phone is the one whose app holds a LAN session with us
     // (it reports lanLastPhoneIP). Other HyperConnect devices on the network
     // (e.g. a coworker's phone) also answer phys sync and dial mitrustservice;
-    // when lanLastPhoneIP is known, only engage that host.
+    // when lanLastPhoneIP is known, only engage that host. The pin is dropped
+    // once it goes stale or stops matching the local subnet (network move).
     static func isExpectedPhoneHost(_ host: String) -> Bool {
-        guard let lanIP = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !lanIP.isEmpty else {
+        guard let lanIP = LANPinnedPhoneIP.current() else {
             return true
         }
         return host == lanIP

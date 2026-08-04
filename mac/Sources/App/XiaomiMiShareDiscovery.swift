@@ -238,7 +238,7 @@ final class XiaomiMiShareDiscovery: NSObject {
             }
             return peer.resolvedIPv4 ?? Self.parseDebugInfoIPv4(peer.debugInfo)
         })
-        var pinnedHost = UserDefaults.standard.string(forKey: "lanLastPhoneIP")
+        var pinnedHost = LANPinnedPhoneIP.current()
         if let pinned = pinnedHost, !pinned.isEmpty, !livePhoneHosts.isEmpty, !livePhoneHosts.contains(pinned) {
             DiagnosticsLog.info(
                 "xiaomi.mishare.stale_pin_ignored pinned=\(pinned) live=\(livePhoneHosts.joined(separator: ","))"
@@ -273,13 +273,10 @@ final class XiaomiMiShareDiscovery: NSObject {
         let history = (meshResponder?.persistedPhoneEndpoints() ?? []).filter { pinned($0.host) }
         endpoints.append(contentsOf: history)
         if let lanIP = pinnedHost, !lanIP.isEmpty {
-            let lanTime = UserDefaults.standard.double(forKey: "lanLastPhoneIPTime")
-            if Date().timeIntervalSince1970 - lanTime < 86_400 {
-                var ports = Set(history.map(\.port))
-                ports.insert(46541)
-                for port in ports {
-                    endpoints.append((lanIP, port))
-                }
+            var ports = Set(history.map(\.port))
+            ports.insert(46541)
+            for port in ports {
+                endpoints.append((lanIP, port))
             }
         }
         var seen = Set<String>()
@@ -326,15 +323,14 @@ final class XiaomiMiShareDiscovery: NSObject {
         else {
             return
         }
-        if let pinned = UserDefaults.standard.string(forKey: "lanLastPhoneIP"),
-           !pinned.isEmpty, host != pinned {
+        if let pinned = LANPinnedPhoneIP.current(), host != pinned {
             return
         }
         startMeshAnnouncer(host: host, ports: [meshPort])
     }
 
     func startMeshAnnouncerOnKnownPhoneEndpoint() {
-        guard let host = UserDefaults.standard.string(forKey: "lanLastPhoneIP"), !host.isEmpty else { return }
+        guard let host = LANPinnedPhoneIP.current() else { return }
         let reported = (UserDefaults.standard.array(forKey: "lyraReportedPhoneMeshPorts") as? [Int]) ?? []
         let ports = reported.compactMap { UInt16(exactly: $0) }
         let ordered = ports.contains(43495) ? [43495] : ports
