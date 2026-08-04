@@ -68,6 +68,7 @@ final class LyraMeshResponder {
     private var syncAuthSharedSecret = Data()
     private var syncAnnounceEndpoint: String?
     private var syncCookieByEndpoint: [String: UInt64] = [:]
+    private let syncTaskServer = LyraSyncTaskServer()
     private var expressDataKey = Data()
     private var eventBytesBuffer = Data()
     private var streamReceives: [UInt32: StreamReceive] = [:]
@@ -212,6 +213,21 @@ final class LyraMeshResponder {
             }
         }
         for logiConn in miFrame.logiConnFrames {
+            if syncTaskServer.handles(logiConn: logiConn) {
+                let replies = syncTaskServer.handleLogiConn(logiConn)
+                if !replies.isEmpty {
+                    let miResponse = MiConnectFrame(version: 0, logiConnFrames: replies)
+                    let responseFrame = LyraMeshPack.Frame(
+                        packType: frame.packType, payload: miResponse.serialized()
+                    )
+                    do {
+                        try reply(responseFrame)
+                    } catch {
+                        DiagnosticsLog.error("xiaomi.synctask.reply_failed", error)
+                    }
+                }
+                continue
+            }
             if logiConn.flag {
                 handleEncryptedLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
             } else {
@@ -384,6 +400,9 @@ final class LyraMeshResponder {
         for (index, candidate) in syncKeyCandidates.enumerated() {
             keys.append(("syncCand\(index)", candidate))
         }
+        for (index, key) in syncTaskServer.sessionKeys.enumerated() {
+            keys.append(("syncTask\(index)", key))
+        }
         if let channelKey {
             keys.append(("channel", channelKey))
         }
@@ -392,8 +411,10 @@ final class LyraMeshResponder {
                 continue
             }
             if label != "channel" {
-                syncSessionKey = key
-                syncKeyCandidates = []
+                if label == "sync" || label.hasPrefix("syncCand") {
+                    syncSessionKey = key
+                    syncKeyCandidates = []
+                }
                 DiagnosticsLog.info(
                     "xiaomi.mishare.sync_announce_decrypted from=\(endpoint.debugDescription) " +
                         "label=\(label) bytes=\(plaintext.count) " +
@@ -1193,6 +1214,20 @@ final class LyraMeshResponder {
                 }
                 return
             }
+            if serviceName == LyraSyncTaskServer.syncServiceName {
+                // The phone's reverse sync task on a classic logi conn.
+                let responseLogiConn = syncTaskServer.handleClassicSyncInfo(
+                    syncInfoData: syncInfoData, logiConn: logiConn
+                )
+                let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+                let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
+                do {
+                    try reply(responseFrame)
+                } catch {
+                    DiagnosticsLog.error("xiaomi.synctask.classic_response_failed", error)
+                }
+                return
+            }
             resetChannelState()
             handleSyncAuthRequest(
                 syncInfoData: syncInfoData, serviceName: serviceName,
@@ -1627,19 +1662,9 @@ final class LyraMeshResponder {
         guard let deviceIdHex = deviceIdHexProvider() else {
             return
         }
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        let deviceInfo = LyraTrustedDeviceInfo.deviceInfoFrame(
-            deviceName: displayNameProvider(),
-            deviceType: 4,
-            deviceId: deviceIdHex,
-            uidHash: "61F2",
-            hwModel: Self.hardwareModel(),
-            lyraVersion: "5.1.208.10.fullCnRelease.0512164",
-            services: Self.announcedServices,
-            ipAddress: Self.primaryIPv4Address(),
-            osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+        let inner = LyraSyncReply.payload(
+            deviceIdHex: deviceIdHex, displayName: displayNameProvider()
         )
-        let inner = LyraTrustedDeviceInfo.plaintextAnnounce(deviceInfo: deviceInfo)
         do {
             let nonce = AES.GCM.Nonce()
             let sealed = try AES.GCM.seal(inner, using: key, nonce: nonce)
@@ -1754,9 +1779,19 @@ final class LyraMeshResponder {
         LyraProtoWriter.appendVarintField(1, value: 256, to: &networkInfo)
         LyraProtoWriter.appendLengthDelimitedField(5, value: Data(), to: &networkInfo)
 
+        // The phone's SyncManager reverse sync task (service 00150323) rides
+        // quick-conn: its phys sync request embeds private_data with a logi
+        // opening (sync_info + AuthHandshake client_notify). Answering inside
+        // the response private_data is what un-parks the phone's kAuthClient
+        // so the sync exchange can populate DevRepo.
+        let quickConn = syncTaskServer.responsePrivateData(
+            requestTrailingFields: request.trailingFields
+        )
+
         let response = PhysConnSyncDeviceInfoResponse(
             timestampMs: UInt64(Date().timeIntervalSince1970 * 1000),
             deviceInfo: deviceInfo,
+            privateData: quickConn?.privateData,
             networkInfo: networkInfo
         )
         let responsePhysConn = PhysConnFrame(
@@ -1774,6 +1809,19 @@ final class LyraMeshResponder {
                 "xiaomi.mishare.mesh_sync_response to=\(endpoint.debugDescription) " +
                     "physConnId=\(physConn.field1) hex=\(responsePayload.map { String(format: "%02x", $0) }.joined())"
             )
+            if let quickConn {
+                // Also offer the sync_info + server_notify as a standalone logi
+                // frame: if the phone's auth-reuse check rejects the embedded
+                // copy it falls back to the normal logi-conn handshake.
+                let miLogi = MiConnectFrame(version: 0, logiConnFrames: [quickConn.logiFrame])
+                socket.sendInboundAsync(
+                    frame: LyraMeshPack.Frame(packType: 2, payload: miLogi.serialized()),
+                    toEndpointDescription: endpoint.debugDescription
+                )
+                DiagnosticsLog.info(
+                    "xiaomi.synctask.logi_sync_info_tx connId=\(quickConn.logiFrame.logiConnId)"
+                )
+            }
             sendAnnounce(endpointDescription: endpoint.debugDescription)
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.mesh_sync_response_failed", error)

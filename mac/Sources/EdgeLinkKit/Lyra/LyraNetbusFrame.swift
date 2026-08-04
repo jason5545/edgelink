@@ -600,13 +600,15 @@ public struct PhysConnSyncDeviceInfoResponse: Equatable, Sendable {
     public var timestampMs: UInt64
     public var deviceInfo: LyraDeviceInfo
     public var field3: UInt32
+    public var privateData: Data?
     public var field5: UInt32?
     public var networkInfo: Data?
 
-    public init(timestampMs: UInt64, deviceInfo: LyraDeviceInfo, field3: UInt32 = 256, field5: UInt32? = nil, networkInfo: Data? = nil) {
+    public init(timestampMs: UInt64, deviceInfo: LyraDeviceInfo, field3: UInt32 = 256, privateData: Data? = nil, field5: UInt32? = nil, networkInfo: Data? = nil) {
         self.timestampMs = timestampMs
         self.deviceInfo = deviceInfo
         self.field3 = field3
+        self.privateData = privateData
         self.field5 = field5
         self.networkInfo = networkInfo
     }
@@ -616,6 +618,9 @@ public struct PhysConnSyncDeviceInfoResponse: Equatable, Sendable {
         LyraProtoWriter.appendVarintField(1, value: timestampMs, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(2, value: deviceInfo.serialized(), to: &data)
         LyraProtoWriter.appendVarintField(3, value: UInt64(field3), to: &data)
+        if let privateData {
+            LyraProtoWriter.appendLengthDelimitedField(4, value: privateData, to: &data)
+        }
         if let field5 {
             LyraProtoWriter.appendVarintField(5, value: UInt64(field5), to: &data)
         }

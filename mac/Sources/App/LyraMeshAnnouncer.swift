@@ -454,6 +454,46 @@ final class LyraMeshAnnouncer {
         return LogiConnInnerFrame(parsing: plaintext)
     }
 
+    // The phone's SyncManager reverse sync task rides the live announce conn:
+    // it pushes its TrustedDeviceInfo payload (PAYLOAD_V2, session key) and
+    // expects ours back — that exchange is what lands our device (with the
+    // relayCall service) in the phone's DevRepo trusted store.
+    private var lastSyncPayloadReplyAt = Date.distantPast
+
+    private func replyToSyncPayload(plaintext: Data) {
+        DiagnosticsLog.info(
+            "xiaomi.mishare.announcer_sync_payload decrypted=\(plaintext.count) " +
+                "head=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
+        )
+        guard Date().timeIntervalSince(lastSyncPayloadReplyAt) > 5 else { return }
+        lastSyncPayloadReplyAt = Date()
+        sendSyncReply()
+    }
+
+    // Full TrustedDeviceInfo in the type-0x00 sync frame (see LyraSyncReply) —
+    // the plain announce frame is rejected by the sync path's FrameParse.
+    private func sendSyncReply() {
+        guard let deviceIdHex = deviceIdHexProvider(), let sessionKey = meshSessionKey else {
+            return
+        }
+        let plaintext = LyraSyncReply.payload(
+            deviceIdHex: deviceIdHex, displayName: displayNameProvider()
+        )
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(plaintext, using: sessionKey, nonce: nonce)
+            var payload = Data()
+            payload.append(UInt8((peerNetId == 0 ? 1 : peerNetId) & 0xFF))
+            payload.append(1)
+            payload.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            payload.append(sealed.ciphertext)
+            payload.append(sealed.tag)
+            send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "sync_reply")
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.announcer_sync_reply_failed", error)
+        }
+    }
+
     private func sendAnnounce() {
         guard !UserDefaults.standard.bool(forKey: "xiaomiMeshAnnounceDisabled") else {
             return
@@ -585,6 +625,7 @@ final class LyraMeshAnnouncer {
                     tag: Data(tag)
                 ), let plaintext = try? AES.GCM.open(box, using: sessionKey) {
                     detail = " decryptedBytes=\(plaintext.count)"
+                    replyToSyncPayload(plaintext: plaintext)
                 }
             }
             DiagnosticsLog.info(

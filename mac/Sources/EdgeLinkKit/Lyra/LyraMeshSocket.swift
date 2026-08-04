@@ -18,6 +18,8 @@ public final class LyraMeshSocket: @unchecked Sendable {
     private struct KcpSessionState {
         var nextSendSn: UInt32 = 0
         var recvUna: UInt32 = 0
+        var recvBuffer = Data()
+        var pendingSegments: [UInt32: Data] = [:]
     }
 
     private let queue = DispatchQueue(label: "edgelink.lyra.mesh", qos: .userInitiated)
@@ -217,30 +219,62 @@ public final class LyraMeshSocket: @unchecked Sendable {
                     var state = self.sessionStates[id] ?? KcpSessionState()
                     let isDuplicate = segment.sn < state.recvUna
                     if !isDuplicate {
-                        state.recvUna = segment.sn &+ 1
+                        state.pendingSegments[segment.sn] = segment.payload
+                        if state.pendingSegments.count > 64 {
+                            state.pendingSegments = [:]
+                            state.recvBuffer.removeAll()
+                        }
+                        var next = state.recvUna
+                        while let payload = state.pendingSegments.removeValue(forKey: next) {
+                            state.recvBuffer.append(payload)
+                            next &+= 1
+                        }
+                        state.recvUna = next
+                        if state.recvBuffer.count > 1_000_000 {
+                            state.recvBuffer.removeAll()
+                        }
                     }
                     self.sessionStates[id] = state
                     let ack = LyraMeshDatagram.encodeAck(tick: Self.tick(), sn: segment.sn, una: state.recvUna)
                     connection.send(content: ack, completion: .idempotent)
-                    if !isDuplicate, let decoded = try? LyraMeshPack.decode(segment.payload) {
-                        let reply: ReplyHandler = { responseFrame in
-                            var replyState = self.sessionStates[id] ?? KcpSessionState()
-                            let datagram = LyraMeshDatagram.encode(
-                                tick: Self.tick(),
-                                sn: replyState.nextSendSn,
-                                una: replyState.recvUna,
-                                payload: try LyraMeshPack.encode(responseFrame)
-                            )
-                            replyState.nextSendSn &+= 1
-                            self.sessionStates[id] = replyState
-                            connection.send(content: datagram, completion: .idempotent)
-                        }
-                        self.onFrame?(decoded.frame, endpoint, reply)
+                    if !isDuplicate {
+                        self.drainFrames(on: connection, id: id, endpoint: endpoint)
                     }
                 }
             }
             if error == nil {
                 self.receive(on: connection, id: id)
+            }
+        }
+    }
+
+    // The mesh stream is length-prefixed LyraMeshPack frames over an ordered
+    // KCP segment stream; a frame can span segments and a segment can carry
+    // multiple frames, so decode from a persistent per-connection buffer.
+    private func drainFrames(on connection: NWConnection, id: ObjectIdentifier, endpoint: NWEndpoint) {
+        let reply: ReplyHandler = { responseFrame in
+            var replyState = self.sessionStates[id] ?? KcpSessionState()
+            let datagram = LyraMeshDatagram.encode(
+                tick: Self.tick(),
+                sn: replyState.nextSendSn,
+                una: replyState.recvUna,
+                payload: try LyraMeshPack.encode(responseFrame)
+            )
+            replyState.nextSendSn &+= 1
+            self.sessionStates[id] = replyState
+            connection.send(content: datagram, completion: .idempotent)
+        }
+        while var state = self.sessionStates[id], state.recvBuffer.count >= LyraMeshPack.headerLength {
+            do {
+                let decoded = try LyraMeshPack.decode(state.recvBuffer)
+                state.recvBuffer.removeFirst(decoded.consumedBytes)
+                self.sessionStates[id] = state
+                self.onFrame?(decoded.frame, endpoint, reply)
+            } catch LyraMeshPack.PackError.truncated {
+                break
+            } catch {
+                state.recvBuffer.removeFirst()
+                self.sessionStates[id] = state
             }
         }
     }

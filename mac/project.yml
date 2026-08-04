@@ -129,6 +129,7 @@ targets:
       - path: Sources/App/MiTrustTicketStore.swift
       - path: Sources/App/MiTrustCryptoBridge.m
       - path: Sources/App/LyraCastTrustSession.swift
+      - path: Sources/App/LyraSyncTaskServer.swift
       - path: Sources/App/XiaomiMirrorWFDClient.swift
       - path: Sources/App/XiaomiMirrorFlowController.swift
       - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift
