@@ -555,6 +555,53 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Live 2026-08-04: after CLOSE_SCREEN the phone releases the cast logi
+    // conn and ignores redialed logi requests on the torn-down phys conn.
+    // The redial stalled until the 30s stage watchdog — and every 重试
+    // reset that watchdog via progress(), so the session zombied through
+    // three user retries (~1min at 正在連接/連接失敗) until the watchdog
+    // finally fired and a fresh session connected instantly. The redial
+    // must fail the session fast; the flow then rebuilds a fresh session
+    // inside its own channel-wait window and recovers with no user retry.
+    func testStalledRedialFailsSessionAndFlowRebuildsFresh() async throws {
+        // Locked + Mac-driven unlock so the phone has adopted the
+        // mitrustservice conn — the session then survives the cast-channel
+        // release (like production) and the redial genuinely stalls.
+        try makeEnvironment(locked: true)
+        session.start()
+        controller.start()
+
+        try await waitFor("flow A lock mask + WFD up") { [self] in
+            self.controller.mask == .locked && self.phone.wfdSessionEstablished
+        }
+        controller.unlockRequested()
+        try await waitFor("flow A streaming after unlock") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        phone.wedgePhysOnRelease = true
+        let oldSession = session!
+        phone.releaseCastChannel()
+
+        try await waitFor("flow reacted to the release") { [self] in
+            self.controller.stage != .streaming || self.controller.mask != nil
+        }
+        // The redial stalls (phone silent on the wedged phys conn); the
+        // session must fail fast, get dropped, and the flow's rebuild must
+        // reach streaming over a fresh session without any user action.
+        try await waitFor("flow recovered on a fresh session", timeout: 25) { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertFalse(
+            session === oldSession,
+            "stalled redial must fail the session so the flow rebuilds a fresh one"
+        )
+        XCTAssertEqual(
+            phone.openMirrorScreenTotal, 2,
+            "exactly one re-OPEN on the rebuilt channel"
+        )
+    }
+
     // Live 2026-08-03: after a stop/restart the phone killed the cast
     // channel ~1s after every re-OPEN (logi disconnect 52011, mid-teardown
     // reaction) and the Mac looped redial → OPEN → kill for ~1 minute,

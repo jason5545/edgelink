@@ -121,6 +121,12 @@ final class FakeXiaomiPhone {
             self?.queue.async {
                 self?.meshConnection?.cancel()
                 self?.meshConnection = connection
+                // A fresh phys conn clears the wedge: the real phone answers
+                // logi requests on a newly dialed session even while it
+                // ignores them on the torn-down one.
+                if self?.wedgedMeshConnection != nil, connection !== self?.wedgedMeshConnection {
+                    self?.wedgedMeshConnection = nil
+                }
                 // Fresh KCP state per connection — the real phone does the
                 // same (a redialed/rebooted session restarts sn at 0).
                 self?.meshSendSn = 0
@@ -363,6 +369,12 @@ final class FakeXiaomiPhone {
               let frame = LogiConnInnerFrame(parsing: inner)
         else { return }
         if case .request(let requestData) = frame.payload {
+            // A redialed logi request on a torn-down phys conn gets no
+            // answer (the phone's side is gone after CLOSE_SCREEN).
+            if let wedged = wedgedMeshConnection, wedged === meshConnection {
+                log("fakephone.logi_request_ignored reason=wedged_phys")
+                return
+            }
             // logi conn request: extract the embedded peer-port request
             let privateData = lengthDelimited(3, in: requestData) ?? Data()
             if let peerPortRequest = lengthDelimited(10, in: privateData) {
@@ -397,6 +409,13 @@ final class FakeXiaomiPhone {
     var releaseChannelAfterOpenCount = 0
     var releaseChannelAfterOpenDelay: TimeInterval = 0.2
 
+    // Live 2026-08-04: after CLOSE_SCREEN the phone releases the cast logi
+    // conn AND goes deaf to redialed logi requests on the same phys conn —
+    // only a fresh session (new phys handshake) gets answers. Modelled by
+    // wedging the current mesh connection on releaseCastChannel().
+    var wedgePhysOnRelease = false
+    private var wedgedMeshConnection: NWConnection?
+
     // Simulates the phone releasing the cast logi conn mid-stream (observed
     // live on phone reboot: unencrypted inner disconnect payload {1: 52011}).
     func releaseCastChannel() {
@@ -407,6 +426,9 @@ final class FakeXiaomiPhone {
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
         sendMesh(packType: 2, payload: miFrame.serialized())
         openMirrorScreenCount = 0
+        if wedgePhysOnRelease {
+            wedgedMeshConnection = meshConnection
+        }
     }
 
     // MARK: - Peer-port command exchange (packType 5)

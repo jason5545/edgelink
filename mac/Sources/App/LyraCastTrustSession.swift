@@ -545,6 +545,24 @@ final class LyraCastTrustSession {
             }
             DiagnosticsLog.info("xiaomi.cast.trust_channel_redial")
             self.sendLogiConnRequest()
+            self.armRedialTimeout()
+        }
+    }
+
+    // A redial the phone never answers would otherwise stall until the 30s
+    // stage watchdog — and every mirror-flow retry resets that watchdog via
+    // progress(), so a phys conn the phone already tore down (it releases
+    // the cast logi conn ~6s after CLOSE_SCREEN, live 2026-08-04) zombied
+    // the session for as long as the user kept retrying. Fail the session
+    // fast: the runtime drops it and the flow builds a fresh one (full
+    // phys handshake), which the phone does answer.
+    var redialResponseTimeout: TimeInterval = 6
+
+    private func armRedialTimeout() {
+        queue.asyncAfter(deadline: .now() + redialResponseTimeout) { [weak self] in
+            guard let self, !self.cancelled, self.stage != .ready else { return }
+            DiagnosticsLog.warn("xiaomi.cast.trust_channel_redial_timeout stage=\(self.stage)")
+            self.fail("redial_timeout")
         }
     }
 
