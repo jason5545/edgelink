@@ -629,8 +629,13 @@ final class LyraRelayCallSession {
     private func respond(to request: RelayURI, fields: [String: String]) {
         var jsonFields = ["\"responseDeviceId\":\"\(Self.responseDeviceId)\""]
         for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
-            let escaped = value.replacingOccurrences(of: "\"", with: "\\\"")
-            jsonFields.append("\"\(key)\":\"\(escaped)\"")
+            // Official shape: code/callstate are JSON numbers, the rest strings.
+            if (key == "code" || key == "callstate"), Int(value) != nil {
+                jsonFields.append("\"\(key)\":\(value)")
+            } else {
+                let escaped = value.replacingOccurrences(of: "\"", with: "\\\"")
+                jsonFields.append("\"\(key)\":\"\(escaped)\"")
+            }
         }
         let json = "{" + jsonFields.joined(separator: ",") + "}"
         let uri = "relay://\(request.method):\(request.methodId)/response?\(json)"
@@ -646,8 +651,10 @@ final class LyraRelayCallSession {
             DiagnosticsLog.warn("xiaomi.relaycall.tx_no_channel")
             return
         }
-        var frame = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: Data(text.utf8), to: &frame)
+        // The channel string node carries the raw URI text — a proto field
+        // wrapper leaks into the phone's payload ("brelay://…", scheme check
+        // fails, every response falls to a 408 timeout phone-side).
+        let frame = Data(text.utf8)
         do {
             try socket.sendVariant(
                 channelFrame: LyraChannelSocket.wrapChannelFrame(frame),

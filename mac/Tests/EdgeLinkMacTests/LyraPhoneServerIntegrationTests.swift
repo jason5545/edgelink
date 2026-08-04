@@ -176,7 +176,7 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
         }
         phone.relayCall.sendRing(number: "0912345678")
         waitFor("ring response") {
-            self.phone.relayCall.lastRingResponse?.contains("\"code\":\"200\"") == true
+            self.phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
         }
         announcer?.stop()
         announcer = nil
