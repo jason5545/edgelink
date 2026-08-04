@@ -49,8 +49,29 @@ final class MacTrustManager: ObservableObject {
     // Truthful keyguard state from the EdgeLink Android app (KeyguardManager
     // via phone.lockState push), freshness-gated by the caller. Used when
     // duo.screen polls only yield placeholders — they lie on om1.
-    var externalLockState: (() -> Bool?)?
-    var isExternallyUnlocked: Bool { externalLockState?() == false }
+    // "locked" reports are conservative and always honored; an "unlocked"
+    // report only vouches while fresh — a lock transition since the report
+    // (screen off → stop → quick restart) must not let the flow stream the
+    // lock screen without an unlock.
+    var externalLockState: (() -> (locked: Bool, at: Date)?)?
+    // Android pushes on screen broadcasts and a 15s always-on heartbeat, so
+    // a fresh report is ~15s old; tolerate a couple of missed beats (doze)
+    // before treating "unlocked" as stale. Fast lock transitions ride the
+    // SCREEN_OFF broadcast push (~0.3s), so this window does not let a
+    // just-locked phone pass as unlocked.
+    var externalUnlockedFreshness: TimeInterval = 45
+    var isExternallyUnlocked: Bool { externalLockState?()?.locked == false }
+
+    // The external report if it may be acted on: locked reports pass at any
+    // age (the caller's own outer gate still applies), unlocked reports only
+    // within externalUnlockedFreshness.
+    private func usableExternalLockState() -> Bool? {
+        guard let report = externalLockState?() else { return nil }
+        guard report.locked || Date().timeIntervalSince(report.at) < externalUnlockedFreshness else {
+            return nil
+        }
+        return report.locked
+    }
     var onAuthActionSent: (() -> Void)?
     var onAuthEventHandled: (() -> Void)?
     var onUnlockSucceeded: (() -> Void)?
@@ -99,6 +120,10 @@ final class MacTrustManager: ObservableObject {
         statusQueryEpoch &+= 1
         statusRetryCount = 0
         keyguardInfoConfirmed = false
+        // A new flow must re-verify: a 562 unlock confirmed in a previous
+        // flow says nothing about the phone's current keyguard (the user may
+        // have re-locked while the mirror was stopped).
+        unlockConfirmed = false
         state = .queryingStatus
         sendStatusQuery()
     }
@@ -238,7 +263,7 @@ final class MacTrustManager: ObservableObject {
                 }
             }
             guard state == .queryingStatus else { return }
-            if let externalLocked = externalLockState?() {
+            if let externalLocked = usableExternalLockState() {
                 DiagnosticsLog.info("trust.mac.status_external_shortcut locked=\(externalLocked)")
                 state = .ready(locked: externalLocked)
                 if autoUnlockOnReady {
@@ -246,6 +271,11 @@ final class MacTrustManager: ObservableObject {
                     Task { await self.requestUnlock() }
                 }
                 return
+            }
+            if let report = externalLockState?(), !report.locked {
+                DiagnosticsLog.info(
+                    "trust.mac.status_external_stale ageMs=\(Int(Date().timeIntervalSince(report.at) * 1000))"
+                )
             }
             if statusRetryCount < maxStatusRetries {
                 statusRetryCount += 1
@@ -262,12 +292,13 @@ final class MacTrustManager: ObservableObject {
             } else {
                 // Placeholders exhausted the official-style retry budget.
                 // Fall back to the phone's own KeyguardManager report when we
-                // have one (duo.screen polls lie on om1); otherwise stay
-                // conservative (locked unless a confirmed unlock) so the
+                // have a usable one (duo.screen polls lie on om1); otherwise
+                // stay conservative (locked unless a confirmed unlock) so the
                 // unlock entry stays reachable.
-                let fallbackLocked = externalLockState?() ?? !unlockConfirmed
+                let externalFallback = usableExternalLockState()
+                let fallbackLocked = externalFallback ?? !unlockConfirmed
                 DiagnosticsLog.info(
-                    "trust.mac.status_query_fallback locked=\(fallbackLocked) source=\(self.externalLockState?() != nil ? "phone_lock_push" : "conservative")"
+                    "trust.mac.status_query_fallback locked=\(fallbackLocked) source=\(externalFallback != nil ? "phone_lock_push" : "conservative")"
                 )
                 state = .ready(locked: fallbackLocked)
                 if autoUnlockOnReady {

@@ -378,7 +378,7 @@ final class MirrorFlowE2ETests: XCTestCase {
     func testExternalLockReportShortcutsPlaceholderRetries() async throws {
         try makeEnvironment(locked: false)
         phone.conflictingStatus = true
-        trustManager.externalLockState = { false }
+        trustManager.externalLockState = { (locked: false, at: Date()) }
         trustManager.statusRetryDelay = 30
         session.start()
         controller.start()
@@ -796,7 +796,7 @@ final class MirrorFlowE2ETests: XCTestCase {
         establishedNotifiesVideoFrame = false
         try makeEnvironment(locked: false)
         phone.conflictingStatus = true
-        trustManager.externalLockState = { false }
+        trustManager.externalLockState = { (locked: false, at: Date()) }
         session.start()
         controller.start()
 
@@ -816,7 +816,7 @@ final class MirrorFlowE2ETests: XCTestCase {
     func testExternalLockedReportKeepsMaskWhenStatusLies() async throws {
         try makeEnvironment(locked: true)
         phone.conflictingStatus = true
-        trustManager.externalLockState = { true }
+        trustManager.externalLockState = { (locked: true, at: Date()) }
         session.start()
         controller.start()
 
@@ -831,6 +831,64 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
         try await waitFor("mask cleared via confirmed unlock") { [self] in
             self.controller.mask == nil
+        }
+    }
+
+    // Companion boundary: an "unlocked" report inside the freshness window
+    // (heartbeat age, e.g. 30s) must still shortcut the placeholder retries
+    // — a steady unlocked phone pushes nothing else, so rejecting these
+    // would demand an unlock on an unlocked phone (2026-08-04 regression).
+    func testRecentExternalUnlockReportStillShortcutsPlaceholders() async throws {
+        try makeEnvironment(locked: false)
+        phone.conflictingStatus = true
+        trustManager.externalLockState = { (locked: false, at: Date().addingTimeInterval(-30)) }
+        session.start()
+        controller.start()
+
+        try await waitFor("resolved unlocked via recent report", timeout: 5) { [self] in
+            if case .ready(let locked) = self.trustManager.state { return !locked }
+            return false
+        }
+        try await waitFor("streaming directly, no unlock demanded") { [self] in
+            self.controller.mask == nil && self.controller.stage == .streaming
+        }
+        XCTAssertEqual(biometricCallCount, 0, "unlocked phone must not require Touch ID")
+        XCTAssertEqual(phone.authActionCount, 0)
+    }
+
+    // Regression (2026-08-04 live): phone re-locked, then mirror stop ->
+    // quick restart. The Android KeyguardManager push still said "unlocked"
+    // (heartbeat from before the lock; the SCREEN_OFF push had not landed),
+    // and the placeholder shortcut resolved .ready(unlocked) from that stale
+    // report — the flow streamed the phone's lock screen without an unlock.
+    // A stale "unlocked" report must be ignored: the flow lands on the lock
+    // mask, and the Mac-driven unlock still works from there.
+    func testStaleExternalUnlockReportDoesNotStreamLockScreen() async throws {
+        try makeEnvironment(locked: true)
+        phone.conflictingStatus = true
+        // 60s-old "unlocked" heartbeat — the phone locked after it was sent.
+        trustManager.externalLockState = { (locked: false, at: Date().addingTimeInterval(-60)) }
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD up while status unresolved") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        // Give the (buggy) shortcut a beat to wrongly clear the mask.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNotNil(controller.mask, "stale unlocked report must not clear the mask")
+
+        try await waitFor("lock mask after retry-budget fallback") { [self] in
+            self.controller.mask == .locked
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("unlock completed") { [self] in
+            self.phone.mitrustUnlockCompleted
+        }
+        try await waitFor("streaming after real unlock") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
         }
     }
 

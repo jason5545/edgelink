@@ -62,11 +62,14 @@ internal class AndroidLockStateReporter(
         emitCurrent(reason = "start", force = true)
         // MIUI throttles background broadcasts (observed 2026-08-02:
         // USER_PRESENT/SCREEN_ON never arrived while the phone dozed), so
-        // poll on a heartbeat as the reliable baseline.
+        // poll on a heartbeat as the reliable baseline. The heartbeat always
+        // re-pushes (no dedupe): the Mac freshness-gates "unlocked" reports
+        // (2026-08-04), and an unchanged-state heartbeat that never re-pushes
+        // would let a steady unlocked report age past the gate.
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(HEARTBEAT_MS)
-                emitCurrent(reason = "heartbeat", force = false)
+                emitCurrent(reason = "heartbeat", force = true)
             }
         }
         EdgeLinkLog.info("lockstate.android.reporter_started")
