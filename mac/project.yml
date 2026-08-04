@@ -107,6 +107,28 @@ targets:
         PRODUCT_NAME: lyra-debug
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: MW4GWYGX56
+  LyraServerKit:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/LyraServerKit
+    dependencies:
+      - target: EdgeLinkKit
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+  LyraServer:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/LyraServerCLI
+      - Sources/LyraServerKit
+      - Sources/EdgeLinkKit
+    settings:
+      base:
+        PRODUCT_NAME: lyra-server
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MW4GWYGX56
   EdgeLinkKitTests:
     type: bundle.unit-test
     platform: macOS
@@ -130,20 +152,44 @@ targets:
       - path: Sources/App/MiTrustCryptoBridge.m
       - path: Sources/App/LyraCastTrustSession.swift
       - path: Sources/App/LyraSyncTaskServer.swift
+      - path: Sources/App/LyraSyncReply.swift
+      - path: Sources/App/LyraMeshAnnouncer.swift
+      - path: Sources/App/LyraMeshResponder.swift
+      - path: Sources/App/LyraTunnelManager.swift
+      - path: Sources/App/LyraRelayCallSession.swift
       - path: Sources/App/XiaomiMirrorWFDClient.swift
       - path: Sources/App/XiaomiMirrorFlowController.swift
       - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift
     dependencies:
       - target: EdgeLinkKit
+      - target: LyraServerKit
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_OBJC_BRIDGING_HEADER: Tests/EdgeLinkMacTests/EdgeLinkMacTests-Bridging-Header.h
+  LyraServerKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/LyraServerKitTests
+    dependencies:
+      - target: EdgeLinkKit
+      - target: LyraServerKit
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   LyraDebug:
     build:
       targets:
         LyraDebug: all
+  LyraServer:
+    build:
+      targets:
+        LyraServer: all
+    test:
+      targets:
+        - LyraServerKitTests
   EdgeLinkKit:
     build:
       targets:
