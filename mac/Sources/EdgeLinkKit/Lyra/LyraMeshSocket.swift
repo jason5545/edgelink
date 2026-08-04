@@ -22,6 +22,11 @@ public final class LyraMeshSocket: @unchecked Sendable {
         var pendingSegments: [UInt32: Data] = [:]
     }
 
+    // The phone's KCP input drops over-MTU UDP datagrams (its own pushes arrive
+    // as 1400-byte datagrams = 1376 stream bytes + 24-byte segment header), so
+    // large frames must be split into <=1376-byte stream chunks on send.
+    private static let maxSegmentPayload = 1376
+
     private let queue = DispatchQueue(label: "edgelink.lyra.mesh", qos: .userInitiated)
     private var listener: NWListener?
     private var inboundConnections: [ObjectIdentifier: NWConnection] = [:]
@@ -101,16 +106,29 @@ public final class LyraMeshSocket: @unchecked Sendable {
             connection = newConnection
         }
         id = ObjectIdentifier(connection)
+        let encoded = try LyraMeshPack.encode(frame)
+        sendEncoded(encoded, on: connection, id: id)
+    }
+
+    // Writes an encoded frame as one or more KCP stream segments (chunked at
+    // maxSegmentPayload), advancing the per-connection send sequence.
+    private func sendEncoded(_ encoded: Data, on connection: NWConnection, id: ObjectIdentifier) {
         var state = sessionStates[id] ?? KcpSessionState()
-        let datagram = LyraMeshDatagram.encode(
-            tick: Self.tick(),
-            sn: state.nextSendSn,
-            una: state.recvUna,
-            payload: try LyraMeshPack.encode(frame)
-        )
-        state.nextSendSn &+= 1
+        let tick = Self.tick()
+        var offset = 0
+        while offset < encoded.count {
+            let end = min(offset + Self.maxSegmentPayload, encoded.count)
+            let datagram = LyraMeshDatagram.encode(
+                tick: tick,
+                sn: state.nextSendSn,
+                una: state.recvUna,
+                payload: encoded[offset..<end]
+            )
+            state.nextSendSn &+= 1
+            connection.send(content: datagram, completion: .idempotent)
+            offset = end
+        }
         sessionStates[id] = state
-        connection.send(content: datagram, completion: .idempotent)
     }
 
     public func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) throws {
@@ -131,16 +149,8 @@ public final class LyraMeshSocket: @unchecked Sendable {
         }) else {
             throw SocketError.invalidEndpoint
         }
-        var state = sessionStates[id] ?? KcpSessionState()
-        let datagram = LyraMeshDatagram.encode(
-            tick: Self.tick(),
-            sn: state.nextSendSn,
-            una: state.recvUna,
-            payload: try LyraMeshPack.encode(frame)
-        )
-        state.nextSendSn &+= 1
-        sessionStates[id] = state
-        connection.send(content: datagram, completion: .idempotent)
+        let encoded = try LyraMeshPack.encode(frame)
+        sendEncoded(encoded, on: connection, id: id)
     }
 
     public static func tick() -> UInt32 {
@@ -253,16 +263,8 @@ public final class LyraMeshSocket: @unchecked Sendable {
     // multiple frames, so decode from a persistent per-connection buffer.
     private func drainFrames(on connection: NWConnection, id: ObjectIdentifier, endpoint: NWEndpoint) {
         let reply: ReplyHandler = { responseFrame in
-            var replyState = self.sessionStates[id] ?? KcpSessionState()
-            let datagram = LyraMeshDatagram.encode(
-                tick: Self.tick(),
-                sn: replyState.nextSendSn,
-                una: replyState.recvUna,
-                payload: try LyraMeshPack.encode(responseFrame)
-            )
-            replyState.nextSendSn &+= 1
-            self.sessionStates[id] = replyState
-            connection.send(content: datagram, completion: .idempotent)
+            let encoded = try LyraMeshPack.encode(responseFrame)
+            self.sendEncoded(encoded, on: connection, id: id)
         }
         while var state = self.sessionStates[id], state.recvBuffer.count >= LyraMeshPack.headerLength {
             do {
