@@ -10,6 +10,12 @@ struct MiTrustTicketStore {
     var peerIdentityPubKey: Data
     var uidHashRaw: Data
     var myKeyIndex: UInt64
+    var deviceKeyData: Data?
+
+    var deviceKey: SymmetricKey? {
+        guard let deviceKeyData, deviceKeyData.count == 32 else { return nil }
+        return SymmetricKey(data: deviceKeyData)
+    }
 
     var isEnabled: Bool { ticketKey != nil && identityPrivateKey != nil && uidHashRaw.count == 32 }
 
@@ -48,8 +54,27 @@ struct MiTrustTicketStore {
             identityPubKey: Data(base64Encoded: pubB64) ?? Data(),
             peerIdentityPubKey: Data(base64Encoded: peerPubB64) ?? Data(),
             uidHashRaw: Data(base64Encoded: uidB64) ?? Data(),
-            myKeyIndex: UInt64(max(1, storedIndex))
+            myKeyIndex: UInt64(max(1, storedIndex)),
+            deviceKeyData: deviceKeyData(defaults: defaults)
         )
+    }
+
+    // Persistent 32-byte device key, advertised as TrustedDeviceInfo f13 (the
+    // officially paired Mac and the phone both carry one in their DevRepo
+    // entries). The phone's DeviceKeyManager resolves it for auth reuse —
+    // without it the sync task's quick-conn dial dies at "key is null" and the
+    // full-handshake fallback at "client not have device key".
+    private static func deviceKeyData(defaults: UserDefaults) -> Data? {
+        if let hex = defaults.string(forKey: "xiaomiTrustDeviceKeyHex"),
+           let data = data(fromHex: hex), data.count == 32 {
+            return data
+        }
+        var generated = Data(count: 32)
+        generated.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
+        }
+        defaults.set(generated.map { String(format: "%02x", $0) }.joined(), forKey: "xiaomiTrustDeviceKeyHex")
+        return generated
     }
 
     static func recordAuthSession(sessionKey: Data, ticket: Data) {
@@ -77,10 +102,49 @@ struct MiTrustTicketStore {
     }
 
     func decryptCredBlob(_ blob: Data) -> Data? {
-        for key in [sessionKey, ticketKey].compactMap({ $0 }) {
-            if let plain = decrypt(blob, with: key) { return plain }
+        decryptCredBlobWithKey(blob)?.plaintext
+    }
+
+    func decryptCredBlobWithKey(_ blob: Data) -> (plaintext: Data, key: SymmetricKey)? {
+        for key in [sessionKey, ticketKey, deviceKey].compactMap({ $0 }) {
+            if let plain = decrypt(blob, with: key) { return (plain, key) }
         }
         return nil
+    }
+
+    // TrustedDeviceInfo f15 cert-cred block, mirroring the phone's own sync
+    // push: two entries, each {f1:3, f4:{nonce32, cert DER, ECDSA-SHA256
+    // sig(nonce)}} carrying the device identity cert. The phone's
+    // HandleSyncDevMsg only runs CheckSharedCred/CheckCertCred (which stamps
+    // the conn trusted type) when f15 is present. Until clean-room enrollment
+    // exists, the cert/key come from UserDefaults injection of officially
+    // issued material (xiaomiTrustCredCertHex / xiaomiTrustCredPrivHex).
+    func certCredBlock() -> Data? {
+        let defaults = UserDefaults.standard
+        guard let certHex = defaults.string(forKey: "xiaomiTrustCredCertHex"),
+              let cert = MiTrustTicketStore.data(fromHex: certHex),
+              let privHex = defaults.string(forKey: "xiaomiTrustCredPrivHex"),
+              let privData = MiTrustTicketStore.data(fromHex: privHex),
+              let priv = try? P256.Signing.PrivateKey(rawRepresentation: privData)
+        else { return nil }
+        var block = Data()
+        LyraProtoWriter.appendVarintField(1, value: 9, to: &block)
+        for fieldNumber in [3, 5] {
+            var nonce = Data(count: 32)
+            nonce.withUnsafeMutableBytes { buffer in
+                if let base = buffer.baseAddress { arc4random_buf(base, 32) }
+            }
+            guard let signature = try? priv.signature(for: nonce) else { return nil }
+            var cred = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &cred)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: cert, to: &cred)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: signature.derRepresentation, to: &cred)
+            var entry = Data()
+            LyraProtoWriter.appendVarintField(1, value: 3, to: &entry)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: cred, to: &entry)
+            LyraProtoWriter.appendLengthDelimitedField(fieldNumber, value: entry, to: &block)
+        }
+        return block
     }
 
     func decrypt(_ blob: Data, with key: SymmetricKey) -> Data? {

@@ -94,6 +94,12 @@ final class LyraMeshResponder {
         self.socket = socket
         self.deviceIdHexProvider = deviceIdHexProvider
         self.displayNameProvider = displayNameProvider
+        syncTaskServer.syncPayloadProvider = { [deviceIdHexProvider, displayNameProvider] in
+            guard let deviceIdHex = deviceIdHexProvider() else { return Data() }
+            return LyraSyncReply.payload(
+                deviceIdHex: deviceIdHex, displayName: displayNameProvider()
+            )
+        }
     }
 
     func attach() {
@@ -1783,10 +1789,46 @@ final class LyraMeshResponder {
         // quick-conn: its phys sync request embeds private_data with a logi
         // opening (sync_info + AuthHandshake client_notify). Answering inside
         // the response private_data is what un-parks the phone's kAuthClient
-        // so the sync exchange can populate DevRepo.
-        let quickConn = syncTaskServer.responsePrivateData(
+        // so the sync exchange can populate DevRepo. TeleService relayCall
+        // dials embed the same way — route those to the relay call session.
+        var quickConn = syncTaskServer.responsePrivateData(
             requestTrailingFields: request.trailingFields
         )
+        if quickConn == nil,
+           let opening = syncTaskServer.embeddedLogiOpening(requestTrailingFields: request.trailingFields),
+           opening.service == LyraRelayCallSession.serviceName {
+            let ticketStore = MiTrustTicketStore.current()
+            let reuseKey = ticketStore.sessionKey
+                ?? MiTrustTicketStore.lastAuthSessionKeyData.map { SymmetricKey(data: $0) }
+            let endpointDescription = endpoint.debugDescription
+            LyraRelayCallSession.adopt(
+                syncInfoData: opening.syncInfo,
+                logiConn: opening.logiConn,
+                endpoint: endpoint,
+                sessionKey: reuseKey
+            ) { [weak self] frame, _ in
+                self?.socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+            }
+            let serverSyncInfo = LyraRelayCallSession.serverSyncInfo(
+                ticketStore: ticketStore, sessionKey: reuseKey
+            )
+            let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(serverSyncInfo))
+            let logiFrame = LogiConnFrame(
+                logiConnId: opening.logiConn.logiConnId,
+                localNetId: 1,
+                remoteNetId: opening.logiConn.localNetId,
+                inner: inner.serialized()
+            )
+            var wrapper = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: logiFrame.serialized(), to: &wrapper)
+            var privateData = Data()
+            LyraProtoWriter.appendLengthDelimitedField(2, value: wrapper, to: &privateData)
+            quickConn = (privateData, logiFrame)
+            DiagnosticsLog.info(
+                "xiaomi.relaycall.embedded_quickconn connId=\(opening.logiConn.logiConnId) " +
+                    "privateDataBytes=\(privateData.count)"
+            )
+        }
 
         let response = PhysConnSyncDeviceInfoResponse(
             timestampMs: UInt64(Date().timeIntervalSince1970 * 1000),

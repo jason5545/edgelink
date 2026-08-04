@@ -82,14 +82,7 @@ final class LyraRelayCallSession {
             }
         }
 
-        var syncInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
-        if let ourEncCred = encryptLocalCred(ticketStore: ticketStore) {
-            LyraProtoWriter.appendLengthDelimitedField(6, value: ourEncCred, to: &syncInfo)
-        }
+        let syncInfo = Self.serverSyncInfo(ticketStore: ticketStore, sessionKey: sessionKey)
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
         let frame = LogiConnFrame(
             logiConnId: connId, localNetId: 1, remoteNetId: peerNetId, inner: inner.serialized()
@@ -100,6 +93,49 @@ final class LyraRelayCallSession {
         if !quickConn.isEmpty {
             handleQuickConn(quickConn, ticketStore: ticketStore)
         }
+    }
+
+    // Server-side sync_info for the relayCall dial ({10000, 16, key_index,
+    // uidFeature, encrypted_cred}) — shared by the conn-level reply and the
+    // phys sync response private_data (quick-conn dials).
+    static func serverSyncInfo(ticketStore: MiTrustTicketStore, sessionKey: SymmetricKey?) -> Data {
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
+        let credKey = sessionKey ?? ticketStore.sessionKey ?? ticketStore.ticketKey
+        if let credKey, let identityPrivateKey = ticketStore.identityPrivateKey {
+            var nonce32 = Data(count: 32)
+            nonce32.withUnsafeMutableBytes { buffer in
+                if let base = buffer.baseAddress { arc4random_buf(base, 32) }
+            }
+            if let signature = try? identityPrivateKey.signature(for: SHA256.hash(data: nonce32)),
+               let blob = sealCred(nonce: nonce32, derSignature: signature.derRepresentation, key: credKey)
+            {
+                LyraProtoWriter.appendLengthDelimitedField(6, value: blob, to: &syncInfo)
+            }
+        }
+        return syncInfo
+    }
+
+    private static func sealCred(nonce: Data, derSignature: Data, key: SymmetricKey) -> Data? {
+        var pubKeyCred = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &pubKeyCred)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: derSignature, to: &pubKeyCred)
+        var credFeature = Data()
+        LyraProtoWriter.appendVarintField(1, value: 2, to: &credFeature)
+        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
+        var frame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
+        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &frame)
+        let gcmNonce = AES.GCM.Nonce()
+        guard let sealed = try? AES.GCM.seal(frame, using: key, nonce: gcmNonce) else { return nil }
+        var blob = Data()
+        blob.append(contentsOf: gcmNonce.withUnsafeBytes { Data($0) })
+        blob.append(sealed.ciphertext)
+        blob.append(sealed.tag)
+        return blob
     }
 
     private func encryptLocalCred(ticketStore: MiTrustTicketStore) -> Data? {

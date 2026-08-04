@@ -76,10 +76,35 @@ enum LyraSyncReply {
     }
 
     static func payload(deviceIdHex: String, displayName: String) -> Data {
+        LyraTrustedDeviceInfo.syncReplyPayload(
+            deviceInfo: deviceInfoFrame(deviceIdHex: deviceIdHex, displayName: displayName)
+        )
+    }
+
+    // Device-initiated type-1 push (see LyraTrustedDeviceInfo.syncPushPayload).
+    static func pushPayload(deviceIdHex: String, displayName: String) -> Data {
+        LyraTrustedDeviceInfo.syncPushPayload(
+            deviceInfo: deviceInfoFrame(deviceIdHex: deviceIdHex, displayName: displayName),
+            groupInfo: groupInfoFrame()
+        )
+    }
+
+    // TrustedGroupInfoFrame {f1:1, f3:CredFeature} — the cred carrier that
+    // FrameParse::PickGroupInfo hands to the phone's DeviceGroupManager cred
+    // checks. CredFeature reuses the f15 cert-cred block shape.
+    private static func groupInfoFrame() -> Data? {
+        guard let credBlock = MiTrustTicketStore.current().certCredBlock() else { return nil }
+        var frame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
+        LyraProtoWriter.appendLengthDelimitedField(3, value: credBlock, to: &frame)
+        return frame
+    }
+
+    private static func deviceInfoFrame(deviceIdHex: String, displayName: String) -> Data {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
         let deviceTypeOverride = UserDefaults.standard.integer(forKey: "xiaomiDeviceTypeOverride")
-        let deviceInfo = LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
+        return LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
             deviceName: displayName,
             deviceType: deviceTypeOverride > 0 ? UInt32(deviceTypeOverride) : 4,
             fullDeviceIdHex: fullDeviceIdHex(shortDeviceIdHex: deviceIdHex),
@@ -93,9 +118,10 @@ enum LyraSyncReply {
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
             accountNumericId: "32717118",
             syncUuid: syncUuid,
-            region: UserDefaults.standard.string(forKey: "xiaomiMeshRegion") ?? "cn"
+            region: UserDefaults.standard.string(forKey: "xiaomiMeshRegion") ?? "cn",
+            deviceKey: MiTrustTicketStore.current().deviceKeyData,
+            credBlock: MiTrustTicketStore.current().certCredBlock()
         )
-        return LyraTrustedDeviceInfo.syncReplyPayload(deviceInfo: deviceInfo)
     }
 
     private static func hardwareModel() -> String {

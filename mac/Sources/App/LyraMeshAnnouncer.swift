@@ -463,11 +463,12 @@ final class LyraMeshAnnouncer {
     private func replyToSyncPayload(plaintext: Data) {
         DiagnosticsLog.info(
             "xiaomi.mishare.announcer_sync_payload decrypted=\(plaintext.count) " +
-                "head=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
+                "head=\(plaintext.map { String(format: "%02x", $0) }.joined())"
         )
         guard Date().timeIntervalSince(lastSyncPayloadReplyAt) > 5 else { return }
         lastSyncPayloadReplyAt = Date()
         sendSyncReply()
+        sendSyncPush()
     }
 
     // Full TrustedDeviceInfo in the type-0x00 sync frame (see LyraSyncReply) —
@@ -494,6 +495,42 @@ final class LyraMeshAnnouncer {
         }
     }
 
+    // Device-initiated type-1 sync push — the shape that routes through the
+    // phone's HandleSyncDevMsg cred checks (the type-2 reply never does), so
+    // the conn's trusted type can leave 0 and AddOnlineDevice accepts us.
+    // Sent proactively after the announce (the phone's sync pushes back off
+    // after failures, so waiting for them stalls the push forever).
+    private var lastSyncPushAt = Date.distantPast
+
+    private func maybeSendSyncPush() {
+        guard Date().timeIntervalSince(lastSyncPushAt) > 60 else { return }
+        lastSyncPushAt = Date()
+        sendSyncPush()
+    }
+
+    private func sendSyncPush() {
+        guard let deviceIdHex = deviceIdHexProvider(), let sessionKey = meshSessionKey else {
+            return
+        }
+        let plaintext = LyraSyncReply.pushPayload(
+            deviceIdHex: deviceIdHex, displayName: displayNameProvider()
+        )
+        DiagnosticsLog.info("xiaomi.mishare.announcer_sync_push_build bytes=\(plaintext.count)")
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(plaintext, using: sessionKey, nonce: nonce)
+            var payload = Data()
+            payload.append(UInt8((peerNetId == 0 ? 1 : peerNetId) & 0xFF))
+            payload.append(1)
+            payload.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            payload.append(sealed.ciphertext)
+            payload.append(sealed.tag)
+            send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "sync_push")
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.announcer_sync_push_failed", error)
+        }
+    }
+
     private func sendAnnounce() {
         guard !UserDefaults.standard.bool(forKey: "xiaomiMeshAnnounceDisabled") else {
             return
@@ -512,7 +549,8 @@ final class LyraMeshAnnouncer {
             services: Self.announcedServices,
             ipAddress: Self.primaryIPv4Address(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
-            region: UserDefaults.standard.string(forKey: "xiaomiMeshRegion") ?? "cn"
+            region: UserDefaults.standard.string(forKey: "xiaomiMeshRegion") ?? "cn",
+            deviceKey: MiTrustTicketStore.current().deviceKeyData
         )
         let inner = LyraTrustedDeviceInfo.plaintextAnnounce(deviceInfo: deviceInfo)
         do {
@@ -525,6 +563,7 @@ final class LyraMeshAnnouncer {
             payload.append(sealed.ciphertext)
             payload.append(sealed.tag)
             send(frame: LyraMeshPack.Frame(packType: 5, payload: payload), label: "announce")
+            maybeSendSyncPush()
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.announcer_announce_failed", error)
         }

@@ -99,4 +99,25 @@ final class MiTrustTicketStoreTests: XCTestCase {
         // answers with a ticket-encrypted blob — we must still decrypt it.
         XCTAssertEqual(store.decryptCredBlob(blob), plaintext)
     }
+
+    func testDeviceKeyIsGeneratedOnceAndPersists() {
+        let defaults = UserDefaults.standard
+        let saved = defaults.string(forKey: "xiaomiTrustDeviceKeyHex")
+        defer {
+            if let saved {
+                defaults.set(saved, forKey: "xiaomiTrustDeviceKeyHex")
+            } else {
+                defaults.removeObject(forKey: "xiaomiTrustDeviceKeyHex")
+            }
+        }
+        defaults.removeObject(forKey: "xiaomiTrustDeviceKeyHex")
+
+        let first = MiTrustTicketStore.current().deviceKeyData
+        XCTAssertEqual(first?.count, 32)
+        XCTAssertEqual(MiTrustTicketStore.current().deviceKeyData, first)
+        XCTAssertEqual(
+            defaults.string(forKey: "xiaomiTrustDeviceKeyHex"),
+            first?.map { String(format: "%02x", $0) }.joined()
+        )
+    }
 }

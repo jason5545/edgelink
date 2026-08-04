@@ -34,6 +34,10 @@ final class LyraSyncTaskServer {
         connOrder.compactMap { conns[$0]?.sessionKey }
     }
 
+    // Builds our TrustedDeviceInfo sync payload (type-2 reply frame) for
+    // answering the phone's payload push on a dialed conn.
+    var syncPayloadProvider: (() -> Data)?
+
     private static let sessionSalt = Data([
         0x5e, 0xd5, 0xa3, 0xf8, 0x36, 0xf6, 0xb5, 0x4f,
         0x7b, 0x1e, 0xfa, 0xd0, 0x27, 0x14, 0xd5, 0x17,
@@ -57,7 +61,7 @@ final class LyraSyncTaskServer {
     // the phone then runs the 4-step AuthHandshake on the conn (step 1/3 in
     // handleLogiConn), followed by the encrypted REQUEST and payload exchange.
     func handleClassicSyncInfo(syncInfoData: Data, logiConn: LogiConnFrame) -> LogiConnFrame {
-        let state = ConnState(
+        var state = ConnState(
             connId: logiConn.logiConnId,
             peerNetId: logiConn.localNetId,
             handshakeId: 0,
@@ -67,8 +71,20 @@ final class LyraSyncTaskServer {
             clientRandom: Data(),
             serverRandom: Data()
         )
-        remember(state)
+        // Auth-reuse classic dial: the phone's sync_info carries key_index +
+        // encrypted_cred and it will send the REQUEST encrypted with the
+        // recorded session key — adopt it so handleEncrypted can proceed
+        // without a fresh full handshake.
         let ticketStore = MiTrustTicketStore.current()
+        if let encCred = Self.lengthDelimited(6, in: syncInfoData),
+           let decrypted = ticketStore.decryptCredBlobWithKey(encCred) {
+            state.sessionKey = decrypted.key
+            DiagnosticsLog.info(
+                "xiaomi.synctask.classic_reuse connId=\(logiConn.logiConnId) " +
+                    "keyIndex=\(Self.varint(3, in: syncInfoData) ?? 0) credBytes=\(decrypted.plaintext.count)"
+            )
+        }
+        remember(state)
         var syncInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
         LyraProtoWriter.appendVarintField(2, value: 40, to: &syncInfo)
@@ -84,6 +100,41 @@ final class LyraSyncTaskServer {
             remoteNetId: logiConn.localNetId,
             inner: inner.serialized()
         )
+    }
+
+    struct EmbeddedOpening {
+        let service: String
+        let syncInfo: Data
+        let logiConn: LogiConnFrame
+    }
+
+    // Extracts the embedded logi opening (sync_info) from a phys sync
+    // request's quick-conn private_data, regardless of target service, so the
+    // responder can route non-sync-service dials (e.g. relayCall) elsewhere.
+    func embeddedLogiOpening(
+        requestTrailingFields: [LyraProtoReader.Field]
+    ) -> EmbeddedOpening? {
+        guard let privateData = requestTrailingFields
+            .first(where: { $0.number == 4 && $0.wireType == 2 })?
+            .lengthDelimitedValue,
+            let pdFields = try? LyraProtoReader.readFields(from: privateData)
+        else {
+            return nil
+        }
+        for field in pdFields where field.number == 2 && field.wireType == 2 {
+            guard let wrapper = field.lengthDelimitedValue,
+                  let logiConnData = Self.lengthDelimited(1, in: wrapper),
+                  let logiConn = LogiConnFrame(parsing: logiConnData),
+                  let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                  case let .syncInfo(syncInfoData) = inner.payload
+            else {
+                continue
+            }
+            let service = Self.lengthDelimited(4, in: syncInfoData)
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            return EmbeddedOpening(service: service, syncInfo: syncInfoData, logiConn: logiConn)
+        }
+        return nil
     }
 
     // Parses the phys sync request's trailing fields for quick-conn private_data
@@ -125,6 +176,14 @@ final class LyraSyncTaskServer {
                   let authFrame = Self.lengthDelimited(7, in: handshake),
                   Self.varint(1, in: authFrame) == 1
             else {
+                // Auth-reuse variant: after a full handshake the phone records
+                // the session key in its DeviceKeyManager and the quick-conn
+                // carries the ConnRequestFrame encrypted with that reuse key
+                // instead of a plaintext client_notify.
+                if let quickConn = Self.lengthDelimited(8, in: syncInfoData),
+                   let reused = reuseKeyForQuickConn(quickConn, logiConn: logiConn) {
+                    return reused
+                }
                 let quickConnHex = Self.lengthDelimited(8, in: syncInfoData)?
                     .map { String(format: "%02x", $0) }.joined() ?? ""
                 DiagnosticsLog.info(
@@ -225,6 +284,61 @@ final class LyraSyncTaskServer {
         }
     }
 
+    // Handles the auth-reuse quick-conn: f8 decrypts to a ConnRequestFrame
+    // ({f1:1, f2:{f2:service, f4:trustLevel, f5:timeout, f6:connType, f7:1}})
+    // with the recorded session key. Registers the conn with the reuse key and
+    // answers with our server sync_info in the phys response private_data.
+    private func reuseKeyForQuickConn(
+        _ quickConn: Data, logiConn: LogiConnFrame
+    ) -> (privateData: Data, logiFrame: LogiConnFrame)? {
+        let ticketStore = MiTrustTicketStore.current()
+        guard let decrypted = ticketStore.decryptCredBlobWithKey(quickConn) else {
+            DiagnosticsLog.warn(
+                "xiaomi.synctask.quickconn_reuse_decrypt_failed connId=\(logiConn.logiConnId)"
+            )
+            return nil
+        }
+        guard Self.varint(1, in: decrypted.plaintext) == 1,
+              let requestFrame = Self.lengthDelimited(2, in: decrypted.plaintext),
+              Self.lengthDelimited(2, in: requestFrame)
+                .flatMap({ String(data: $0, encoding: .utf8) }) == Self.syncServiceName
+        else {
+            DiagnosticsLog.warn(
+                "xiaomi.synctask.quickconn_reuse_shape connId=\(logiConn.logiConnId) " +
+                    "plain=\(decrypted.plaintext.map { String(format: "%02x", $0) }.joined())"
+            )
+            return nil
+        }
+        var state = ConnState(
+            connId: logiConn.logiConnId,
+            peerNetId: logiConn.localNetId,
+            handshakeId: 0,
+            serverEphPriv: P256.KeyAgreement.PrivateKey(),
+            clientEphPub: Data(),
+            sharedZ: Data(),
+            clientRandom: Data(),
+            serverRandom: Data()
+        )
+        state.sessionKey = decrypted.key
+        remember(state)
+        let logiFrame = buildResponseLogiFrame(
+            connId: logiConn.logiConnId,
+            peerNetId: logiConn.localNetId,
+            handshakeId: 0,
+            serverNotifyAuthFrame: nil,
+            withQuickConn: false
+        )
+        var wrapper = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: logiFrame.serialized(), to: &wrapper)
+        var privateData = Data()
+        LyraProtoWriter.appendLengthDelimitedField(2, value: wrapper, to: &privateData)
+        DiagnosticsLog.info(
+            "xiaomi.synctask.quickconn_reuse connId=\(logiConn.logiConnId) " +
+                "privateDataBytes=\(privateData.count)"
+        )
+        return (privateData, logiFrame)
+    }
+
     // MARK: - AuthHandshake server (mirrors LyraRelayCallSession)
 
     private func makeServerNotify(
@@ -241,9 +355,16 @@ final class LyraSyncTaskServer {
               let clientPub = Self.lengthDelimited(2, in: publicKeyMessage),
               clientPub.count == 65, clientPub.first == 0x04
         else {
-            DiagnosticsLog.warn("xiaomi.synctask.auth_notify_parse_failed")
+            DiagnosticsLog.warn(
+                "xiaomi.synctask.auth_notify_parse_failed " +
+                    "authFrame=\(authFrame.prefix(48).map { String(format: "%02x", $0) }.joined())"
+            )
             return nil
         }
+        DiagnosticsLog.info(
+            "xiaomi.synctask.auth_notify_parsed clientPub=\(clientPub.prefix(9).map { String(format: "%02x", $0) }.joined()) " +
+                "clientRandom=\(clientRandom.prefix(6).map { String(format: "%02x", $0) }.joined())"
+        )
         let ticketStore = MiTrustTicketStore.current()
         guard let identityKey = ticketStore.identityPrivateKey else {
             DiagnosticsLog.warn("xiaomi.synctask.auth_no_identity")
@@ -339,7 +460,12 @@ final class LyraSyncTaskServer {
             guard peerIdentity.isValidSignature(
                 signature, for: SHA256.hash(data: conn.clientEphPub + serverEphPub)
             ) else {
-                DiagnosticsLog.warn("xiaomi.synctask.auth_sig_invalid connId=\(conn.connId)")
+                DiagnosticsLog.warn(
+                    "xiaomi.synctask.auth_sig_invalid connId=\(conn.connId) " +
+                        "clientEphPub=\(conn.clientEphPub.map { String(format: "%02x", $0) }.joined()) " +
+                        "serverEphPub=\(serverEphPub.map { String(format: "%02x", $0) }.joined()) " +
+                        "sig=\(sigC.map { String(format: "%02x", $0) }.joined())"
+                )
                 return []
             }
         } catch {
@@ -411,6 +537,9 @@ final class LyraSyncTaskServer {
             )
             return []
         }
+        if case let .data(payloadData) = decoded.payload {
+            return handleSyncPayloadPush(payloadData, logiConn: logiConn, conn: conn, sessionKey: sessionKey)
+        }
         guard case let .request(requestData) = decoded.payload else {
             DiagnosticsLog.info(
                 "xiaomi.synctask.enc_frame connId=\(conn.connId) frameType=\(decoded.frameType)"
@@ -456,6 +585,39 @@ final class LyraSyncTaskServer {
         }
     }
 
+    // The phone's payload push on the dialed conn (PAYLOAD_V2 sync frame) —
+    // answer with our TrustedDeviceInfo payload so its sync task completes.
+    private func handleSyncPayloadPush(
+        _ payloadData: Data, logiConn: LogiConnFrame, conn: ConnState, sessionKey: SymmetricKey
+    ) -> [LogiConnFrame] {
+        DiagnosticsLog.info(
+            "xiaomi.synctask.payload_push connId=\(conn.connId) bytes=\(payloadData.count) " +
+                "head=\(payloadData.prefix(24).map { String(format: "%02x", $0) }.joined())"
+        )
+        guard let reply = syncPayloadProvider?() else { return [] }
+        let replyInner = LogiConnInnerFrame(frameType: 7, payload: .data(reply))
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(replyInner.serialized(), using: sessionKey, nonce: nonce)
+            var encryptedInner = Data()
+            encryptedInner.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            encryptedInner.append(sealed.ciphertext)
+            encryptedInner.append(sealed.tag)
+            let frame = LogiConnFrame(
+                logiConnId: conn.connId,
+                localNetId: 1,
+                remoteNetId: conn.peerNetId,
+                flag: true,
+                inner: encryptedInner
+            )
+            DiagnosticsLog.info("xiaomi.synctask.payload_reply_tx connId=\(conn.connId)")
+            return [frame]
+        } catch {
+            DiagnosticsLog.error("xiaomi.synctask.payload_reply_enc_failed", error)
+            return []
+        }
+    }
+
     // MARK: - Builders
 
     private func buildResponsePrivateData(
@@ -482,34 +644,30 @@ final class LyraSyncTaskServer {
         connId: UInt32,
         peerNetId: UInt32,
         handshakeId: UInt64,
-        serverNotifyAuthFrame: Data,
+        serverNotifyAuthFrame: Data?,
         withQuickConn: Bool
     ) -> LogiConnFrame {
-        var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: serverNotifyAuthFrame, to: &handshake)
-        var upgrade = Data()
-        LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
-        let quickConn = LogiConnInnerFrame(frameType: 6, payload: .upgrade(upgrade))
-
         let ticketStore = MiTrustTicketStore.current()
         var syncInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
         LyraProtoWriter.appendVarintField(2, value: 40, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
+        // Official server shape: no key_index / encrypted_cred. Advertising a
+        // key_index makes the phone attempt auth reuse against its (possibly
+        // empty) DeviceKeyManager — "key is null" terminally drops quick-conn
+        // dials instead of falling back to the full handshake we serve below.
         LyraProtoWriter.appendLengthDelimitedField(
             4, value: Data(Self.syncServiceName.utf8), to: &syncInfo
         )
         LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
-        // key_index + encrypted_cred let the phone's DeviceKeyManager resolve
-        // our device key for the full-handshake fallback ("client not have
-        // device key" otherwise), same as the relayCall server sync_info.
-        if let ourEncCred = ticketStore.encryptLocalCred() {
-            LyraProtoWriter.appendLengthDelimitedField(6, value: ourEncCred, to: &syncInfo)
-        }
-        if withQuickConn {
+        if withQuickConn, let serverNotifyAuthFrame {
+            var handshake = Data()
+            LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(7, value: serverNotifyAuthFrame, to: &handshake)
+            var upgrade = Data()
+            LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
+            let quickConn = LogiConnInnerFrame(frameType: 6, payload: .upgrade(upgrade))
             LyraProtoWriter.appendLengthDelimitedField(8, value: quickConn.serialized(), to: &syncInfo)
         }
 

@@ -33,7 +33,8 @@ public enum LyraTrustedDeviceInfo {
         services: [Service],
         ipAddress: String?,
         osVersion: String?,
-        region: String = "cn"
+        region: String = "cn",
+        deviceKey: Data? = nil
     ) -> Data {
         var data = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: Data(deviceName.utf8), to: &data)
@@ -43,6 +44,9 @@ public enum LyraTrustedDeviceInfo {
         LyraProtoWriter.appendVarintField(10, value: 1, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(11, value: Data(hwModel.utf8), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(12, value: Data(lyraVersion.utf8), to: &data)
+        if let deviceKey {
+            LyraProtoWriter.appendLengthDelimitedField(13, value: deviceKey, to: &data)
+        }
         for service in services {
             LyraProtoWriter.appendLengthDelimitedField(14, value: serviceInfoFrame(service), to: &data)
         }
@@ -101,7 +105,9 @@ public enum LyraTrustedDeviceInfo {
         osVersion: String?,
         accountNumericId: String,
         syncUuid: String,
-        region: String = "cn"
+        region: String = "cn",
+        deviceKey: Data? = nil,
+        credBlock: Data? = nil
     ) -> Data {
         var data = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: Data(deviceName.utf8), to: &data)
@@ -114,8 +120,20 @@ public enum LyraTrustedDeviceInfo {
         LyraProtoWriter.appendVarintField(10, value: 5, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(11, value: Data(hwModel.utf8), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(12, value: Data(lyraVersion.utf8), to: &data)
+        // 32-byte device key (real Mac and phone both carry f13 in their
+        // DevRepo entries) — the phone's DeviceKeyManager resolves it for
+        // auth reuse on the sync task's quick-conn dial.
+        if let deviceKey {
+            LyraProtoWriter.appendLengthDelimitedField(13, value: deviceKey, to: &data)
+        }
         for service in services {
             LyraProtoWriter.appendLengthDelimitedField(14, value: serviceInfoFrame(service), to: &data)
+        }
+        // f15 cert-cred block (two {nonce, cert, sig} entries) — the phone's
+        // HandleSyncDevMsg only runs the cred checks that stamp the conn
+        // trusted type when this is present.
+        if let credBlock {
+            LyraProtoWriter.appendLengthDelimitedField(15, value: credBlock, to: &data)
         }
         LyraProtoWriter.appendVarintField(16, value: 1, to: &data)
         LyraProtoWriter.appendVarintField(18, value: 0x3FFF, to: &data)
@@ -159,6 +177,29 @@ public enum LyraTrustedDeviceInfo {
         var frame = Data()
         LyraProtoWriter.appendVarintField(1, value: 2, to: &frame)
         LyraProtoWriter.appendLengthDelimitedField(6, value: wrapper, to: &frame)
+        var payload = Data()
+        payload.append(0)
+        payload.append(frame)
+        return payload
+    }
+
+    // Device-initiated sync push: same 0x00 prefix with the type-1 sync frame
+    // the phone itself sends. Only this shape routes through the phone's
+    // HandleSyncDevMsg, which runs the cred checks (CheckSharedCred /
+    // CheckCertCred) that stamp the conn's trusted type — replies never do.
+    // groupInfo rides the sync inner's f3 (FrameParse::PickGroupInfo feeds it
+    // to DeviceGroupManagerImpl::IsDeviceCredExist): a TrustedGroupInfoFrame
+    // {f1:1, f3:CredFeature} carrying our cert creds.
+    public static func syncPushPayload(deviceInfo: Data, groupInfo: Data? = nil) -> Data {
+        var sync = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &sync)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: deviceInfo, to: &sync)
+        if let groupInfo {
+            LyraProtoWriter.appendLengthDelimitedField(3, value: groupInfo, to: &sync)
+        }
+        var frame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: sync, to: &frame)
         var payload = Data()
         payload.append(0)
         payload.append(frame)
