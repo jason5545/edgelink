@@ -52,6 +52,8 @@ final class LyraCastTrustSession {
     var onFinish: (() -> Void)?
 
     private let queue = DispatchQueue(label: "edgelink.lyra.cast", qos: .userInitiated)
+    // Test seam: the session mesh socket's bound port (nil until started).
+    var meshSocketBoundPort: UInt16? { socket.boundPort }
     private var endpoints: [(host: String, port: UInt16)]
     private var host: String
     private var port: UInt16
@@ -134,6 +136,11 @@ final class LyraCastTrustSession {
     // Defer the response until the phone's response_ack (post-kConnected).
     private var mitrustPeerPortAwaitingAck = false
     private var passkeyPair: LyraPasskeyPairServer?
+    // The phone's reverse sync task (service 00150323) reuses whichever phys
+    // conn is up — with a mirror session live that is this session's socket.
+    // Serve its classic logi dial here so the task stops timing out and our
+    // reply (tdi.f15 cert cred) reaches the phone's cred-check path.
+    private let syncTaskServer = LyraSyncTaskServer()
     // Set when the phone dialed our published mesh port directly (PIN-bind /
     // pairing flow) and the responder handed the mitrustservice conn to us.
     // Outbound frames then ride the responder's socket so the source port
@@ -159,6 +166,9 @@ final class LyraCastTrustSession {
         self.deviceIdHex = deviceIdHex
         self.displayName = displayName
         self.trustManager = trustManager
+        syncTaskServer.syncPayloadProvider = {
+            LyraSyncReply.payload(deviceIdHex: deviceIdHex, displayName: displayName)
+        }
     }
 
     func start() {
@@ -618,6 +628,12 @@ final class LyraCastTrustSession {
         return fields.contains {
             $0.number == 4 && $0.lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } == Self.mitrustServiceName
         }
+    }
+
+    private static func syncServiceName(of data: Data) -> String {
+        guard let fields = try? LyraProtoReader.readFields(from: data) else { return "" }
+        return fields.first { $0.number == 4 && $0.wireType == 2 }?
+            .lengthDelimitedValue.flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
 
     // Stable random uid (NOT the Xiaomi account uid) for the mitrustservice
@@ -1534,6 +1550,21 @@ final class LyraCastTrustSession {
         frame: LyraMeshPack.Frame,
         reply: LyraMeshSocket.ReplyHandler
     ) {
+        if syncTaskServer.handles(logiConn: logiConn) {
+            let replies = syncTaskServer.handleLogiConn(logiConn)
+            if !replies.isEmpty {
+                let miResponse = MiConnectFrame(version: 0, logiConnFrames: replies)
+                let responseFrame = LyraMeshPack.Frame(
+                    packType: frame.packType, payload: miResponse.serialized()
+                )
+                do {
+                    try reply(responseFrame)
+                } catch {
+                    DiagnosticsLog.error("xiaomi.cast.synctask_reply_failed", error)
+                }
+            }
+            return
+        }
         if logiConn.flag {
             if srvConnId != 0, logiConn.logiConnId == srvConnId {
                 handleMitrustEncrypted(logiConn)
@@ -1567,6 +1598,19 @@ final class LyraCastTrustSession {
         case let .syncInfo(syncInfoData):
             if isMitrustSyncInfo(syncInfoData) {
                 handleMitrustSyncInfo(syncInfoData, logiConn: logiConn)
+            } else if Self.syncServiceName(of: syncInfoData) == LyraSyncTaskServer.syncServiceName {
+                let responseLogiConn = syncTaskServer.handleClassicSyncInfo(
+                    syncInfoData: syncInfoData, logiConn: logiConn
+                )
+                let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
+                let responseFrame = LyraMeshPack.Frame(
+                    packType: frame.packType, payload: miResponse.serialized()
+                )
+                do {
+                    try reply(responseFrame)
+                } catch {
+                    DiagnosticsLog.error("xiaomi.cast.synctask_sync_info_reply_failed", error)
+                }
             } else {
                 handleSyncInfoResponse(syncInfoData, logiConn: logiConn)
             }

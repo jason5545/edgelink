@@ -1,0 +1,131 @@
+import EdgeLinkKit
+import Foundation
+import Network
+import XCTest
+
+// The phone's reverse sync task (service 00150323) dials whichever phys conn
+// is up; with a mirror session live that is the cast trust session's socket.
+// Live 2026-08-04: the session dropped that sync_info (stage != .syncAuth)
+// and every sync task died with "kcp trans timeout", so the phone never
+// learned our TrustedDeviceInfo. The dial must get the classic server
+// sync_info reply and follow-up conn frames must reach the sync task server.
+final class LyraCastTrustSyncTaskTests: XCTestCase {
+    private static let defaultsKeys = [
+        "xiaomiTrustIdentityPrivHex",
+        "xiaomiTrustIdentityPubB64",
+        "xiaomiTrustDeviceUUID",
+    ]
+
+    private var savedValues: [String: Any?] = [:]
+    private var session: LyraCastTrustSession?
+    private var phoneSocket: LyraMeshSocket?
+
+    override func setUp() {
+        super.setUp()
+        let defaults = UserDefaults.standard
+        for key in Self.defaultsKeys {
+            savedValues[key] = defaults.object(forKey: key)
+        }
+        defaults.set(UUID().uuidString, forKey: "xiaomiTrustDeviceUUID")
+    }
+
+    override func tearDown() {
+        session?.cancel()
+        session = nil
+        phoneSocket?.stop()
+        phoneSocket = nil
+        let defaults = UserDefaults.standard
+        for key in Self.defaultsKeys {
+            if let value = savedValues[key] ?? nil {
+                defaults.set(value, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        super.tearDown()
+    }
+
+    private func waitFor(
+        _ description: String, timeout: TimeInterval = 10,
+        _ predicate: @escaping () -> Bool
+    ) {
+        let expectation = XCTestExpectation(description: description)
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now(), repeating: .milliseconds(50))
+        timer.setEventHandler {
+            if predicate() {
+                expectation.fulfill()
+                timer.cancel()
+            }
+        }
+        timer.resume()
+        let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        timer.cancel()
+        XCTAssertEqual(result, .completed, "timed out waiting for: \(description)")
+    }
+
+    func testSyncServiceDialOnCastTrustSocketGetsSyncInfoReply() throws {
+        let trustManager = MacTrustManager()
+        let session = LyraCastTrustSession(
+            endpoints: [("127.0.0.1", 9)],
+            deviceIdHex: "721572C3",
+            displayName: "EdgeLinkMacTests",
+            trustManager: trustManager
+        )
+        self.session = session
+        session.start()
+        waitFor("cast trust socket bound") { session.meshSocketBoundPort != nil }
+        let sessionPort = try XCTUnwrap(session.meshSocketBoundPort)
+
+        let phoneSocket = LyraMeshSocket()
+        self.phoneSocket = phoneSocket
+        var replyLogiConns: [LogiConnFrame] = []
+        let replyLock = NSLock()
+        phoneSocket.onFrame = { frame, _, _ in
+            guard let miFrame = MiConnectFrame(parsing: frame.payload) else { return }
+            replyLock.lock()
+            replyLogiConns.append(contentsOf: miFrame.logiConnFrames)
+            replyLock.unlock()
+        }
+        try phoneSocket.start()
+
+        // The phone's classic sync-task dial: plaintext logi sync_info for
+        // service 00150323 on a fresh logi conn.
+        let connId: UInt32 = 0x0BAD_F00D
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(
+            4, value: Data(LyraSyncTaskServer.syncServiceName.utf8), to: &syncInfo
+        )
+        let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
+        let dial = LogiConnFrame(
+            logiConnId: connId, localNetId: 1, remoteNetId: 0, inner: inner.serialized()
+        )
+        let miDial = MiConnectFrame(version: 0, logiConnFrames: [dial])
+        try phoneSocket.send(
+            frame: LyraMeshPack.Frame(packType: 2, payload: miDial.serialized()),
+            to: "127.0.0.1", port: sessionPort
+        )
+
+        waitFor("server sync_info reply") {
+            replyLock.lock()
+            defer { replyLock.unlock() }
+            return replyLogiConns.contains { $0.logiConnId == connId }
+        }
+
+        replyLock.lock()
+        let replyConn = try XCTUnwrap(replyLogiConns.first { $0.logiConnId == connId })
+        replyLock.unlock()
+        XCTAssertEqual(replyConn.remoteNetId, 1)
+        let replyInner = try XCTUnwrap(LogiConnInnerFrame(parsing: replyConn.inner))
+        guard case let .syncInfo(replySyncInfo) = replyInner.payload else {
+            XCTFail("expected sync_info reply payload")
+            return
+        }
+        let fields = try LyraProtoReader.readFields(from: replySyncInfo)
+        let protocolVersion = fields.first { $0.number == 1 && $0.wireType == 0 }?.varintValue
+        XCTAssertEqual(protocolVersion, 10000)
+        XCTAssertNotNil(fields.first { $0.number == 5 && $0.wireType == 2 })
+    }
+}
