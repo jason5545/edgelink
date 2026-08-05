@@ -1,5 +1,6 @@
-import { badRequest, json, type Env, type PairingRecord, type RelaySocketAttachment } from "./types";
-import { isDeviceId, parseJson } from "./validation";
+import { isBase64Bytes, sha256Hex } from "./crypto";
+import { badRequest, json, notFound, type Env, type PairingRecord, type RelaySocketAttachment } from "./types";
+import { isDeviceId, isNonEmptyString, parseJson } from "./validation";
 
 const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
 const MAX_TURN_TTL_SECONDS = 48 * 60 * 60;
@@ -27,6 +28,10 @@ export class RelayDO implements DurableObject {
       }
       await this.state.storage.put(`pair:${body.clientId}`, body);
       return json({ ok: true });
+    }
+
+    if (url.pathname === "/v1/dev/pair" && request.method === "POST") {
+      return this.devPair(request);
     }
 
     if (url.pathname === "/v1/turn/credentials" && request.method === "POST") {
@@ -129,6 +134,56 @@ export class RelayDO implements DurableObject {
     this.closeReplacedRoleSockets(sender, body.b.deviceId, role);
 
     sender.send(JSON.stringify({ t: "relay.ready", b: { role, ...(colo ? { colo } : {}) } }));
+  }
+
+  private async devPair(request: Request): Promise<Response> {
+    const secret = this.env.DEV_PAIR_SECRET?.trim();
+    if (!secret) {
+      return notFound();
+    }
+
+    const body = await parseJson<{
+      secret?: string;
+      hostId?: string;
+      clientId?: string;
+      hostPk?: string;
+      clientPk?: string;
+      hostName?: string;
+      clientName?: string;
+    }>(request);
+
+    const provided = typeof body?.secret === "string" ? body.secret : "";
+    const [expectedDigest, providedDigest] = await Promise.all([
+      sha256Hex(new TextEncoder().encode(secret)),
+      sha256Hex(new TextEncoder().encode(provided))
+    ]);
+    if (providedDigest !== expectedDigest) {
+      return json({ error: "dev_pair_forbidden" }, { status: 403 });
+    }
+
+    if (
+      !body ||
+      !isDeviceId(body.hostId) ||
+      !isDeviceId(body.clientId) ||
+      !body.hostPk ||
+      !isBase64Bytes(body.hostPk, 32) ||
+      !body.clientPk ||
+      !isBase64Bytes(body.clientPk, 32)
+    ) {
+      return badRequest("invalid_dev_pair");
+    }
+
+    const record: PairingRecord = {
+      hostId: body.hostId,
+      clientId: body.clientId,
+      hostPk: body.hostPk,
+      clientPk: body.clientPk,
+      hostName: isNonEmptyString(body.hostName) ? body.hostName : "dev-host",
+      clientName: isNonEmptyString(body.clientName) ? body.clientName : "fake-phone",
+      pairedAt: new Date().toISOString()
+    };
+    await this.state.storage.put(`pair:${record.clientId}`, record);
+    return json({ ok: true, pair: { hostId: record.hostId, clientId: record.clientId } });
   }
 
   private async issueTurnCredentials(request: Request): Promise<Response> {

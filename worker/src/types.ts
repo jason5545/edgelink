@@ -5,6 +5,7 @@ export interface Env {
   CLOUDFLARE_TURN_KEY_ID?: string;
   CLOUDFLARE_TURN_KEY_API_TOKEN?: string;
   TURN_TTL_SECONDS?: string;
+  DEV_PAIR_SECRET?: string;
 }
 
 export type Platform = "macos" | "android" | "ios" | "windows" | "linux";

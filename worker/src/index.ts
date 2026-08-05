@@ -34,6 +34,16 @@ export default {
       return env.PAIRING.get(id).fetch(request);
     }
 
+    if (url.pathname === "/v1/dev/pair" && request.method === "POST") {
+      const body = await request.clone().json().catch(() => null) as { hostId?: string } | null;
+      const hostId = url.searchParams.get("hostId") ?? body?.hostId;
+      if (!hostId) {
+        return badRequest("missing_host_id");
+      }
+      const id = env.RELAY.idFromName(hostId);
+      return env.RELAY.get(id).fetch(request);
+    }
+
     if (url.pathname === "/v1/connect") {
       const hostId = url.searchParams.get("hostId");
       if (!hostId) {

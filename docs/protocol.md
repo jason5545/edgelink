@@ -238,6 +238,27 @@ for byte in digest:
 
 測試向量：`docs/test-vectors/pairing-sas-v1.json`
 
+### Dev Pair（測試用後門）
+
+給 fake phone / 測試 harness 用的 pairing 注入端點，繞過 SAS ceremony，
+直接把 pair record 寫進 RelayDO。只有在 worker 設了 `DEV_PAIR_SECRET`
+secret 時才存在；未設定時回 404。
+
+```text
+POST /v1/dev/pair
+{ "secret": "<DEV_PAIR_SECRET>",
+  "hostId": "949758990", "clientId": "123456789",
+  "hostPk": "base64-32B", "clientPk": "base64-32B",
+  "hostName": "Mac (dev)", "clientName": "FakePhone" }
+```
+
+`hostName` / `clientName` 可省略（預設 `dev-host` / `fake-phone`）。
+secret 比較是 SHA-256 digest 對 digest。成功後 client 可用正常的
+`relay.auth` 以 client 角色連上該 host 的 relay。client 仍需先走
+`/v1/device/register` 註冊（relay auth 驗簽會查 RegistryDO）。
+
+設定：`cd worker && npx wrangler secret put DEV_PAIR_SECRET`，重新 deploy。
+
 ## 4. Handshake
 
 每台裝置有一把長期 Ed25519 身分金鑰。每次連線使用新的 X25519 ephemeral key，
