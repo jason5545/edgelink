@@ -51,7 +51,12 @@ class AndroidPhotoSync(
             isVideo = true,
             sinceSec = watermark
         )
-        return items
+        val eligible = items.filter { it.dateTakenMs >= MIN_DATE_TAKEN_MS }
+        val skippedOld = items.size - eligible.size
+        if (skippedOld > 0) {
+            EdgeLinkLog.info("photo.android.skip_old count=$skippedOld min_year=2015")
+        }
+        return eligible
             .filter { it.id !in acked }
             .sortedBy { it.dateAddedSec }
             .take(maxItems)
@@ -102,7 +107,8 @@ class AndroidPhotoSync(
                     val bytes = cursor.getLong(sizeCol)
                     if (bytes <= 0L) continue
                     val dateAdded = cursor.getLong(addedCol)
-                    val dateTaken = if (cursor.isNull(takenCol)) dateAdded * 1_000L else cursor.getLong(takenCol)
+                    val takenRaw = if (cursor.isNull(takenCol)) 0L else cursor.getLong(takenCol)
+                    val dateTaken = if (takenRaw > 0L) takenRaw else dateAdded * 1_000L
                     results += MediaItem(
                         id = "$idPrefix-$rowId",
                         contentUri = ContentUris.withAppendedId(collection, rowId),
@@ -123,6 +129,7 @@ class AndroidPhotoSync(
 
     companion object {
         const val CHUNK_BYTES = 32 * 1024
+        const val MIN_DATE_TAKEN_MS = 1_420_070_400_000L
 
         fun requiredPermissions(): Array<String> =
             when {
