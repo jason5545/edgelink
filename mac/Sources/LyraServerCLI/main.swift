@@ -22,11 +22,33 @@ import Foundation
 //   sync <port>     run the reverse sync task against a Mac responder port
 //   ping            (relay mode) send status.ping, prints RTT on pong
 //   say <text>      (relay mode) send a debug.echo envelope to the peer
+//   tuntest <port> <text>  (relay host) open a tunnel to a phone-local TCP
+//                     port, send text, print whatever comes back
 //   status          dump oracle records
 //   quit
 
 struct EchoBody: Codable, Sendable {
     let text: String
+}
+
+func printTunnelEnvelope(type: String, plaintext: Data) {
+    switch type {
+    case EnvelopeType.tunnelOpenResult:
+        if let envelope = try? JSONDecoder().decode(Envelope<TunnelOpenResultBody>.self, from: plaintext) {
+            print("[tunnel] open_result ok=\(envelope.b.ok) listenPort=\(envelope.b.listenPort.map(String.init) ?? "-")")
+        }
+    case EnvelopeType.tunnelData:
+        if let envelope = try? JSONDecoder().decode(Envelope<TunnelDataBody>.self, from: plaintext),
+           let data = TunnelChunker.payloadFromBase64(envelope.b.payload), !data.isEmpty {
+            print("[tunnel] recv stream=\(envelope.b.streamId) \(String(decoding: data, as: UTF8.self))")
+        }
+    case EnvelopeType.tunnelError:
+        if let envelope = try? JSONDecoder().decode(Envelope<TunnelErrorBody>.self, from: plaintext) {
+            print("[tunnel] error \(envelope.b.code.rawValue) \(envelope.b.message ?? "")")
+        }
+    default:
+        break
+    }
 }
 
 setvbuf(stdout, nil, _IONBF, 0)
@@ -163,11 +185,26 @@ if let workerArg {
                 identity: identity,
                 log: { print("[relay] \($0)") }
             )
+            let tunnelBridge = LyraTunnelBridge(
+                sendHandler: { data in
+                    guard let session = relayBox.session else { return }
+                    try await session.sendPlaintext(data)
+                },
+                log: { print("[tunnel] \($0)") }
+            )
             let session = LyraRelaySession(
                 channel: channel,
                 identity: identity,
                 log: { print("[relay] \($0)") },
                 onEnvelope: { type, plaintext in
+                    if LyraTunnelBridge.handles(type) {
+                        if roleArg == "client" {
+                            await tunnelBridge.handleEnvelope(type: type, plaintext: plaintext)
+                        } else {
+                            printTunnelEnvelope(type: type, plaintext: plaintext)
+                        }
+                        return
+                    }
                     if type == "debug.echo",
                        let echo = try? JSONDecoder().decode(Envelope<EchoBody>.self, from: plaintext) {
                         print("[relay] echo: \(echo.b.text)")
@@ -274,6 +311,37 @@ DispatchQueue.global().async {
                     print("[relay] say failed: \(error)")
                 }
             }
+        case "tuntest":
+            guard parts.count > 2, let targetPort = Int(parts[1]) else {
+                print("usage: tuntest <phone-local-port> <text>")
+                continue
+            }
+            let text = parts.dropFirst(2).joined(separator: " ")
+            guard let session = relayBox.session else {
+                print("[relay] not in relay mode")
+                continue
+            }
+            Task {
+                do {
+                    let tunnelId = UUID().uuidString
+                    try await session.sendEnvelope(EnvelopeType.tunnelOpen, TunnelOpenBody(
+                        tunnelId: tunnelId,
+                        direction: .local,
+                        targetHost: "127.0.0.1",
+                        targetPort: targetPort,
+                        label: "cli-probe"
+                    ))
+                    try await Task.sleep(nanoseconds: 300_000_000)
+                    try await session.sendEnvelope(EnvelopeType.tunnelData, TunnelDataBody(
+                        tunnelId: tunnelId,
+                        streamId: 1,
+                        seq: 0,
+                        payload: Data(text.utf8).base64EncodedString()
+                    ))
+                } catch {
+                    print("[tunnel] tuntest failed: \(error)")
+                }
+            }
         case "status":
             for record in phone.oracle.records.values {
                 print(
@@ -284,7 +352,7 @@ DispatchQueue.global().async {
         case "quit":
             exit(0)
         default:
-            print("commands: ring <number> | idle | sync <port> | ping | say <text> | status | quit")
+            print("commands: ring <number> | idle | sync <port> | ping | say <text> | tuntest <port> <text> | status | quit")
         }
     }
 }

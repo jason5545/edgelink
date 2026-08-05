@@ -12,14 +12,14 @@ public actor LyraRelaySession {
     private let log: @Sendable (String) -> Void
     private var established: EstablishedHandshake?
 
-    private let onEnvelope: @Sendable (String, Data) -> Void
+    private let onEnvelope: @Sendable (String, Data) async -> Void
     private let onPong: @Sendable (_ rttMs: Int64, _ offsetMs: Int64) -> Void
 
     public init(
         channel: any ByteChannel,
         identity: LocalIdentity,
         log: @escaping @Sendable (String) -> Void = { _ in },
-        onEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
+        onEnvelope: @escaping @Sendable (String, Data) async -> Void = { _, _ in },
         onPong: @escaping @Sendable (Int64, Int64) -> Void = { _, _ in }
     ) {
         self.channel = channel
@@ -134,7 +134,7 @@ public actor LyraRelaySession {
             default:
                 break
             }
-            onEnvelope(peek.t, plaintext)
+            await onEnvelope(peek.t, plaintext)
         }
     }
 

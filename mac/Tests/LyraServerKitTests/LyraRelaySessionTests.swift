@@ -6,8 +6,8 @@ import XCTest
 final class LyraRelaySessionTests: XCTestCase {
     func testClientHostHandshakePingPongAndEcho() async throws {
         let pair = LoopbackChannelPair()
-        let hostIdentity = Self.makeIdentity(deviceId: "123456789", name: "FakeHost")
-        let clientIdentity = Self.makeIdentity(deviceId: "987654321", name: "FakePhone")
+        let hostIdentity = makeRelayTestIdentity(deviceId: "123456789", name: "FakeHost")
+        let clientIdentity = makeRelayTestIdentity(deviceId: "987654321", name: "FakePhone")
 
         let hostEchoed = expectation(description: "host receives debug.echo")
         let clientGotPong = expectation(description: "client receives pong")
@@ -86,14 +86,6 @@ final class LyraRelaySessionTests: XCTestCase {
         )
         XCTAssertEqual(again.deviceId, registered.deviceId)
     }
-
-    private static func makeIdentity(deviceId: String, name: String) -> LocalIdentity {
-        LocalIdentity(
-            deviceId: deviceId,
-            name: name,
-            signingKey: Curve25519.Signing.PrivateKey()
-        )
-    }
 }
 
 private struct RelayEchoBody: Codable, Sendable {
@@ -111,58 +103,5 @@ private final class StubDeviceRegistrar: DeviceRegistrar, @unchecked Sendable {
     func register(pubkey: Data, name: String, platform: String) async throws -> String {
         platforms.append(platform)
         return deviceId
-    }
-}
-
-private final class LoopbackEndpoint: ByteChannel, @unchecked Sendable {
-    private let incoming: AsyncStream<Data>
-    private let continuation: AsyncStream<Data>.Continuation
-    private let peer: () -> LoopbackEndpoint?
-
-    init(peer: @escaping () -> LoopbackEndpoint?) {
-        var continuation: AsyncStream<Data>.Continuation!
-        incoming = AsyncStream { continuation = $0 }
-        self.continuation = continuation
-        self.peer = peer
-    }
-
-    func send(_ bytes: Data) async throws {
-        guard let peer = peer() else {
-            throw LoopbackChannelError.closed
-        }
-        peer.deliver(bytes)
-    }
-
-    func receive() async throws -> Data? {
-        for await data in incoming {
-            return data
-        }
-        return nil
-    }
-
-    func close() {
-        continuation.finish()
-    }
-
-    fileprivate func deliver(_ data: Data) {
-        continuation.yield(data)
-    }
-}
-
-private enum LoopbackChannelError: Error {
-    case closed
-}
-
-private final class LoopbackChannelPair {
-    let hostSide: LoopbackEndpoint
-    let clientSide: LoopbackEndpoint
-
-    init() {
-        var host: LoopbackEndpoint!
-        var client: LoopbackEndpoint!
-        host = LoopbackEndpoint { client }
-        client = LoopbackEndpoint { host }
-        hostSide = host
-        clientSide = client
     }
 }
