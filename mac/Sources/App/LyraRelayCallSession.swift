@@ -623,6 +623,15 @@ final class LyraRelayCallSession {
             )
         case ("call_state_idle", "request"), ("update_call_state", "request"):
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
+        case ("update_call_info", "request"):
+            // Caller name/number update mid-call; ack so the phone stops
+            // retrying into a 10 s 408 (the info itself is only logged —
+            // nothing surfaces it yet).
+            DiagnosticsLog.info(
+                "xiaomi.relaycall.call_info name=\(parsed.jsonString("contactName") ?? "") " +
+                    "number=\(parsed.jsonString("address") ?? "")"
+            )
+            respond(to: parsed, fields: ["code": "200", "msg": "ok"])
         case ("wantRelay", "request"):
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
         default:
