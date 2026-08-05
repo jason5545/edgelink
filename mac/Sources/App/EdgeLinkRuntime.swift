@@ -1588,6 +1588,9 @@ final class EdgeLinkRuntime: ObservableObject {
         DiagnosticsLog.info(
             "xiaomi.mishare.discovery_started reason=\(reason) localDeviceId=\(identity.deviceId) displayName=\(displayName)"
         )
+        Task.detached(priority: .utility) {
+            await MijiaCertEnrollment.refreshIfNeeded(devName: displayName)
+        }
     }
 
     private func handleXiaomiMiShareDiscoverySnapshot(_ snapshot: XiaomiMiShareDiscoverySnapshot) {

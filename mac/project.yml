@@ -150,6 +150,7 @@ targets:
       - path: Sources/App/MacTrustManager.swift
       - path: Sources/App/MiTrustAuthService.swift
       - path: Sources/App/MiTrustTicketStore.swift
+      - path: Sources/App/MijiaCertEnrollment.swift
       - path: Sources/App/MiTrustCryptoBridge.m
       - path: Sources/App/LyraCastTrustSession.swift
       - path: Sources/App/LyraSyncTaskServer.swift

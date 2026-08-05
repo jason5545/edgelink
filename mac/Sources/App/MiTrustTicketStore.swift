@@ -120,6 +120,9 @@ struct MiTrustTicketStore {
     // responder can decrypt quick-conn private_data addressed to us.
     static var lastAuthSessionKeyData: Data?
 
+    // Test hook: overrides the enrolled-cert lookup in certCredBlock().
+    static var enrolledCertOverride: (() -> MijiaEnrolledCert?)?
+
     func uidFeatureInfo() -> Data {
         var nonce = Data(count: 8)
         nonce.withUnsafeMutableBytes { buffer in
@@ -147,17 +150,36 @@ struct MiTrustTicketStore {
     // push: two entries, each {f1:3, f4:{nonce32, cert DER, ECDSA-SHA256
     // sig(nonce)}} carrying the device identity cert. The phone's
     // HandleSyncDevMsg only runs CheckSharedCred/CheckCertCred (which stamps
-    // the conn trusted type) when f15 is present. Until clean-room enrollment
-    // exists, the cert/key come from UserDefaults injection of officially
-    // issued material (xiaomiTrustCredCertHex / xiaomiTrustCredPrivHex).
+    // the conn trusted type) when f15 is present. Cert provenance: our own
+    // Mijia-enrolled cert (MijiaEnrolledCertStore, did must match the current
+    // full device id) first; the UserDefaults injection of officially issued
+    // material (xiaomiTrustCredCertHex / xiaomiTrustCredPrivHex) is the
+    // fallback until enrollment has proven out on-device.
     func certCredBlock() -> Data? {
-        let defaults = UserDefaults.standard
-        guard let certHex = defaults.string(forKey: "xiaomiTrustCredCertHex"),
-              let cert = MiTrustTicketStore.data(fromHex: certHex),
-              let privHex = defaults.string(forKey: "xiaomiTrustCredPrivHex"),
-              let privData = MiTrustTicketStore.data(fromHex: privHex),
-              let priv = try? P256.Signing.PrivateKey(rawRepresentation: privData)
-        else { return nil }
+        let cert: Data
+        let priv: P256.Signing.PrivateKey
+        let shortId = MijiaCertEnrollment.currentShortDeviceIdHex
+        let enrolledLookup = MiTrustTicketStore.enrolledCertOverride ?? {
+            guard let did = MijiaCertEnrollment.currentDid(shortDeviceIdHex: shortId) else { return nil }
+            return MijiaEnrolledCertStore.usableCert(forDid: did)
+        }
+        if let enrolled = enrolledLookup(),
+           let enrolledCert = enrolled.certDER,
+           let enrolledPrivRaw = enrolled.privateKeyRaw,
+           let enrolledPriv = try? P256.Signing.PrivateKey(rawRepresentation: enrolledPrivRaw) {
+            cert = enrolledCert
+            priv = enrolledPriv
+        } else {
+            let defaults = UserDefaults.standard
+            guard let certHex = defaults.string(forKey: "xiaomiTrustCredCertHex"),
+                  let injectedCert = MiTrustTicketStore.data(fromHex: certHex),
+                  let privHex = defaults.string(forKey: "xiaomiTrustCredPrivHex"),
+                  let privData = MiTrustTicketStore.data(fromHex: privHex),
+                  let injectedPriv = try? P256.Signing.PrivateKey(rawRepresentation: privData)
+            else { return nil }
+            cert = injectedCert
+            priv = injectedPriv
+        }
         var block = Data()
         LyraProtoWriter.appendVarintField(1, value: 9, to: &block)
         for fieldNumber in [3, 5] {
