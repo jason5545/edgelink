@@ -45,6 +45,12 @@ public enum LyraAuthHandshake {
         return fields.first { $0.number == fieldNumber && $0.wireType == 0 }?.varintValue
     }
 
+    // The phone wraps client auth frames in handshake f7 on some dials
+    // (relayCall) and f6 on others (sync-task quick-conn, live 2026-08-05).
+    public static func authFrame(fromHandshake handshake: Data) -> Data? {
+        lengthDelimited(7, in: handshake) ?? lengthDelimited(6, in: handshake)
+    }
+
     static func gcmSeal(_ plaintext: Data, using key: SymmetricKey) -> Data? {
         guard let sealed = try? AES.GCM.seal(plaintext, using: key) else { return nil }
         var out = Data()

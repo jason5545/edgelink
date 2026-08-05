@@ -6,6 +6,7 @@ import Security
 struct MiTrustTicketStore {
     var ticketKey: SymmetricKey?
     var sessionKey: SymmetricKey?
+    var sessionKeyRing: [SymmetricKey] = []
     var identityPrivateKey: P256.Signing.PrivateKey?
     var identityPubKey: Data
     var peerIdentityPubKey: Data
@@ -60,6 +61,11 @@ struct MiTrustTicketStore {
         if let sessionData = data(fromHex: sessionHex), sessionData.count == 32 {
             sessionKey = SymmetricKey(data: sessionData)
         }
+        let ringHexes = defaults.stringArray(forKey: sessionKeyRingDefaultsKey) ?? []
+        let sessionKeyRing = ringHexes.compactMap { hex -> SymmetricKey? in
+            guard let keyData = data(fromHex: hex), keyData.count == 32 else { return nil }
+            return SymmetricKey(data: keyData)
+        }
         var privateKey: P256.Signing.PrivateKey?
         if let privData = data(fromHex: privHex), let key = try? P256.Signing.PrivateKey(rawRepresentation: privData) {
             privateKey = key
@@ -67,6 +73,7 @@ struct MiTrustTicketStore {
         return MiTrustTicketStore(
             ticketKey: ticketKey,
             sessionKey: sessionKey,
+            sessionKeyRing: sessionKeyRing,
             identityPrivateKey: privateKey,
             identityPubKey: Data(base64Encoded: pubB64) ?? Data(),
             peerIdentityPubKey: Data(base64Encoded: peerPubB64) ?? Data(),
@@ -108,11 +115,27 @@ struct MiTrustTicketStore {
         return generated
     }
 
+    // Recent auth session keys, most-recent-first. The phone's DeviceKeyManager
+    // picks any previously recorded key for quick-conn auth reuse — which one
+    // depends on handshake history we don't control — so a single-slot store
+    // breaks reuse decryption whenever a later handshake (e.g. a mirror cast
+    // session) overwrites it. Live 2026-08-05: sync task kcp-timeout loop.
+    static let sessionKeyRingDefaultsKey = "xiaomiTrustSessionKeyRingHex"
+    private static let sessionKeyRingLimit = 8
+
     static func recordAuthSession(sessionKey: Data, ticket: Data) {
         lastAuthSessionKeyData = sessionKey
         let defaults = UserDefaults.standard
-        defaults.set(sessionKey.map { String(format: "%02x", $0) }.joined(), forKey: "xiaomiTrustSessionKeyHex")
+        let hex = sessionKey.map { String(format: "%02x", $0) }.joined()
+        defaults.set(hex, forKey: "xiaomiTrustSessionKeyHex")
         defaults.set(ticket.map { String(format: "%02x", $0) }.joined(), forKey: "xiaomiTrustTicketHex")
+        var ring = defaults.stringArray(forKey: sessionKeyRingDefaultsKey) ?? []
+        ring.removeAll { $0 == hex }
+        ring.insert(hex, at: 0)
+        if ring.count > sessionKeyRingLimit {
+            ring = Array(ring.prefix(sessionKeyRingLimit))
+        }
+        defaults.set(ring, forKey: sessionKeyRingDefaultsKey)
         DiagnosticsLog.info("xiaomi.cast.mitrust_auth_session_saved")
     }
 
@@ -140,7 +163,12 @@ struct MiTrustTicketStore {
     }
 
     func decryptCredBlobWithKey(_ blob: Data) -> (plaintext: Data, key: SymmetricKey)? {
-        for key in [sessionKey, ticketKey, deviceKey].compactMap({ $0 }) {
+        var candidates: [SymmetricKey] = []
+        if let sessionKey { candidates.append(sessionKey) }
+        candidates.append(contentsOf: sessionKeyRing)
+        if let ticketKey { candidates.append(ticketKey) }
+        if let deviceKey { candidates.append(deviceKey) }
+        for key in candidates {
             if let plain = decrypt(blob, with: key) { return (plain, key) }
         }
         return nil

@@ -107,7 +107,8 @@ public enum LyraTrustedDeviceInfo {
         syncUuid: String,
         region: String = "cn",
         deviceKey: Data? = nil,
-        credBlock: Data? = nil
+        credBlock: Data? = nil,
+        stateVersion: UInt64 = 4_294_963_213
     ) -> Data {
         var data = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: Data(deviceName.utf8), to: &data)
@@ -115,7 +116,7 @@ public enum LyraTrustedDeviceInfo {
         LyraProtoWriter.appendLengthDelimitedField(3, value: Data(fullDeviceIdHex.utf8), to: &data)
         LyraProtoWriter.appendLengthDelimitedField(4, value: Data(uidHash.utf8), to: &data)
         LyraProtoWriter.appendVarintField(7, value: 15879, to: &data)
-        LyraProtoWriter.appendVarintField(8, value: 4294963213, to: &data)
+        LyraProtoWriter.appendVarintField(8, value: stateVersion, to: &data)
         LyraProtoWriter.appendVarintField(9, value: 14619, to: &data)
         LyraProtoWriter.appendVarintField(10, value: 5, to: &data)
         LyraProtoWriter.appendLengthDelimitedField(11, value: Data(hwModel.utf8), to: &data)

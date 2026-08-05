@@ -109,7 +109,12 @@ enum LyraSyncReply {
             syncUuid: syncUuid,
             region: UserDefaults.standard.string(forKey: "xiaomiMeshRegion") ?? "cn",
             deviceKey: MiTrustTicketStore.current().deviceKeyData,
-            credBlock: MiTrustTicketStore.current().certCredBlock()
+            credBlock: MiTrustTicketStore.current().certCredBlock(),
+            // Vary state_version so the phone's AddOnlineDevice always sees a
+            // change and reports it ("without change, no need to report"
+            // otherwise) — TeleService's relayCall re-registration after a Mac
+            // app restart rides that dispatch (live 2026-08-05).
+            stateVersion: UInt64(UInt32(truncatingIfNeeded: Int(Date().timeIntervalSince1970)))
         )
     }
 

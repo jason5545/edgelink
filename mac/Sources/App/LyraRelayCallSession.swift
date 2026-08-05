@@ -350,7 +350,7 @@ final class LyraRelayCallSession {
     private func handleAuthUpgrade(_ upgradeData: Data) {
         guard let handshake = lengthDelimited(2, in: upgradeData),
               let handshakeId = varint(1, in: upgradeData),
-              let authFrame = lengthDelimited(7, in: handshake),
+              let authFrame = lengthDelimited(7, in: handshake) ?? lengthDelimited(6, in: handshake),
               let step = varint(1, in: authFrame)
         else {
             DiagnosticsLog.warn(

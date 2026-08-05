@@ -79,7 +79,9 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
             var handshake = Data()
             LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
             LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-            LyraProtoWriter.appendLengthDelimitedField(7, value: clientNotify, to: &handshake)
+            // Live 2026-08-05: the real phone wraps the sync-task client_notify
+            // auth frame in handshake f6 (relayCall dials use f7).
+            LyraProtoWriter.appendLengthDelimitedField(6, value: clientNotify, to: &handshake)
             var upgrade = Data()
             LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
             LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
@@ -167,12 +169,20 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
               let qcInner = LogiConnInnerFrame(parsing: quickConn),
               case let .upgrade(upgradeData) = qcInner.payload,
               let handshake = LyraAuthHandshake.lengthDelimited(2, in: upgradeData),
-              let authFrame = LyraAuthHandshake.lengthDelimited(7, in: handshake),
+              let authFrame = LyraAuthHandshake.authFrame(fromHandshake: handshake),
               let client,
               let clientFinished = client.handleServerNotify(authFrame: authFrame)
         else {
-            state = .failed("server sync_info missing quick-conn server_notify")
-            onEvent("sync task failed: bad server sync_info")
+            // f8-less server sync_info: the real phone's "continue normal conn
+            // from quick conn" fallback — run the full handshake on the conn.
+            if state == .handshaking {
+                let authClient = LyraAuthHandshake.Client(identity: identity)
+                client = authClient
+                sendAuthFrame(authClient.makeClientNotify(), server: server)
+            } else {
+                state = .failed("server sync_info missing quick-conn server_notify")
+                onEvent("sync task failed: bad server sync_info")
+            }
             return
         }
         sendAuthFrame(clientFinished, server: server)
@@ -235,7 +245,7 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
         }
         guard case let .upgrade(upgradeData) = inner.payload,
               let handshake = LyraAuthHandshake.lengthDelimited(2, in: upgradeData),
-              let authFrame = LyraAuthHandshake.lengthDelimited(7, in: handshake),
+              let authFrame = LyraAuthHandshake.authFrame(fromHandshake: handshake),
               let step = LyraAuthHandshake.varint(1, in: authFrame)
         else { return }
         if step == 2, let client, let clientFinished = client.handleServerNotify(authFrame: authFrame) {

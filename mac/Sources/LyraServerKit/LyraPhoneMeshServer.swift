@@ -404,7 +404,7 @@ public final class LyraPhoneMeshServer {
     private func handleAnnounceAuth(upgradeData: Data, connId: UInt32) {
         guard let handshake = LyraAuthHandshake.lengthDelimited(2, in: upgradeData),
               let handshakeId = LyraAuthHandshake.varint(1, in: upgradeData),
-              let authFrame = LyraAuthHandshake.lengthDelimited(7, in: handshake),
+              let authFrame = LyraAuthHandshake.authFrame(fromHandshake: handshake),
               let step = LyraAuthHandshake.varint(1, in: authFrame),
               let authServer
         else { return }
