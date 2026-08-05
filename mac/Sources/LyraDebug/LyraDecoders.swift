@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Security
 
 struct ProtoField {
     let number: Int
@@ -498,6 +499,9 @@ final class LyraAnalyzer {
                 if let plain = LyraCrypto.aesGcmDecrypt(key: candidate.key, blob: body) {
                     decryptedBlobCount += 1
                     dump.line("decrypt OK key=\"\(candidate.label)\" (\(plain.count)B)")
+                    if dumpSyncPayloadIfSyncFrame(plain, dump: &dump) {
+                        return
+                    }
                     dump.hex("channel plaintext", plain, maxBytes: 96)
                     dumpProtoGeneric(plain, dump: &dump, depthLimit: 2)
                     return
@@ -654,6 +658,47 @@ final class LyraAnalyzer {
         }
     }
 
+    // Decrypted sync payloads are 0x00 | SyncNetworkingFrame{f1, f5|f6}:
+    // type-1 push = f5{f1:1, f2:tdi}, type-2 reply = f6{f2:trustedType,
+    // f3:tdi}. The group cred rides tdi.f15 (TrustedGroupInfoFrame) on BOTH —
+    // sync.f3 is the oneof sibling that makes the phone delete the dev frame.
+    private func dumpSyncPayloadIfSyncFrame(_ plain: Data, dump: inout Dump) -> Bool {
+        guard plain.first == 0x00 else { return false }
+        guard let frame = Proto.fields(plain.dropFirst()) else { return false }
+        guard let cmd = Proto.varint(frame, 1), cmd == 1 || cmd == 2 else { return false }
+        let tdiData: Data?
+        if cmd == 1, let sync = Proto.bytes(frame, 5).flatMap(Proto.fields) {
+            dump.line("sync type-1 push (HandleSyncDevMsg)")
+            tdiData = Proto.bytes(sync, 2)
+        } else if cmd == 2, let wrapper = Proto.bytes(frame, 6).flatMap(Proto.fields) {
+            dump.line("sync type-2 reply (HandleReplyDevMsg) trustedType=\(Proto.varint(wrapper, 2) ?? 0)")
+            tdiData = Proto.bytes(wrapper, 3)
+        } else {
+            return false
+        }
+        guard let tdiData, let tdi = Proto.fields(tdiData) else { return false }
+        dump.section("TrustedDeviceInfoFrame") { dump in
+            if let name = Proto.bytes(tdi, 1).flatMap({ String(data: $0, encoding: .utf8) }) {
+                dump.line("name: \(name)")
+            }
+            if let fullId = Proto.bytes(tdi, 3).flatMap({ String(data: $0, encoding: .utf8) }) {
+                dump.line("full_id: \(fullId)")
+            }
+            if let deviceKey = Proto.bytes(tdi, 13) {
+                dump.line("f13 device_key (\(deviceKey.count)B)")
+            }
+            if let region = Proto.bytes(tdi, 19).flatMap({ String(data: $0, encoding: .utf8) }) {
+                dump.line("region: \(region)")
+            }
+            if let groupInfo = Proto.bytes(tdi, 15) {
+                dump.section("f15 group_info (cred carrier)") { dump in
+                    dumpTrustedGroupInfo(groupInfo, dump: &dump)
+                }
+            }
+        }
+        return true
+    }
+
     private func dumpTrustedGroupInfo(_ data: Data, dump: inout Dump) {
         dump.hex("tdif raw", data, maxBytes: 128)
         guard let fields = Proto.fields(data) else {
@@ -668,6 +713,23 @@ final class LyraAnalyzer {
             guard let cred = Proto.bytes(fields, number), let credFeature = Proto.fields(cred) else { continue }
             let typeName = number == 2 ? "type2" : number == 3 ? "type1" : "type8"
             dump.section("cred \(typeName)") { dump in
+                // CertCredFrame carrier: CredFeature{f1:3, f4:{nonce, cert, sig}}
+                // (what same-account devices push in tdi.f15). The sig verifies
+                // under the cert's own embedded key (account identity).
+                if let certCred = Proto.bytes(credFeature, 4), let certCredFields = Proto.fields(certCred) {
+                    let nonce = Proto.bytes(certCredFields, 1) ?? Data()
+                    let cert = Proto.bytes(certCredFields, 2) ?? Data()
+                    let sig = Proto.bytes(certCredFields, 3) ?? Data()
+                    dump.hex("nonce", nonce)
+                    dump.line("cert DER (\(cert.count)B) \(certSubjectSummary(cert))")
+                    dump.hex("signature(DER)", sig, maxBytes: 80)
+                    if let certPub = certPubKey(cert),
+                       LyraCrypto.verifyECDSA(derSignature: sig, publicKeyX963: certPub, message: nonce)
+                    {
+                        dump.line("signature VALID under cert-embedded account key")
+                    }
+                    return
+                }
                 let inner = Proto.bytes(credFeature, 3) ?? Proto.bytes(credFeature, 2)
                 let sub = inner.flatMap { Proto.fields($0) } ?? credFeature
                 let nonce = Proto.bytes(sub, 1) ?? Data()
@@ -681,6 +743,21 @@ final class LyraAnalyzer {
                 }
             }
         }
+    }
+
+    // Best-effort subject CN + embedded P-256 pubkey from a DER X.509 cert.
+    private func certSubjectSummary(_ der: Data) -> String {
+        guard let cert = SecCertificateCreateWithData(nil, der as CFData) else { return "" }
+        return SecCertificateCopySubjectSummary(cert) as String? ?? ""
+    }
+
+    private func certPubKey(_ der: Data) -> Data? {
+        guard let cert = SecCertificateCreateWithData(nil, der as CFData),
+              let key = SecCertificateCopyKey(cert),
+              let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+              rep.count == 65, rep.first == 0x04
+        else { return nil }
+        return rep
     }
 
     private func tryDumpAuthHandshake(_ data: Data, flowKey: String, dump: inout Dump) -> Bool? {

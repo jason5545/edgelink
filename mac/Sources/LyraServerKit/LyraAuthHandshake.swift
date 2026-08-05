@@ -88,7 +88,7 @@ public enum LyraAuthHandshake {
                   let publicKeyMessage = LyraAuthHandshake.lengthDelimited(5, in: cipherSuite),
                   let clientPub = LyraAuthHandshake.lengthDelimited(2, in: publicKeyMessage),
                   clientPub.count == 65, clientPub.first == 0x04,
-                  let identityKey = identity.identityPrivateKey
+                  let identityKey = identity.accountPrivateKey ?? identity.identityPrivateKey
             else { return nil }
             let privateKey = P256.KeyAgreement.PrivateKey()
             var serverRandom = Data(count: 32)
@@ -238,7 +238,7 @@ public enum LyraAuthHandshake {
                   let peerKey = try? P256.KeyAgreement.PublicKey(x963Representation: serverPub),
                   let secret = try? ephPriv.sharedSecretFromKeyAgreement(with: peerKey)
                     .withUnsafeBytes({ Data($0) }),
-                  let identityKey = identity.identityPrivateKey,
+                  let identityKey = identity.accountPrivateKey ?? identity.identityPrivateKey,
                   let signature = try? identityKey.signature(
                       for: SHA256.hash(data: ephPriv.publicKey.x963Representation + serverPub)
                   ),

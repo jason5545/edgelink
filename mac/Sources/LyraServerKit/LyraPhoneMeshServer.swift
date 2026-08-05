@@ -173,17 +173,12 @@ public final class LyraPhoneMeshServer {
     }
 
     // The phone's own device-initiated type-1 sync push — its full
-    // TrustedDeviceInfo plus the group cred, mirroring the real phone's
-    // HandleSyncDevMsg-bound push.
+    // TrustedDeviceInfo with the group cred in tdi.f15 (the only carrier the
+    // real phone's parse survives; sync.f3 is the oneof sibling that kills
+    // the dev frame).
     public func sendSyncPush() {
-        let deviceInfo = ownDeviceInfoFrame()
-        var groupInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &groupInfo)
-        if let credFeature = ownCredFeature() {
-            LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &groupInfo)
-        }
         let payload = LyraTrustedDeviceInfo.syncPushPayload(
-            deviceInfo: deviceInfo, groupInfo: groupInfo
+            deviceInfo: ownDeviceInfoFrame(), groupInfo: nil
         )
         sendEncryptedPayload(payload)
         peer.pushSent = true
@@ -525,30 +520,16 @@ public final class LyraPhoneMeshServer {
             // Answer with our own push (the phone's side of the exchange).
             sendSyncPush()
         case .reply:
-            let record = oracle.handleSyncReply(device: parsed.device)
+            let record = oracle.handleSyncReply(device: parsed.device, groupInfo: parsed.groupInfo)
             emit(.announceReceived(parsed.device))
-            emit(.log("peer reply: online=\(record.online)"))
+            emit(.log(
+                "peer reply: trustedType=\(record.trustedType) online=\(record.online) " +
+                    "reasons=\(record.rejectionReasons.joined(separator: "; "))"
+            ))
         }
     }
 
     // MARK: - Own frames
-
-    private func ownCredFeature() -> Data? {
-        guard let identityKey = identity.identityPrivateKey else { return nil }
-        var nonce32 = Data(count: 32)
-        nonce32.withUnsafeMutableBytes { buffer in
-            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-        }
-        guard let signature = try? identityKey.signature(for: SHA256.hash(data: nonce32))
-        else { return nil }
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce32, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendVarintField(1, value: 2, to: &credFeature)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        return credFeature
-    }
 
     private func ownDeviceInfoFrame() -> Data {
         LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
@@ -567,7 +548,7 @@ public final class LyraPhoneMeshServer {
             syncUuid: UUID().uuidString.lowercased(),
             region: "cn",
             deviceKey: identity.deviceKeyData,
-            credBlock: nil
+            credBlock: identity.accountCertCredBlock()
         )
     }
 

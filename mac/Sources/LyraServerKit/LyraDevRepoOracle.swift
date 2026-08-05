@@ -4,26 +4,30 @@ import Foundation
 
 // The phone-side acceptance oracle: our clean-room model of the decision
 // logic the real phone runs in conn/DeviceManager + DeviceGroupManager +
-// DeviceKeyManager, reconstructed from jadx + live errors (2026-08):
+// DeviceKeyManager, reconstructed from jadx + live errors + binary analysis
+// (2026-08):
 //
-//   - only device-initiated type-1 sync pushes route through
-//     HandleSyncDevMsg, which runs CheckSharedCred/CheckCertCred; type-2
-//     replies never stamp the conn trusted type.
+//   - BOTH the device-initiated type-1 push (HandleSyncDevMsg) and the
+//     type-2 reply (HandleReplyDevMsg) run the cred checks — the group cred
+//     carrier is tdi.f15 (TrustedGroupInfoFrame bitmask + per-slot
+//     CredFeature), never sync.f3 (that oneof sibling makes the phone delete
+//     the whole dev frame on parse).
+//   - CheckCertCred compares the account uid only (cert CN lyra.<uid> vs the
+//     local account uid); the shared slot failing ("537 not shared account")
+//     is benign for same-account devices.
 //   - DeviceKeyManager resolves the f13 device key for auth reuse; missing
 //     key → "key is null" (quick-conn dial) / "client not have device key"
 //     (full-handshake fallback).
 //   - AddOnlineDevice rejects conns whose trusted_type is 0 → the device
 //     never lands in the online repo → TeleService: "No relay service".
 //
-// The exact trusted_type constants are placeholders (configurable) — what is
-// wire-confirmed is the gate shape: push-path + creds ⇒ non-zero trusted
-// type ⇒ online. Everything the oracle decides is recorded with reasons so
-// tests assert *why* the phone would reject us, not just that it would.
+// Everything the oracle decides is recorded with reasons so tests assert
+// *why* the phone would reject us, not just that it would.
 public final class LyraDevRepoOracle {
     public enum CredKind: String, Sendable {
-        case sharedCred
-        case certCred
-        case groupCred
+        case accountCertCred
+        case sharedCertCred
+        case pubKeyCred
     }
 
     public struct CredCheck: Sendable, Equatable {
@@ -51,21 +55,20 @@ public final class LyraDevRepoOracle {
     // f15 {nonce, cert, sig(nonce)} entries can be verified without X.509.
     public var trustedCerts: [Data: Data] = [:]
 
-    // trusted_type values stamped per passed check (constants not yet
-    // wire-confirmed; the gate is non-zero, magnitudes are placeholders).
-    public var sharedCredTrustedType: UInt32 = 1
-    public var certCredTrustedType: UInt32 = 2
+    // trusted_type stamped when the account cert cred verifies (the phone's
+    // GetDeviceInfo prints trusted type 1 for same-account devices).
+    public var accountCredTrustedType: UInt32 = 1
 
     public init() {}
 
     // MARK: - Sync message handling
 
-    // A device-initiated type-1 push (the only path that stamps trusted
-    // type). Returns the updated record.
-    @discardableResult
-    public func handleSyncPush(
-        device: LyraTrustedDevice, groupInfo: Data?, connHadFullHandshake: Bool
-    ) -> DeviceRecord {
+    // Shared cred-check core for the push and reply paths — both run
+    // CheckExchangeGroupInfo over tdi.f15 (TrustedGroupInfoFrame) on the
+    // real phone. Returns (trustedType, checks, reasons).
+    private func runCredChecks(
+        device: LyraTrustedDevice, groupInfo: Data?
+    ) -> (UInt32, [CredCheck], [String]) {
         var checks: [CredCheck] = []
         var reasons: [String] = []
         var trustedType: UInt32 = 0
@@ -80,30 +83,36 @@ public final class LyraDevRepoOracle {
             reasons.append("client not have device key")
         }
 
-        if let credBlock = device.credBlock {
-            let certResult = checkCertCred(credBlock)
-            checks.append(certResult)
-            if certResult.passed {
-                trustedType |= certCredTrustedType
-            } else {
-                reasons.append("CheckCertCred failed: \(certResult.detail)")
-            }
-        }
-
+        // tdi.f15 = TrustedGroupInfoFrame{f1 bitmask, f3 account cred,
+        // f5 shared cred}. Each slot is a CredFeature{f1:3, f4:CertCredFrame
+        // {nonce, cert, sig(nonce)}}; the account slot passing stamps
+        // trusted_type 1. The shared slot failing is benign (the real phone
+        // logs "537 not shared account" for same-account devices too), so it
+        // is recorded as a check but never a rejection reason.
         if let groupInfo {
-            let groupResult = checkGroupCred(groupInfo)
-            checks.append(groupResult)
-            if groupResult.passed {
-                trustedType |= sharedCredTrustedType
+            let account = checkCertCredSlot(3, in: groupInfo, kind: .accountCertCred)
+            checks.append(account)
+            if account.passed {
+                trustedType |= accountCredTrustedType
             } else {
-                reasons.append("IsDeviceCredExist failed: \(groupResult.detail)")
+                reasons.append("CheckCertCred failed: \(account.detail)")
             }
+            let shared = checkCertCredSlot(5, in: groupInfo, kind: .sharedCertCred)
+            if shared.detail != "slot absent" {
+                checks.append(shared)
+            }
+        } else {
+            reasons.append("no group cred (tdi.f15 absent)")
         }
+        return (trustedType, checks, reasons)
+    }
 
-        if device.credBlock == nil, groupInfo == nil {
-            reasons.append("no creds in push (f15/groupInfo absent)")
-        }
-
+    // A device-initiated type-1 push. Returns the updated record.
+    @discardableResult
+    public func handleSyncPush(
+        device: LyraTrustedDevice, groupInfo: Data?, connHadFullHandshake: Bool
+    ) -> DeviceRecord {
+        var (trustedType, checks, reasons) = runCredChecks(device: device, groupInfo: groupInfo)
         let online = trustedType != 0 && deviceKeys[device.fullDeviceIdHex] != nil
         if !online {
             if trustedType == 0 {
@@ -175,21 +184,27 @@ public final class LyraDevRepoOracle {
         return merged
     }
 
-    // A type-2 reply: stored (device info lands in DevRepo) but NEVER stamps
-    // trusted type — the phone's reply path skips the cred checks.
+    // A type-2 reply: HandleReplyDevMsg runs the SAME cred checks on tdi.f15
+    // and stamps trusted type (0731 ground truth: the real Mac registered
+    // online with trusted_type 1 through the reply path alone).
     @discardableResult
-    public func handleSyncReply(device: LyraTrustedDevice) -> DeviceRecord {
-        if let key = device.deviceKey, key.count == 32 {
-            deviceKeys[device.fullDeviceIdHex] = key
-        }
+    public func handleSyncReply(device: LyraTrustedDevice, groupInfo: Data? = nil) -> DeviceRecord {
         let existing = records[device.fullDeviceIdHex]
+        let group = groupInfo ?? existing?.device.credBlock
+        var (trustedType, checks, reasons) = runCredChecks(
+            device: device, groupInfo: group
+        )
+        if trustedType == 0 {
+            trustedType = existing?.trustedType ?? 0
+            checks = existing?.checks ?? checks
+        }
+        let online = trustedType != 0 && deviceKeys[device.fullDeviceIdHex] != nil
         let record = DeviceRecord(
             device: mergedDevice(new: device, existing: existing?.device),
-            trustedType: existing?.trustedType ?? 0,
-            online: existing?.online ?? false,
-            checks: existing?.checks ?? [],
-            rejectionReasons: existing?.rejectionReasons
-                ?? ["sync reply path: cred checks not run"]
+            trustedType: trustedType,
+            online: online,
+            checks: checks,
+            rejectionReasons: online ? [] : reasons
         )
         records[device.fullDeviceIdHex] = record
         return record
@@ -219,73 +234,52 @@ public final class LyraDevRepoOracle {
 
     // MARK: - Cred checks
 
-    // f15 cert-cred block: {f1:9, f3: entry, f5: entry} where each entry is
-    // {f1:3, f4:{f1: nonce32, f2: cert, f3: ECDSA-SHA256 sig(nonce)}}.
-    public func checkCertCred(_ block: Data) -> CredCheck {
-        checkCertCredBlock(block, kind: .certCred)
-    }
-
-    private func checkCertCredBlock(_ block: Data, kind: CredKind) -> CredCheck {
-        var verified = 0
-        var entries = 0
-        for fieldNumber in [3, 5] {
-            guard let entry = LyraTrustedDeviceParser.lengthDelimited(fieldNumber, in: block)
-            else { continue }
-            entries += 1
-            guard let cred = LyraTrustedDeviceParser.lengthDelimited(4, in: entry),
-                  let nonce = LyraTrustedDeviceParser.lengthDelimited(1, in: cred),
-                  let cert = LyraTrustedDeviceParser.lengthDelimited(2, in: cred),
-                  let sigDer = LyraTrustedDeviceParser.lengthDelimited(3, in: cred)
-            else {
-                return CredCheck(kind: kind, passed: false, detail: "entry \(fieldNumber) malformed")
-            }
-            guard let pubKeyData = trustedCerts[cert],
-                  let pubKey = try? P256.Signing.PublicKey(x963Representation: pubKeyData),
-                  let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer),
-                  pubKey.isValidSignature(signature, for: nonce)
-            else {
-                return CredCheck(
-                    kind: kind, passed: false,
-                    detail: "entry \(fieldNumber) cert untrusted or sig invalid"
-                )
-            }
-            verified += 1
-        }
-        guard entries > 0 else {
-            return CredCheck(kind: kind, passed: false, detail: "no entries")
-        }
-        return CredCheck(
-            kind: kind, passed: verified == entries,
-            detail: "\(verified)/\(entries) entries verified"
-        )
-    }
-
-    // TrustedGroupInfoFrame {f1:1, f3: credCarrier}. Two observed carrier
-    // shapes: a pubKeyCred CredFeature ({f3|f2: {f1: nonce, f2: sig}} —
-    // shared-cred style) and the f15 cert-cred block (what the Mac's
-    // groupInfoFrame currently sends).
-    public func checkGroupCred(_ groupInfo: Data) -> CredCheck {
-        guard let carrier = LyraTrustedDeviceParser.lengthDelimited(3, in: groupInfo)
+    // One slot of the TrustedGroupInfoFrame: CredFeature{f1:3, f4:
+    // CertCredFrame{f1: nonce32, f2: cert, f3: ECDSA-SHA256 sig(nonce)}}.
+    // The cert must be a registered trust anchor and the sig must verify
+    // under the cert's own key — mirroring CheckCertCred (uid comparison is
+    // implicit: tests register certs for the account they stand for).
+    public func checkCertCredSlot(
+        _ slot: Int, in groupInfo: Data, kind: CredKind
+    ) -> CredCheck {
+        guard let entry = LyraTrustedDeviceParser.lengthDelimited(slot, in: groupInfo)
         else {
-            return CredCheck(kind: .groupCred, passed: false, detail: "shape mismatch")
+            return CredCheck(kind: kind, passed: false, detail: "slot absent")
         }
-        if let pubKeyCred = LyraTrustedDeviceParser.lengthDelimited(3, in: carrier)
-            ?? LyraTrustedDeviceParser.lengthDelimited(2, in: carrier),
-           let nonce = LyraTrustedDeviceParser.lengthDelimited(1, in: pubKeyCred),
-           let sigDer = LyraTrustedDeviceParser.lengthDelimited(2, in: pubKeyCred),
-           let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer)
-        {
-            for identityData in trustedPeerIdentities {
-                guard let identity = try? P256.Signing.PublicKey(x963Representation: identityData)
-                else { continue }
-                if identity.isValidSignature(signature, for: SHA256.hash(data: nonce))
-                    || identity.isValidSignature(signature, for: nonce)
-                {
-                    return CredCheck(kind: .groupCred, passed: true, detail: "pubKeyCred verified")
-                }
-            }
-            return CredCheck(kind: .groupCred, passed: false, detail: "no trusted identity matched")
+        guard let cred = LyraTrustedDeviceParser.lengthDelimited(4, in: entry),
+              let nonce = LyraTrustedDeviceParser.lengthDelimited(1, in: cred),
+              let cert = LyraTrustedDeviceParser.lengthDelimited(2, in: cred),
+              let sigDer = LyraTrustedDeviceParser.lengthDelimited(3, in: cred)
+        else {
+            return CredCheck(kind: kind, passed: false, detail: "slot \(slot) malformed")
         }
-        return checkCertCredBlock(carrier, kind: .groupCred)
+        guard let pubKeyData = trustedCerts[cert],
+              let pubKey = try? P256.Signing.PublicKey(x963Representation: pubKeyData),
+              let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer),
+              pubKey.isValidSignature(signature, for: nonce)
+        else {
+            return CredCheck(
+                kind: kind, passed: false,
+                detail: "slot \(slot) cert untrusted or sig invalid"
+            )
+        }
+        return CredCheck(kind: kind, passed: true, detail: "slot \(slot) verified")
+    }
+
+    // Whole-block check (all present slots must verify) — kept for tests that
+    // assert on the full TGI block.
+    public func checkCertCred(_ block: Data) -> CredCheck {
+        let account = checkCertCredSlot(3, in: block, kind: .accountCertCred)
+        let shared = checkCertCredSlot(5, in: block, kind: .sharedCertCred)
+        let present = [account, shared].filter { $0.detail != "slot absent" }
+        guard !present.isEmpty else {
+            return CredCheck(kind: .accountCertCred, passed: false, detail: "no entries")
+        }
+        let failed = present.first { !$0.passed }
+        return CredCheck(
+            kind: .accountCertCred,
+            passed: failed == nil,
+            detail: failed?.detail ?? "\(present.count) slot(s) verified"
+        )
     }
 }

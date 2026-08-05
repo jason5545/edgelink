@@ -104,6 +104,30 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
         }
     }
 
+    // Classic dial (the phone's "reuse classic conn" mode): a plaintext logi
+    // sync_info on the mesh conn itself — no phys private_data embedding.
+    // The server answers with its own sync_info, then the 4-step handshake
+    // runs on the conn.
+    public func dialClassic(server: LyraPhoneMeshServer, host: String, port: UInt16) {
+        state = .dialing
+        responderHost = host
+        responderPort = port
+        connId = UInt32.random(in: 1...UInt32.max)
+        handshakeId = UInt64.random(in: 1...UInt64(UInt32.max))
+        payloadPushed = false
+        server.adoptOutboundConn(connId: connId, handler: self)
+
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(4, value: Data(serviceName.utf8), to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: identity.uidFeatureInfo(), to: &syncInfo)
+        let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
+        server.sendLogi(connId: connId, inner: inner, toHost: host, port: port)
+        state = .handshaking
+        onEvent("sync task classic dial")
+    }
+
     private func buildConnRequestFrame() -> Data {
         var request = Data()
         LyraProtoWriter.appendLengthDelimitedField(2, value: Data(serviceName.utf8), to: &request)
@@ -170,7 +194,15 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
 
     public func handleServiceSyncInfo(
         syncInfoData: Data, logiConn: LogiConnFrame, server: LyraPhoneMeshServer
-    ) {}
+    ) {
+        // Classic dial: the server's sync_info answer kicks off the
+        // full-handshake client_notify on the conn.
+        guard state == .handshaking else { return }
+        let authClient = LyraAuthHandshake.Client(identity: identity)
+        client = authClient
+        let clientNotify = authClient.makeClientNotify()
+        sendAuthFrame(clientNotify, server: server)
+    }
 
     public func handleServiceLogiConn(_ logiConn: LogiConnFrame, server: LyraPhoneMeshServer) {
         if logiConn.flag {
@@ -180,10 +212,11 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
             else { return }
             switch inner.payload {
             case let .data(payloadData):
-                // The Mac's payload reply: its TrustedDeviceInfo → DevRepo.
+                // The Mac's payload reply: its TrustedDeviceInfo → DevRepo
+                // (reply path runs the same tdi.f15 cred checks).
                 if let parsed = LyraTrustedDeviceParser.parsePayload(payloadData) {
                     peerDevice = parsed.device
-                    _ = oracle.handleSyncReply(device: parsed.device)
+                    _ = oracle.handleSyncReply(device: parsed.device, groupInfo: parsed.groupInfo)
                     onEvent("sync task peer payload: \(parsed.device.deviceName)")
                 }
             case .response:
@@ -194,11 +227,23 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
             }
             return
         }
-        guard let inner = LogiConnInnerFrame(parsing: logiConn.inner),
-              case let .upgrade(upgradeData) = inner.payload,
+        guard let inner = LogiConnInnerFrame(parsing: logiConn.inner) else { return }
+        // Classic dial: the server's sync_info answer arrives on the conn.
+        if case let .syncInfo(syncInfoData) = inner.payload {
+            handleServiceSyncInfo(syncInfoData: syncInfoData, logiConn: logiConn, server: server)
+            return
+        }
+        guard case let .upgrade(upgradeData) = inner.payload,
               let handshake = LyraAuthHandshake.lengthDelimited(2, in: upgradeData),
               let authFrame = LyraAuthHandshake.lengthDelimited(7, in: handshake),
-              let step = LyraAuthHandshake.varint(1, in: authFrame), step == 4,
+              let step = LyraAuthHandshake.varint(1, in: authFrame)
+        else { return }
+        if step == 2, let client, let clientFinished = client.handleServerNotify(authFrame: authFrame) {
+            // Classic dial: server_notify arrives on the conn.
+            sendAuthFrame(clientFinished, server: server)
+            return
+        }
+        guard step == 4,
               let client, let result = client.handleServerFinished(authFrame: authFrame)
         else { return }
         sessionKey = result.sessionKey
@@ -236,7 +281,8 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
             accountNumericId: identity.accountNumericId,
             syncUuid: UUID().uuidString.lowercased(),
             region: "cn",
-            deviceKey: identity.deviceKeyData
+            deviceKey: identity.deviceKeyData,
+            credBlock: identity.accountCertCredBlock()
         )
         let payload = LyraTrustedDeviceInfo.syncPushPayload(deviceInfo: deviceInfo, groupInfo: nil)
         let inner = LogiConnInnerFrame(frameType: 7, payload: .data(payload))

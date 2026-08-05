@@ -3,9 +3,10 @@ import EdgeLinkKit
 import LyraServerKit
 import XCTest
 
-// Pins the oracle's acceptance model: announce never stamps trusted type,
-// only the type-1 push does, and AddOnlineDevice needs both a non-zero
-// trusted type and a resolvable f13 device key.
+// Pins the oracle's acceptance model (binary + ground-truth aligned
+// 2026-08-05): the announce never stamps trusted type; BOTH the type-1 push
+// and the type-2 reply run the tdi.f15 TrustedGroupInfoFrame cred checks;
+// AddOnlineDevice needs a non-zero trusted type and a resolvable f13 key.
 final class LyraDevRepoOracleTests: XCTestCase {
     private func makeDevice(
         fullId: String = "AA",
@@ -20,6 +21,19 @@ final class LyraDevRepoOracleTests: XCTestCase {
         device.credBlock = withCredBlock
         device.services = services
         return device
+    }
+
+    // The phone fixture: account keypair + its Mijia-shape cert. Registering
+    // the cert in trustedCerts is the oracle-side equivalent of the phone
+    // having the cert's uid on the account.
+    private func makeTrustedIdentity() -> (identity: LyraPhoneIdentity, groupInfo: Data) {
+        let identity = LyraPhoneIdentity.generate()
+        let groupInfo = identity.accountCertCredBlock()!
+        return (identity, groupInfo)
+    }
+
+    private func trustFixtureCert(_ oracle: LyraDevRepoOracle, _ identity: LyraPhoneIdentity) {
+        oracle.trustedCerts[identity.accountCertData!] = identity.accountPubKeyData
     }
 
     func testAnnounceNeverStampsTrustedType() {
@@ -37,28 +51,13 @@ final class LyraDevRepoOracleTests: XCTestCase {
         )
         XCTAssertEqual(record.trustedType, 0)
         XCTAssertFalse(record.online)
-        XCTAssertTrue(record.rejectionReasons.contains("no creds in push (f15/groupInfo absent)"))
+        XCTAssertTrue(record.rejectionReasons.contains("no group cred (tdi.f15 absent)"))
     }
 
-    func testPushWithGroupCredStampsAndGoesOnline() throws {
+    func testPushWithAccountCertCredStampsAndGoesOnline() throws {
         let oracle = LyraDevRepoOracle()
-        let macIdentity = P256.Signing.PrivateKey()
-        oracle.trustedPeerIdentities = [macIdentity.publicKey.x963Representation]
-
-        var nonce = Data(count: 32)
-        nonce.withUnsafeMutableBytes { buffer in
-            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-        }
-        let signature = try macIdentity.signature(for: SHA256.hash(data: nonce))
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendVarintField(1, value: 2, to: &credFeature)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        var groupInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &groupInfo)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &groupInfo)
+        let (identity, groupInfo) = makeTrustedIdentity()
+        trustFixtureCert(oracle, identity)
 
         let record = oracle.handleSyncPush(
             device: makeDevice(services: [
@@ -67,9 +66,11 @@ final class LyraDevRepoOracleTests: XCTestCase {
             groupInfo: groupInfo,
             connHadFullHandshake: true
         )
-        XCTAssertNotEqual(record.trustedType, 0)
+        XCTAssertEqual(record.trustedType, 1)
         XCTAssertTrue(record.online)
         XCTAssertTrue(record.rejectionReasons.isEmpty)
+        // The account slot verified; the shared slot runs but is not the gate.
+        XCTAssertTrue(record.checks.contains { $0.kind == .accountCertCred && $0.passed })
         // The announce that follows the push now passes AddOnlineDevice.
         let announced = oracle.handleAnnounce(device: makeDevice())
         XCTAssertTrue(announced.online)
@@ -79,20 +80,8 @@ final class LyraDevRepoOracleTests: XCTestCase {
 
     func testPushWithoutDeviceKeyStaysOffline() throws {
         let oracle = LyraDevRepoOracle()
-        let macIdentity = P256.Signing.PrivateKey()
-        oracle.trustedPeerIdentities = [macIdentity.publicKey.x963Representation]
-        var nonce = Data(count: 32)
-        nonce.withUnsafeMutableBytes { buffer in
-            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-        }
-        let signature = try macIdentity.signature(for: SHA256.hash(data: nonce))
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        var groupInfo = Data()
-        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &groupInfo)
+        let (identity, groupInfo) = makeTrustedIdentity()
+        trustFixtureCert(oracle, identity)
 
         let record = oracle.handleSyncPush(
             device: makeDevice(withKey: false), groupInfo: groupInfo, connHadFullHandshake: true
@@ -102,7 +91,25 @@ final class LyraDevRepoOracleTests: XCTestCase {
         XCTAssertNil(oracle.resolveDeviceKey(for: "AA"))
     }
 
-    func testReplyPathStoresButNeverStamps() {
+    // 0731 ground truth: the real Mac registered online (trusted_type 1)
+    // through the REPLY path — HandleReplyDevMsg runs the same cred checks.
+    func testReplyPathAlsoStampsTrustedType() throws {
+        let oracle = LyraDevRepoOracle()
+        let (identity, groupInfo) = makeTrustedIdentity()
+        trustFixtureCert(oracle, identity)
+
+        let record = oracle.handleSyncReply(
+            device: makeDevice(services: [
+                LyraTrustedDevice.Service(name: "relayCall", package: "com.ios.phone", data: nil),
+            ]),
+            groupInfo: groupInfo
+        )
+        XCTAssertEqual(record.trustedType, 1)
+        XCTAssertTrue(record.online)
+        XCTAssertNotNil(oracle.resolveDeviceKey(for: "AA"))
+    }
+
+    func testReplyWithoutCredsStaysOffline() {
         let oracle = LyraDevRepoOracle()
         let record = oracle.handleSyncReply(device: makeDevice())
         XCTAssertEqual(record.trustedType, 0)
@@ -110,26 +117,18 @@ final class LyraDevRepoOracleTests: XCTestCase {
         XCTAssertNotNil(oracle.resolveDeviceKey(for: "AA"))
     }
 
-    func testGroupCredRejectsUnknownIdentity() throws {
+    // A cert cred signed by an unregistered cert must not pass — the
+    // phone-side equivalent of CheckCertCred's "not same account".
+    func testCertCredRejectsUnregisteredCert() throws {
         let oracle = LyraDevRepoOracle()
-        let unknownIdentity = P256.Signing.PrivateKey()
-        var nonce = Data(count: 32)
-        nonce.withUnsafeMutableBytes { buffer in
-            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-        }
-        let signature = try unknownIdentity.signature(for: SHA256.hash(data: nonce))
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        var groupInfo = Data()
-        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &groupInfo)
-
+        let (identity, groupInfo) = makeTrustedIdentity()
+        _ = identity
+        // Deliberately do NOT register the cert.
         let record = oracle.handleSyncPush(
             device: makeDevice(), groupInfo: groupInfo, connHadFullHandshake: true
         )
         XCTAssertEqual(record.trustedType, 0)
         XCTAssertFalse(record.online)
+        XCTAssertTrue(record.rejectionReasons.contains { $0.hasPrefix("CheckCertCred failed") })
     }
 }

@@ -14,6 +14,7 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
         "xiaomiTrustIdentityPrivHex",
         "xiaomiTrustIdentityPubB64",
         "xiaomiTrustPeerIdentityPubB64",
+        "xiaomiTrustPeerAccountPubB64",
         "xiaomiTrustSessionKeyHex",
         "xiaomiTrustTicketHex",
         "xiaomiTrustUidHashB64",
@@ -55,6 +56,11 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
         defaults.set(credKey.rawRepresentation.map { String(format: "%02x", $0) }.joined(),
                      forKey: "xiaomiTrustCredPrivHex")
         defaults.set(true, forKey: "xiaomiRelayCallAdvertise")
+        // The mock phone signs AuthHandshake client_finished with its account
+        // identity (Mijia cert fixture) — seed it like the production default.
+        defaults.set(
+            LyraPhoneIdentity.fixtureAccountPubB64, forKey: "xiaomiTrustPeerAccountPubB64"
+        )
         MiTrustTicketStore.lastAuthSessionKeyData = nil
     }
 

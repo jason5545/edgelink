@@ -17,12 +17,12 @@ final class LyraAuthHandshakeTests: XCTestCase {
         let serverNotify = try XCTUnwrap(server.handleClientNotify(authFrame: clientNotify))
         let clientFinished = try XCTUnwrap(client.handleServerNotify(authFrame: serverNotify))
 
-        // The phone verifies the Mac's signature against the paired identity
-        // — here the client used the phone identity, so pair with itself.
+        // The client signs client_finished with the ACCOUNT identity (the
+        // real phone's auth_type 4 behavior), so verify against that key.
         let serverFinished = try XCTUnwrap(
             server.handleClientFinished(
                 authFrame: clientFinished,
-                peerIdentityPubKey: phoneIdentity.identityPubKeyData
+                peerIdentityPubKey: phoneIdentity.accountPubKeyData
             )
         )
         let clientResult = try XCTUnwrap(client.handleServerFinished(authFrame: serverFinished.serverFinished))
@@ -65,7 +65,7 @@ final class LyraAuthHandshakeTests: XCTestCase {
         let serverFinished = try XCTUnwrap(
             server.handleClientFinished(
                 authFrame: clientFinished,
-                peerIdentityPubKey: phoneIdentity.identityPubKeyData
+                peerIdentityPubKey: phoneIdentity.accountPubKeyData
             )
         )
 

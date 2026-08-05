@@ -49,11 +49,12 @@ public enum LyraTrustedDeviceParser {
         // the phone's AddOnlineDevice rejects it with trusted_type 0 — the
         // cred checks never run on this path.
         case announce
-        // Device-initiated type-1 sync push: the only shape that routes
-        // through HandleSyncDevMsg's cred checks.
+        // Device-initiated type-1 sync push: routes through HandleSyncDevMsg
+        // and its cred checks (binary-confirmed 2026-08-04).
         case push
-        // Type-2 reply (trusted-type wrapper f6): parsed into DevRepo but
-        // never stamps trusted type.
+        // Type-2 reply (trusted-type wrapper f6): HandleReplyDevMsg ALSO runs
+        // the cred checks and stamps trusted type (0731 ground truth) — the
+        // earlier "reply never stamps" note was wrong.
         case reply
     }
 
@@ -67,8 +68,11 @@ public enum LyraTrustedDeviceParser {
     // Parses the post-decryption plaintext of a packType-5 payload. Handles
     // all three observed shapes:
     //   announce:     netId 0x00 0x00 | frame{f1:1, f5:sync{f1:1, f2:info}}
-    //   sync push:    0x00 | frame{f1:1, f5:sync{f1:1, f2:info, f3:group?}}
-    //   sync reply:   0x00 | frame{f1:2, f6:{f2:trustedType, f3:info}}
+    //   sync push:    0x00 | frame{f1:1, f5:sync{f1:1, f2:info(f15:groupInfo)}}
+    //   sync reply:   0x00 | frame{f1:2, f6:{f2:trustedType, f3:info(f15:groupInfo)}}
+    // The group cred carrier is tdi.f15 on BOTH sync paths (binary-proven):
+    // SyncFrame's f2(dev)/f3(adv_key) are a oneof, so anything in sync.f3
+    // makes the phone delete the whole dev frame on parse.
     public static func parsePayload(_ plaintext: Data) -> Payload? {
         var frameData = Data(plaintext)
         var isAnnounce = false
@@ -91,7 +95,7 @@ public enum LyraTrustedDeviceParser {
             return Payload(
                 kind: isAnnounce ? .announce : .push,
                 device: device,
-                groupInfo: lengthDelimited(3, in: sync),
+                groupInfo: isAnnounce ? nil : lengthDelimited(15, in: deviceInfo),
                 trustedType: nil
             )
         }
@@ -102,7 +106,7 @@ public enum LyraTrustedDeviceParser {
             return Payload(
                 kind: .reply,
                 device: device,
-                groupInfo: nil,
+                groupInfo: lengthDelimited(15, in: deviceInfo),
                 trustedType: varint(2, in: wrapper)
             )
         }

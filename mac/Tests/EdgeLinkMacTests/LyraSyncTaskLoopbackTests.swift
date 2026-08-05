@@ -12,6 +12,7 @@ final class LyraSyncTaskLoopbackTests: XCTestCase {
         "xiaomiTrustIdentityPrivHex",
         "xiaomiTrustIdentityPubB64",
         "xiaomiTrustPeerIdentityPubB64",
+        "xiaomiTrustPeerAccountPubB64",
         "xiaomiTrustSessionKeyHex",
         "xiaomiTrustTicketHex",
         "xiaomiTrustUidHashB64",
@@ -98,6 +99,11 @@ final class LyraSyncTaskLoopbackTests: XCTestCase {
         // The Mac verifies client_finished against our identity.
         UserDefaults.standard.set(
             identity.identityPubB64, forKey: "xiaomiTrustPeerIdentityPubB64"
+        )
+        // …and on auth_type 4 dials the phone signs with its ACCOUNT identity
+        // (Mijia cert key) — seed it like the production default does.
+        UserDefaults.standard.set(
+            identity.accountPubB64, forKey: "xiaomiTrustPeerAccountPubB64"
         )
         try phone.start(port: 0)
         waitFor("phone listener ready") { phone.boundPort != nil }
