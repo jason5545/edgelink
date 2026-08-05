@@ -1487,7 +1487,7 @@ final class LyraCastTrustSession {
             handlePhysConn(physConn, frame: frame, endpoint: endpoint, reply: reply)
         }
         for logiConn in miFrame.logiConnFrames {
-            handleLogiConn(logiConn, frame: frame, reply: reply)
+            handleLogiConn(logiConn, frame: frame, endpoint: endpoint, reply: reply)
         }
     }
 
@@ -1548,6 +1548,7 @@ final class LyraCastTrustSession {
     private func handleLogiConn(
         _ logiConn: LogiConnFrame,
         frame: LyraMeshPack.Frame,
+        endpoint: NWEndpoint,
         reply: LyraMeshSocket.ReplyHandler
     ) {
         if syncTaskServer.handles(logiConn: logiConn) {
@@ -1563,6 +1564,10 @@ final class LyraCastTrustSession {
                     DiagnosticsLog.error("xiaomi.cast.synctask_reply_failed", error)
                 }
             }
+            return
+        }
+        if let relaySession = LyraRelayCallSession.activeRelaySession, relaySession.handles(logiConn: logiConn) {
+            relaySession.handleFrame(logiConn)
             return
         }
         if logiConn.flag {
@@ -1610,6 +1615,21 @@ final class LyraCastTrustSession {
                     try reply(responseFrame)
                 } catch {
                     DiagnosticsLog.error("xiaomi.cast.synctask_sync_info_reply_failed", error)
+                }
+            } else if Self.syncServiceName(of: syncInfoData) == LyraRelayCallSession.serviceName {
+                // TeleService relayCall dials also reuse the live phys conn —
+                // adopt them here or channel creation dies at kAuthClient.
+                DiagnosticsLog.info(
+                    "xiaomi.cast.relaycall_sync_info connId=\(logiConn.logiConnId) " +
+                        "peerNetId=\(logiConn.localNetId)"
+                )
+                LyraRelayCallSession.adopt(
+                    syncInfoData: syncInfoData,
+                    logiConn: logiConn,
+                    endpoint: endpoint,
+                    sessionKey: MiTrustTicketStore.current().sessionKey
+                ) { [weak self] frame, label in
+                    self?.send(frame: frame, label: label)
                 }
             } else {
                 handleSyncInfoResponse(syncInfoData, logiConn: logiConn)

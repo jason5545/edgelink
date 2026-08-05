@@ -128,4 +128,72 @@ final class LyraCastTrustSyncTaskTests: XCTestCase {
         XCTAssertEqual(protocolVersion, 10000)
         XCTAssertNotNil(fields.first { $0.number == 5 && $0.wireType == 2 })
     }
+
+    // Live 2026-08-05: TeleService's relayCall channel dial reuses the live
+    // mirror phys conn the same way the sync task does — the cast trust
+    // session must adopt it or channel creation dies at kAuthClient and every
+    // call-state update falls to a 408 timeout.
+    func testRelayCallDialOnCastTrustSocketGetsSyncInfoReply() throws {
+        let phoneSocket = LyraMeshSocket()
+        self.phoneSocket = phoneSocket
+        var replyLogiConns: [LogiConnFrame] = []
+        let replyLock = NSLock()
+        phoneSocket.onFrame = { frame, _, _ in
+            guard let miFrame = MiConnectFrame(parsing: frame.payload) else { return }
+            replyLock.lock()
+            replyLogiConns.append(contentsOf: miFrame.logiConnFrames)
+            replyLock.unlock()
+        }
+        try phoneSocket.start()
+        waitFor("phone socket bound") { phoneSocket.boundPort != nil }
+        let phonePort = try XCTUnwrap(phoneSocket.boundPort)
+
+        // Point the session's endpoint at the phone socket so the adopt reply
+        // (sent via the session's own send path) lands back on it.
+        let trustManager = MacTrustManager()
+        let session = LyraCastTrustSession(
+            endpoints: [("127.0.0.1", phonePort)],
+            deviceIdHex: "721572C3",
+            displayName: "EdgeLinkMacTests",
+            trustManager: trustManager
+        )
+        self.session = session
+        session.start()
+        waitFor("cast trust socket bound") { session.meshSocketBoundPort != nil }
+        let sessionPort = try XCTUnwrap(session.meshSocketBoundPort)
+
+        let connId: UInt32 = 0x0BAD_BEEF
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(
+            4, value: Data(LyraRelayCallSession.serviceName.utf8), to: &syncInfo
+        )
+        let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
+        let dial = LogiConnFrame(
+            logiConnId: connId, localNetId: 1, remoteNetId: 0, inner: inner.serialized()
+        )
+        let miDial = MiConnectFrame(version: 0, logiConnFrames: [dial])
+        try phoneSocket.send(
+            frame: LyraMeshPack.Frame(packType: 2, payload: miDial.serialized()),
+            to: "127.0.0.1", port: sessionPort
+        )
+
+        waitFor("relayCall server sync_info reply") {
+            replyLock.lock()
+            defer { replyLock.unlock() }
+            return replyLogiConns.contains { $0.logiConnId == connId }
+        }
+        replyLock.lock()
+        let replyConn = try XCTUnwrap(replyLogiConns.first { $0.logiConnId == connId })
+        replyLock.unlock()
+        let replyInner = try XCTUnwrap(LogiConnInnerFrame(parsing: replyConn.inner))
+        guard case let .syncInfo(replySyncInfo) = replyInner.payload else {
+            XCTFail("expected sync_info reply payload")
+            return
+        }
+        let fields = try LyraProtoReader.readFields(from: replySyncInfo)
+        XCTAssertEqual(fields.first { $0.number == 1 && $0.wireType == 0 }?.varintValue, 10000)
+        XCTAssertTrue(LyraRelayCallSession.activeRelaySession?.handles(logiConn: dial) == true)
+    }
 }

@@ -47,6 +47,10 @@ final class LyraRelayCallSession {
         self.send = send
     }
 
+    func handles(logiConn: LogiConnFrame) -> Bool {
+        connId != 0 && logiConn.logiConnId == connId
+    }
+
     func teardown() {
         channelSocket?.stop()
         channelSocket = nil
