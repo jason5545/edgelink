@@ -119,9 +119,6 @@ internal object EdgeLinkShizukuCommandPolicy {
         if (isAllowedProcNetUdpReadCommand(command)) {
             return true
         }
-        if (isAllowedSystemPropertyCommand(command)) {
-            return true
-        }
         return isAllowedPermissionGrantCommand(command)
     }
 
@@ -243,49 +240,6 @@ internal object EdgeLinkShizukuCommandPolicy {
             else -> false
         }
     }
-
-    private fun isAllowedSystemPropertyCommand(command: Array<String>): Boolean {
-        if (command.size != 3 || command[0] != "setprop") {
-            return false
-        }
-        val key = command[1]
-        val value = command[2]
-        return when (key) {
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY ->
-                value.length in 1..16 && value.all { it in '0'..'9' }
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY ->
-                value.length in 1..16 && value.all { it in '0'..'9' }
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY ->
-                value == "pad"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY ->
-                value == "pad"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY ->
-                value == "official"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY ->
-                value == "1"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY ->
-                value == "offhook" || value == "idle"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY ->
-                value == "source" || value == "sink" || value == "both"
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY ->
-                MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointPort(value) != null
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY,
-            MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY ->
-                isAllowedRelayEndpointHostValue(value)
-            else -> false
-        }
-    }
-
-    private fun isAllowedRelayEndpointHostValue(value: String): Boolean =
-        MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(value) == value &&
-            value.all { char -> char.isLetterOrDigit() || char == '.' || char == '-' || char == ':' }
 
     private fun isScreenShareProtectionKey(namespace: String, key: String): Boolean =
         namespace == "global" && key == GLOBAL_DISABLE_SCREEN_SHARE_PROTECTIONS ||

@@ -21,8 +21,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
-import java.net.Inet4Address
-import java.net.NetworkInterface
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -32,11 +30,7 @@ private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val SHIZUKU_USER_SERVICE_BIND_TIMEOUT_MS = 5_000L
 private const val ANDROID_UIDS_PER_USER = 100_000
-private const val PHONE_CALL_RELAY_LATCH_MAX_TTL_MS = 120_000L
-private const val PHONE_RELAY_DEFAULT_PORT = 7_102
-private const val PHONE_RELAY_SINK_RTSP_PORT = 15_550
 private const val PHONE_DTMF_KEY_DELAY_MS = 120L
-private const val MIRROR_SCREEN_REMOTE_TTL_MS = 180_000L
 private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
     "logcat",
     "-d",
@@ -292,52 +286,6 @@ object AndroidShizukuSupport {
             listOf(result).toOperationResult("mishare:settings")
         }
 
-    suspend fun armMirrorScreenRemote(
-        context: Context,
-        peerHost: String? = null,
-        peerPort: Int? = null
-    ): ShizukuOperationResult =
-        withService(context) { service ->
-            val untilEpochMs = System.currentTimeMillis() + MIRROR_SCREEN_REMOTE_TTL_MS
-            val sanitizedPeerHost = MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(peerHost)
-            val sanitizedPeerPort = peerPort?.takeIf { it in 1..65_535 }
-            val commands = mutableListOf(
-                arrayOf(
-                    "setprop",
-                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_PROPERTY,
-                    "pad"
-                ),
-                arrayOf(
-                    "setprop",
-                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_UNTIL_PROPERTY,
-                    untilEpochMs.toString()
-                ),
-                arrayOf(
-                    "setprop",
-                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_SCREEN_AUDIO_OWNER_PROPERTY,
-                    "official"
-                )
-            )
-            sanitizedPeerHost?.let {
-                commands += arrayOf(
-                    "setprop",
-                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY,
-                    it
-                )
-            }
-            sanitizedPeerPort?.let {
-                commands += arrayOf(
-                    "setprop",
-                    MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY,
-                    it.toString()
-                )
-            }
-            val results = commands.map { command -> service.runCommandResult(command) }
-            results.toOperationResult(
-                "mirror:screen_remote peer=${sanitizedPeerHost ?: "default"}:${sanitizedPeerPort ?: "default"}"
-            )
-        }
-
     suspend fun recentMirrorBluetoothMac(context: Context): MirrorBluetoothMacResult =
         withService(context) { service ->
             val result = service.runCommandResult(
@@ -393,75 +341,6 @@ object AndroidShizukuSupport {
             } else {
                 "setting:$namespace:$key write=${writeResult.exitCode} read=${readResult.exitCode} expected=$value observed=$observed"
             }
-        )
-    }
-
-    suspend fun armPhoneCallRelay(context: Context, ttlMs: Long): ShizukuOperationResult {
-        val boundedTtlMs = ttlMs.coerceIn(1_000L, PHONE_CALL_RELAY_LATCH_MAX_TTL_MS)
-        val untilEpochMs = System.currentTimeMillis() + boundedTtlMs
-        return writeDebugProperty(
-            context = context,
-            key = MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
-            value = untilEpochMs.toString(),
-            name = "phone:relay_latch"
-        )
-    }
-
-    suspend fun clearPhoneCallRelay(context: Context): ShizukuOperationResult =
-        withService(context) { service ->
-            val results = listOf(
-                service.runCommandResult(
-                    arrayOf(
-                        "setprop",
-                        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_RELAY_UNTIL_PROPERTY,
-                        "0"
-                    )
-                ),
-                service.runCommandResult(
-                    arrayOf(
-                        "setprop",
-                        MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY,
-                        "idle"
-                    )
-                )
-            )
-            results.toOperationResult("phone:relay_latch_clear")
-        }
-
-    suspend fun configurePhoneCallRelayHooks(
-        context: Context,
-        relayHost: String?,
-        relayPort: Int?
-    ): ShizukuOperationResult = withService(context) { service ->
-        val endpointPort = relayPort?.takeIf { it in 1..65_535 } ?: PHONE_RELAY_DEFAULT_PORT
-        val localHost = preferredLocalIPv4Address()
-        val peerHost = localHost ?: MiLinkPrivilegeHookPolicy.mirrorFakeRemoteEndpointHost(relayHost)
-        val sinkPort = PHONE_RELAY_SINK_RTSP_PORT
-        val commands = mutableListOf<Array<String>>()
-
-        fun setProp(key: String, value: String) {
-            commands += arrayOf("setprop", key, value)
-        }
-
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PROPERTY, "pad")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_ATTACH_PROPERTY, "1")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_KEY_PROPERTY, "1")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_USING_PAD_PROPERTY, "1")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_CALL_STATE_PROPERTY, "offhook")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PROPERTY, "1")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_PARAMS_PROPERTY, "1")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_START_PROPERTY, "both")
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_AUDIO_SINK_ARG_PROPERTY, sinkPort.toString())
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PLAIN_RTP_PROPERTY, "1")
-        peerHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_IP_PROPERTY, it) }
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_PEER_PORT_PROPERTY, sinkPort.toString())
-        localHost?.let { setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_IP_PROPERTY, it) }
-        setProp(MiLinkPrivilegeHookPolicy.MIRROR_FAKE_REMOTE_LOCAL_PORT_PROPERTY, endpointPort.toString())
-
-        val results = commands.map { command -> service.runCommandResult(command) }
-        results.toOperationResult(
-            "phone:relay_hooks peer=${peerHost ?: "default"}:$sinkPort " +
-                "local=${localHost ?: "default"}:$endpointPort"
         )
     }
 
@@ -593,42 +472,6 @@ object AndroidShizukuSupport {
             )
         }
     }
-
-    private suspend fun writeDebugProperty(
-        context: Context,
-        key: String,
-        value: String,
-        name: String
-    ): ShizukuOperationResult = withService(context) { service ->
-        val result = service.runCommandResult(arrayOf("setprop", key, value))
-        listOf(result).toOperationResult(name)
-    }
-
-    private fun preferredLocalIPv4Address(): String? =
-        runCatching {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
-            var fallback: String? = null
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                if (!networkInterface.isUp || networkInterface.isLoopback) {
-                    continue
-                }
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (address is Inet4Address && !address.isLoopbackAddress) {
-                        val host = address.hostAddress
-                        if (networkInterface.name == "wlan0") {
-                            return@runCatching host
-                        }
-                        if (fallback == null) {
-                            fallback = host
-                        }
-                    }
-                }
-            }
-            fallback
-        }.getOrNull()
 
     private suspend fun <T> withService(
         context: Context,
