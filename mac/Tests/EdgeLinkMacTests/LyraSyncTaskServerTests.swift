@@ -5,8 +5,9 @@ import XCTest
 
 // Pins the quick-conn sync-task server: the phone's reverse sync task embeds
 // private_data (trailing field 4 of the phys sync request) carrying a logi
-// opening with an AuthHandshake client_notify; the answer must go back inside
-// the phys sync response private_data, after which client_finished and the
+// opening with an AuthHandshake client_notify; the phys sync response stays
+// private_data-less and the answer (f8-less server sync_info + server_notify)
+// goes out as standalone logi frames, after which client_finished and the
 // encrypted logi REQUEST continue on the embedded logi conn.
 final class LyraSyncTaskServerTests: XCTestCase {
     private static let defaultsKeys = [
@@ -59,7 +60,15 @@ final class LyraSyncTaskServerTests: XCTestCase {
         var requestTrailingFields: [LyraProtoReader.Field]
     }
 
-    private func makeClient(service: String = LyraSyncTaskServer.syncServiceName) -> ClientSide {
+    private enum EmbeddedFamily {
+        case auth
+        case accountPair
+    }
+
+    private func makeClient(
+        service: String = LyraSyncTaskServer.syncServiceName,
+        family: EmbeddedFamily = .auth
+    ) -> ClientSide {
         let connId: UInt32 = 0x00AB_CDEF
         let handshakeId: UInt64 = 7
         let ephKey = P256.KeyAgreement.PrivateKey()
@@ -76,21 +85,31 @@ final class LyraSyncTaskServerTests: XCTestCase {
         var cipherSuite = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(2, value: clientRandom, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(3, value: 64, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(4, value: 2, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(3, value: family == .accountPair ? 16 : 64, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(4, value: family == .accountPair ? 8 : 2, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(5, value: publicKeyMessage, to: &cipherSuite)
         var clientNotify = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: cipherSuite, to: &clientNotify)
-        LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
-        var authFrame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &authFrame)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: clientNotify, to: &authFrame)
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        switch family {
+        case .auth:
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
+            var authFrame = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &authFrame)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: clientNotify, to: &authFrame)
+            LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        case .accountPair:
+            var accountFrame = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &accountFrame)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: clientNotify, to: &accountFrame)
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(6, value: accountFrame, to: &handshake)
+        }
         var upgrade = Data()
         LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
         LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
@@ -150,6 +169,212 @@ final class LyraSyncTaskServerTests: XCTestCase {
     }
 
     private struct Failure: Error {}
+
+    private static let sessionSalt = Data([
+        0x5e, 0xd5, 0xa3, 0xf8, 0x36, 0xf6, 0xb5, 0x4f,
+        0x7b, 0x1e, 0xfa, 0xd0, 0x27, 0x14, 0xd5, 0x17,
+        0x7b, 0x8a, 0x1f, 0x0f, 0x19, 0xe3, 0x69, 0xcc,
+        0x0b, 0xe8, 0xd9, 0x8b, 0xa6, 0x29, 0x73, 0x17
+    ])
+
+    // Account-pair family session-key salt (libmicontinuity.so
+    // AccountPairHandshake, 2026-08-06) — different from the AUTH family.
+    private static let accountPairSessionSalt = Data([
+        0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
+        0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
+        0xfa, 0xa3, 0x37, 0xf2, 0xe0, 0xbe, 0xb5, 0x73,
+        0xb1, 0xf9, 0xa3, 0xd0, 0x15, 0x57, 0x64, 0x80
+    ])
+
+    private struct AccountPairNotify {
+        var serverRandom: Data
+        var serverPub: Data
+        var sharedZ: Data
+        var sessionKey: SymmetricKey
+    }
+
+    // Verifies an account-pair server_notify frame (step 2): selected cipher
+    // 16/8, 32B server_random, 65B server pub, and encSig opening under Z to
+    // {certDER, ECDSA-SHA256(serverEph‖clientEph) by the enrolled cert key}.
+    private func unwrapAccountPairServerNotify(
+        accountFrame: Data,
+        client: ClientSide,
+        certKey: P256.Signing.PrivateKey,
+        expectedCertDER: Data,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> AccountPairNotify {
+        XCTAssertEqual(varint(1, in: accountFrame), 2, file: file, line: line)
+        let serverNotify = try XCTUnwrap(lengthDelimited(3, in: accountFrame), file: file, line: line)
+        let selected = try XCTUnwrap(lengthDelimited(1, in: serverNotify), file: file, line: line)
+        let serverRandom = try XCTUnwrap(lengthDelimited(2, in: selected), file: file, line: line)
+        XCTAssertEqual(serverRandom.count, 32, file: file, line: line)
+        XCTAssertEqual(varint(3, in: selected), 16, file: file, line: line)
+        XCTAssertEqual(varint(4, in: selected), 8, file: file, line: line)
+        let outGPK = try XCTUnwrap(lengthDelimited(5, in: selected), file: file, line: line)
+        let serverPub = try XCTUnwrap(lengthDelimited(2, in: outGPK), file: file, line: line)
+        XCTAssertEqual(serverPub.count, 65, file: file, line: line)
+        let encSig = try XCTUnwrap(lengthDelimited(2, in: serverNotify), file: file, line: line)
+        XCTAssertNotNil(lengthDelimited(3, in: serverNotify), file: file, line: line)
+        XCTAssertNotNil(lengthDelimited(4, in: serverNotify), file: file, line: line)
+
+        let peerKey = try P256.KeyAgreement.PublicKey(x963Representation: serverPub)
+        let z = try client.ephKey.sharedSecretFromKeyAgreement(with: peerKey).withUnsafeBytes { Data($0) }
+        let box = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: encSig.prefix(12)),
+            ciphertext: encSig.dropFirst(12).dropLast(16),
+            tag: encSig.suffix(16)
+        )
+        let credMessage = try AES.GCM.open(box, using: SymmetricKey(data: z))
+        let cert = try XCTUnwrap(lengthDelimited(1, in: credMessage), file: file, line: line)
+        XCTAssertEqual(cert, expectedCertDER, file: file, line: line)
+        let sig = try XCTUnwrap(lengthDelimited(2, in: credMessage), file: file, line: line)
+        let ecdsaSig = try P256.Signing.ECDSASignature(derRepresentation: sig)
+        XCTAssertTrue(
+            certKey.publicKey.isValidSignature(
+                ecdsaSig, for: SHA256.hash(data: serverPub + client.ephKey.publicKey.x963Representation)
+            ),
+            file: file, line: line
+        )
+        let sessionKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: z),
+            salt: Self.accountPairSessionSalt,
+            info: client.clientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        return AccountPairNotify(
+            serverRandom: serverRandom, serverPub: serverPub, sharedZ: z, sessionKey: sessionKey
+        )
+    }
+
+    // Pulls the account-pair server_notify out of a standalone logi frame
+    // (upgrade → handshake {2,4}+f6).
+    private func unwrapAccountPairServerNotifyFrame(
+        _ frame: LogiConnFrame,
+        client: ClientSide,
+        certKey: P256.Signing.PrivateKey,
+        expectedCertDER: Data,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> AccountPairNotify {
+        XCTAssertEqual(frame.logiConnId, client.connId, file: file, line: line)
+        let inner = try XCTUnwrap(LogiConnInnerFrame(parsing: frame.inner), file: file, line: line)
+        guard case let .upgrade(upgradeData) = inner.payload else {
+            XCTFail("expected upgrade payload", file: file, line: line)
+            throw Failure()
+        }
+        XCTAssertEqual(varint(1, in: upgradeData), client.handshakeId, file: file, line: line)
+        let handshake = try XCTUnwrap(lengthDelimited(2, in: upgradeData), file: file, line: line)
+        XCTAssertEqual(varint(1, in: handshake), 2, file: file, line: line)
+        XCTAssertEqual(varint(2, in: handshake), 4, file: file, line: line)
+        let accountFrame = try XCTUnwrap(lengthDelimited(6, in: handshake), file: file, line: line)
+        return try unwrapAccountPairServerNotify(
+            accountFrame: accountFrame, client: client,
+            certKey: certKey, expectedCertDER: expectedCertDER,
+            file: file, line: line
+        )
+    }
+
+    private func makeAccountPairClientFinishedFrame(
+        client: ClientSide,
+        notify: AccountPairNotify,
+        phoneCertKey: P256.Signing.PrivateKey,
+        phoneCertDER: Data
+    ) throws -> LogiConnFrame {
+        let phoneSig = try phoneCertKey.signature(
+            for: SHA256.hash(data: client.ephKey.publicKey.x963Representation + notify.serverPub)
+        )
+        var phoneCred = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: phoneCertDER, to: &phoneCred)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: phoneSig.derRepresentation, to: &phoneCred)
+        let credNonce = AES.GCM.Nonce()
+        let credSealed = try AES.GCM.seal(phoneCred, using: SymmetricKey(data: notify.sharedZ), nonce: credNonce)
+        var credBlob = Data()
+        credBlob.append(contentsOf: credNonce.withUnsafeBytes { Data($0) })
+        credBlob.append(credSealed.ciphertext)
+        credBlob.append(credSealed.tag)
+        let proofNonce = AES.GCM.Nonce()
+        let proofSealed = try AES.GCM.seal(Data(count: 24), using: notify.sessionKey, nonce: proofNonce)
+        var proof = Data()
+        proof.append(contentsOf: proofNonce.withUnsafeBytes { Data($0) })
+        proof.append(proofSealed.ciphertext)
+        proof.append(proofSealed.tag)
+
+        var clientFinished = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: credBlob, to: &clientFinished)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: proof, to: &clientFinished)
+        var finishedAccountFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 3, to: &finishedAccountFrame)
+        LyraProtoWriter.appendLengthDelimitedField(4, value: clientFinished, to: &finishedAccountFrame)
+        var finishedHandshake = Data()
+        LyraProtoWriter.appendVarintField(1, value: 2, to: &finishedHandshake)
+        LyraProtoWriter.appendVarintField(2, value: 4, to: &finishedHandshake)
+        LyraProtoWriter.appendLengthDelimitedField(6, value: finishedAccountFrame, to: &finishedHandshake)
+        var finishedUpgrade = Data()
+        LyraProtoWriter.appendVarintField(1, value: client.handshakeId, to: &finishedUpgrade)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: finishedHandshake, to: &finishedUpgrade)
+        let finishedInner = LogiConnInnerFrame(frameType: 6, payload: .upgrade(finishedUpgrade))
+        return LogiConnFrame(
+            logiConnId: client.connId, localNetId: 1, remoteNetId: 1, inner: finishedInner.serialized()
+        )
+    }
+
+    private func assertAccountPairServerFinished(
+        _ frame: LogiConnFrame?,
+        client: ClientSide,
+        notify: AccountPairNotify,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let frame = try XCTUnwrap(frame, file: file, line: line)
+        XCTAssertEqual(frame.logiConnId, client.connId, file: file, line: line)
+        let inner = try XCTUnwrap(LogiConnInnerFrame(parsing: frame.inner), file: file, line: line)
+        guard case let .upgrade(upgradeData) = inner.payload else {
+            XCTFail("expected server_finished upgrade", file: file, line: line)
+            throw Failure()
+        }
+        let handshake = try XCTUnwrap(lengthDelimited(2, in: upgradeData), file: file, line: line)
+        XCTAssertEqual(varint(1, in: handshake), 2, file: file, line: line)
+        XCTAssertEqual(varint(2, in: handshake), 4, file: file, line: line)
+        let accountFrame = try XCTUnwrap(lengthDelimited(6, in: handshake), file: file, line: line)
+        XCTAssertEqual(varint(1, in: accountFrame), 4, file: file, line: line)
+        let serverFinished = try XCTUnwrap(lengthDelimited(5, in: accountFrame), file: file, line: line)
+        let proofBlob = try XCTUnwrap(lengthDelimited(1, in: serverFinished), file: file, line: line)
+        let proofBox = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: proofBlob.prefix(12)),
+            ciphertext: proofBlob.dropFirst(12).dropLast(16),
+            tag: proofBlob.suffix(16)
+        )
+        XCTAssertEqual(
+            try AES.GCM.open(proofBox, using: notify.sessionKey),
+            notify.sharedZ + notify.serverPub,
+            file: file, line: line
+        )
+    }
+
+    private func makeEncryptedDataFrame(
+        client: ClientSide, inner: LogiConnInnerFrame, sessionKey: SymmetricKey
+    ) throws -> LogiConnFrame {
+        let nonce = AES.GCM.Nonce()
+        let sealed = try AES.GCM.seal(inner.serialized(), using: sessionKey, nonce: nonce)
+        var encryptedInner = Data()
+        encryptedInner.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+        encryptedInner.append(sealed.ciphertext)
+        encryptedInner.append(sealed.tag)
+        return LogiConnFrame(
+            logiConnId: client.connId, localNetId: 1, remoteNetId: 1, flag: true, inner: encryptedInner
+        )
+    }
+
+    private func openEncryptedFrame(
+        _ frame: LogiConnFrame, sessionKey: SymmetricKey
+    ) throws -> LogiConnInnerFrame {
+        XCTAssertTrue(frame.flag)
+        let box = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: frame.inner.prefix(12)),
+            ciphertext: frame.inner.dropFirst(12).dropLast(16),
+            tag: frame.inner.suffix(16)
+        )
+        let plaintext = try AES.GCM.open(box, using: sessionKey)
+        return try XCTUnwrap(LogiConnInnerFrame(parsing: plaintext))
+    }
 
     // On-conn AUTH-family client_notify (the phone's "continue normal conn
     // from quick conn" fallback sends this on the logi conn).
@@ -241,19 +466,14 @@ final class LyraSyncTaskServerTests: XCTestCase {
         )
     }
 
-    // The f8-less quick-conn answer must be a plain server sync_info with no
-    // embedded server_notify, so the phone falls back to the on-conn
-    // AUTH-family handshake.
-    private func assertF8LessSyncInfo(
-        _ privateData: Data, client: ClientSide, server: LyraSyncTaskServer,
+    // The standalone server sync_info frame must be f8-less — the handshake
+    // answer rides separate standalone logi frames, never sync_info f8.
+    private func assertF8LessSyncInfoFrame(
+        _ frame: LogiConnFrame, client: ClientSide,
         file: StaticString = #filePath, line: UInt = #line
     ) throws {
-        let pdFields = try LyraProtoReader.readFields(from: privateData)
-        let wrapper = try XCTUnwrap(pdFields.first { $0.number == 2 && $0.wireType == 2 }?.lengthDelimitedValue, file: file, line: line)
-        let logiConnData = try XCTUnwrap(lengthDelimited(1, in: wrapper), file: file, line: line)
-        let logiConn = try XCTUnwrap(LogiConnFrame(parsing: logiConnData), file: file, line: line)
-        XCTAssertEqual(logiConn.logiConnId, client.connId, file: file, line: line)
-        let inner = try XCTUnwrap(LogiConnInnerFrame(parsing: logiConn.inner), file: file, line: line)
+        XCTAssertEqual(frame.logiConnId, client.connId, file: file, line: line)
+        let inner = try XCTUnwrap(LogiConnInnerFrame(parsing: frame.inner), file: file, line: line)
         guard case let .syncInfo(syncInfoData) = inner.payload else {
             XCTFail("expected sync_info payload", file: file, line: line)
             throw Failure()
@@ -261,8 +481,7 @@ final class LyraSyncTaskServerTests: XCTestCase {
         XCTAssertEqual(varint(1, in: syncInfoData), 10000, file: file, line: line)
         XCTAssertEqual(varint(2, in: syncInfoData), 40, file: file, line: line)
         XCTAssertNotNil(lengthDelimited(4, in: syncInfoData), file: file, line: line)
-        XCTAssertNil(lengthDelimited(8, in: syncInfoData), "quick-conn answer must be f8-less", file: file, line: line)
-        XCTAssertTrue(server.handles(logiConn: LogiConnFrame(logiConnId: client.connId, inner: Data())), file: file, line: line)
+        XCTAssertNil(lengthDelimited(8, in: syncInfoData), "server sync_info must be f8-less", file: file, line: line)
     }
 
     private func makeClientFinishedFrame(
@@ -315,17 +534,20 @@ final class LyraSyncTaskServerTests: XCTestCase {
         let server = LyraSyncTaskServer()
         let client = makeClient()
 
-        let privateData = try XCTUnwrap(
-            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)?.privateData
+        // AUTH-family embedded client_notify: no phys private_data; standalone
+        // f8-less sync_info + AUTH server_notify (official Mac shape).
+        let built = try XCTUnwrap(
+            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)
         )
-        try assertF8LessSyncInfo(privateData, client: client, server: server)
+        XCTAssertNil(built.privateData, "embedded client_notify dials get no phys private_data")
+        XCTAssertEqual(built.logiFrames.count, 2)
+        try assertF8LessSyncInfoFrame(built.logiFrames[0], client: client)
+        XCTAssertTrue(server.handles(logiConn: LogiConnFrame(logiConnId: client.connId, inner: Data())))
 
         let stray = LogiConnFrame(logiConnId: client.connId &+ 1, inner: Data())
         XCTAssertFalse(server.handles(logiConn: stray))
 
-        let notifyReplies = server.handleLogiConn(makeClientNotifyFrame(client: client))
-        XCTAssertEqual(notifyReplies.count, 1)
-        let notify = try unwrapServerNotify(try XCTUnwrap(notifyReplies.first), client: client)
+        let notify = try unwrapServerNotify(built.logiFrames[1], client: client)
 
         let clientFinished = try makeClientFinishedFrame(client: client, notify: notify)
         XCTAssertTrue(server.handles(logiConn: clientFinished))
@@ -411,10 +633,12 @@ final class LyraSyncTaskServerTests: XCTestCase {
 
         let server = LyraSyncTaskServer()
         let client = makeClient()
-        let privateData = try XCTUnwrap(
-            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)?.privateData
+        let built = try XCTUnwrap(
+            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)
         )
-        try assertF8LessSyncInfo(privateData, client: client, server: server)
+        XCTAssertNil(built.privateData)
+        XCTAssertEqual(built.logiFrames.count, 2)
+        try assertF8LessSyncInfoFrame(built.logiFrames[0], client: client)
         let notifyReplies = server.handleLogiConn(makeClientNotifyFrame(client: client))
         let notify = try unwrapServerNotify(try XCTUnwrap(notifyReplies.first), client: client)
 
@@ -472,12 +696,29 @@ final class LyraSyncTaskServerTests: XCTestCase {
     }
 
     // Live 2026-08-05 (real phone, sync task 28 dial): the sync-task quick-conn
-    // client_notify wraps the auth frame in handshake f6, not f7. It must be
-    // parsed (otherwise the phone parks in kAuthClient → kcp trans timeout →
-    // 33-min backoff), but the answer must be the f8-less server sync_info so
-    // the phone falls back to the on-conn AUTH-family handshake — the embedded
-    // path runs the account-pair family we don't serve.
+    // client_notify is the ACCOUNT-PAIR family — handshake wrapper {2,4} with
+    // the frame in f6. The official Mac (pcap) leaves the phys sync response
+    // private_data-less and answers with a standalone account-pair
+    // server_notify on the conn; embedding even an f8-less sync_info in the
+    // phys response hard-fails the phone ("auth reuse failed: service check
+    // error", no fallback). Structural assertions only: the fixture's client
+    // ephemeral private key is unknown, so encSig can't be opened here — full
+    // crypto verification lives in testEmbeddedAccountPairClientNotifyCompletesSync.
     func testRealPhoneF6WrappedClientNotifyAccepted() throws {
+        let serverCertKey = P256.Signing.PrivateKey()
+        let serverCertDER = makeSelfSignedCert(
+            pubX963: serverCertKey.publicKey.x963Representation, cn: "lyra.test-uid.test-did.14"
+        )
+        MiTrustTicketStore.enrolledCertOverride = {
+            MijiaEnrolledCert(
+                certDERBase64: serverCertDER.base64EncodedString(),
+                privateKeyBase64: serverCertKey.rawRepresentation.base64EncodedString(),
+                did: "test-did",
+                enrolledAt: Date()
+            )
+        }
+        defer { MiTrustTicketStore.enrolledCertOverride = nil }
+
         let realSyncInfo = try XCTUnwrap(MiTrustTicketStore.data(fromHex:
             "08904e1010220830303135303332332a2c0a084bab18b6596b8e401220d0a2e7f19" +
             "eba0e72f00a1e89320b70539aea10dd121b65a227fdc1dfe16cae33428d0108063a" +
@@ -502,22 +743,43 @@ final class LyraSyncTaskServerTests: XCTestCase {
         let server = LyraSyncTaskServer()
         let built = try XCTUnwrap(
             server.responsePrivateData(requestTrailingFields: trailingFields),
-            "f6-wrapped client_notify must still get a (f8-less) sync_info answer"
+            "f6 account-pair client_notify must get a server_notify answer"
         )
-        let pdFields = try LyraProtoReader.readFields(from: built.privateData)
-        let outWrapper = try XCTUnwrap(pdFields.first { $0.number == 2 }?.lengthDelimitedValue)
-        let outLogiConnData = try XCTUnwrap(lengthDelimited(1, in: outWrapper))
-        let outLogiConn = try XCTUnwrap(LogiConnFrame(parsing: outLogiConnData))
-        XCTAssertEqual(outLogiConn.logiConnId, 4_110_687_169)
-        let outInner = try XCTUnwrap(LogiConnInnerFrame(parsing: outLogiConn.inner))
-        guard case let .syncInfo(outSyncInfo) = outInner.payload else {
+        XCTAssertNil(built.privateData, "official Mac leaves the phys response private_data-less")
+        XCTAssertEqual(built.logiFrames.count, 2)
+
+        let syncInfoFrame = built.logiFrames[0]
+        XCTAssertEqual(syncInfoFrame.logiConnId, 4_110_687_169)
+        let syncInfoInner = try XCTUnwrap(LogiConnInnerFrame(parsing: syncInfoFrame.inner))
+        guard case let .syncInfo(outSyncInfo) = syncInfoInner.payload else {
             XCTFail("expected sync_info payload")
             return
         }
         XCTAssertEqual(varint(1, in: outSyncInfo), 10000)
         XCTAssertEqual(varint(2, in: outSyncInfo), 40)
         XCTAssertNotNil(lengthDelimited(4, in: outSyncInfo))
-        XCTAssertNil(lengthDelimited(8, in: outSyncInfo))
+        XCTAssertNil(lengthDelimited(8, in: outSyncInfo), "server sync_info must be f8-less")
+
+        let notifyFrame = built.logiFrames[1]
+        XCTAssertEqual(notifyFrame.logiConnId, 4_110_687_169)
+        let notifyInner = try XCTUnwrap(LogiConnInnerFrame(parsing: notifyFrame.inner))
+        guard case let .upgrade(upgradeData) = notifyInner.payload else {
+            XCTFail("expected server_notify upgrade payload")
+            return
+        }
+        let handshake = try XCTUnwrap(lengthDelimited(2, in: upgradeData))
+        XCTAssertEqual(varint(1, in: handshake), 2)
+        XCTAssertEqual(varint(2, in: handshake), 4)
+        let accountFrame = try XCTUnwrap(lengthDelimited(6, in: handshake))
+        XCTAssertEqual(varint(1, in: accountFrame), 2)
+        let serverNotify = try XCTUnwrap(lengthDelimited(3, in: accountFrame))
+        let selected = try XCTUnwrap(lengthDelimited(1, in: serverNotify))
+        XCTAssertEqual(try XCTUnwrap(lengthDelimited(2, in: selected)).count, 32)
+        XCTAssertEqual(varint(3, in: selected), 16)
+        XCTAssertEqual(varint(4, in: selected), 8)
+        let outGPK = try XCTUnwrap(lengthDelimited(5, in: selected))
+        XCTAssertEqual(try XCTUnwrap(lengthDelimited(2, in: outGPK)).count, 65)
+        XCTAssertFalse(try XCTUnwrap(lengthDelimited(2, in: serverNotify)).isEmpty)
         XCTAssertTrue(server.handles(logiConn: LogiConnFrame(logiConnId: 4_110_687_169, inner: Data())))
     }
 
@@ -562,103 +824,118 @@ final class LyraSyncTaskServerTests: XCTestCase {
         XCTAssertEqual(varint(1, in: handshake), 2)
         XCTAssertEqual(varint(2, in: handshake), 4)
         let accountFrame = try XCTUnwrap(lengthDelimited(6, in: handshake))
-        XCTAssertEqual(varint(1, in: accountFrame), 2)
-        let serverNotify = try XCTUnwrap(lengthDelimited(3, in: accountFrame))
-        let selected = try XCTUnwrap(lengthDelimited(1, in: serverNotify))
-        let serverRandom = try XCTUnwrap(lengthDelimited(2, in: selected))
-        let outGPK = try XCTUnwrap(lengthDelimited(5, in: selected))
-        let serverPub = try XCTUnwrap(lengthDelimited(2, in: outGPK))
-        let encSig = try XCTUnwrap(lengthDelimited(2, in: serverNotify))
-        XCTAssertNotNil(lengthDelimited(3, in: serverNotify))
-        XCTAssertNotNil(lengthDelimited(4, in: serverNotify))
-
-        // encSig decrypts under Z to {cert, sig}; sig covers serverEph‖clientEph.
-        let peerKey = try P256.KeyAgreement.PublicKey(x963Representation: serverPub)
-        let z = try client.ephKey.sharedSecretFromKeyAgreement(with: peerKey).withUnsafeBytes { Data($0) }
-        let box = try AES.GCM.SealedBox(
-            nonce: AES.GCM.Nonce(data: encSig.prefix(12)),
-            ciphertext: encSig.dropFirst(12).dropLast(16),
-            tag: encSig.suffix(16)
-        )
-        let credMessage = try AES.GCM.open(box, using: SymmetricKey(data: z))
-        let cert = try XCTUnwrap(lengthDelimited(1, in: credMessage))
-        XCTAssertEqual(cert, serverCertDER)
-        let sig = try XCTUnwrap(lengthDelimited(2, in: credMessage))
-        let ecdsaSig = try P256.Signing.ECDSASignature(derRepresentation: sig)
-        XCTAssertTrue(
-            serverCertKey.publicKey.isValidSignature(
-                ecdsaSig, for: SHA256.hash(data: serverPub + client.ephKey.publicKey.x963Representation)
-            )
+        let notify = try unwrapAccountPairServerNotify(
+            accountFrame: accountFrame, client: client,
+            certKey: serverCertKey, expectedCertDER: serverCertDER
         )
 
         // step 3: client_finished with the phone's cert + sig (clientEph‖serverEph).
-        let phoneSig = try phoneCertKey.signature(
-            for: SHA256.hash(data: client.ephKey.publicKey.x963Representation + serverPub)
-        )
-        var phoneCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: phoneCertDER, to: &phoneCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: phoneSig.derRepresentation, to: &phoneCred)
-        let credNonce = AES.GCM.Nonce()
-        let credSealed = try AES.GCM.seal(phoneCred, using: SymmetricKey(data: z), nonce: credNonce)
-        var credBlob = Data()
-        credBlob.append(contentsOf: credNonce.withUnsafeBytes { Data($0) })
-        credBlob.append(credSealed.ciphertext)
-        credBlob.append(credSealed.tag)
-        let sessionKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: z),
-            salt: Data([
-                0x5e, 0xd5, 0xa3, 0xf8, 0x36, 0xf6, 0xb5, 0x4f,
-                0x7b, 0x1e, 0xfa, 0xd0, 0x27, 0x14, 0xd5, 0x17,
-                0x7b, 0x8a, 0x1f, 0x0f, 0x19, 0xe3, 0x69, 0xcc,
-                0x0b, 0xe8, 0xd9, 0x8b, 0xa6, 0x29, 0x73, 0x17
-            ]),
-            info: client.clientRandom + serverRandom,
-            outputByteCount: 32
-        )
-        let proofNonce = AES.GCM.Nonce()
-        let proofSealed = try AES.GCM.seal(Data(count: 24), using: sessionKey, nonce: proofNonce)
-        var proof = Data()
-        proof.append(contentsOf: proofNonce.withUnsafeBytes { Data($0) })
-        proof.append(proofSealed.ciphertext)
-        proof.append(proofSealed.tag)
-
-        var clientFinished = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: credBlob, to: &clientFinished)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: proof, to: &clientFinished)
-        var finishedAccountFrame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 3, to: &finishedAccountFrame)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: clientFinished, to: &finishedAccountFrame)
-        var finishedHandshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 2, to: &finishedHandshake)
-        LyraProtoWriter.appendVarintField(2, value: 4, to: &finishedHandshake)
-        LyraProtoWriter.appendLengthDelimitedField(6, value: finishedAccountFrame, to: &finishedHandshake)
-        var finishedUpgrade = Data()
-        LyraProtoWriter.appendVarintField(1, value: client.handshakeId, to: &finishedUpgrade)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: finishedHandshake, to: &finishedUpgrade)
-        let finishedInner = LogiConnInnerFrame(frameType: 6, payload: .upgrade(finishedUpgrade))
         let finishedReplies = server.handleLogiConn(
-            LogiConnFrame(logiConnId: client.connId, localNetId: 1, remoteNetId: 1, inner: finishedInner.serialized())
+            try makeAccountPairClientFinishedFrame(
+                client: client, notify: notify,
+                phoneCertKey: phoneCertKey, phoneCertDER: phoneCertDER
+            )
         )
         XCTAssertEqual(finishedReplies.count, 1)
-        let finishedReply = try XCTUnwrap(finishedReplies.first)
-        let frInner = try XCTUnwrap(LogiConnInnerFrame(parsing: finishedReply.inner))
-        guard case let .upgrade(frUpgrade) = frInner.payload else {
-            XCTFail("expected server_finished upgrade")
-            return
-        }
-        let frHandshake = try XCTUnwrap(lengthDelimited(2, in: frUpgrade))
-        XCTAssertEqual(varint(1, in: frHandshake), 2)
-        let frAccountFrame = try XCTUnwrap(lengthDelimited(6, in: frHandshake))
-        XCTAssertEqual(varint(1, in: frAccountFrame), 4)
-        let serverFinished = try XCTUnwrap(lengthDelimited(5, in: frAccountFrame))
-        let proofBlob = try XCTUnwrap(lengthDelimited(1, in: serverFinished))
-        let proofBox = try AES.GCM.SealedBox(
-            nonce: AES.GCM.Nonce(data: proofBlob.prefix(12)),
-            ciphertext: proofBlob.dropFirst(12).dropLast(16),
-            tag: proofBlob.suffix(16)
-        )
-        XCTAssertEqual(try AES.GCM.open(proofBox, using: sessionKey), z + serverPub)
+        try assertAccountPairServerFinished(finishedReplies.first, client: client, notify: notify)
         XCTAssertEqual(server.sessionKeys.count, 1)
+    }
+
+    // E2E through the embedded quick-conn path (the real phone's flow): the
+    // account-pair client_notify embedded in the phys sync request is answered
+    // by a server_notify in the response private_data (f8), then
+    // client_finished, the encrypted REQUEST/RESPONSE and the payload exchange
+    // all run on the logi conn.
+    func testEmbeddedAccountPairClientNotifyCompletesSync() throws {
+        let serverCertKey = P256.Signing.PrivateKey()
+        let serverCertDER = makeSelfSignedCert(
+            pubX963: serverCertKey.publicKey.x963Representation, cn: "lyra.test-uid.test-did.14"
+        )
+        MiTrustTicketStore.enrolledCertOverride = {
+            MijiaEnrolledCert(
+                certDERBase64: serverCertDER.base64EncodedString(),
+                privateKeyBase64: serverCertKey.rawRepresentation.base64EncodedString(),
+                did: "test-did",
+                enrolledAt: Date()
+            )
+        }
+        defer { MiTrustTicketStore.enrolledCertOverride = nil }
+
+        let phoneCertKey = P256.Signing.PrivateKey()
+        let phoneCertDER = makeSelfSignedCert(
+            pubX963: phoneCertKey.publicKey.x963Representation, cn: "lyra.phone-uid.phone-did.1"
+        )
+
+        let server = LyraSyncTaskServer()
+        let replyPayload = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        server.syncPayloadProvider = { replyPayload }
+        let client = makeClient(family: .accountPair)
+
+        // step 1→2: embedded client_notify answered by a standalone
+        // server_notify on the conn (no phys private_data).
+        let built = try XCTUnwrap(
+            server.responsePrivateData(requestTrailingFields: client.requestTrailingFields)
+        )
+        XCTAssertNil(built.privateData)
+        XCTAssertEqual(built.logiFrames.count, 2)
+        try assertF8LessSyncInfoFrame(built.logiFrames[0], client: client)
+        let notify = try unwrapAccountPairServerNotifyFrame(
+            built.logiFrames[1], client: client,
+            certKey: serverCertKey, expectedCertDER: serverCertDER
+        )
+        XCTAssertTrue(server.handles(logiConn: LogiConnFrame(logiConnId: client.connId, inner: Data())))
+
+        // step 3→4: client_finished on the logi conn → server_finished.
+        let finishedReplies = server.handleLogiConn(
+            try makeAccountPairClientFinishedFrame(
+                client: client, notify: notify,
+                phoneCertKey: phoneCertKey, phoneCertDER: phoneCertDER
+            )
+        )
+        XCTAssertEqual(finishedReplies.count, 1)
+        try assertAccountPairServerFinished(finishedReplies.first, client: client, notify: notify)
+        XCTAssertEqual(server.sessionKeys.count, 1)
+
+        // Encrypted logi REQUEST → minimal official-shape RESPONSE.
+        var request = Data()
+        LyraProtoWriter.appendLengthDelimitedField(
+            2, value: Data(LyraSyncTaskServer.syncServiceName.utf8), to: &request
+        )
+        LyraProtoWriter.appendVarintField(4, value: 16, to: &request)
+        LyraProtoWriter.appendVarintField(5, value: 10000, to: &request)
+        let requestInner = LogiConnInnerFrame(frameType: 1, payload: .request(request))
+        let encryptedRequest = try makeEncryptedDataFrame(
+            client: client, inner: requestInner, sessionKey: notify.sessionKey
+        )
+        let responses = server.handleLogiConn(encryptedRequest)
+        XCTAssertEqual(responses.count, 1)
+        let decodedResponse = try openEncryptedFrame(
+            try XCTUnwrap(responses.first), sessionKey: notify.sessionKey
+        )
+        XCTAssertEqual(decodedResponse.frameType, 2)
+        guard case let .response(responseData) = decodedResponse.payload else {
+            XCTFail("expected logi response payload")
+            throw Failure()
+        }
+        XCTAssertEqual(varint(1, in: responseData), 0)
+        XCTAssertEqual(varint(3, in: responseData), 1)
+
+        // Payload push (PAYLOAD_V2 sync frame) → our TrustedDeviceInfo reply.
+        let pushInner = LogiConnInnerFrame(frameType: 7, payload: .data(Data([0x01, 0x02, 0x03])))
+        let pushFrame = try makeEncryptedDataFrame(
+            client: client, inner: pushInner, sessionKey: notify.sessionKey
+        )
+        let pushReplies = server.handleLogiConn(pushFrame)
+        XCTAssertEqual(pushReplies.count, 1)
+        let decodedReply = try openEncryptedFrame(
+            try XCTUnwrap(pushReplies.first), sessionKey: notify.sessionKey
+        )
+        XCTAssertEqual(decodedReply.frameType, 7)
+        guard case let .data(replyData) = decodedReply.payload else {
+            XCTFail("expected payload reply data")
+            throw Failure()
+        }
+        XCTAssertEqual(replyData, replyPayload)
     }
 
     private func makeAccountPairClientNotifyFrame(client: ClientSide) -> LogiConnFrame {

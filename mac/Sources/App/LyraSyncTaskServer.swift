@@ -6,11 +6,15 @@ import Security
 // Server side of the phone's SyncManager reverse sync task (service 00150323).
 // The task dials our mesh port in quick-conn mode: its phys sync request
 // carries private_data (trailing field 4) with an embedded LogiConnFrame whose
-// sync_info holds a quick-conn AuthHandshake client_notify. Without an answer
-// embedded in the phys sync response private_data the phone parks in
-// kAuthClient and the task dies with a kcp trans timeout — so DevRepo never
-// learns our TrustedDeviceInfo and TeleService finds no relay service.
-// Auth server logic mirrors the proven LyraRelayCallSession implementation.
+// sync_info holds a quick-conn AuthHandshake client_notify. The official Mac
+// (2026-08-05 pcap) leaves the phys sync response private_data-less and sends
+// the f8-less server sync_info plus the matching-family server_notify as
+// standalone logi frames on the quick conn; embedding an answer in the phys
+// response instead makes the phone park in kAuthClient ("auth reuse failed:
+// service check error") and the task dies with a logical conn timeout — so
+// DevRepo never learns our TrustedDeviceInfo and TeleService finds no relay
+// service. Auth server logic mirrors the proven LyraRelayCallSession
+// implementation.
 final class LyraSyncTaskServer {
     static let syncServiceName = "00150323"
 
@@ -50,6 +54,24 @@ final class LyraSyncTaskServer {
         0x76, 0xd3, 0x08, 0x09, 0x51, 0xdd, 0x1b, 0xb8,
         0x6b, 0x4e, 0x9e, 0xe2, 0x57, 0x92, 0x4b, 0xaf,
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
+    ])
+    // The account-pair family derives its session/ticket keys with its OWN
+    // salt pair (libmicontinuity.so AccountPairHandshake::ParseServerNotifyMessage
+    // / ParseClientFinishedMessage, 2026-08-06): HKDF256(Z, salt,
+    // clientRandom‖serverRandom). Using the AUTH salts derives a key the phone
+    // rejects — its client_finished proof won't open and it disconnects with
+    // code 29001 right after server_finished.
+    private static let accountPairSessionSalt = Data([
+        0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
+        0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
+        0xfa, 0xa3, 0x37, 0xf2, 0xe0, 0xbe, 0xb5, 0x73,
+        0xb1, 0xf9, 0xa3, 0xd0, 0x15, 0x57, 0x64, 0x80
+    ])
+    private static let accountPairTicketSalt = Data([
+        0x7a, 0x83, 0xe2, 0xdc, 0x8e, 0x9a, 0x93, 0x37,
+        0xc7, 0x8e, 0xc1, 0x35, 0xfc, 0x39, 0x9d, 0xc3,
+        0x70, 0x56, 0x96, 0xe3, 0x94, 0x9e, 0x49, 0x77,
+        0xdd, 0xb2, 0xd1, 0x67, 0xfe, 0xb0, 0x08, 0x11
     ])
 
     func handles(logiConn: LogiConnFrame) -> Bool {
@@ -139,12 +161,17 @@ final class LyraSyncTaskServer {
     }
 
     // Parses the phys sync request's trailing fields for quick-conn private_data
-    // and, when it embeds a sync-service client_notify, returns the private_data
-    // to embed in the phys sync response (our sync_info + server_notify) plus
-    // the standalone logi frame to offer on the conn as well.
+    // and, when it embeds a sync-service client_notify, answers the way the
+    // official Mac does (2026-08-05 pcap): the phys sync response carries NO
+    // private_data, and the f8-less server sync_info plus the server_notify
+    // answering the embedded client_notify go out as standalone logi frames on
+    // the quick conn. (Embedding even an f8-less sync_info in the phys response
+    // makes the phone hard-fail with "auth reuse failed: service check error"
+    // and park in kAuthClient.) The auth-reuse variant keeps the embedded
+    // private_data answer, which the phone accepts.
     func responsePrivateData(
         requestTrailingFields: [LyraProtoReader.Field]
-    ) -> (privateData: Data, logiFrame: LogiConnFrame)? {
+    ) -> (privateData: Data?, logiFrames: [LogiConnFrame])? {
         guard let privateData = requestTrailingFields
             .first(where: { $0.number == 4 && $0.wireType == 2 })?
             .lengthDelimitedValue,
@@ -172,7 +199,7 @@ final class LyraSyncTaskServer {
             guard let quickConn = Self.lengthDelimited(8, in: syncInfoData),
                   let qcInner = LogiConnInnerFrame(parsing: quickConn),
                   case let .upgrade(upgradeData) = qcInner.payload,
-                  Self.varint(1, in: upgradeData) != nil,
+                  let handshakeId = Self.varint(1, in: upgradeData),
                   let handshake = Self.lengthDelimited(2, in: upgradeData),
                   let authFrame = Self.authFrame(fromHandshake: handshake),
                   Self.varint(1, in: authFrame) == 1
@@ -195,40 +222,60 @@ final class LyraSyncTaskServer {
                 )
                 continue
             }
-            // The embedded quick-conn dial runs the ACCOUNT-pair handshake
-            // family (f6), which we don't serve — any embedded answer makes the
-            // phone park in kAuthClient. Answering with the f8-less server
-            // sync_info instead drives its "continue normal conn from quick
-            // conn" fallback: a plaintext AUTH-family client_notify on the
-            // conn, which handleLogiConn serves ({4,5}+f7, live 2026-08-05).
-            var state = ConnState(
-                connId: logiConn.logiConnId,
-                peerNetId: logiConn.localNetId,
-                handshakeId: 0,
-                serverEphPriv: P256.KeyAgreement.PrivateKey(),
-                clientEphPub: Data(),
-                sharedZ: Data(),
-                clientRandom: Data(),
-                serverRandom: Data()
-            )
-            state.sessionKey = nil
-            remember(state)
-            let logiFrame = buildResponseLogiFrame(
+            // Answer the embedded client_notify with a same-family
+            // server_notify as a standalone logi frame (official Mac shape):
+            // account-pair (wrapper {2,4}+f6) for family-2 dials, AUTH
+            // (wrapper {4,5}+f7) for family-4 dials. The phys response stays
+            // private_data-less; the f8-less server sync_info precedes it.
+            let syncInfoFrame = buildResponseLogiFrame(
                 connId: logiConn.logiConnId,
                 peerNetId: logiConn.localNetId,
                 handshakeId: 0,
                 serverNotifyAuthFrame: nil,
                 withQuickConn: false
             )
-            var outWrapper = Data()
-            LyraProtoWriter.appendLengthDelimitedField(1, value: logiFrame.serialized(), to: &outWrapper)
-            var privateData = Data()
-            LyraProtoWriter.appendLengthDelimitedField(2, value: outWrapper, to: &privateData)
-            DiagnosticsLog.info(
-                "xiaomi.synctask.quickconn_force_conn_handshake connId=\(logiConn.logiConnId) " +
-                    "privateDataBytes=\(privateData.count)"
+            if Self.varint(1, in: handshake) == 2 {
+                guard let built = makeAccountPairServerNotify(
+                    accountFrame: authFrame,
+                    handshakeId: handshakeId,
+                    connId: logiConn.logiConnId,
+                    peerNetId: logiConn.localNetId
+                ) else {
+                    DiagnosticsLog.warn(
+                        "xiaomi.synctask.acctpair_embedded_unanswered connId=\(logiConn.logiConnId)"
+                    )
+                    return (nil, [syncInfoFrame])
+                }
+                remember(built.state)
+                let notifyFrame = accountPairHandshakeFrame(
+                    accountFrame: built.accountFrame, handshakeId: handshakeId, conn: built.state
+                )
+                DiagnosticsLog.info(
+                    "xiaomi.synctask.acctpair_embedded_server_notify connId=\(logiConn.logiConnId) " +
+                        "handshakeId=\(handshakeId)"
+                )
+                return (nil, [syncInfoFrame, notifyFrame])
+            }
+            guard let built = makeServerNotify(
+                authFrame: authFrame,
+                handshakeId: handshakeId,
+                connId: logiConn.logiConnId,
+                peerNetId: logiConn.localNetId
+            ) else {
+                DiagnosticsLog.warn(
+                    "xiaomi.synctask.auth_embedded_unanswered connId=\(logiConn.logiConnId)"
+                )
+                return (nil, [syncInfoFrame])
+            }
+            remember(built.state)
+            let notifyFrame = authHandshakeFrame(
+                authFrame: built.authFrame, handshakeId: handshakeId, conn: built.state
             )
-            return (privateData, logiFrame)
+            DiagnosticsLog.info(
+                "xiaomi.synctask.auth_embedded_server_notify connId=\(logiConn.logiConnId) " +
+                    "handshakeId=\(handshakeId)"
+            )
+            return (nil, [syncInfoFrame, notifyFrame])
         }
         return nil
     }
@@ -250,7 +297,19 @@ final class LyraSyncTaskServer {
         else {
             DiagnosticsLog.info(
                 "xiaomi.synctask.conn_frame_ignored connId=\(logiConn.logiConnId) " +
-                    "bytes=\(logiConn.inner.count)"
+                    "bytes=\(logiConn.inner.count) " +
+                    "hex=\(logiConn.inner.prefix(32).map { String(format: "%02x", $0) }.joined())"
+            )
+            return []
+        }
+        // ALERT frames (AuthHandshake msg=1) abort the handshake — log the
+        // code/text so a phone-side rejection is visible in diagnostics.
+        if Self.varint(2, in: handshake) == 1 {
+            let code = Self.varint(1, in: authFrame) ?? 0
+            let text = Self.lengthDelimited(2, in: authFrame)
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            DiagnosticsLog.warn(
+                "xiaomi.synctask.handshake_alert connId=\(logiConn.logiConnId) code=\(code) text=\(text)"
             )
             return []
         }
@@ -315,7 +374,7 @@ final class LyraSyncTaskServer {
     // answers with our server sync_info in the phys response private_data.
     private func reuseKeyForQuickConn(
         _ quickConn: Data, logiConn: LogiConnFrame
-    ) -> (privateData: Data, logiFrame: LogiConnFrame)? {
+    ) -> (privateData: Data?, logiFrames: [LogiConnFrame])? {
         let ticketStore = MiTrustTicketStore.current()
         guard let decrypted = ticketStore.decryptCredBlobWithKey(quickConn) else {
             DiagnosticsLog.warn(
@@ -361,7 +420,7 @@ final class LyraSyncTaskServer {
             "xiaomi.synctask.quickconn_reuse connId=\(logiConn.logiConnId) " +
                 "privateDataBytes=\(privateData.count)"
         )
-        return (privateData, logiFrame)
+        return (privateData, [logiFrame])
     }
 
     // MARK: - AuthHandshake server (mirrors LyraRelayCallSession)
@@ -382,6 +441,36 @@ final class LyraSyncTaskServer {
         logiConn: LogiConnFrame,
         conn: ConnState
     ) -> [LogiConnFrame] {
+        guard let built = makeAccountPairServerNotify(
+            accountFrame: accountFrame,
+            handshakeId: handshakeId,
+            connId: logiConn.logiConnId,
+            peerNetId: conn.peerNetId
+        ) else {
+            return []
+        }
+        var state = built.state
+        state.logiResponseSent = conn.logiResponseSent
+        conns[logiConn.logiConnId] = state
+        let frame = accountPairHandshakeFrame(
+            accountFrame: built.accountFrame, handshakeId: handshakeId, conn: state
+        )
+        DiagnosticsLog.info(
+            "xiaomi.synctask.acctpair_server_notify connId=\(logiConn.logiConnId) " +
+                "handshakeId=\(handshakeId)"
+        )
+        return [frame]
+    }
+
+    // Builds the account-pair server_notify for a parsed client_notify and the
+    // ConnState the eventual client_finished will consume. Shared by the
+    // on-conn path and the embedded quick-conn answer.
+    private func makeAccountPairServerNotify(
+        accountFrame: Data,
+        handshakeId: UInt64,
+        connId: UInt32,
+        peerNetId: UInt32
+    ) -> (accountFrame: Data, state: ConnState)? {
         guard let clientNotify = Self.lengthDelimited(2, in: accountFrame),
               let cipherSuite = Self.lengthDelimited(1, in: clientNotify),
               let clientRandom = Self.lengthDelimited(2, in: cipherSuite),
@@ -394,11 +483,11 @@ final class LyraSyncTaskServer {
                 "xiaomi.synctask.acctpair_notify_parse_failed " +
                     "authFrame=\(accountFrame.prefix(48).map { String(format: "%02x", $0) }.joined())"
             )
-            return []
+            return nil
         }
         guard let (certDER, certPriv) = Self.enrolledCertMaterial() else {
             DiagnosticsLog.warn("xiaomi.synctask.acctpair_no_cert")
-            return []
+            return nil
         }
         let privateKey = P256.KeyAgreement.PrivateKey()
         var serverRandom = Data(count: 32)
@@ -412,11 +501,11 @@ final class LyraSyncTaskServer {
             secret = try privateKey.sharedSecretFromKeyAgreement(with: peerKey).withUnsafeBytes { Data($0) }
         } catch {
             DiagnosticsLog.error("xiaomi.synctask.acctpair_ecdh_failed", error)
-            return []
+            return nil
         }
         guard let signature = try? certPriv.signature(for: SHA256.hash(data: serverPub + clientPub)) else {
             DiagnosticsLog.warn("xiaomi.synctask.acctpair_sign_failed")
-            return []
+            return nil
         }
         var credMessage = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: certDER, to: &credMessage)
@@ -433,7 +522,7 @@ final class LyraSyncTaskServer {
             encSig = blob
         } catch {
             DiagnosticsLog.error("xiaomi.synctask.acctpair_enc_failed", error)
-            return []
+            return nil
         }
 
         var outPublicKeyMessage = Data()
@@ -458,23 +547,17 @@ final class LyraSyncTaskServer {
         LyraProtoWriter.appendVarintField(1, value: 2, to: &outAccountFrame)
         LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &outAccountFrame)
 
-        var state = conn
-        state.handshakeId = handshakeId
-        state.serverEphPriv = privateKey
-        state.clientEphPub = clientPub
-        state.sharedZ = secret
-        state.clientRandom = clientRandom
-        state.serverRandom = serverRandom
-        state.logiResponseSent = conn.logiResponseSent
-        conns[logiConn.logiConnId] = state
-        let frame = accountPairHandshakeFrame(
-            accountFrame: outAccountFrame, handshakeId: handshakeId, conn: state
+        let state = ConnState(
+            connId: connId,
+            peerNetId: peerNetId,
+            handshakeId: handshakeId,
+            serverEphPriv: privateKey,
+            clientEphPub: clientPub,
+            sharedZ: secret,
+            clientRandom: clientRandom,
+            serverRandom: serverRandom
         )
-        DiagnosticsLog.info(
-            "xiaomi.synctask.acctpair_server_notify connId=\(logiConn.logiConnId) " +
-                "handshakeId=\(handshakeId) encSigBytes=\(encSig.count)"
-        )
-        return [frame]
+        return (outAccountFrame, state)
     }
 
     private func handleAccountPairClientFinished(
@@ -506,15 +589,16 @@ final class LyraSyncTaskServer {
             DiagnosticsLog.warn("xiaomi.synctask.acctpair_sig_invalid connId=\(conn.connId)")
             return []
         }
+        MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
         let newSessionKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: zKey,
-            salt: Self.sessionSalt,
+            salt: Self.accountPairSessionSalt,
             info: conn.clientRandom + conn.serverRandom,
             outputByteCount: 32
         )
         let ticket = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: zKey,
-            salt: Self.ticketSalt,
+            salt: Self.accountPairTicketSalt,
             info: conn.clientRandom + conn.serverRandom,
             outputByteCount: 32
         )

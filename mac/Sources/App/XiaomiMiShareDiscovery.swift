@@ -1,6 +1,7 @@
 import CryptoKit
 import EdgeLinkKit
 import Foundation
+import Network
 
 struct XiaomiMiShareDiscoveredPeer: Equatable, Identifiable {
     var id: String { deviceIdHex ?? serviceName }
@@ -50,6 +51,8 @@ final class XiaomiMiShareDiscovery: NSObject {
     private var publishedDeviceIdHex: String?
     private var publishedDisplayName: String?
     private var lastError: String?
+    private var pathMonitor: NWPathMonitor?
+    private var lastInterfaceSignature: String?
 
     override init() {
         super.init()
@@ -69,6 +72,7 @@ final class XiaomiMiShareDiscovery: NSObject {
         isBrowsing = true
         DiagnosticsLog.info("xiaomi.mishare.discovery_browser_started type=\(Self.serviceType)")
 
+        startNetworkChangeMonitor()
         startMeshSocket()
         emitSnapshot()
     }
@@ -79,6 +83,9 @@ final class XiaomiMiShareDiscovery: NSObject {
 
     private func stop(emitsSnapshot: Bool) {
         browser.stop()
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastInterfaceSignature = nil
         lyraPublisher?.stop()
         meshSocket.stop()
         for service in discoveredServices.values {
@@ -154,6 +161,37 @@ final class XiaomiMiShareDiscovery: NSObject {
             isPublishing = false
             lastError = String(localized: "Lyra mDNS 廣播失敗")
             DiagnosticsLog.error("xiaomi.mishare.discovery_publish_payload_failed deviceId=\(deviceIdHex)", error)
+        }
+    }
+
+    // Interface/Wi-Fi changes invalidate resolved peer addresses: re-resolve
+    // every discovered service so the phone's new endpoint is learned (and the
+    // responder's announce target refreshed) instead of expiring minutes late.
+    private func startNetworkChangeMonitor() {
+        pathMonitor?.cancel()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.handleNetworkPathUpdate()
+            }
+        }
+        monitor.start(queue: .global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    private func handleNetworkPathUpdate() {
+        let signature = LANPinnedPhoneIP.localIPv4Interfaces()
+            .map { "\($0.address)/\($0.netmask)" }
+            .joined(separator: ",")
+        guard signature != lastInterfaceSignature else { return }
+        let hadBaseline = lastInterfaceSignature != nil
+        lastInterfaceSignature = signature
+        guard hadBaseline else { return }
+        DiagnosticsLog.info(
+            "xiaomi.mishare.discovery_network_change interfaces=\(signature)"
+        )
+        for service in discoveredServices.values {
+            service.resolve(withTimeout: 5)
         }
     }
 
@@ -326,6 +364,7 @@ final class XiaomiMiShareDiscovery: NSObject {
         if let pinned = LANPinnedPhoneIP.current(), host != pinned {
             return
         }
+        meshResponder?.noteDiscoveredPhoneEndpoint(host: host, port: meshPort)
         startMeshAnnouncer(host: host, ports: [meshPort])
     }
 

@@ -2,6 +2,7 @@ import CryptoKit
 import EdgeLinkKit
 import Foundation
 import Network
+import Security
 
 final class LyraMeshAnnouncer {
     private enum State {
@@ -28,6 +29,7 @@ final class LyraMeshAnnouncer {
     private var authClientRandom = Data()
     private var authSharedZ = Data()
     private var authServerEphPub = Data()
+    private var authIsAccountPair = false
     private var meshSessionKey: SymmetricKey?
     private var announceTimer: DispatchSourceTimer?
     private var lastActivity = Date.distantPast
@@ -48,6 +50,21 @@ final class LyraMeshAnnouncer {
         0x76, 0xd3, 0x08, 0x09, 0x51, 0xdd, 0x1b, 0xb8,
         0x6b, 0x4e, 0x9e, 0xe2, 0x57, 0x92, 0x4b, 0xaf,
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
+    ])
+    // Account-pair family salt pair (libmicontinuity.so AccountPairHandshake,
+    // 2026-08-06) — the phone runs account-pair as client AND server with
+    // these; the AUTH salts derive keys it rejects.
+    private static let accountPairSessionSalt = Data([
+        0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
+        0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
+        0xfa, 0xa3, 0x37, 0xf2, 0xe0, 0xbe, 0xb5, 0x73,
+        0xb1, 0xf9, 0xa3, 0xd0, 0x15, 0x57, 0x64, 0x80
+    ])
+    private static let accountPairTicketSalt = Data([
+        0x7a, 0x83, 0xe2, 0xdc, 0x8e, 0x9a, 0x93, 0x37,
+        0xc7, 0x8e, 0xc1, 0x35, 0xfc, 0x39, 0x9d, 0xc3,
+        0x70, 0x56, 0x96, 0xe3, 0x94, 0x9e, 0x49, 0x77,
+        0xdd, 0xb2, 0xd1, 0x67, 0xfe, 0xb0, 0x08, 0x11
     ])
 
     private static var announcedDeviceType: UInt32 {
@@ -152,9 +169,14 @@ final class LyraMeshAnnouncer {
         }
         physConnId = .random(in: 1...UInt32.max)
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        // Account-pair dials present the enrolled Mijia cert (CN device type
+        // 14); the phone rejects the handshake when the phys-conn device type
+        // disagrees ("expected device type 4, cert device type 14"). The
+        // override-driven type (relay presentation) stays on the tdi payload.
+        let physDeviceType = Self.enrolledCertMaterial() != nil ? 14 : Self.announcedDeviceType
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: Self.announcedDeviceType,
+            deviceType: physDeviceType,
             uidHash: "61F2",
             displayName: displayNameProvider(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
@@ -223,6 +245,12 @@ final class LyraMeshAnnouncer {
         authEphKey = ephemeral
         authClientRandom = clientRandom
         handshakeId = 1
+        // Once the phone's DevRepo carries our Mijia cert cred (written by an
+        // account-pair sync), it rejects AUTH-family client_finished with
+        // ALERT 202 "verify failed" — the official client dials account-pair
+        // in that state (2026-08-05 pcap), so go straight to it when we hold
+        // an enrolled cert.
+        authIsAccountPair = Self.enrolledCertMaterial() != nil
 
         var publicKeyMessage = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &publicKeyMessage)
@@ -233,15 +261,20 @@ final class LyraMeshAnnouncer {
         var cipherSuite = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(2, value: clientRandom, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(3, value: 64, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(4, value: 2, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(3, value: authIsAccountPair ? 16 : 64, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(4, value: authIsAccountPair ? 8 : 2, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(5, value: publicKeyMessage, to: &cipherSuite)
 
         var clientNotify = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: cipherSuite, to: &clientNotify)
-        LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
+        if authIsAccountPair {
+            LyraProtoWriter.appendLengthDelimitedField(2, value: Data([0x08, 0x01]), to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
+        } else {
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
+        }
 
         var authFrame = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &authFrame)
@@ -251,11 +284,32 @@ final class LyraMeshAnnouncer {
         state = .authHandshake
     }
 
+    private static func enrolledCertMaterial() -> (certDER: Data, priv: P256.Signing.PrivateKey)? {
+        let lookup = MiTrustTicketStore.enrolledCertOverride ?? {
+            guard let did = MijiaCertEnrollment.currentDid(
+                shortDeviceIdHex: MijiaCertEnrollment.currentShortDeviceIdHex
+            ) else { return nil }
+            return MijiaEnrolledCertStore.usableCert(forDid: did)
+        }
+        guard let enrolled = lookup(),
+              let certDER = enrolled.certDER,
+              let privRaw = enrolled.privateKeyRaw,
+              let priv = try? P256.Signing.PrivateKey(rawRepresentation: privRaw)
+        else { return nil }
+        return (certDER, priv)
+    }
+
     private func sendAuthHandshake(authFrame: Data, label: String) {
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        if authIsAccountPair {
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(6, value: authFrame, to: &handshake)
+        } else {
+            LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        }
 
         var upgrade = Data()
         LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
@@ -273,12 +327,25 @@ final class LyraMeshAnnouncer {
     }
 
     private func handleAuthUpgrade(_ upgradeData: Data) {
-        guard let handshake = lengthDelimitedField(2, in: upgradeData),
-              let authFrame = lengthDelimitedField(7, in: handshake),
-              let step = varintField(1, in: authFrame)
-        else {
+        guard let handshake = lengthDelimitedField(2, in: upgradeData) else {
             DiagnosticsLog.warn(
                 "xiaomi.mishare.announcer_auth_parse_failed hex=\(upgradeData.prefix(64).map { String(format: "%02x", $0) }.joined())"
+            )
+            return
+        }
+        let authFrame = lengthDelimitedField(7, in: handshake) ?? lengthDelimitedField(6, in: handshake)
+        guard let authFrame, let step = varintField(1, in: authFrame) else {
+            DiagnosticsLog.warn(
+                "xiaomi.mishare.announcer_auth_parse_failed hex=\(upgradeData.prefix(64).map { String(format: "%02x", $0) }.joined())"
+            )
+            return
+        }
+        if varintField(2, in: handshake) == 1 {
+            let code = varintField(1, in: authFrame) ?? 0
+            let text = lengthDelimitedField(2, in: authFrame)
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            DiagnosticsLog.warn(
+                "xiaomi.mishare.announcer_auth_alert code=\(code) text=\(text)"
             )
             return
         }
@@ -317,6 +384,13 @@ final class LyraMeshAnnouncer {
         authSharedZ = secret
         authServerEphPub = serverPub
         let clientPub = ephemeral.publicKey.x963Representation
+        if authIsAccountPair {
+            handleAccountPairServerNotify(
+                encSig: encSig, secret: secret,
+                serverRandom: serverRandom, serverPub: serverPub, clientPub: clientPub
+            )
+            return
+        }
         let ticketStore = MiTrustTicketStore.current()
         if let sigDer = ticketStore.decrypt(encSig, with: SymmetricKey(data: secret)),
            let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer)
@@ -375,6 +449,86 @@ final class LyraMeshAnnouncer {
             sendAuthHandshake(authFrame: outAuthFrame, label: "auth_client_finished")
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.announcer_auth_finish_enc_failed", error)
+        }
+    }
+
+    // Account-pair family server_notify (official client shape, 2026-08-05
+    // pcap): encSig opens under Z to {phone cert, sig}; our client_finished
+    // carries OUR enrolled cert + sig over clientEph‖serverEph plus the
+    // proof, keyed by the account-pair HKDF salt pair.
+    private func handleAccountPairServerNotify(
+        encSig: Data, secret: Data, serverRandom: Data, serverPub: Data, clientPub: Data
+    ) {
+        let ticketStore = MiTrustTicketStore.current()
+        let zKey = SymmetricKey(data: secret)
+        if let credMessage = ticketStore.decrypt(encSig, with: zKey),
+           let phoneCert = lengthDelimitedField(1, in: credMessage),
+           let sigDer = lengthDelimitedField(2, in: credMessage),
+           let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer)
+        {
+            MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
+            var valid = false
+            if let cert = SecCertificateCreateWithData(nil, phoneCert as CFData),
+               let key = SecCertificateCopyKey(cert),
+               let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+               let pub = try? P256.Signing.PublicKey(x963Representation: rep)
+            {
+                valid = pub.isValidSignature(signature, for: SHA256.hash(data: serverPub + clientPub))
+            }
+            DiagnosticsLog.info("xiaomi.mishare.announcer_acctpair_server_sig valid=\(valid)")
+        } else {
+            DiagnosticsLog.warn("xiaomi.mishare.announcer_acctpair_encsig_decrypt_failed")
+        }
+        let sessionKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairSessionSalt,
+            info: authClientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        let ticket = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairTicketSalt,
+            info: authClientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        meshSessionKey = sessionKey
+        MiTrustTicketStore.recordAuthSession(
+            sessionKey: sessionKey.withUnsafeBytes { Data($0) },
+            ticket: ticket.withUnsafeBytes { Data($0) }
+        )
+        guard let (certDER, certPriv) = Self.enrolledCertMaterial(),
+              let signature = try? certPriv.signature(for: SHA256.hash(data: clientPub + serverPub))
+        else {
+            DiagnosticsLog.warn("xiaomi.mishare.announcer_acctpair_no_cert")
+            return
+        }
+        do {
+            var credMessage = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: certDER, to: &credMessage)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &credMessage)
+            let credNonce = AES.GCM.Nonce()
+            let credSealed = try AES.GCM.seal(credMessage, using: zKey, nonce: credNonce)
+            var credBlob = Data()
+            credBlob.append(contentsOf: credNonce.withUnsafeBytes { Data($0) })
+            credBlob.append(credSealed.ciphertext)
+            credBlob.append(credSealed.tag)
+
+            let proofNonce = AES.GCM.Nonce()
+            let proofSealed = try AES.GCM.seal(Data(count: 24), using: sessionKey, nonce: proofNonce)
+            var proof = Data()
+            proof.append(contentsOf: proofNonce.withUnsafeBytes { Data($0) })
+            proof.append(proofSealed.ciphertext)
+            proof.append(proofSealed.tag)
+
+            var clientFinished = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: credBlob, to: &clientFinished)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: proof, to: &clientFinished)
+            var outAuthFrame = Data()
+            LyraProtoWriter.appendVarintField(1, value: 3, to: &outAuthFrame)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: clientFinished, to: &outAuthFrame)
+            sendAuthHandshake(authFrame: outAuthFrame, label: "auth_client_finished")
+        } catch {
+            DiagnosticsLog.error("xiaomi.mishare.announcer_acctpair_finish_enc_failed", error)
         }
     }
 

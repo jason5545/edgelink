@@ -61,6 +61,8 @@ final class LyraMeshResponder {
     private var lastEndpointDescription: String?
     private var announceTimer: DispatchSourceTimer?
     private let announceQueue = DispatchQueue(label: "edgelink.lyra.announce")
+    private var pathMonitor: NWPathMonitor?
+    private var lastInterfaceSnapshot: [LANPinnedPhoneIP.InterfaceAddress] = []
     private var syncAuthPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     private var syncAuthPeerConnId = Data()
     private var syncAuthOurConnId = Data()
@@ -108,6 +110,121 @@ final class LyraMeshResponder {
             self?.handle(frame: frame, endpoint: endpoint, reply: reply)
         }
         startAnnounceTimer()
+        startPathMonitor()
+    }
+
+    // mDNS re-resolved the phone at this endpoint: adopt it as the announce
+    // target even when a previously-heard endpoint is pinned, as long as the
+    // discovered host sits on a current local subnet.
+    func noteDiscoveredPhoneEndpoint(host: String, port: UInt16) {
+        announceQueue.async { [weak self] in
+            guard let self else { return }
+            let description = "\(host):\(port)"
+            guard Self.isEndpointOnLocalSubnet(
+                description, interfaces: LANPinnedPhoneIP.localIPv4Interfaces()
+            ) else {
+                return
+            }
+            guard self.lastEndpointDescription != description else { return }
+            self.lastEndpointDescription = description
+            Self.recordPhoneEndpoint(description)
+            DiagnosticsLog.info(
+                "xiaomi.mishare.announce_target_discovered to=\(description)"
+            )
+        }
+    }
+
+    // Drops in-memory and persisted phone endpoints whose host is outside
+    // every current local subnet (network move). Returns the evicted entries.
+    @discardableResult
+    func evictStalePhoneEndpoints(reason: String) -> [String] {
+        let interfaces = LANPinnedPhoneIP.localIPv4Interfaces()
+        var evicted = Self.evictStalePhoneEndpoints(interfaces: interfaces)
+        if let inMemory = lastEndpointDescription,
+           !Self.isEndpointOnLocalSubnet(inMemory, interfaces: interfaces) {
+            lastEndpointDescription = nil
+            evicted.append(inMemory)
+        }
+        if let syncEndpoint = syncAnnounceEndpoint,
+           !Self.isEndpointOnLocalSubnet(syncEndpoint, interfaces: interfaces) {
+            syncAnnounceEndpoint = nil
+            evicted.append(syncEndpoint)
+        }
+        if !evicted.isEmpty {
+            DiagnosticsLog.info(
+                "xiaomi.mishare.stale_endpoint_evicted reason=\(reason) evicted=\(evicted.joined(separator: ","))"
+            )
+        }
+        return evicted
+    }
+
+    static func isEndpointOnLocalSubnet(
+        _ description: String, interfaces: [LANPinnedPhoneIP.InterfaceAddress]
+    ) -> Bool {
+        guard let host = parseEndpoint(description)?.host else {
+            return false
+        }
+        return LANPinnedPhoneIP.isOnLocalNetwork(host, interfaces: interfaces)
+    }
+
+    // Picks the first candidate (most-recently-heard first) whose host sits on
+    // a current local subnet; nil when every candidate is stale.
+    static func selectReachableEndpoint(
+        candidates: [String], interfaces: [LANPinnedPhoneIP.InterfaceAddress]
+    ) -> String? {
+        var seen = Set<String>()
+        for candidate in candidates {
+            guard seen.insert(candidate).inserted else { continue }
+            if isEndpointOnLocalSubnet(candidate, interfaces: interfaces) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    // Evicts persisted endpoints (last + history) outside every local subnet.
+    @discardableResult
+    static func evictStalePhoneEndpoints(
+        interfaces: [LANPinnedPhoneIP.InterfaceAddress],
+        defaults: UserDefaults = .standard
+    ) -> [String] {
+        var evicted: [String] = []
+        if let last = defaults.string(forKey: lastPhoneEndpointDefaultsKey),
+           !isEndpointOnLocalSubnet(last, interfaces: interfaces) {
+            evicted.append(last)
+            defaults.removeObject(forKey: lastPhoneEndpointDefaultsKey)
+            defaults.removeObject(forKey: lastPhoneEndpointTimeDefaultsKey)
+        }
+        let history = defaults.stringArray(forKey: phoneEndpointHistoryDefaultsKey) ?? []
+        let kept = history.filter { isEndpointOnLocalSubnet($0, interfaces: interfaces) }
+        if kept.count != history.count {
+            evicted.append(contentsOf: history.filter { !kept.contains($0) })
+            defaults.set(kept, forKey: phoneEndpointHistoryDefaultsKey)
+        }
+        return evicted
+    }
+
+    private func startPathMonitor() {
+        pathMonitor?.cancel()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] _ in
+            self?.handlePossibleNetworkChange()
+        }
+        monitor.start(queue: announceQueue)
+        pathMonitor = monitor
+    }
+
+    private func handlePossibleNetworkChange() {
+        let interfaces = LANPinnedPhoneIP.localIPv4Interfaces()
+        guard interfaces != lastInterfaceSnapshot else { return }
+        let hadBaseline = !lastInterfaceSnapshot.isEmpty
+        lastInterfaceSnapshot = interfaces
+        guard hadBaseline else { return }
+        DiagnosticsLog.info(
+            "xiaomi.mishare.network_change interfaces=" +
+                interfaces.map { "\($0.address)/\($0.netmask)" }.joined(separator: ",")
+        )
+        evictStalePhoneEndpoints(reason: "network_change")
     }
 
     func currentPhoneEndpoint() -> (host: String, port: UInt16)? {
@@ -157,9 +274,30 @@ final class LyraMeshResponder {
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let endpoint = self.lastEndpointDescription
-                ?? UserDefaults.standard.string(forKey: Self.lastPhoneEndpointDefaultsKey)
-            guard let endpoint else { return }
+            // Validate the announce target against the CURRENT local subnets:
+            // after a network move the persisted/in-memory endpoint points
+            // into the void, and the phone never hears us until it dials.
+            let interfaces = LANPinnedPhoneIP.localIPv4Interfaces()
+            let defaults = UserDefaults.standard
+            var candidates: [String] = []
+            if let live = self.lastEndpointDescription {
+                candidates.append(live)
+            }
+            if let persisted = defaults.string(forKey: Self.lastPhoneEndpointDefaultsKey) {
+                candidates.append(persisted)
+            }
+            candidates.append(contentsOf: defaults.stringArray(forKey: Self.phoneEndpointHistoryDefaultsKey) ?? [])
+            guard let endpoint = Self.selectReachableEndpoint(
+                candidates: candidates, interfaces: interfaces
+            ) else {
+                if !candidates.isEmpty {
+                    self.evictStalePhoneEndpoints(reason: "announce_unreachable")
+                }
+                return
+            }
+            if endpoint != self.lastEndpointDescription {
+                self.lastEndpointDescription = endpoint
+            }
             self.sendAnnounce(endpointDescription: endpoint)
         }
         announceTimer = timer
@@ -1788,10 +1926,11 @@ final class LyraMeshResponder {
 
         // The phone's SyncManager reverse sync task (service 00150323) rides
         // quick-conn: its phys sync request embeds private_data with a logi
-        // opening (sync_info + AuthHandshake client_notify). Answering inside
-        // the response private_data is what un-parks the phone's kAuthClient
-        // so the sync exchange can populate DevRepo. TeleService relayCall
-        // dials embed the same way — route those to the relay call session.
+        // opening (sync_info + AuthHandshake client_notify). Answering with
+        // standalone logi frames (f8-less sync_info + server_notify) is what
+        // un-parks the phone's kAuthClient so the sync exchange can populate
+        // DevRepo. TeleService relayCall dials embed the same way — route
+        // those to the relay call session.
         var quickConn = syncTaskServer.responsePrivateData(
             requestTrailingFields: request.trailingFields
         )
@@ -1824,7 +1963,7 @@ final class LyraMeshResponder {
             LyraProtoWriter.appendLengthDelimitedField(1, value: logiFrame.serialized(), to: &wrapper)
             var privateData = Data()
             LyraProtoWriter.appendLengthDelimitedField(2, value: wrapper, to: &privateData)
-            quickConn = (privateData, logiFrame)
+            quickConn = (privateData, [logiFrame])
             DiagnosticsLog.info(
                 "xiaomi.relaycall.embedded_quickconn connId=\(opening.logiConn.logiConnId) " +
                     "privateDataBytes=\(privateData.count)"
@@ -1834,7 +1973,7 @@ final class LyraMeshResponder {
         let response = PhysConnSyncDeviceInfoResponse(
             timestampMs: UInt64(Date().timeIntervalSince1970 * 1000),
             deviceInfo: deviceInfo,
-            privateData: quickConn?.privateData,
+            privateData: quickConn.flatMap { $0.privateData },
             networkInfo: networkInfo
         )
         let responsePhysConn = PhysConnFrame(
@@ -1853,16 +1992,17 @@ final class LyraMeshResponder {
                     "physConnId=\(physConn.field1) hex=\(responsePayload.map { String(format: "%02x", $0) }.joined())"
             )
             if let quickConn {
-                // Also offer the sync_info + server_notify as a standalone logi
-                // frame: if the phone's auth-reuse check rejects the embedded
-                // copy it falls back to the normal logi-conn handshake.
-                let miLogi = MiConnectFrame(version: 0, logiConnFrames: [quickConn.logiFrame])
+                // Offer the server sync_info (+ server_notify for embedded
+                // client_notify dials) as standalone logi frames on the conn —
+                // the official Mac's shape (2026-08-05 pcap).
+                let miLogi = MiConnectFrame(version: 0, logiConnFrames: quickConn.logiFrames)
                 socket.sendInboundAsync(
                     frame: LyraMeshPack.Frame(packType: 2, payload: miLogi.serialized()),
                     toEndpointDescription: endpoint.debugDescription
                 )
                 DiagnosticsLog.info(
-                    "xiaomi.synctask.logi_sync_info_tx connId=\(quickConn.logiFrame.logiConnId)"
+                    "xiaomi.synctask.logi_sync_info_tx connId=\(quickConn.logiFrames.first?.logiConnId ?? 0) " +
+                        "frames=\(quickConn.logiFrames.count)"
                 )
             }
             sendAnnounce(endpointDescription: endpoint.debugDescription)

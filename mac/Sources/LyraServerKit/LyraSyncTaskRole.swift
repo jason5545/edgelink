@@ -151,13 +151,15 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
               case let .syncInfo(syncInfoData) = inner.payload
         else {
             // Auth-reuse dials get their server sync_info here too; a missing
-            // private_data means the Mac's sync server ignored us.
+            // private_data means the Mac answers on the conn instead (official
+            // Mac shape, 2026-08-05 pcap: no embedded answer, standalone
+            // sync_info + server_notify) — wait for the on-conn server_notify
+            // and consume it with the embedded handshake's client.
             if state == .established {
                 pushPayload(server: server)
                 return
             }
-            state = .failed("no private_data in phys sync response")
-            onEvent("sync task failed: no private_data")
+            onEvent("sync task awaiting on-conn server_notify")
             return
         }
         if state == .established {
@@ -206,8 +208,10 @@ public final class LyraSyncTaskRole: LyraServiceHandler {
         syncInfoData: Data, logiConn: LogiConnFrame, server: LyraPhoneMeshServer
     ) {
         // Classic dial: the server's sync_info answer kicks off the
-        // full-handshake client_notify on the conn.
-        guard state == .handshaking else { return }
+        // full-handshake client_notify on the conn. A quick-conn dial already
+        // has its embedded handshake in flight (client != nil) — the on-conn
+        // sync_info is just the server's opening there, not a kickoff.
+        guard state == .handshaking, client == nil else { return }
         let authClient = LyraAuthHandshake.Client(identity: identity)
         client = authClient
         let clientNotify = authClient.makeClientNotify()

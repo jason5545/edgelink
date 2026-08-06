@@ -97,6 +97,23 @@ struct MiTrustTicketStore {
         return true
     }
 
+    // Harvests the phone's account identity pubkey straight from a Mijia cert
+    // DER (account-pair client_finished carries it). Live 2026-08-06: after an
+    // account-pair sync the phone signs AUTH-family messages with this key —
+    // without the harvest both directions fail verification ("verify failed").
+    @discardableResult
+    static func harvestPeerAccountPubKey(fromCertDER certDER: Data) -> Bool {
+        guard let cert = SecCertificateCreateWithData(nil, certDER as CFData),
+              let key = SecCertificateCopyKey(cert),
+              let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+              rep.count == 65, rep.first == 0x04,
+              rep != current().peerAccountPubKey
+        else { return false }
+        UserDefaults.standard.set(rep.base64EncodedString(), forKey: "xiaomiTrustPeerAccountPubB64")
+        DiagnosticsLog.info("xiaomi.trust.peer_account_pub_harvested source=cert bytes=\(rep.count)")
+        return true
+    }
+
     // Persistent 32-byte device key, advertised as TrustedDeviceInfo f13 (the
     // officially paired Mac and the phone both carry one in their DevRepo
     // entries). The phone's DeviceKeyManager resolves it for auth reuse —
