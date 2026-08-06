@@ -327,7 +327,8 @@ data class PhoneActionBody(
     val relayControlPort: Int? = null,
     val lanHost: String? = null,
     val lanPort: Int? = null,
-    val lanProbePort: Int? = null
+    val lanProbePort: Int? = null,
+    val skipDial: Boolean? = null
 )
 
 @Serializable

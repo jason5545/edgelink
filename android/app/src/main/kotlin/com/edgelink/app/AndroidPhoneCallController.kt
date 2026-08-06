@@ -39,6 +39,20 @@ class AndroidPhoneCallController(context: Context) {
                 error = "invalid_number",
                 ts = now
             )
+        if (body.skipDial == true) {
+            // The native Xiaomi relay path already placed the call with
+            // telecomm.EXTRA_CALL_RELAYED; we only attach the audio bridge.
+            EdgeLinkLog.info(
+                "phone.android.action_skip_dial numberFp=${AndroidSmsSync.fingerprint(number)}"
+            )
+            return PhoneActionResultBody(
+                requestId = body.requestId,
+                action = body.action,
+                success = true,
+                error = null,
+                ts = now
+            )
+        }
         val telUri = "tel:$number"
         return runCatching {
             AndroidShizukuSupport.placePhoneCall(appContext, telUri)

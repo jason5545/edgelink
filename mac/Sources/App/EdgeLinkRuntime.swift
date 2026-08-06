@@ -1246,8 +1246,10 @@ final class EdgeLinkRuntime: ObservableObject {
             startNativeRelayDial(number: number) { [weak self] nativeSent in
                 guard let self else { return }
                 if nativeSent {
-                    phoneCallStatus = String(localized: "已透過原生中繼撥出")
-                    DiagnosticsLog.info("phone.mac.bridge_dial_suppressed native_relay_ok")
+                    // Native relay placed the call; attach the audio bridge
+                    // without letting the phone place a second call.
+                    _ = self.sendPhoneAction(action: "dial", number: number, skipDial: true)
+                    DiagnosticsLog.info("phone.mac.bridge_dial_skip_dial native_relay_ok")
                     return
                 }
                 DiagnosticsLog.info("phone.mac.bridge_dial_fallback native_relay_failed")
@@ -3182,7 +3184,7 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     @discardableResult
-    private func sendPhoneAction(action: String, number: String? = nil) -> String? {
+    private func sendPhoneAction(action: String, number: String? = nil, skipDial: Bool = false) -> String? {
         guard let session = currentSession, isConnected else {
             phoneCallStatus = String(localized: "電話目前不可用")
             DiagnosticsLog.warn("phone.mac.action_ignored action=\(action) not_connected")
@@ -3207,7 +3209,8 @@ final class EdgeLinkRuntime: ObservableObject {
                     relayControlPort: endpoint.controlPort,
                     lanHost: endpoint.lanHost,
                     lanPort: endpoint.lanPort,
-                    lanProbePort: endpoint.lanProbePort
+                    lanProbePort: endpoint.lanProbePort,
+                    skipDial: skipDial ? true : nil
                 )
                 self.pendingPhoneActions[requestId] = body
                 await self.sendPhoneActionBody(body, session: session)

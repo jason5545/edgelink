@@ -508,6 +508,9 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
     public let lanHost: String?
     public let lanPort: Int?
     public let lanProbePort: Int?
+    // Native Xiaomi relay dial already placed the call — attach the audio
+    // bridge without placing a second call.
+    public let skipDial: Bool?
 
     public init(
         requestId: String,
@@ -519,7 +522,8 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         relayControlPort: Int? = nil,
         lanHost: String? = nil,
         lanPort: Int? = nil,
-        lanProbePort: Int? = nil
+        lanProbePort: Int? = nil,
+        skipDial: Bool? = nil
     ) {
         self.requestId = requestId
         self.action = action
@@ -531,6 +535,7 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         self.lanHost = lanHost
         self.lanPort = lanPort
         self.lanProbePort = lanProbePort
+        self.skipDial = skipDial
     }
 }
 
