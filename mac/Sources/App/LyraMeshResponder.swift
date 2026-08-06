@@ -825,6 +825,33 @@ final class LyraMeshResponder {
                 )
             )
         }
+        if UserDefaults.standard.object(forKey: "xiaomiDistHardwareAdvertise") as? Bool ?? false {
+            // milink DistributedHardware static service (marker data [1,1,1,1]
+            // like the phone's own tdi) + dynamic metadata version + the
+            // audiomonitor RPC service, so the phone pulls our HardwareInfo
+            // and can route relayed-call audio to us.
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "distributedHardware",
+                    package: "com.milink.service",
+                    data: Data([0x01, 0x01, 0x01, 0x01])
+                )
+            )
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "publicMetadataVersion",
+                    package: "com.milink.service",
+                    data: Data([0x00, 0x01])
+                )
+            )
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "DistAudioService",
+                    package: "com.miui.audiomonitor",
+                    data: Data([0x01, 0x01, 0x01, 0x01])
+                )
+            )
+        }
         return services
     }
 
@@ -1370,6 +1397,40 @@ final class LyraMeshResponder {
                     try reply(responseFrame)
                 } catch {
                     DiagnosticsLog.error("xiaomi.synctask.classic_response_failed", error)
+                }
+                return
+            }
+            if serviceName == LyraDistHardwareSession.serviceName
+                || serviceName == LyraDistAudioRpcSession.serviceName {
+                // milink/audiomonitor pull dials on a classic conn.
+                guard let deviceIdHex = deviceIdHexProvider() else { return }
+                let ticketStore = MiTrustTicketStore.current()
+                let reuseKey = ticketStore.sessionKey
+                    ?? MiTrustTicketStore.lastAuthSessionKeyData.map { SymmetricKey(data: $0) }
+                let endpointDescription = endpoint.debugDescription
+                let send: (LyraMeshPack.Frame, String) -> Void = { [weak self] frame, _ in
+                    self?.socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+                }
+                if serviceName == LyraDistHardwareSession.serviceName {
+                    LyraDistHardwareSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: reuseKey,
+                        deviceIdHex: deviceIdHex,
+                        deviceName: displayNameProvider(),
+                        send: send
+                    )
+                } else {
+                    LyraDistAudioRpcSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: reuseKey,
+                        deviceIdHex: deviceIdHex,
+                        deviceName: displayNameProvider(),
+                        send: send
+                    )
                 }
                 return
             }
@@ -1936,18 +1997,43 @@ final class LyraMeshResponder {
         )
         if quickConn == nil,
            let opening = syncTaskServer.embeddedLogiOpening(requestTrailingFields: request.trailingFields),
-           opening.service == LyraRelayCallSession.serviceName {
+           opening.service == LyraRelayCallSession.serviceName || opening.service == LyraDistHardwareSession.serviceName
+               || opening.service == LyraDistAudioRpcSession.serviceName {
             let ticketStore = MiTrustTicketStore.current()
             let reuseKey = ticketStore.sessionKey
                 ?? MiTrustTicketStore.lastAuthSessionKeyData.map { SymmetricKey(data: $0) }
             let endpointDescription = endpoint.debugDescription
-            LyraRelayCallSession.adopt(
-                syncInfoData: opening.syncInfo,
-                logiConn: opening.logiConn,
-                endpoint: endpoint,
-                sessionKey: reuseKey
-            ) { [weak self] frame, _ in
+            let send: (LyraMeshPack.Frame, String) -> Void = { [weak self] frame, _ in
                 self?.socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+            }
+            if opening.service == LyraRelayCallSession.serviceName {
+                LyraRelayCallSession.adopt(
+                    syncInfoData: opening.syncInfo,
+                    logiConn: opening.logiConn,
+                    endpoint: endpoint,
+                    sessionKey: reuseKey,
+                    send: send
+                )
+            } else if opening.service == LyraDistHardwareSession.serviceName {
+                LyraDistHardwareSession.adopt(
+                    syncInfoData: opening.syncInfo,
+                    logiConn: opening.logiConn,
+                    endpoint: endpoint,
+                    sessionKey: reuseKey,
+                    deviceIdHex: deviceIdHex,
+                    deviceName: displayNameProvider(),
+                    send: send
+                )
+            } else {
+                LyraDistAudioRpcSession.adopt(
+                    syncInfoData: opening.syncInfo,
+                    logiConn: opening.logiConn,
+                    endpoint: endpoint,
+                    sessionKey: reuseKey,
+                    deviceIdHex: deviceIdHex,
+                    deviceName: displayNameProvider(),
+                    send: send
+                )
             }
             let serverSyncInfo = LyraRelayCallSession.serverSyncInfo(
                 ticketStore: ticketStore, sessionKey: reuseKey

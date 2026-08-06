@@ -72,6 +72,24 @@ enum LyraSyncReply {
                 )
             )
         }
+        if UserDefaults.standard.object(forKey: "xiaomiDistHardwareAdvertise") as? Bool ?? false {
+            // The sync-path device info is what feeds the phone's
+            // BusinessServiceInfo store (ServiceListener notifications) —
+            // the mesh-announce tdi alone never produced one for
+            // DistAudioService (RpcManager "no RPC service to device").
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "DistAudioService", package: "com.miui.audiomonitor",
+                    data: Data("1".utf8)
+                )
+            )
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "publicMetadataVersion", package: "com.milink.service",
+                    data: Data([0x00, 0x01])
+                )
+            )
+        }
         return services
     }
 

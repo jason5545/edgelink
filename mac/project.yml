@@ -159,6 +159,10 @@ targets:
       - path: Sources/App/LyraMeshResponder.swift
       - path: Sources/App/LyraTunnelManager.swift
       - path: Sources/App/LyraRelayCallSession.swift
+      - path: Sources/App/LyraRelayCallDialer.swift
+      - path: Sources/App/LyraDistHardwareSession.swift
+      - path: Sources/App/LyraDistAudioRpcSession.swift
+      - path: Sources/App/LyraDistAudioWFD.swift
       - path: Sources/App/XiaomiMirrorWFDClient.swift
       - path: Sources/App/XiaomiMirrorFlowController.swift
       - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift

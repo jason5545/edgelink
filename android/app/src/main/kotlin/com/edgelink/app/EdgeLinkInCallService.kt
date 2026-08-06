@@ -10,11 +10,14 @@ import java.util.IdentityHashMap
 private const val PHONE_DTMF_TONE_DURATION_MS = 180L
 private const val PHONE_DTMF_TONE_GAP_MS = 120L
 private const val PHONE_DTMF_SEQUENCE_PAUSE_MS = 650L
+private const val EXTRA_CALL_RELAYED = "telecomm.EXTRA_CALL_RELAYED"
+private const val EXTRA_RELAY_DEVICE_ID = "telecomm.EXTRA_RELAY_DEVICE_ID"
 
 class EdgeLinkInCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         EdgeLinkLog.configure(applicationContext)
+        DistAudioConnector.appContext = applicationContext
         runCatching {
             EdgeLinkForegroundService.ensureStarted(applicationContext)
         }.onFailure { error ->
@@ -75,7 +78,20 @@ private object EdgeLinkInCallCallStore {
             override fun onStateChanged(call: Call, state: Int) {
                 EdgeLinkLog.info("phone.android.incall_service state=$state calls=${callStatesSummary()}")
                 EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "state_changed"))
+                if (state == Call.STATE_ACTIVE) {
+                    val extras = call.details?.extras
+                    if (extras?.getBoolean(EXTRA_CALL_RELAYED) == true) {
+                        val deviceId = extras.getString(EXTRA_RELAY_DEVICE_ID).orEmpty()
+                        if (deviceId.isNotEmpty()) {
+                            DistAudioConnector.appContext?.let { context ->
+                                DistAudioConnector.onRelayedCallActive(context, deviceId)
+                            }
+                        }
+                    }
+                }
                 if (state == Call.STATE_DISCONNECTED) {
+                    val deviceId = call.details?.extras?.getString(EXTRA_RELAY_DEVICE_ID)
+                    DistAudioConnector.onCallEnded(deviceId)
                     remove(call, "disconnected")
                 }
             }

@@ -3,30 +3,35 @@ import EdgeLinkKit
 import Foundation
 import Network
 
-// Server side of the TeleService relayCall dial (com.ios.phone:relayCall).
-// The phone dials our device after discovering the relayCall service in our
-// encrypted mesh announce; its sync_info carries an auth-reuse cred plus a
-// quick-conn ConnRequestFrame, both AES-GCM'd with the AuthHandshake session
-// key from the announce conn.
-final class LyraRelayCallSession {
-    static let serviceName = "com.ios.phone:relayCall"
-    static let servicePackage = "com.ios.phone"
+// Server side of the audiomonitor DistAudio JSON-RPC service
+// (com.miui.audiomonitor:DistAudioService). After the phone connects a
+// DistAudio device (TeleService DistAudioDeviceProvider.connectDistAudioDevice),
+// it dials this service and calls distAudio.openSpeaker / openMicrophone
+// (JSON-RPC 2.0 over the lyra channel). We answer with real endpoints and
+// capture the MiPlayCast/RTSP bytes both ways to ground-truth the transport.
+final class LyraDistAudioRpcSession {
+    static let serviceName = "com.miui.audiomonitor:DistAudioService"
+    static let servicePackage = "com.miui.audiomonitor"
 
-    private(set) static var activeRelaySession: LyraRelayCallSession?
+    private(set) static var activeSession: LyraDistAudioRpcSession?
 
     static func adopt(
         syncInfoData: Data,
         logiConn: LogiConnFrame,
         endpoint: NWEndpoint,
         sessionKey: SymmetricKey?,
+        deviceIdHex: String,
+        deviceName: String,
         send: @escaping (LyraMeshPack.Frame, String) -> Void
-    ) -> LyraRelayCallSession {
-        if let existing = activeRelaySession, existing.connId != logiConn.logiConnId {
+    ) -> LyraDistAudioRpcSession {
+        if let existing = activeSession, existing.connId != logiConn.logiConnId {
             existing.teardown()
-            activeRelaySession = nil
+            activeSession = nil
         }
-        let session = activeRelaySession ?? LyraRelayCallSession(send: send)
-        activeRelaySession = session
+        let session = activeSession ?? LyraDistAudioRpcSession(send: send)
+        session.deviceIdHex = deviceIdHex
+        session.deviceName = deviceName
+        activeSession = session
         session.handleSyncInfo(syncInfoData: syncInfoData, logiConn: logiConn, sessionKey: sessionKey)
         return session
     }
@@ -35,13 +40,14 @@ final class LyraRelayCallSession {
     private var connId: UInt32 = 0
     private var peerNetId: UInt32 = 0
     private var sessionKey: SymmetricKey?
+    private var deviceIdHex = ""
+    private var deviceName = ""
     private var responseSent = false
     private var peerPortAwaitingAck = false
     private var peerPortResponseSent = false
     private var channelSocket: LyraChannelSocket?
     private var transKey = Data()
     private var peerChannelId: UInt64 = 0
-    private var methodCounter: UInt64 = 0
 
     init(send: @escaping (LyraMeshPack.Frame, String) -> Void) {
         self.send = send
@@ -54,6 +60,7 @@ final class LyraRelayCallSession {
     func teardown() {
         channelSocket?.stop()
         channelSocket = nil
+        stopAudioTransport()
     }
 
     private func lengthDelimited(_ fieldNumber: Int, in data: Data) -> Data? {
@@ -71,121 +78,36 @@ final class LyraRelayCallSession {
         peerNetId = logiConn.localNetId
         self.sessionKey = sessionKey
         let ticketStore = MiTrustTicketStore.current()
-        let peerKeyIndex = varint(3, in: syncInfoData) ?? 0
-        let peerEncryptedCred = lengthDelimited(6, in: syncInfoData) ?? Data()
         let quickConn = lengthDelimited(8, in: syncInfoData) ?? Data()
         DiagnosticsLog.info(
-            "xiaomi.relaycall.peer_sync_info connId=\(connId) keyIndex=\(peerKeyIndex) " +
-                "encCredBytes=\(peerEncryptedCred.count) quickConnBytes=\(quickConn.count)"
+            "xiaomi.distrpc.peer_sync_info connId=\(connId) quickConnBytes=\(quickConn.count)"
         )
-        if !peerEncryptedCred.isEmpty {
-            if let sessionKey, let plaintext = ticketStore.decrypt(peerEncryptedCred, with: sessionKey) {
-                DiagnosticsLog.info("xiaomi.relaycall.peer_cred_decrypted bytes=\(plaintext.count)")
-            } else {
-                DiagnosticsLog.warn("xiaomi.relaycall.peer_cred_decrypt_failed")
-            }
-        }
 
-        let syncInfo = Self.serverSyncInfo(ticketStore: ticketStore, sessionKey: sessionKey)
+        let syncInfo = LyraRelayCallSession.serverSyncInfo(ticketStore: ticketStore, sessionKey: sessionKey)
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
         let frame = LogiConnFrame(
             logiConnId: connId, localNetId: 1, remoteNetId: peerNetId, inner: inner.serialized()
         )
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
-        send(LyraMeshPack.Frame(packType: 2, payload: miFrame.serialized()), "relaycall_sync_info")
+        send(LyraMeshPack.Frame(packType: 2, payload: miFrame.serialized()), "distrpc_sync_info")
 
         if !quickConn.isEmpty {
-            handleQuickConn(quickConn, ticketStore: ticketStore)
+            handleQuickConn(quickConn)
         }
     }
 
-    // Server-side sync_info for the relayCall dial ({10000, 16, key_index,
-    // uidFeature, encrypted_cred}) — shared by the conn-level reply and the
-    // phys sync response private_data (quick-conn dials).
-    static func serverSyncInfo(ticketStore: MiTrustTicketStore, sessionKey: SymmetricKey?) -> Data {
-        var syncInfo = Data()
-        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
-        LyraProtoWriter.appendVarintField(3, value: ticketStore.myKeyIndex, to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(5, value: ticketStore.uidFeatureInfo(), to: &syncInfo)
-        let credKey = sessionKey ?? ticketStore.sessionKey ?? ticketStore.ticketKey
-        if let credKey, let identityPrivateKey = ticketStore.identityPrivateKey {
-            var nonce32 = Data(count: 32)
-            nonce32.withUnsafeMutableBytes { buffer in
-                if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-            }
-            if let signature = try? identityPrivateKey.signature(for: SHA256.hash(data: nonce32)),
-               let blob = sealCred(nonce: nonce32, derSignature: signature.derRepresentation, key: credKey)
-            {
-                LyraProtoWriter.appendLengthDelimitedField(6, value: blob, to: &syncInfo)
-            }
-        }
-        return syncInfo
-    }
-
-    private static func sealCred(nonce: Data, derSignature: Data, key: SymmetricKey) -> Data? {
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: derSignature, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendVarintField(1, value: 2, to: &credFeature)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        var frame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &frame)
-        let gcmNonce = AES.GCM.Nonce()
-        guard let sealed = try? AES.GCM.seal(frame, using: key, nonce: gcmNonce) else { return nil }
-        var blob = Data()
-        blob.append(contentsOf: gcmNonce.withUnsafeBytes { Data($0) })
-        blob.append(sealed.ciphertext)
-        blob.append(sealed.tag)
-        return blob
-    }
-
-    private func encryptLocalCred(ticketStore: MiTrustTicketStore) -> Data? {
-        guard let identityPrivateKey = ticketStore.identityPrivateKey else { return nil }
-        let key = sessionKey ?? ticketStore.sessionKey ?? ticketStore.ticketKey
-        guard let key else { return nil }
-        var nonce32 = Data(count: 32)
-        nonce32.withUnsafeMutableBytes { buffer in
-            if let base = buffer.baseAddress { arc4random_buf(base, 32) }
-        }
-        guard let signature = try? identityPrivateKey.signature(for: SHA256.hash(data: nonce32)) else {
-            return nil
-        }
-        var pubKeyCred = Data()
-        LyraProtoWriter.appendLengthDelimitedField(1, value: nonce32, to: &pubKeyCred)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &pubKeyCred)
-        var credFeature = Data()
-        LyraProtoWriter.appendVarintField(1, value: 2, to: &credFeature)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: pubKeyCred, to: &credFeature)
-        var frame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 1, to: &frame)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: credFeature, to: &frame)
-        do {
-            let nonce = AES.GCM.Nonce()
-            let sealed = try AES.GCM.seal(frame, using: key, nonce: nonce)
-            var blob = Data()
-            blob.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
-            blob.append(sealed.ciphertext)
-            blob.append(sealed.tag)
-            return blob
-        } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.cred_encrypt_failed", error)
-            return nil
-        }
-    }
-
-    private func handleQuickConn(_ quickConn: Data, ticketStore: MiTrustTicketStore) {
-        guard let sessionKey, let plaintext = ticketStore.decrypt(quickConn, with: sessionKey) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.quickconn_decrypt_failed")
+    private func handleQuickConn(_ quickConn: Data) {
+        guard let sessionKey,
+              let plaintext = MiTrustTicketStore.current().decrypt(quickConn, with: sessionKey)
+        else {
+            DiagnosticsLog.warn("xiaomi.distrpc.quickconn_decrypt_failed")
             return
         }
         let request = lengthDelimited(2, in: plaintext) ?? Data()
         let userInfo = lengthDelimited(3, in: request) ?? Data()
         let peerPortRequest = lengthDelimited(10, in: userInfo)
         DiagnosticsLog.info(
-            "xiaomi.relaycall.quickconn_decrypted userInfoBytes=\(userInfo.count) " +
+            "xiaomi.distrpc.quickconn_decrypted userInfoBytes=\(userInfo.count) " +
                 "hasPeerPort=\(peerPortRequest != nil)"
         )
         sendLogiResponse()
@@ -200,14 +122,41 @@ final class LyraRelayCallSession {
             guard !responseSent else { return }
         }
         responseSent = true
-        let serverInfo = LyraMitrustResponse.serverUserInfo(
+        // The RPC dial (ServerChannelOptionsV2) carries a V2-confirm userData
+        // payload in userInfo field 4 — {"serviceVersion":"","userData":"DistAudio"}
+        // (wire capture 2026-08-06). The phone's client waits for our confirm
+        // to echo it ("logical conn remote confirm timeout" otherwise).
+        let base = LyraMitrustResponse.serverUserInfo(
             package: Self.servicePackage,
             nodeIdColonHex: Self.serverFingerprint,
             medium: 136
         )
-        let responseFrame = LyraMitrustResponse.logiConnResponse(userInfo: serverInfo)
+        var userInfo = Data()
+        let fields = (try? LyraProtoReader.readFields(from: base)) ?? []
+        var inserted = false
+        for field in fields {
+            if !inserted, field.number > 4 {
+                LyraProtoWriter.appendLengthDelimitedField(
+                    4,
+                    value: Data("{\"serviceVersion\":\"\",\"userData\":\"DistAudio\"}".utf8),
+                    to: &userInfo
+                )
+                inserted = true
+            }
+            switch field.wireType {
+            case 0:
+                LyraProtoWriter.appendVarintField(field.number, value: field.varintValue ?? 0, to: &userInfo)
+            case 2:
+                LyraProtoWriter.appendLengthDelimitedField(
+                    field.number, value: field.lengthDelimitedValue ?? Data(), to: &userInfo
+                )
+            default:
+                continue
+            }
+        }
+        let responseFrame = LyraMitrustResponse.logiConnResponse(userInfo: userInfo)
         let inner = LogiConnInnerFrame(frameType: 2, payload: .response(responseFrame))
-        sendEncrypted(inner: inner, label: "relaycall_logi_response")
+        sendEncrypted(inner: inner, label: "distrpc_logi_response")
     }
 
     private static var serverFingerprint: String {
@@ -243,7 +192,7 @@ final class LyraRelayCallSession {
             let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
             send(LyraMeshPack.Frame(packType: 2, payload: miFrame.serialized()), label)
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.encrypt_failed label=\(label)", error)
+            DiagnosticsLog.error("xiaomi.distrpc.encrypt_failed label=\(label)", error)
         }
     }
 
@@ -253,7 +202,7 @@ final class LyraRelayCallSession {
             return
         }
         guard let inner = LogiConnInnerFrame(parsing: logiConn.inner) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.plain_parse_failed bytes=\(logiConn.inner.count)")
+            DiagnosticsLog.warn("xiaomi.distrpc.plain_parse_failed bytes=\(logiConn.inner.count)")
             return
         }
         switch inner.payload {
@@ -261,17 +210,16 @@ final class LyraRelayCallSession {
             handleAuthUpgrade(upgradeData)
         case let .disconnect(data):
             let code = varint(1, in: data) ?? 0
-            DiagnosticsLog.warn("xiaomi.relaycall.disconnect code=\(code)")
-            LyraRelayCallDialer.activeDialer?.cancelRedial()
+            DiagnosticsLog.warn("xiaomi.distrpc.disconnect code=\(code)")
             teardown()
-            if Self.activeRelaySession === self {
-                Self.activeRelaySession = nil
+            if Self.activeSession === self {
+                Self.activeSession = nil
             }
         case let .request(requestData):
             handleLogiRequest(requestData)
         default:
             DiagnosticsLog.info(
-                "xiaomi.relaycall.plain_frame frameType=\(inner.frameType) bytes=\(logiConn.inner.count)"
+                "xiaomi.distrpc.plain_frame frameType=\(inner.frameType) bytes=\(logiConn.inner.count)"
             )
         }
     }
@@ -288,11 +236,11 @@ final class LyraRelayCallSession {
               let plaintext = try? AES.GCM.open(box, using: sessionKey),
               let decoded = LogiConnInnerFrame(parsing: plaintext)
         else {
-            DiagnosticsLog.warn("xiaomi.relaycall.decrypt_failed bytes=\(logiConn.inner.count)")
+            DiagnosticsLog.warn("xiaomi.distrpc.decrypt_failed bytes=\(logiConn.inner.count)")
             return
         }
         if decoded.frameType == 3 {
-            DiagnosticsLog.info("xiaomi.relaycall.response_ack_rx")
+            DiagnosticsLog.info("xiaomi.distrpc.response_ack_rx")
             peerPortAwaitingAck = false
             sendPeerPortResponseIfReady()
             return
@@ -303,7 +251,6 @@ final class LyraRelayCallSession {
         }
         let payloadData = decoded.payload?.data ?? Data()
         if let (header, commandBody) = try? LyraChannelProtocol.decode(payloadData) {
-            DiagnosticsLog.info("xiaomi.relaycall.command type=\(header.type) frameType=\(decoded.frameType)")
             if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue {
                 prepareChannel(peerPortRequest: commandBody)
                 sendPeerPortResponseIfReady()
@@ -311,7 +258,7 @@ final class LyraRelayCallSession {
             return
         }
         DiagnosticsLog.info(
-            "xiaomi.relaycall.frame frameType=\(decoded.frameType) bytes=\(payloadData.count) " +
+            "xiaomi.distrpc.frame frameType=\(decoded.frameType) bytes=\(payloadData.count) " +
                 "head=\(payloadData.prefix(32).map { String(format: "%02x", $0) }.joined())"
         )
     }
@@ -320,7 +267,8 @@ final class LyraRelayCallSession {
         let userInfo = lengthDelimited(3, in: requestData) ?? Data()
         let peerPortRequest = lengthDelimited(10, in: userInfo)
         DiagnosticsLog.info(
-            "xiaomi.relaycall.logi_request_rx userInfoBytes=\(userInfo.count) hasPeerPort=\(peerPortRequest != nil)"
+            "xiaomi.distrpc.logi_request_rx userInfoBytes=\(userInfo.count) hasPeerPort=\(peerPortRequest != nil) " +
+                "userInfoHex=\(userInfo.map { String(format: "%02x", $0) }.joined())"
         )
         // REQUESTs may be KCP retransmits of one whose answer was lost
         // or keyed pre-auth — always re-answer with the current session key.
@@ -331,7 +279,7 @@ final class LyraRelayCallSession {
         }
     }
 
-    // MARK: - AuthHandshake server (fallback when auth reuse fails)
+    // MARK: - AuthHandshake server (account-pair family + AUTH fallback reply)
 
     private var authServerEphPriv: P256.KeyAgreement.PrivateKey?
     private var authClientEphPub = Data()
@@ -351,8 +299,6 @@ final class LyraRelayCallSession {
         0x6b, 0x4e, 0x9e, 0xe2, 0x57, 0x92, 0x4b, 0xaf,
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
     ])
-    // Account-pair family salt pair (libmicontinuity.so AccountPairHandshake,
-    // same as LyraSyncTaskServer / LyraMeshAnnouncer).
     private static let accountPairSessionSalt = Data([
         0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
         0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
@@ -371,9 +317,7 @@ final class LyraRelayCallSession {
         guard let handshake = lengthDelimited(2, in: upgradeData),
               let handshakeId = varint(1, in: upgradeData)
         else {
-            DiagnosticsLog.warn(
-                "xiaomi.relaycall.auth_parse_failed hex=\(upgradeData.prefix(48).map { String(format: "%02x", $0) }.joined())"
-            )
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_parse_failed")
             return
         }
         let accountFrame = lengthDelimited(6, in: handshake)
@@ -381,9 +325,7 @@ final class LyraRelayCallSession {
         handshakeIsAccountPair[handshakeId] = accountFrame != nil && lengthDelimited(7, in: handshake) == nil
         guard let authFrame, let step = varint(1, in: authFrame)
         else {
-            DiagnosticsLog.warn(
-                "xiaomi.relaycall.auth_parse_failed hex=\(upgradeData.prefix(48).map { String(format: "%02x", $0) }.joined())"
-            )
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_parse_failed")
             return
         }
         switch step {
@@ -392,7 +334,7 @@ final class LyraRelayCallSession {
         case 3:
             handleAuthClientFinished(authFrame: authFrame, handshakeId: handshakeId)
         default:
-            DiagnosticsLog.info("xiaomi.relaycall.auth_other step=\(step)")
+            DiagnosticsLog.info("xiaomi.distrpc.auth_other step=\(step)")
         }
     }
 
@@ -427,12 +369,7 @@ final class LyraRelayCallSession {
               let clientPub = lengthDelimited(2, in: publicKeyMessage),
               clientPub.count == 65, clientPub.first == 0x04
         else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_notify_parse_failed")
-            return
-        }
-        let ticketStore = MiTrustTicketStore.current()
-        guard let identityKey = ticketStore.identityPrivateKey else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_no_identity")
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_notify_parse_failed")
             return
         }
         let privateKey = P256.KeyAgreement.PrivateKey()
@@ -446,7 +383,7 @@ final class LyraRelayCallSession {
             let peerKey = try P256.KeyAgreement.PublicKey(x963Representation: clientPub)
             secret = try privateKey.sharedSecretFromKeyAgreement(with: peerKey).withUnsafeBytes { Data($0) }
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.auth_ecdh_failed", error)
+            DiagnosticsLog.error("xiaomi.distrpc.auth_ecdh_failed", error)
             return
         }
         authServerEphPriv = privateKey
@@ -462,13 +399,16 @@ final class LyraRelayCallSession {
             )
             return
         }
-        guard let signature = try? identityKey.signature(for: SHA256.hash(data: serverPub + clientPub)) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_sign_failed")
+        let ticketStore = MiTrustTicketStore.current()
+        guard let identityKey = ticketStore.identityPrivateKey,
+              let signature = try? identityKey.signature(for: SHA256.hash(data: serverPub + clientPub))
+        else {
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_no_identity")
             return
         }
         let nonce = AES.GCM.Nonce()
         guard let sealed = try? AES.GCM.seal(signature.derRepresentation, using: SymmetricKey(data: secret), nonce: nonce) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_enc_failed")
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_enc_failed")
             return
         }
         var encSig = Data()
@@ -497,11 +437,9 @@ final class LyraRelayCallSession {
         var outAuthFrame = Data()
         LyraProtoWriter.appendVarintField(1, value: 2, to: &outAuthFrame)
         LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &outAuthFrame)
-        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_auth_server_notify")
+        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "distrpc_auth_server_notify")
     }
 
-    // Account-pair server_notify (mirrors LyraSyncTaskServer): encSig opens
-    // under Z to {our enrolled cert, sig by cert key over serverEph‖clientEph}.
     private func sendAccountPairServerNotify(
         cipherSuite: Data, secret: Data, serverPub: Data, clientPub: Data,
         serverRandom: Data, handshakeId: UInt64
@@ -509,7 +447,7 @@ final class LyraRelayCallSession {
         guard let (certDER, certPriv) = Self.enrolledCertMaterial(),
               let signature = try? certPriv.signature(for: SHA256.hash(data: serverPub + clientPub))
         else {
-            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_no_cert")
+            DiagnosticsLog.warn("xiaomi.distrpc.acctpair_no_cert")
             return
         }
         var credMessage = Data()
@@ -545,9 +483,9 @@ final class LyraRelayCallSession {
             var outAuthFrame = Data()
             LyraProtoWriter.appendVarintField(1, value: 2, to: &outAuthFrame)
             LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &outAuthFrame)
-            sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_acctpair_server_notify")
+            sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "distrpc_acctpair_server_notify")
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.acctpair_enc_failed", error)
+            DiagnosticsLog.error("xiaomi.distrpc.acctpair_enc_failed", error)
         }
     }
 
@@ -568,115 +506,80 @@ final class LyraRelayCallSession {
 
     private func handleAuthClientFinished(authFrame: Data, handshakeId: UInt64) {
         guard let clientFinished = lengthDelimited(4, in: authFrame),
-              let encSigC = lengthDelimited(1, in: clientFinished),
-              !encSigC.isEmpty,
               let serverEphPub = authServerEphPriv?.publicKey.x963Representation,
               !authSharedZ.isEmpty, !authClientEphPub.isEmpty
         else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_finished_parse_failed")
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_finished_parse_failed")
             return
         }
         let ticketStore = MiTrustTicketStore.current()
         let zKey = SymmetricKey(data: authSharedZ)
         if handshakeIsAccountPair[handshakeId] == true {
-            handleAccountPairClientFinished(
-                clientFinished: clientFinished, zKey: zKey, handshakeId: handshakeId
+            guard let credBlob = lengthDelimited(1, in: clientFinished),
+                  let credMessage = ticketStore.decrypt(credBlob, with: zKey),
+                  let phoneCert = lengthDelimited(1, in: credMessage),
+                  let phoneSig = lengthDelimited(2, in: credMessage),
+                  let cert = SecCertificateCreateWithData(nil, phoneCert as CFData),
+                  let key = SecCertificateCopyKey(cert),
+                  let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+                  let phonePub = try? P256.Signing.PublicKey(x963Representation: rep),
+                  let signature = try? P256.Signing.ECDSASignature(derRepresentation: phoneSig)
+            else {
+                DiagnosticsLog.warn("xiaomi.distrpc.acctpair_finished_parse_failed")
+                return
+            }
+            guard phonePub.isValidSignature(
+                signature, for: SHA256.hash(data: authClientEphPub + serverEphPub)
+            ) else {
+                DiagnosticsLog.warn("xiaomi.distrpc.acctpair_sig_invalid")
+                return
+            }
+            MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
+            completeHandshake(
+                zKey: zKey, sessionSalt: Self.accountPairSessionSalt, ticketSalt: Self.accountPairTicketSalt,
+                serverEphPub: serverEphPub, handshakeId: handshakeId,
+                label: "distrpc_acctpair_server_finished",
+                proof: lengthDelimited(2, in: clientFinished)
             )
             return
         }
-        guard let sigC = ticketStore.decrypt(encSigC, with: zKey) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_decrypt_failed")
+        guard let encSigC = lengthDelimited(1, in: clientFinished),
+              !encSigC.isEmpty,
+              let sigC = ticketStore.decrypt(encSigC, with: zKey),
+              let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigC)
+        else {
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_sig_decrypt_failed")
             return
         }
         let digest = SHA256.hash(data: authClientEphPub + serverEphPub)
-        guard let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigC) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_parse_failed")
-            return
-        }
         let verified = ticketStore.peerSigningPubKeys.contains { keyData in
             guard let key = try? P256.Signing.PublicKey(x963Representation: keyData) else { return false }
             return key.isValidSignature(signature, for: digest)
         }
         guard verified else {
-            DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_invalid")
+            DiagnosticsLog.warn("xiaomi.distrpc.auth_sig_invalid")
             return
         }
-        let newSessionKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: zKey,
-            salt: Self.sessionSalt,
-            info: authClientRandom + authServerRandom,
-            outputByteCount: 32
+        completeHandshake(
+            zKey: zKey, sessionSalt: Self.sessionSalt, ticketSalt: Self.ticketSalt,
+            serverEphPub: serverEphPub, handshakeId: handshakeId,
+            label: "distrpc_auth_server_finished", proof: nil
         )
-        let ticket = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: zKey,
-            salt: Self.ticketSalt,
-            info: authClientRandom + authServerRandom,
-            outputByteCount: 32
-        )
-        let sessionKeyData = newSessionKey.withUnsafeBytes { Data($0) }
-        MiTrustTicketStore.recordAuthSession(
-            sessionKey: sessionKeyData,
-            ticket: ticket.withUnsafeBytes { Data($0) }
-        )
-        sessionKey = newSessionKey
-
-        var serverFinished = Data()
-        do {
-            let nonce = AES.GCM.Nonce()
-            let sealed = try AES.GCM.seal(authSharedZ + serverEphPub, using: newSessionKey, nonce: nonce)
-            var blob = Data()
-            blob.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
-            blob.append(sealed.ciphertext)
-            blob.append(sealed.tag)
-            LyraProtoWriter.appendLengthDelimitedField(1, value: blob, to: &serverFinished)
-        } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.auth_finish_enc_failed", error)
-            return
-        }
-        var outAuthFrame = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &outAuthFrame)
-        LyraProtoWriter.appendLengthDelimitedField(5, value: serverFinished, to: &outAuthFrame)
-        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_auth_server_finished")
-        DiagnosticsLog.info("xiaomi.relaycall.auth_completed")
     }
 
-    // Account-pair client_finished: {f1:credBlob(AES-GCM(Z, {phone cert,
-    // sig over clientEph‖serverEph})), f2:proof(AES-GCM(sessionKey, 24B))}.
-    private func handleAccountPairClientFinished(
-        clientFinished: Data, zKey: SymmetricKey, handshakeId: UInt64
+    private func completeHandshake(
+        zKey: SymmetricKey, sessionSalt: Data, ticketSalt: Data,
+        serverEphPub: Data, handshakeId: UInt64, label: String, proof: Data?
     ) {
-        let ticketStore = MiTrustTicketStore.current()
-        guard let credBlob = lengthDelimited(1, in: clientFinished),
-              let credMessage = ticketStore.decrypt(credBlob, with: zKey),
-              let phoneCert = lengthDelimited(1, in: credMessage),
-              let phoneSig = lengthDelimited(2, in: credMessage),
-              let cert = SecCertificateCreateWithData(nil, phoneCert as CFData),
-              let key = SecCertificateCopyKey(cert),
-              let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
-              let phonePub = try? P256.Signing.PublicKey(x963Representation: rep),
-              let signature = try? P256.Signing.ECDSASignature(derRepresentation: phoneSig),
-              let serverEphPriv = authServerEphPriv
-        else {
-            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_finished_parse_failed")
-            return
-        }
-        let serverEphPub = serverEphPriv.publicKey.x963Representation
-        guard phonePub.isValidSignature(
-            signature, for: SHA256.hash(data: authClientEphPub + serverEphPub)
-        ) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_sig_invalid")
-            return
-        }
-        MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
         let newSessionKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: zKey,
-            salt: Self.accountPairSessionSalt,
+            salt: sessionSalt,
             info: authClientRandom + authServerRandom,
             outputByteCount: 32
         )
         let ticket = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: zKey,
-            salt: Self.accountPairTicketSalt,
+            salt: ticketSalt,
             info: authClientRandom + authServerRandom,
             outputByteCount: 32
         )
@@ -685,9 +588,9 @@ final class LyraRelayCallSession {
             ticket: ticket.withUnsafeBytes { Data($0) }
         )
         sessionKey = newSessionKey
-        if let proof = lengthDelimited(2, in: clientFinished) {
-            let proofOk = ticketStore.decrypt(proof, with: newSessionKey) != nil
-            DiagnosticsLog.info("xiaomi.relaycall.acctpair_proof ok=\(proofOk)")
+        if let proof {
+            let proofOk = MiTrustTicketStore.current().decrypt(proof, with: newSessionKey) != nil
+            DiagnosticsLog.info("xiaomi.distrpc.acctpair_proof ok=\(proofOk)")
         }
         var serverFinished = Data()
         do {
@@ -699,15 +602,17 @@ final class LyraRelayCallSession {
             blob.append(sealed.tag)
             LyraProtoWriter.appendLengthDelimitedField(1, value: blob, to: &serverFinished)
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.acctpair_finish_enc_failed", error)
+            DiagnosticsLog.error("xiaomi.distrpc.finish_enc_failed", error)
             return
         }
         var outAuthFrame = Data()
         LyraProtoWriter.appendVarintField(1, value: 4, to: &outAuthFrame)
         LyraProtoWriter.appendLengthDelimitedField(5, value: serverFinished, to: &outAuthFrame)
-        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_acctpair_server_finished")
-        DiagnosticsLog.info("xiaomi.relaycall.acctpair_completed")
+        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: label)
+        DiagnosticsLog.info("xiaomi.distrpc.handshake_completed")
     }
+
+    // MARK: - Channel
 
     private func prepareChannel(peerPortRequest: Data) {
         var channelId: UInt64 = 0
@@ -721,7 +626,7 @@ final class LyraRelayCallSession {
             }
         }
         guard !key.isEmpty else {
-            DiagnosticsLog.warn("xiaomi.relaycall.peer_port_bad_request")
+            DiagnosticsLog.warn("xiaomi.distrpc.peer_port_bad_request")
             return
         }
         guard channelSocket == nil else { return }
@@ -731,17 +636,20 @@ final class LyraRelayCallSession {
         socket.onMessage = { [weak self] message, _ in
             self?.handleChannelMessage(message)
         }
-        socket.onPeerConnected = { from in
-            DiagnosticsLog.info("xiaomi.relaycall.channel_peer from=\(from.debugDescription)")
+        socket.onPeerConnected = { [weak self] from in
+            DiagnosticsLog.info("xiaomi.distrpc.channel_peer from=\(from.debugDescription)")
+            // The RPC (openMicrophone) can arrive immediately after the channel
+            // is up — have the uplink port ready before then.
+            self?.startUplinkServer()
         }
         socket.onNegotiated = { serverChannelId, mtu in
-            DiagnosticsLog.info("xiaomi.relaycall.channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
+            DiagnosticsLog.info("xiaomi.distrpc.channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
         }
         do {
-            try socket.start(socketKey: key, serverChannelId: 6)
+            try socket.start(socketKey: key, serverChannelId: 10)
             channelSocket = socket
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.channel_start_failed", error)
+            DiagnosticsLog.error("xiaomi.distrpc.channel_start_failed", error)
         }
     }
 
@@ -756,7 +664,7 @@ final class LyraRelayCallSession {
         }
         let responseBody = LyraMitrustResponse.peerPortResponseBody(
             clientChannelId: peerChannelId,
-            serverChannelId: 6,
+            serverChannelId: 10,
             port: port,
             serverKey: serverKey
         )
@@ -765,9 +673,11 @@ final class LyraRelayCallSession {
         payload.append(UInt8(peerNetId & 0xFF))
         payload.append(0)
         payload.append(command)
-        send(LyraMeshPack.Frame(packType: 5, payload: payload), "relaycall_peer_port_response")
-        DiagnosticsLog.info("xiaomi.relaycall.peer_port_tx port=\(port)")
+        send(LyraMeshPack.Frame(packType: 5, payload: payload), "distrpc_peer_port_response")
+        DiagnosticsLog.info("xiaomi.distrpc.peer_port_tx port=\(port)")
     }
+
+    // MARK: - JSON-RPC over the channel
 
     private func handleChannelMessage(_ message: Data) {
         var payload = message
@@ -776,134 +686,182 @@ final class LyraRelayCallSession {
         {
             payload = payloadNode.payload
         }
-        guard let text = String(data: payload, encoding: .utf8), text.hasPrefix("relay://") else {
+        guard let text = String(data: payload, encoding: .utf8),
+              let request = JsonRpcRequest(text)
+        else {
             DiagnosticsLog.info(
-                "xiaomi.relaycall.channel_rx bytes=\(message.count) " +
-                    "head=\(message.prefix(48).map { String(format: "%02x", $0) }.joined())"
+                "xiaomi.distrpc.channel_rx bytes=\(message.count) " +
+                    "head=\(message.prefix(96).map { String(format: "%02x", $0) }.joined())"
             )
             return
         }
-        DiagnosticsLog.info("xiaomi.relaycall.uri_rx \(text)")
-        handleRelayURI(text)
+        DiagnosticsLog.info("xiaomi.distrpc.rpc_rx method=\(request.method) id=\(request.id ?? -1) \(text.prefix(200))")
+        handleRpc(request)
     }
 
-    // URI protocol: relay://<method>:<methodId>/request?<paramJson> requests
-    // from the phone; answers are relay://<method>:<methodId>/response?<json>
-    // with {responseDeviceId, code(200/408/500), msg, address, callstate}.
-    private func handleRelayURI(_ text: String) {
-        guard let parsed = RelayURI(text) else {
-            DiagnosticsLog.warn("xiaomi.relaycall.uri_parse_failed \(text.prefix(120))")
-            return
-        }
-        switch (parsed.method, parsed.kind) {
-        case ("ring", "request"):
-            let number = parsed.jsonString("address") ?? ""
-            let state = parsed.jsonString("callstate") ?? ""
-            DiagnosticsLog.info("xiaomi.relaycall.ring number=\(number) state=\(state)")
-            respond(
-                to: parsed,
-                fields: ["code": "200", "msg": "ok", "address": number, "callstate": state]
-            )
-        case ("call_state_idle", "request"), ("update_call_state", "request"):
-            // callState 3 = DIALING: arm the phone's DistAudio connect by
-            // re-dialing once (see LyraRelayCallDialer.redialForRelayedAudio).
-            if parsed.method == "update_call_state", parsed.jsonInt("callState") == 3 {
-                LyraRelayCallDialer.activeDialer?.redialForRelayedAudio()
-            }
-            respond(to: parsed, fields: ["code": "200", "msg": "ok"])
-        case ("update_call_info", "request"):
-            // Caller name/number update mid-call; ack so the phone stops
-            // retrying into a 10 s 408 (the info itself is only logged —
-            // nothing surfaces it yet).
+    private func handleRpc(_ request: JsonRpcRequest) {
+        switch request.method {
+        case "openSpeaker":
+            // params.params carries the phone's MiCastServer endpoint + key.
+            let ip = request.nestedString("params", "ip")
+            let port = request.nestedInt("params", "port")
+            let key = request.nestedString("params", "encryptKey")
             DiagnosticsLog.info(
-                "xiaomi.relaycall.call_info name=\(parsed.jsonString("contactName") ?? "") " +
-                    "number=\(parsed.jsonString("address") ?? "")"
+                "xiaomi.distrpc.open_speaker ip=\(ip ?? "?") port=\(port ?? 0) keyB64=\(key?.count ?? 0)"
             )
-            respond(to: parsed, fields: ["code": "200", "msg": "ok"])
-        case ("wantRelay", "request"):
-            respond(to: parsed, fields: ["code": "200", "msg": "ok"])
+            if let ip, let port, port > 0, let key {
+                startDownlinkClient(host: ip, port: UInt16(port), keyBase64: key)
+            }
+            respond(result: "true", to: request)
+        case "openMicrophone":
+            startUplinkServer()
+            let port = wfdServer?.port ?? 0
+            let ip = Self.primaryIPv4Address() ?? "0.0.0.0"
+            let result =
+                "{\"bitDepth\":16,\"channels\":1,\"dynamicChange\":false," +
+                "\"encryptKey\":\"\(Self.uplinkKey.base64EncodedString())\",\"ip\":\"\(ip)\",\"port\":\(port),\"sampleRate\":16000}"
+            DiagnosticsLog.info("xiaomi.distrpc.open_mic_reply ip=\(ip) port=\(port)")
+            respond(result: result, to: request)
+        case "startMicrophoneStream", "startSpeakerStream",
+             "stopMicrophoneStream", "stopSpeakerStream",
+             "closeMicrophone", "closeSpeaker":
+            DiagnosticsLog.info("xiaomi.distrpc.stream_ctl \(request.method)")
+            respond(result: "true", to: request)
         default:
-            DiagnosticsLog.info("xiaomi.relaycall.uri_unhandled \(text.prefix(160))")
+            DiagnosticsLog.info("xiaomi.distrpc.rpc_unhandled \(request.method)")
+            respond(result: "true", to: request)
         }
     }
 
-    private func respond(to request: RelayURI, fields: [String: String]) {
-        var jsonFields = ["\"responseDeviceId\":\"\(Self.responseDeviceId)\""]
-        for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
-            // Official shape: code/callstate are JSON numbers, the rest strings.
-            if (key == "code" || key == "callstate"), Int(value) != nil {
-                jsonFields.append("\"\(key)\":\(value)")
-            } else {
-                let escaped = value.replacingOccurrences(of: "\"", with: "\\\"")
-                jsonFields.append("\"\(key)\":\"\(escaped)\"")
-            }
-        }
-        let json = "{" + jsonFields.joined(separator: ",") + "}"
-        let uri = "relay://\(request.method):\(request.methodId)/response?\(json)"
-        sendChannelText(uri)
-    }
-
-    private static var responseDeviceId: String {
-        UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId") ?? "721572C3"
-    }
-
-    private func sendChannelText(_ text: String) {
+    private func respond(result: String, to request: JsonRpcRequest) {
+        guard let id = request.id else { return }
+        let text = "{\"jsonrpc\":\"2.0\",\"id\":\(id),\"result\":\(result)}"
         guard let socket = channelSocket, !transKey.isEmpty else {
-            DiagnosticsLog.warn("xiaomi.relaycall.tx_no_channel")
+            DiagnosticsLog.warn("xiaomi.distrpc.tx_no_channel")
             return
         }
-        // The channel string node carries the raw URI text — a proto field
-        // wrapper leaks into the phone's payload ("brelay://…", scheme check
-        // fails, every response falls to a 408 timeout phone-side).
-        let frame = Data(text.utf8)
         do {
             try socket.sendVariant(
-                channelFrame: LyraChannelSocket.wrapChannelFrame(frame),
+                channelFrame: LyraChannelSocket.wrapChannelFrame(Data(text.utf8)),
                 key: transKey,
                 singleLayer: true
             )
-            DiagnosticsLog.info("xiaomi.relaycall.uri_tx \(text)")
+            DiagnosticsLog.info("xiaomi.distrpc.rpc_tx \(text.prefix(160))")
         } catch {
-            DiagnosticsLog.error("xiaomi.relaycall.channel_tx_failed", error)
+            DiagnosticsLog.error("xiaomi.distrpc.channel_tx_failed", error)
         }
     }
 
-    private struct RelayURI {
+    private struct JsonRpcRequest {
         let method: String
-        let methodId: String
-        let kind: String
-        let query: String
+        let id: Int?
+        let raw: String
 
         init?(_ text: String) {
-            guard text.hasPrefix("relay://") else { return nil }
-            let rest = String(text.dropFirst("relay://".count))
-            guard let slash = rest.firstIndex(of: "/") else { return nil }
-            let head = String(rest[..<slash])
-            guard let colon = head.lastIndex(of: ":") else { return nil }
-            method = String(head[..<colon])
-            methodId = String(head[head.index(after: colon)...])
-            let tail = String(rest[rest.index(after: slash)...])
-            if let question = tail.firstIndex(of: "?") {
-                kind = String(tail[..<question])
-                query = String(tail[tail.index(after: question)...])
+            guard text.contains("\"jsonrpc\""),
+                  let methodRange = text.range(of: "\"method\":\"")
+            else { return nil }
+            raw = text
+            let methodTail = text[methodRange.upperBound...]
+            guard let methodEnd = methodTail.firstIndex(of: "\"") else { return nil }
+            let full = String(methodTail[..<methodEnd])
+            guard let dot = full.lastIndex(of: ".") else { return nil }
+            method = String(full[full.index(after: dot)...])
+            if let idRange = text.range(of: "\"id\":") {
+                let idTail = text[idRange.upperBound...]
+                let digits = idTail.prefix(while: { $0.isNumber || $0 == "-" })
+                id = Int(digits)
             } else {
-                kind = tail
-                query = ""
+                id = nil
             }
         }
 
-        func jsonString(_ key: String) -> String? {
-            guard let range = query.range(of: "\"\(key)\":\"") else { return nil }
-            let valueStart = query[range.upperBound...]
-            guard let end = valueStart.firstIndex(of: "\"") else { return nil }
-            return String(valueStart[..<end])
+        func nestedString(_ object: String, _ key: String) -> String? {
+            guard let objectRange = raw.range(of: "\"\(object)\":{") else { return nil }
+            let tail = raw[objectRange.upperBound...]
+            guard let keyRange = tail.range(of: "\"\(key)\":\"") else { return nil }
+            let valueTail = tail[keyRange.upperBound...]
+            guard let end = valueTail.firstIndex(of: "\"") else { return nil }
+            return String(valueTail[..<end])
         }
 
-        func jsonInt(_ key: String) -> Int? {
-            guard let range = query.range(of: "\"\(key)\":") else { return nil }
-            let valueStart = query[range.upperBound...]
-            let digits = valueStart.prefix(while: { $0.isNumber || $0 == "-" })
+        func nestedInt(_ object: String, _ key: String) -> Int? {
+            guard let objectRange = raw.range(of: "\"\(object)\":{") else { return nil }
+            let tail = raw[objectRange.upperBound...]
+            guard let keyRange = tail.range(of: "\"\(key)\":") else { return nil }
+            let valueTail = tail[keyRange.upperBound...]
+            let digits = valueTail.prefix(while: { $0.isNumber || $0 == "-" })
             return Int(digits)
         }
+    }
+
+    // MARK: - Audio transport (MiPlayCast/WFD RTSP + AES-ECB PCM)
+
+    // Random per-process 128-bit key for our uplink; the phone decrypts with
+    // the base64 we return from openMicrophone.
+    private static let uplinkKey: Data = {
+        var key = Data(count: 16)
+        key.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, 16) }
+        }
+        return key
+    }()
+
+    private var wfdServer: LyraDistAudioWFDServer?
+    private var wfdClient: LyraDistAudioWFDClient?
+
+    private func startUplinkServer() {
+        guard wfdServer == nil else { return }
+        let server = LyraDistAudioWFDServer(mediaKeyBase64: Self.uplinkKey.base64EncodedString())
+        do {
+            try server.start()
+            wfdServer = server
+            DiagnosticsLog.info("xiaomi.distrpc.uplink_listen port=\(server.port ?? 0)")
+        } catch {
+            DiagnosticsLog.error("xiaomi.distrpc.uplink_listen_failed", error)
+        }
+    }
+
+    private func startDownlinkClient(host: String, port: UInt16, keyBase64: String) {
+        wfdClient?.stop()
+        let client = LyraDistAudioWFDClient(host: host, port: port, mediaKeyBase64: keyBase64)
+        _ = client.prepareClientMediaPort()
+        wfdClient = client
+        client.start()
+    }
+
+    private func stopAudioTransport() {
+        wfdClient?.stop()
+        wfdClient = nil
+        wfdServer?.stop()
+        wfdServer = nil
+    }
+
+    private static func primaryIPv4Address() -> String? {
+        var address: String?
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0 else { return nil }
+        defer { freeifaddrs(interfaces) }
+        var current = interfaces
+        while let interface = current {
+            let flags = Int32(interface.pointee.ifa_flags)
+            let name = String(cString: interface.pointee.ifa_name)
+            if name == "en0", flags & IFF_UP != 0, interface.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(
+                    interface.pointee.ifa_addr,
+                    socklen_t(interface.pointee.ifa_addr.pointee.sa_len),
+                    &host,
+                    socklen_t(host.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                address = String(cString: host)
+                break
+            }
+            current = interface.pointee.ifa_next
+        }
+        return address
     }
 }

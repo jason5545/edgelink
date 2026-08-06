@@ -89,6 +89,29 @@ final class LyraMeshAnnouncer {
                 )
             )
         }
+        if UserDefaults.standard.object(forKey: "xiaomiDistHardwareAdvertise") as? Bool ?? false {
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "distributedHardware",
+                    package: "com.milink.service",
+                    data: Data([0x01, 0x01, 0x01, 0x01])
+                )
+            )
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "publicMetadataVersion",
+                    package: "com.milink.service",
+                    data: Data([0x00, 0x01])
+                )
+            )
+            services.append(
+                LyraTrustedDeviceInfo.Service(
+                    name: "DistAudioService",
+                    package: "com.miui.audiomonitor",
+                    data: Data([0x01, 0x01, 0x01, 0x01])
+                )
+            )
+        }
         return services
     }
 
@@ -885,6 +908,48 @@ final class LyraMeshAnnouncer {
         for logiConn in miFrame.logiConnFrames {
             if logiConn.logiConnId != logiConnId {
                 if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraDistAudioRpcSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.announcer_distrpc_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraDistAudioRpcSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey,
+                        deviceIdHex: deviceIdHexProvider() ?? "",
+                        deviceName: displayNameProvider()
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraDistAudioRpcSession.activeSession, session.handles(logiConn: logiConn) {
+                    session.handleFrame(logiConn)
+                } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraDistHardwareSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.mishare.announcer_disthw_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraDistHardwareSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey,
+                        deviceIdHex: deviceIdHexProvider() ?? "",
+                        deviceName: displayNameProvider()
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraDistHardwareSession.activeSession, session.handles(logiConn: logiConn) {
+                    session.handleFrame(logiConn)
+                } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
                    case let .syncInfo(syncInfoData) = inner.payload,
                    lengthDelimitedField(4, in: syncInfoData)
                        .flatMap({ String(data: $0, encoding: .utf8) }) == LyraRelayCallSession.serviceName

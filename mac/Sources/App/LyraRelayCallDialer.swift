@@ -101,11 +101,16 @@ final class LyraRelayCallDialer {
             guard let self, !ports.isEmpty else { return }
             self.stopLocked()
             self.outcomeReported = false
+            self.redialStage = 0
+            self.dialAcked = false
+            Self.activeDialer = self
             self.number = number
             self.host = host
             self.candidatePorts = Array(ports.prefix(8))
             self.state = .idle
-            self.methodId = String(UInt32.random(in: 1...UInt32.max))
+            // Phone parses methodId as a Java int — stay within Int32 or the
+            // dial response comes back as relay://dial:-1/response.
+            self.methodId = String(UInt32.random(in: 1...UInt32(Int32.max)))
             self.socket.onFrame = { [weak self] frame, endpoint, reply in
                 self?.handle(frame: frame, endpoint: endpoint, reply: reply)
             }
@@ -129,6 +134,21 @@ final class LyraRelayCallDialer {
 
     private var outcomeReported = false
 
+    private(set) static var activeDialer: LyraRelayCallDialer?
+
+    // TeleService's handleRelayDialRequest calls setDeviceInRelay immediately
+    // after placeCall, before the relayed Connection exists, so
+    // mConnectRelayAudio is never armed and DistAudio never connects. A second
+    // dial while the first call is still DIALING gets its duplicate placeCall
+    // dropped by Telecom (observed 2026-08-06, bridge double-dial race) but
+    // re-runs setDeviceInRelay with the connection present, arming the
+    // ACTIVE-state connectDistAudioDevice.
+    func redialForRelayedAudio() {
+        queue.async { [weak self] in
+            self?.redialForRelayedAudioLocked()
+        }
+    }
+
     private func reportOutcome(_ sent: Bool) {
         guard !outcomeReported else { return }
         outcomeReported = true
@@ -139,6 +159,9 @@ final class LyraRelayCallDialer {
     private func stopLocked() {
         if state != .done, state != .channelUp, state != .idle {
             reportOutcome(false)
+        }
+        if Self.activeDialer === self {
+            Self.activeDialer = nil
         }
         timeoutItem?.cancel()
         timeoutItem = nil
@@ -604,12 +627,61 @@ final class LyraRelayCallDialer {
         }
     }
 
-    private func sendDialRequest() {
+    private func sendDialRequest(deviceIdOverride: String? = nil) {
+        let deviceId = deviceIdOverride ?? Self.currentDeviceIdHex()
         let json =
-            "{\"address\":\"\(number)\",\"requestDeviceId\":\"\(Self.currentDeviceIdHex())\",\"videoState\":0}"
+            "{\"address\":\"\(number)\",\"requestDeviceId\":\"\(deviceId)\",\"videoState\":0}"
         let uri = "relay://dial:\(methodId)/request?\(json)"
         sendChannelText(uri)
         reportOutcome(true)
+        // The back-channel update_call_state(DIALING) is not guaranteed to
+        // arrive (channel negotiation can lag), so also schedule the
+        // audio-arming redials after the dial — cellular calls stay DIALING
+        // for several seconds, and Telecom drops the duplicate placeCall
+        // while re-running setDeviceInRelay with the connection present.
+        queue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.redialForRelayedAudio()
+        }
+        queue.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+            self?.redialForRelayedAudio()
+        }
+    }
+
+    private var dialAcked = false
+    private var redialStage = 0
+
+    // TeleService's handleRelayDialRequest calls setDeviceInRelay right after
+    // placeCall, before the relayed Connection exists, so mConnectRelayAudio
+    // is never armed and DistAudio never connects. Re-dialing while DIALING
+    // makes Telecom drop the duplicate placeCall but re-run setDeviceInRelay
+    // with the connection present — but only when the device id CHANGES (the
+    // whole body sits inside an old!=new guard). So redial #2 uses a
+    // lowercased id to arm mConnectRelayAudio, and redial #3 restores the
+    // exact id so the ACTIVE-state connectDistAudioDevice lookup matches our
+    // published DistAudio device.
+    private func redialForRelayedAudioLocked() {
+        guard state == .done || state == .channelUp, dialAcked, channelSocket != nil else { return }
+        switch redialStage {
+        case 0:
+            redialStage = 1
+            methodId = String(UInt32.random(in: 1...UInt32(Int32.max)))
+            DiagnosticsLog.info("xiaomi.relaydial.redial_for_audio stage=lowercase")
+            sendDialRequest(deviceIdOverride: Self.currentDeviceIdHex().lowercased())
+        case 1:
+            redialStage = 2
+            methodId = String(UInt32.random(in: 1...UInt32(Int32.max)))
+            DiagnosticsLog.info("xiaomi.relaydial.redial_for_audio stage=restore")
+            sendDialRequest()
+        default:
+            return
+        }
+    }
+
+    // Suppress the scheduled audio redials (call ended / channel lost).
+    func cancelRedial() {
+        queue.async { [weak self] in
+            self?.redialStage = 99
+        }
     }
 
     private func sendChannelText(_ text: String) {
@@ -644,6 +716,13 @@ final class LyraRelayCallDialer {
             return
         }
         DiagnosticsLog.info("xiaomi.relaydial.uri_rx \(text)")
+        if text == "ok" {
+            // Transport-level ack on the dial channel; the real dial response
+            // (code 200) arrives on the back-channel.
+            dialAcked = true
+            if state == .channelUp { state = .done }
+            return
+        }
         if text.hasPrefix("relay://dial:\(methodId)/response?") {
             if text.contains("\"code\":0") || text.contains("\"code\": 0")
                 || text.contains("\"code\":200") || text.contains("\"code\": 200")
@@ -719,6 +798,48 @@ final class LyraRelayCallDialer {
             // conns into the shared relay session, same as the announcer.
             if logiConn.logiConnId != logiConnId {
                 if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraDistAudioRpcSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.relaydial.distrpc_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraDistAudioRpcSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey,
+                        deviceIdHex: deviceIdHexProvider() ?? "",
+                        deviceName: displayNameProvider()
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraDistAudioRpcSession.activeSession, session.handles(logiConn: logiConn) {
+                    session.handleFrame(logiConn)
+                } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraDistHardwareSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.relaydial.disthw_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraDistHardwareSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey,
+                        deviceIdHex: deviceIdHexProvider() ?? "",
+                        deviceName: displayNameProvider()
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraDistHardwareSession.activeSession, session.handles(logiConn: logiConn) {
+                    session.handleFrame(logiConn)
+                } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
                    case let .syncInfo(syncInfoData) = inner.payload,
                    lengthDelimitedField(4, in: syncInfoData)
                        .flatMap({ String(data: $0, encoding: .utf8) }) == LyraRelayCallSession.serviceName

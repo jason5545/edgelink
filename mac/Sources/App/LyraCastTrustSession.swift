@@ -1570,6 +1570,14 @@ final class LyraCastTrustSession {
             relaySession.handleFrame(logiConn)
             return
         }
+        if let distSession = LyraDistHardwareSession.activeSession, distSession.handles(logiConn: logiConn) {
+            distSession.handleFrame(logiConn)
+            return
+        }
+        if let rpcSession = LyraDistAudioRpcSession.activeSession, rpcSession.handles(logiConn: logiConn) {
+            rpcSession.handleFrame(logiConn)
+            return
+        }
         if logiConn.flag {
             if srvConnId != 0, logiConn.logiConnId == srvConnId {
                 handleMitrustEncrypted(logiConn)
