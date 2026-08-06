@@ -346,12 +346,35 @@ final class LyraRelayCallSession {
         0x6b, 0x4e, 0x9e, 0xe2, 0x57, 0x92, 0x4b, 0xaf,
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
     ])
+    // Account-pair family salt pair (libmicontinuity.so AccountPairHandshake,
+    // same as LyraSyncTaskServer / LyraMeshAnnouncer).
+    private static let accountPairSessionSalt = Data([
+        0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
+        0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
+        0xfa, 0xa3, 0x37, 0xf2, 0xe0, 0xbe, 0xb5, 0x73,
+        0xb1, 0xf9, 0xa3, 0xd0, 0x15, 0x57, 0x64, 0x80
+    ])
+    private static let accountPairTicketSalt = Data([
+        0x7a, 0x83, 0xe2, 0xdc, 0x8e, 0x9a, 0x93, 0x37,
+        0xc7, 0x8e, 0xc1, 0x35, 0xfc, 0x39, 0x9d, 0xc3,
+        0x70, 0x56, 0x96, 0xe3, 0x94, 0x9e, 0x49, 0x77,
+        0xdd, 0xb2, 0xd1, 0x67, 0xfe, 0xb0, 0x08, 0x11
+    ])
+    private var handshakeIsAccountPair: [UInt64: Bool] = [:]
 
     private func handleAuthUpgrade(_ upgradeData: Data) {
         guard let handshake = lengthDelimited(2, in: upgradeData),
-              let handshakeId = varint(1, in: upgradeData),
-              let authFrame = lengthDelimited(7, in: handshake) ?? lengthDelimited(6, in: handshake),
-              let step = varint(1, in: authFrame)
+              let handshakeId = varint(1, in: upgradeData)
+        else {
+            DiagnosticsLog.warn(
+                "xiaomi.relaycall.auth_parse_failed hex=\(upgradeData.prefix(48).map { String(format: "%02x", $0) }.joined())"
+            )
+            return
+        }
+        let accountFrame = lengthDelimited(6, in: handshake)
+        let authFrame = lengthDelimited(7, in: handshake) ?? accountFrame
+        handshakeIsAccountPair[handshakeId] = accountFrame != nil && lengthDelimited(7, in: handshake) == nil
+        guard let authFrame, let step = varint(1, in: authFrame)
         else {
             DiagnosticsLog.warn(
                 "xiaomi.relaycall.auth_parse_failed hex=\(upgradeData.prefix(48).map { String(format: "%02x", $0) }.joined())"
@@ -370,9 +393,15 @@ final class LyraRelayCallSession {
 
     private func sendAuthHandshake(authFrame: Data, handshakeId: UInt64, label: String) {
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        if handshakeIsAccountPair[handshakeId] == true {
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(6, value: authFrame, to: &handshake)
+        } else {
+            LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        }
         var upgrade = Data()
         LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
         LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
@@ -420,6 +449,14 @@ final class LyraRelayCallSession {
         authSharedZ = secret
         authClientRandom = clientRandom
         authServerRandom = serverRandom
+        if handshakeIsAccountPair[handshakeId] == true {
+            sendAccountPairServerNotify(
+                cipherSuite: cipherSuite, secret: secret,
+                serverPub: serverPub, clientPub: clientPub,
+                serverRandom: serverRandom, handshakeId: handshakeId
+            )
+            return
+        }
         guard let signature = try? identityKey.signature(for: SHA256.hash(data: serverPub + clientPub)) else {
             DiagnosticsLog.warn("xiaomi.relaycall.auth_sign_failed")
             return
@@ -458,6 +495,72 @@ final class LyraRelayCallSession {
         sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_auth_server_notify")
     }
 
+    // Account-pair server_notify (mirrors LyraSyncTaskServer): encSig opens
+    // under Z to {our enrolled cert, sig by cert key over serverEph‖clientEph}.
+    private func sendAccountPairServerNotify(
+        cipherSuite: Data, secret: Data, serverPub: Data, clientPub: Data,
+        serverRandom: Data, handshakeId: UInt64
+    ) {
+        guard let (certDER, certPriv) = Self.enrolledCertMaterial(),
+              let signature = try? certPriv.signature(for: SHA256.hash(data: serverPub + clientPub))
+        else {
+            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_no_cert")
+            return
+        }
+        var credMessage = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: certDER, to: &credMessage)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &credMessage)
+        let zKey = SymmetricKey(data: secret)
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(credMessage, using: zKey, nonce: nonce)
+            var encSig = Data()
+            encSig.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            encSig.append(sealed.ciphertext)
+            encSig.append(sealed.tag)
+
+            var outPublicKeyMessage = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &outPublicKeyMessage)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: serverPub, to: &outPublicKeyMessage)
+            let offeredP3 = varint(3, in: cipherSuite) ?? 0x10
+            let offeredP4 = varint(4, in: cipherSuite) ?? 0x08
+            var selected = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &selected)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: serverRandom, to: &selected)
+            LyraProtoWriter.appendVarintField(3, value: offeredP3, to: &selected)
+            LyraProtoWriter.appendVarintField(4, value: offeredP4, to: &selected)
+            LyraProtoWriter.appendLengthDelimitedField(5, value: outPublicKeyMessage, to: &selected)
+            var tiny = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &tiny)
+            var serverNotify = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: selected, to: &serverNotify)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: encSig, to: &serverNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: tiny, to: &serverNotify)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: tiny, to: &serverNotify)
+            var outAuthFrame = Data()
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &outAuthFrame)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: serverNotify, to: &outAuthFrame)
+            sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_acctpair_server_notify")
+        } catch {
+            DiagnosticsLog.error("xiaomi.relaycall.acctpair_enc_failed", error)
+        }
+    }
+
+    private static func enrolledCertMaterial() -> (certDER: Data, priv: P256.Signing.PrivateKey)? {
+        let lookup = MiTrustTicketStore.enrolledCertOverride ?? {
+            guard let did = MijiaCertEnrollment.currentDid(
+                shortDeviceIdHex: MijiaCertEnrollment.currentShortDeviceIdHex
+            ) else { return nil }
+            return MijiaEnrolledCertStore.usableCert(forDid: did)
+        }
+        guard let enrolled = lookup(),
+              let certDER = enrolled.certDER,
+              let privRaw = enrolled.privateKeyRaw,
+              let priv = try? P256.Signing.PrivateKey(rawRepresentation: privRaw)
+        else { return nil }
+        return (certDER, priv)
+    }
+
     private func handleAuthClientFinished(authFrame: Data, handshakeId: UInt64) {
         guard let clientFinished = lengthDelimited(4, in: authFrame),
               let encSigC = lengthDelimited(1, in: clientFinished),
@@ -470,6 +573,12 @@ final class LyraRelayCallSession {
         }
         let ticketStore = MiTrustTicketStore.current()
         let zKey = SymmetricKey(data: authSharedZ)
+        if handshakeIsAccountPair[handshakeId] == true {
+            handleAccountPairClientFinished(
+                clientFinished: clientFinished, zKey: zKey, handshakeId: handshakeId
+            )
+            return
+        }
         guard let sigC = ticketStore.decrypt(encSigC, with: zKey) else {
             DiagnosticsLog.warn("xiaomi.relaycall.auth_sig_decrypt_failed")
             return
@@ -524,6 +633,75 @@ final class LyraRelayCallSession {
         LyraProtoWriter.appendLengthDelimitedField(5, value: serverFinished, to: &outAuthFrame)
         sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_auth_server_finished")
         DiagnosticsLog.info("xiaomi.relaycall.auth_completed")
+    }
+
+    // Account-pair client_finished: {f1:credBlob(AES-GCM(Z, {phone cert,
+    // sig over clientEph‖serverEph})), f2:proof(AES-GCM(sessionKey, 24B))}.
+    private func handleAccountPairClientFinished(
+        clientFinished: Data, zKey: SymmetricKey, handshakeId: UInt64
+    ) {
+        let ticketStore = MiTrustTicketStore.current()
+        guard let credBlob = lengthDelimited(1, in: clientFinished),
+              let credMessage = ticketStore.decrypt(credBlob, with: zKey),
+              let phoneCert = lengthDelimited(1, in: credMessage),
+              let phoneSig = lengthDelimited(2, in: credMessage),
+              let cert = SecCertificateCreateWithData(nil, phoneCert as CFData),
+              let key = SecCertificateCopyKey(cert),
+              let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+              let phonePub = try? P256.Signing.PublicKey(x963Representation: rep),
+              let signature = try? P256.Signing.ECDSASignature(derRepresentation: phoneSig),
+              let serverEphPriv = authServerEphPriv
+        else {
+            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_finished_parse_failed")
+            return
+        }
+        let serverEphPub = serverEphPriv.publicKey.x963Representation
+        guard phonePub.isValidSignature(
+            signature, for: SHA256.hash(data: authClientEphPub + serverEphPub)
+        ) else {
+            DiagnosticsLog.warn("xiaomi.relaycall.acctpair_sig_invalid")
+            return
+        }
+        MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
+        let newSessionKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairSessionSalt,
+            info: authClientRandom + authServerRandom,
+            outputByteCount: 32
+        )
+        let ticket = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairTicketSalt,
+            info: authClientRandom + authServerRandom,
+            outputByteCount: 32
+        )
+        MiTrustTicketStore.recordAuthSession(
+            sessionKey: newSessionKey.withUnsafeBytes { Data($0) },
+            ticket: ticket.withUnsafeBytes { Data($0) }
+        )
+        sessionKey = newSessionKey
+        if let proof = lengthDelimited(2, in: clientFinished) {
+            let proofOk = ticketStore.decrypt(proof, with: newSessionKey) != nil
+            DiagnosticsLog.info("xiaomi.relaycall.acctpair_proof ok=\(proofOk)")
+        }
+        var serverFinished = Data()
+        do {
+            let nonce = AES.GCM.Nonce()
+            let sealed = try AES.GCM.seal(authSharedZ + serverEphPub, using: newSessionKey, nonce: nonce)
+            var blob = Data()
+            blob.append(contentsOf: nonce.withUnsafeBytes { Data($0) })
+            blob.append(sealed.ciphertext)
+            blob.append(sealed.tag)
+            LyraProtoWriter.appendLengthDelimitedField(1, value: blob, to: &serverFinished)
+        } catch {
+            DiagnosticsLog.error("xiaomi.relaycall.acctpair_finish_enc_failed", error)
+            return
+        }
+        var outAuthFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: 4, to: &outAuthFrame)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: serverFinished, to: &outAuthFrame)
+        sendAuthHandshake(authFrame: outAuthFrame, handshakeId: handshakeId, label: "relaycall_acctpair_server_finished")
+        DiagnosticsLog.info("xiaomi.relaycall.acctpair_completed")
     }
 
     private func prepareChannel(peerPortRequest: Data) {

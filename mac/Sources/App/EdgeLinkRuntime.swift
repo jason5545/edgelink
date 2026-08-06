@@ -1236,15 +1236,38 @@ final class EdgeLinkRuntime: ObservableObject {
             return nil
         }
         rememberDialedPhoneNumber(number)
-        startNativeRelayDial(number: number)
+        // Native relay dial first; the bridge dial is deferred so the two
+        // don't race (a bridge call already DIALING makes the phone drop the
+        // relayed placeCall). If the native path reports failure, fall back
+        // to the bridge dial.
+        if UserDefaults.standard.bool(forKey: "xiaomiRelayCallNativeDial") {
+            let placeholderRequestId = UUID().uuidString
+            phoneCallStatus = Self.localizedPhoneActionInProgress("dial")
+            startNativeRelayDial(number: number) { [weak self] nativeSent in
+                guard let self else { return }
+                if nativeSent {
+                    phoneCallStatus = String(localized: "已透過原生中繼撥出")
+                    DiagnosticsLog.info("phone.mac.bridge_dial_suppressed native_relay_ok")
+                    return
+                }
+                DiagnosticsLog.info("phone.mac.bridge_dial_fallback native_relay_failed")
+                _ = self.sendPhoneAction(action: "dial", number: number)
+            }
+            return placeholderRequestId
+        }
         return sendPhoneAction(action: "dial", number: number)
     }
 
     // Native Xiaomi relay dial (pad-style DIAL request to the phone's
     // relayPhoneCall service) — runs alongside our own bridge dial.
+    // Returns true when the native relay dial was started; the caller should
+    // defer the bridge dial and let the outcome callback decide.
     private var relayCallDialer: LyraRelayCallDialer?
-    private func startNativeRelayDial(number: String) {
-        guard UserDefaults.standard.bool(forKey: "xiaomiRelayCallNativeDial") else { return }
+    private func startNativeRelayDial(number: String, onOutcome: @escaping (Bool) -> Void) {
+        guard UserDefaults.standard.bool(forKey: "xiaomiRelayCallNativeDial") else {
+            onOutcome(false)
+            return
+        }
         var host: String?
         var ports: [UInt16] = []
         var candidates = UserDefaults.standard.stringArray(forKey: "lyraPhoneMeshEndpointHistory") ?? []
@@ -1261,7 +1284,10 @@ final class EdgeLinkRuntime: ObservableObject {
             guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
             ports.append(endpoint.port)
         }
-        guard let host, !ports.isEmpty else { return }
+        guard let host, !ports.isEmpty else {
+            onOutcome(false)
+            return
+        }
         if relayCallDialer == nil {
             relayCallDialer = LyraRelayCallDialer(
                 deviceIdHexProvider: { [weak self] in
@@ -1275,6 +1301,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 }
             )
         }
+        relayCallDialer?.onDialOutcome = onOutcome
         relayCallDialer?.dial(number: number, host: host, ports: ports)
     }
 

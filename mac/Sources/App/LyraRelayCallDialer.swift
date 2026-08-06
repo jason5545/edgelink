@@ -47,9 +47,15 @@ final class LyraRelayCallDialer {
     private var channelSocket: LyraChannelSocket?
     private var methodId = "1"
     private var timeoutItem: DispatchWorkItem?
+    private var authIsAccountPair = false
 
     private let deviceIdHexProvider: () -> String?
     private let displayNameProvider: () -> String
+
+    // One-shot outcome for the runtime's bridge-dial fallback: true once the
+    // DIAL URI is on the channel (the phone placeCalls on receipt), false on
+    // timeout/failure before that.
+    var onDialOutcome: ((Bool) -> Void)?
 
     private static let sessionSalt = Data([
         0x5e, 0xd5, 0xa3, 0xf8, 0x36, 0xf6, 0xb5, 0x4f,
@@ -62,6 +68,20 @@ final class LyraRelayCallDialer {
         0x76, 0xd3, 0x08, 0x09, 0x51, 0xdd, 0x1b, 0xb8,
         0x6b, 0x4e, 0x9e, 0xe2, 0x57, 0x92, 0x4b, 0xaf,
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
+    ])
+    // Account-pair family salt pair (libmicontinuity.so AccountPairHandshake,
+    // same as LyraMeshAnnouncer / LyraSyncTaskServer).
+    private static let accountPairSessionSalt = Data([
+        0x32, 0x9b, 0xfc, 0x53, 0x39, 0x36, 0x55, 0xd7,
+        0x5a, 0xb0, 0x83, 0x98, 0xca, 0x91, 0x91, 0xef,
+        0xfa, 0xa3, 0x37, 0xf2, 0xe0, 0xbe, 0xb5, 0x73,
+        0xb1, 0xf9, 0xa3, 0xd0, 0x15, 0x57, 0x64, 0x80
+    ])
+    private static let accountPairTicketSalt = Data([
+        0x7a, 0x83, 0xe2, 0xdc, 0x8e, 0x9a, 0x93, 0x37,
+        0xc7, 0x8e, 0xc1, 0x35, 0xfc, 0x39, 0x9d, 0xc3,
+        0x70, 0x56, 0x96, 0xe3, 0x94, 0x9e, 0x49, 0x77,
+        0xdd, 0xb2, 0xd1, 0x67, 0xfe, 0xb0, 0x08, 0x11
     ])
 
     init(
@@ -80,6 +100,7 @@ final class LyraRelayCallDialer {
         queue.async { [weak self] in
             guard let self, !ports.isEmpty else { return }
             self.stopLocked()
+            self.outcomeReported = false
             self.number = number
             self.host = host
             self.candidatePorts = Array(ports.prefix(8))
@@ -106,7 +127,19 @@ final class LyraRelayCallDialer {
         }
     }
 
+    private var outcomeReported = false
+
+    private func reportOutcome(_ sent: Bool) {
+        guard !outcomeReported else { return }
+        outcomeReported = true
+        let handler = onDialOutcome
+        DispatchQueue.main.async { handler?(sent) }
+    }
+
     private func stopLocked() {
+        if state != .done, state != .channelUp, state != .idle {
+            reportOutcome(false)
+        }
         timeoutItem?.cancel()
         timeoutItem = nil
         channelSocket?.stop()
@@ -202,6 +235,11 @@ final class LyraRelayCallDialer {
         }
         authEphKey = ephemeral
         authClientRandom = clientRandom
+        // With an enrolled Mijia cert the phone's DevRepo cred for us is
+        // cert-based and it rejects AUTH-family client_finished (ALERT 301
+        // "bad public key" observed live 2026-08-06); the official client
+        // dials account-pair in that state, so do the same.
+        authIsAccountPair = Self.enrolledCertMaterial() != nil
 
         var publicKeyMessage = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &publicKeyMessage)
@@ -211,14 +249,19 @@ final class LyraRelayCallDialer {
         var cipherSuite = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(2, value: clientRandom, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(3, value: 64, to: &cipherSuite)
-        LyraProtoWriter.appendVarintField(4, value: 2, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(3, value: authIsAccountPair ? 16 : 64, to: &cipherSuite)
+        LyraProtoWriter.appendVarintField(4, value: authIsAccountPair ? 8 : 2, to: &cipherSuite)
         LyraProtoWriter.appendLengthDelimitedField(5, value: publicKeyMessage, to: &cipherSuite)
         var clientNotify = Data()
         LyraProtoWriter.appendLengthDelimitedField(1, value: cipherSuite, to: &clientNotify)
-        LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
+        if authIsAccountPair {
+            LyraProtoWriter.appendLengthDelimitedField(2, value: Data([0x08, 0x01]), to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
+        } else {
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(3, value: Data([0x08, 0x01]), to: &clientNotify)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: Data([0x08, 0x01]), to: &clientNotify)
+        }
         var authFrame = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &authFrame)
         LyraProtoWriter.appendLengthDelimitedField(2, value: clientNotify, to: &authFrame)
@@ -226,11 +269,32 @@ final class LyraRelayCallDialer {
         state = .authHandshake
     }
 
+    private static func enrolledCertMaterial() -> (certDER: Data, priv: P256.Signing.PrivateKey)? {
+        let lookup = MiTrustTicketStore.enrolledCertOverride ?? {
+            guard let did = MijiaCertEnrollment.currentDid(
+                shortDeviceIdHex: MijiaCertEnrollment.currentShortDeviceIdHex
+            ) else { return nil }
+            return MijiaEnrolledCertStore.usableCert(forDid: did)
+        }
+        guard let enrolled = lookup(),
+              let certDER = enrolled.certDER,
+              let privRaw = enrolled.privateKeyRaw,
+              let priv = try? P256.Signing.PrivateKey(rawRepresentation: privRaw)
+        else { return nil }
+        return (certDER, priv)
+    }
+
     private func sendAuthHandshake(authFrame: Data, label: String) {
         var handshake = Data()
-        LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
-        LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
-        LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        if authIsAccountPair {
+            LyraProtoWriter.appendVarintField(1, value: 2, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 4, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(6, value: authFrame, to: &handshake)
+        } else {
+            LyraProtoWriter.appendVarintField(1, value: 4, to: &handshake)
+            LyraProtoWriter.appendVarintField(2, value: 5, to: &handshake)
+            LyraProtoWriter.appendLengthDelimitedField(7, value: authFrame, to: &handshake)
+        }
         var upgrade = Data()
         LyraProtoWriter.appendVarintField(1, value: handshakeId, to: &upgrade)
         LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &upgrade)
@@ -246,14 +310,37 @@ final class LyraRelayCallDialer {
     }
 
     private func handleAuthUpgrade(_ upgradeData: Data) {
-        guard let handshake = lengthDelimitedField(2, in: upgradeData),
-              let authFrame = lengthDelimitedField(7, in: handshake)
+        guard let handshake = lengthDelimitedField(2, in: upgradeData) else {
+            DiagnosticsLog.warn(
+                "xiaomi.relaydial.auth_parse_failed hex=\(upgradeData.prefix(64).map { String(format: "%02x", $0) }.joined())"
+            )
+            return
+        }
+        // ALERT (observed live 2026-08-06): handshake{f1:7, f2:{f1:4, f2:1,
+        // f3:{f1:code, f2:text}}}, e.g. code 301 "bad public key".
+        if varintField(1, in: handshake) == 7,
+           let alertOuter = lengthDelimitedField(2, in: handshake),
+           let alertInner = lengthDelimitedField(3, in: alertOuter)
+        {
+            let code = varintField(1, in: alertInner) ?? 0
+            let text = lengthDelimitedField(2, in: alertInner)
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            DiagnosticsLog.warn("xiaomi.relaydial.auth_alert code=\(code) text=\(text)")
+            return
+        }
+        guard let authFrame = lengthDelimitedField(7, in: handshake)
                 ?? lengthDelimitedField(6, in: handshake),
               let step = varintField(1, in: authFrame)
         else {
             DiagnosticsLog.warn(
                 "xiaomi.relaydial.auth_parse_failed hex=\(upgradeData.prefix(64).map { String(format: "%02x", $0) }.joined())"
             )
+            return
+        }
+        if varintField(2, in: handshake) == 1 {
+            let text = lengthDelimitedField(2, in: authFrame)
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            DiagnosticsLog.warn("xiaomi.relaydial.auth_alert code=\(step) text=\(text)")
             return
         }
         switch step {
@@ -290,6 +377,13 @@ final class LyraRelayCallDialer {
         authSharedZ = secret
         authServerEphPub = serverPub
         let clientPub = ephemeral.publicKey.x963Representation
+        if authIsAccountPair {
+            handleAccountPairServerNotify(
+                authFrame: authFrame, secret: secret,
+                serverRandom: serverRandom, serverPub: serverPub, clientPub: clientPub
+            )
+            return
+        }
         let sessionKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: secret),
             salt: Self.sessionSalt,
@@ -334,6 +428,92 @@ final class LyraRelayCallDialer {
         }
     }
 
+    // Account-pair family server_notify — mirrors LyraMeshAnnouncer: encSig
+    // opens under Z to {phone cert, sig}; our client_finished carries OUR
+    // enrolled cert + sig over clientEph‖serverEph plus the proof, keyed by
+    // the account-pair HKDF salt pair.
+    private func handleAccountPairServerNotify(
+        authFrame: Data, secret: Data, serverRandom: Data, serverPub: Data, clientPub: Data
+    ) {
+        guard let serverNotify = lengthDelimitedField(3, in: authFrame),
+              let encSig = lengthDelimitedField(2, in: serverNotify)
+        else {
+            DiagnosticsLog.warn("xiaomi.relaydial.acctpair_notify_parse_failed")
+            return
+        }
+        let ticketStore = MiTrustTicketStore.current()
+        let zKey = SymmetricKey(data: secret)
+        if let credMessage = ticketStore.decrypt(encSig, with: zKey),
+           let phoneCert = lengthDelimitedField(1, in: credMessage),
+           let sigDer = lengthDelimitedField(2, in: credMessage),
+           let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer)
+        {
+            MiTrustTicketStore.harvestPeerAccountPubKey(fromCertDER: phoneCert)
+            var valid = false
+            if let cert = SecCertificateCreateWithData(nil, phoneCert as CFData),
+               let key = SecCertificateCopyKey(cert),
+               let rep = SecKeyCopyExternalRepresentation(key, nil) as? Data,
+               let pub = try? P256.Signing.PublicKey(x963Representation: rep)
+            {
+                valid = pub.isValidSignature(signature, for: SHA256.hash(data: serverPub + clientPub))
+            }
+            DiagnosticsLog.info("xiaomi.relaydial.acctpair_server_sig valid=\(valid)")
+        } else {
+            DiagnosticsLog.warn("xiaomi.relaydial.acctpair_encsig_decrypt_failed")
+        }
+        let sessionKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairSessionSalt,
+            info: authClientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        let ticket = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: zKey,
+            salt: Self.accountPairTicketSalt,
+            info: authClientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        meshSessionKey = sessionKey
+        MiTrustTicketStore.recordAuthSession(
+            sessionKey: sessionKey.withUnsafeBytes { Data($0) },
+            ticket: ticket.withUnsafeBytes { Data($0) }
+        )
+        guard let (certDER, certPriv) = Self.enrolledCertMaterial(),
+              let signature = try? certPriv.signature(for: SHA256.hash(data: clientPub + serverPub))
+        else {
+            DiagnosticsLog.warn("xiaomi.relaydial.acctpair_no_cert")
+            return
+        }
+        do {
+            var credMessage = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: certDER, to: &credMessage)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: signature.derRepresentation, to: &credMessage)
+            let credNonce = AES.GCM.Nonce()
+            let credSealed = try AES.GCM.seal(credMessage, using: zKey, nonce: credNonce)
+            var credBlob = Data()
+            credBlob.append(contentsOf: credNonce.withUnsafeBytes { Data($0) })
+            credBlob.append(credSealed.ciphertext)
+            credBlob.append(credSealed.tag)
+
+            let proofNonce = AES.GCM.Nonce()
+            let proofSealed = try AES.GCM.seal(Data(count: 24), using: sessionKey, nonce: proofNonce)
+            var proof = Data()
+            proof.append(contentsOf: proofNonce.withUnsafeBytes { Data($0) })
+            proof.append(proofSealed.ciphertext)
+            proof.append(proofSealed.tag)
+
+            var clientFinished = Data()
+            LyraProtoWriter.appendLengthDelimitedField(1, value: credBlob, to: &clientFinished)
+            LyraProtoWriter.appendLengthDelimitedField(2, value: proof, to: &clientFinished)
+            var outAuthFrame = Data()
+            LyraProtoWriter.appendVarintField(1, value: 3, to: &outAuthFrame)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: clientFinished, to: &outAuthFrame)
+            sendAuthHandshake(authFrame: outAuthFrame, label: "auth_client_finished")
+        } catch {
+            DiagnosticsLog.error("xiaomi.relaydial.acctpair_finish_enc_failed", error)
+        }
+    }
+
     private func handleAuthServerFinished(authFrame: Data) {
         guard let serverFinished = lengthDelimitedField(5, in: authFrame),
               let blob = lengthDelimitedField(1, in: serverFinished),
@@ -375,9 +555,10 @@ final class LyraRelayCallDialer {
         state = .connRequest
     }
 
-    private func connectChannel(port peerPort: UInt16) {
+    private func connectChannel(port peerPort: UInt16, serverChannelId: UInt32) {
         guard let host else { return }
         let socket = LyraChannelSocket()
+        socket.suppressNegotiationReply = true
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
             guard let self else { return }
             self.state = .channelUp
@@ -394,14 +575,32 @@ final class LyraRelayCallDialer {
         }
         do {
             try socket.connect(host: host, port: peerPort, socketKey: transKey)
-            try socket.sendClientNegotiation(
-                channelId: UInt32(Self.clientChannelId), version: 1, mtu: 0xFF00
-            )
             channelSocket = socket
             DiagnosticsLog.info("xiaomi.relaydial.channel_connect port=\(peerPort)")
         } catch {
             DiagnosticsLog.error("xiaomi.relaydial.channel_connect_failed", error)
             state = .failed("channel connect failed")
+            return
+        }
+        // The phone's server channel comes up asynchronously after confirm;
+        // the cast flow waits then retries the negotiation — mirror that.
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.sendChannelNegotiation(serverChannelId: serverChannelId, attempt: 0)
+        }
+    }
+
+    private func sendChannelNegotiation(serverChannelId: UInt32, attempt: Int) {
+        guard state == .awaitingPeerPort, attempt < 3, let socket = channelSocket else { return }
+        do {
+            try socket.sendClientNegotiation(channelId: serverChannelId, version: 1, mtu: 0xFF00)
+            DiagnosticsLog.info(
+                "xiaomi.relaydial.channel_negotiation_tx channelId=\(serverChannelId) attempt=\(attempt)"
+            )
+        } catch {
+            DiagnosticsLog.error("xiaomi.relaydial.channel_negotiation_failed", error)
+        }
+        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.sendChannelNegotiation(serverChannelId: serverChannelId, attempt: attempt + 1)
         }
     }
 
@@ -410,6 +609,7 @@ final class LyraRelayCallDialer {
             "{\"address\":\"\(number)\",\"requestDeviceId\":\"\(Self.currentDeviceIdHex())\",\"videoState\":0}"
         let uri = "relay://dial:\(methodId)/request?\(json)"
         sendChannelText(uri)
+        reportOutcome(true)
     }
 
     private func sendChannelText(_ text: String) {
@@ -445,7 +645,9 @@ final class LyraRelayCallDialer {
         }
         DiagnosticsLog.info("xiaomi.relaydial.uri_rx \(text)")
         if text.hasPrefix("relay://dial:\(methodId)/response?") {
-            if text.contains("\"code\":0") || text.contains("\"code\": 0") {
+            if text.contains("\"code\":0") || text.contains("\"code\": 0")
+                || text.contains("\"code\":200") || text.contains("\"code\": 200")
+            {
                 DiagnosticsLog.info("xiaomi.relaydial.dial_accepted")
                 state = .done
             } else {
@@ -465,6 +667,10 @@ final class LyraRelayCallDialer {
         }
         if frame.packType == 5 {
             handlePayloadFrame(frame)
+            return
+        }
+        if frame.packType == 4 {
+            handleLogiPayloadFrame(frame)
             return
         }
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
@@ -507,10 +713,61 @@ final class LyraRelayCallDialer {
                 break
             }
         }
-        for logiConn in miFrame.logiConnFrames where logiConn.logiConnId == logiConnId {
+        for logiConn in miFrame.logiConnFrames {
+            // The phone may reuse this phys conn to dial our relayCall service
+            // (createRelayChannel after a DIAL request) — adopt those logi
+            // conns into the shared relay session, same as the announcer.
+            if logiConn.logiConnId != logiConnId {
+                if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == LyraRelayCallSession.serviceName
+                {
+                    DiagnosticsLog.info(
+                        "xiaomi.relaydial.relaycall_sync_info connId=\(logiConn.logiConnId) " +
+                            "peerNetId=\(logiConn.localNetId)"
+                    )
+                    LyraRelayCallSession.adopt(
+                        syncInfoData: syncInfoData,
+                        logiConn: logiConn,
+                        endpoint: endpoint,
+                        sessionKey: meshSessionKey
+                    ) { [weak self] frame, label in
+                        self?.send(frame: frame, label: label)
+                    }
+                } else if let session = LyraRelayCallSession.activeRelaySession {
+                    session.handleFrame(logiConn)
+                } else {
+                    DiagnosticsLog.info(
+                        "xiaomi.relaydial.stray_conn connId=\(logiConn.logiConnId) " +
+                            "bytes=\(logiConn.inner.count)"
+                    )
+                }
+                continue
+            }
             var inner = LogiConnInnerFrame(parsing: logiConn.inner)
             if inner == nil, logiConn.flag {
                 inner = decryptInner(logiConn)
+            }
+            // responseOfPeerPort may arrive as a raw ChannelProtocol command in
+            // the logi frame inner (plaintext or session-key encrypted), not
+            // wrapped in a LogiConnInnerFrame — same as the cast flow.
+            if inner == nil {
+                if let (header, body) = try? LyraChannelProtocol.decode(logiConn.inner) {
+                    DiagnosticsLog.info("xiaomi.relaydial.command_logi_plain type=\(header.type)")
+                    handlePeerPortResponse(type: header.type, body: body)
+                } else if logiConn.flag, let plain = decryptInnerRaw(logiConn),
+                          let (header, body) = try? LyraChannelProtocol.decode(plain)
+                {
+                    DiagnosticsLog.info("xiaomi.relaydial.command_logi_enc type=\(header.type)")
+                    handlePeerPortResponse(type: header.type, body: body)
+                } else {
+                    DiagnosticsLog.info(
+                        "xiaomi.relaydial.logi_unparsed bytes=\(logiConn.inner.count) " +
+                            "head=\(logiConn.inner.prefix(32).map { String(format: "%02x", $0) }.joined())"
+                    )
+                }
+                continue
             }
             guard let inner else { continue }
             switch inner.payload {
@@ -576,16 +833,67 @@ final class LyraRelayCallDialer {
         )
     }
 
+    // packType-4 "logi payload": either a MiConnectFrame whose logi inner is
+    // a raw ChannelProtocol command (cast flow), or [netId][flag] + AES-GCM
+    // blob keyed by the session or channel trans key. Observed live
+    // 2026-08-06: the phone's responseOfPeerPort arrived this way.
+    private func handleLogiPayloadFrame(_ frame: LyraMeshPack.Frame) {
+        let body = frame.payload
+        if let miFrame = MiConnectFrame(parsing: body) {
+            for logiConn in miFrame.logiConnFrames {
+                if let (header, commandBody) = try? LyraChannelProtocol.decode(logiConn.inner) {
+                    DiagnosticsLog.info("xiaomi.relaydial.command_p4_logi type=\(header.type)")
+                    handlePeerPortResponse(type: header.type, body: commandBody)
+                    return
+                }
+            }
+        }
+        var keys: [SymmetricKey] = []
+        if let meshSessionKey { keys.append(meshSessionKey) }
+        if !transKey.isEmpty { keys.append(SymmetricKey(data: transKey)) }
+        for headerBytes in 1...2 where body.count > headerBytes + 28 {
+            let nonce = body[body.index(body.startIndex, offsetBy: headerBytes)..<body.index(body.startIndex, offsetBy: headerBytes + 12)]
+            let ciphertext = body[body.index(body.startIndex, offsetBy: headerBytes + 12)..<body.index(body.endIndex, offsetBy: -16)]
+            let tag = body[body.index(body.endIndex, offsetBy: -16)..<body.endIndex]
+            guard let box = try? AES.GCM.SealedBox(
+                nonce: AES.GCM.Nonce(data: Data(nonce)),
+                ciphertext: Data(ciphertext),
+                tag: Data(tag)
+            ) else { continue }
+            for key in keys {
+                guard let plaintext = try? AES.GCM.open(box, using: key),
+                      let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext)
+                else { continue }
+                DiagnosticsLog.info(
+                    "xiaomi.relaydial.command_p4_enc type=\(header.type) headerBytes=\(headerBytes)"
+                )
+                handlePeerPortResponse(type: header.type, body: commandBody)
+                return
+            }
+        }
+        DiagnosticsLog.info(
+            "xiaomi.relaydial.p4_unparsed bytes=\(body.count) " +
+                "head=\(body.prefix(32).map { String(format: "%02x", $0) }.joined())"
+        )
+    }
+
     private func handlePeerPortResponse(type: UInt8, body: Data) {
         guard type == LyraChannelProtocol.CommandType.responseOfPeerPort.rawValue else { return }
         let fields = (try? LyraProtoReader.readFields(from: body)) ?? []
         var peerPort: UInt16 = 0
-        for field in fields where field.number == 3 && field.wireType == 0 {
-            peerPort = UInt16(field.varintValue ?? 0)
+        var serverChannelId: UInt64 = 0
+        for field in fields {
+            switch (field.number, field.wireType) {
+            case (2, 0): serverChannelId = field.varintValue ?? 0
+            case (3, 0): peerPort = UInt16(field.varintValue ?? 0)
+            default: continue
+            }
         }
         guard peerPort != 0, state == .awaitingPeerPort else { return }
-        DiagnosticsLog.info("xiaomi.relaydial.peer_port_rx port=\(peerPort)")
-        connectChannel(port: peerPort)
+        DiagnosticsLog.info(
+            "xiaomi.relaydial.peer_port_rx port=\(peerPort) serverChannelId=\(serverChannelId)"
+        )
+        connectChannel(port: peerPort, serverChannelId: UInt32(serverChannelId))
     }
 
     // MARK: - helpers
@@ -614,6 +922,11 @@ final class LyraRelayCallDialer {
     }
 
     private func decryptInner(_ logiConn: LogiConnFrame) -> LogiConnInnerFrame? {
+        guard let plaintext = decryptInnerRaw(logiConn) else { return nil }
+        return LogiConnInnerFrame(parsing: plaintext)
+    }
+
+    private func decryptInnerRaw(_ logiConn: LogiConnFrame) -> Data? {
         guard let sessionKey = meshSessionKey else { return nil }
         let inner = logiConn.inner
         guard inner.count > 28 else { return nil }
@@ -624,7 +937,7 @@ final class LyraRelayCallDialer {
         ), let plaintext = try? AES.GCM.open(box, using: sessionKey) else {
             return nil
         }
-        return LogiConnInnerFrame(parsing: plaintext)
+        return plaintext
     }
 
     private func send(frame: LyraMeshPack.Frame, label: String, toPort: UInt16? = nil) {
