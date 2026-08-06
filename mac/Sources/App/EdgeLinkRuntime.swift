@@ -1236,7 +1236,46 @@ final class EdgeLinkRuntime: ObservableObject {
             return nil
         }
         rememberDialedPhoneNumber(number)
+        startNativeRelayDial(number: number)
         return sendPhoneAction(action: "dial", number: number)
+    }
+
+    // Native Xiaomi relay dial (pad-style DIAL request to the phone's
+    // relayPhoneCall service) — runs alongside our own bridge dial.
+    private var relayCallDialer: LyraRelayCallDialer?
+    private func startNativeRelayDial(number: String) {
+        guard UserDefaults.standard.bool(forKey: "xiaomiRelayCallNativeDial") else { return }
+        var host: String?
+        var ports: [UInt16] = []
+        var candidates = UserDefaults.standard.stringArray(forKey: "lyraPhoneMeshEndpointHistory") ?? []
+        if let live = UserDefaults.standard.string(forKey: "lyraLastPhoneMeshEndpoint") {
+            candidates.insert(live, at: 0)
+        }
+        for description in candidates {
+            guard let parsed = LyraMeshResponder.parseEndpoint(description) else { continue }
+            host = parsed.host
+            if !ports.contains(parsed.port) { ports.append(parsed.port) }
+        }
+        for endpoint in xiaomiMiShareDiscovery.currentPhoneMeshEndpoints() {
+            if host == nil { host = endpoint.host }
+            guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
+            ports.append(endpoint.port)
+        }
+        guard let host, !ports.isEmpty else { return }
+        if relayCallDialer == nil {
+            relayCallDialer = LyraRelayCallDialer(
+                deviceIdHexProvider: { [weak self] in
+                    let cloneId = UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let cloneId, !cloneId.isEmpty { return cloneId }
+                    return self?.xiaomiMiShareDiscovery.localDeviceIdHex
+                },
+                displayNameProvider: { [weak self] in
+                    self?.xiaomiMiShareDiscovery.localDisplayName ?? "EdgeLink Mac"
+                }
+            )
+        }
+        relayCallDialer?.dial(number: number, host: host, ports: ports)
     }
 
     @discardableResult
