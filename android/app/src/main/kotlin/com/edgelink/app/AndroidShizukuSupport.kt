@@ -202,6 +202,16 @@ object AndroidShizukuSupport {
             withService(context) { service -> service.runCommandResult(command) }
         }.getOrNull()
 
+    suspend fun startAudioMonitorKeepalive(context: Context): Boolean =
+        runCatching {
+            withService(context) { service -> service.startAudioMonitorKeepalive() }
+        }.isSuccess
+
+    suspend fun stopAudioMonitorKeepalive(context: Context): Boolean =
+        runCatching {
+            withService(context) { service -> service.stopAudioMonitorKeepalive() }
+        }.isSuccess
+
     suspend fun probeMiLinkRoot(context: Context): ShizukuOperationResult {
         val state = currentState()
         if (state.uid != 0) {

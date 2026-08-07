@@ -353,4 +353,21 @@ class EdgeLinkShizukuCommandPolicyTest {
             )
         )
     }
+
+    @Test
+    fun allowsExactDistAudioMaintenanceCommands() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                EdgeLinkShizukuCommands.RELAY_ROUTE_REGISTER_COMMAND
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("sh", "-c", "rm -rf /data/local/tmp")
+            )
+        )
+        val tampered = EdgeLinkShizukuCommands.RELAY_ROUTE_REGISTER_COMMAND.copyOf()
+        tampered[2] = tampered[2] + "; reboot"
+        assertFalse(EdgeLinkShizukuCommandPolicy.isAllowed(tampered))
+    }
 }

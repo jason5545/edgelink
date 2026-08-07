@@ -18,6 +18,10 @@ class EdgeLinkInCallService : InCallService() {
         super.onCallAdded(call)
         EdgeLinkLog.configure(applicationContext)
         DistAudioConnector.appContext = applicationContext
+        // After a reboot MIUI keeps com.milink.service dead and TeleService
+        // never sees the Mac as a relay device; re-register the route with
+        // root on every call so the first dial after a reboot can relay too.
+        RelayRouteRegistrar.ensureRegistered(applicationContext)
         runCatching {
             EdgeLinkForegroundService.ensureStarted(applicationContext)
         }.onFailure { error ->

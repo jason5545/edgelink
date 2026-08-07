@@ -111,6 +111,28 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
+    fun hooksAudioMonitorForCallUplinkInject() {
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHook(
+                packageName = "com.miui.audiomonitor",
+                processName = "com.miui.audiomonitor"
+            )
+        )
+        assertTrue(
+            MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(
+                packageName = "com.miui.audiomonitor",
+                processName = "com.miui.audiomonitor"
+            )
+        )
+        assertFalse(
+            MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(
+                packageName = "com.milink.service",
+                processName = "com.milink.service"
+            )
+        )
+    }
+
+    @Test
     fun allowsOnlyKnownMirrorPhoneProviderMethods() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("getCallRelayService"))
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("queryRemoteDevices"))

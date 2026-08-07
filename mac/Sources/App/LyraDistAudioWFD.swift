@@ -698,8 +698,14 @@ final class LyraDistAudioWFDServer {
                 }
                 uplinkStage = .awaitSetupRequest
                 ourCSeq += 1
+                // M4 selection is "<encodeType> <modeIndex>" (sscanf "%d %d",
+                // then AudioFormats::GetConfiguration). The capability bitmask
+                // (16) is NOT a valid encodeType (phone logs "invalid type:16"
+                // and leaves the audio format all-zero = silence). encodeType
+                // 0 = LPCM; mode index 4 = 16kHz/1ch/16-bit (the distaudio
+                // format; the official mirror used "0 1" = 48kHz/2ch).
                 let m4 = [
-                    "wfd_audio_codecs_v2: \(selectedAudioCodec) 1",
+                    "wfd_audio_codecs_v2: 0 4",
                     "wfd_type_encryp: 4 1 1 1 1",
                     "wfd_buffer_capabity: 1F",
                     "",
@@ -762,17 +768,25 @@ final class LyraDistAudioWFDServer {
             send(LyraDistAudioWFD.serializeResponse(cseq: cseq, headers: [], body: ""), on: connection, label: "setparam_response")
         case "SETUP":
             // The phone (sink) sends SETUP with its client_port; answer with
-            // our server_port, then it sends PLAY.
+            // our server_port, then it sends PLAY. client_port may be a
+            // range ("15550-15551" = RTP+RTCP); take the first port.
             if let transport = headers["transport"] {
                 for component in transport.components(separatedBy: ";") {
                     let pair = component.trimmingCharacters(in: .whitespaces)
-                    if pair.hasPrefix("client_port="),
-                       let port = UInt16(pair.dropFirst("client_port=".count)) {
-                        clientMediaPort = port
+                    if pair.hasPrefix("client_port=") {
+                        let value = pair.dropFirst("client_port=".count)
+                        let firstPort = value.components(separatedBy: "-").first ?? ""
+                        if let port = UInt16(firstPort) {
+                            clientMediaPort = port
+                        }
                     }
                 }
             }
-            let serverMediaPort = UInt16.random(in: 30000...60000)
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_setup clientMediaPort=\(clientMediaPort) transport=\(headers["transport"] ?? "none")")
+            // RTP ports must be even (the phone logs "Server picked an odd
+            // numbered RTP port." otherwise); bind our media socket to it so
+            // packets actually carry the declared source port.
+            let serverMediaPort = (UInt16.random(in: 15000...30000)) & 0xFFFE
             let sessionId = UInt32.random(in: 100000...999999999)
             send(
                 LyraDistAudioWFD.serializeResponse(
@@ -869,7 +883,17 @@ final class LyraDistAudioWFDServer {
     }
 
     private func startMediaPush() {
-        guard uplink == nil, let peerHost, clientMediaPort > 0 else { return }
+        guard uplink == nil else {
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_media_start_skipped reason=already_running")
+            return
+        }
+        guard let peerHost, clientMediaPort > 0 else {
+            DiagnosticsLog.warn(
+                "xiaomi.distaudio.uplink_media_start_skipped reason=missing_target " +
+                    "peerHost=\(peerHost ?? "nil") clientMediaPort=\(clientMediaPort)"
+            )
+            return
+        }
         let uplink = LyraDistAudioUplink(
             host: peerHost, port: clientMediaPort, localPort: pendingServerPort, mediaKey: mediaKey
         )
@@ -879,7 +903,12 @@ final class LyraDistAudioWFDServer {
     }
 }
 
-// Mic capture → AES-ECB → UDP RTP push to the phone.
+// Mic capture → AES-ECB → UDP RTP push to the phone. The sink parses plain
+// RTP on its first client_port (parseRTP reached directly, mRtpUseLyra=0;
+// KCP/framed datagrams fail the RTP version check with err -1010). The RTP
+// payload must carry the MPEG-TS container (PAT/PMT + private_stream_1 PES
+// with the ff02 private-audio header + encrypted PCM) — raw cipher blobs
+// parse as RTP but never reach the audio decoder.
 final class LyraDistAudioUplink {
     private let host: String
     private let port: UInt16
@@ -889,9 +918,34 @@ final class LyraDistAudioUplink {
     private var connection: NWConnection?
     private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
+    // 20ms s16le mono frames (640 bytes) accumulate here between taps.
+    private var pcmCarry = Data()
+    private var frameIndex: UInt32 = 0
     private var sequence: UInt16 = 0
-    private var timestamp: UInt32 = 0
+    private var pts90k: UInt32 = 0
     private let ssrc: UInt32 = UInt32.random(in: 1...UInt32.max)
+    private var esContinuityCounter: UInt8 = 0
+    private var psiContinuityCounter: UInt8 = 0
+    private static let pcmFrameBytes = 640
+    // The phone's renderer waits for an RTCP sender report to anchor its
+    // MediaClock before it drains audio (without one the pipeline primes a
+    // few buffers and stalls). Mirror the mirror path: one SR per second to
+    // the RTCP port (client_port + 1), sent from server_port + 1.
+    private var rtcpConnection: NWConnection?
+    private var rtcpTimer: DispatchSourceTimer?
+    private var rtcpSRSent = 0
+    // Call-uplink injection: the phone's miplaycast runtime never delivers
+    // this session's decoded audio to the DAS call stream (RuntimeToClient
+    // shared memory stays empty), so the mic PCM is also streamed raw to
+    // the EdgeLink Android hook in com.miui.audiomonitor (TCP :19307,
+    // "ELMA" magic, then 16k s16le mono), which feeds it into
+    // DistAudioStream.playCastAudioData → TELEPHONY_TX (modem uplink).
+    private static let callInjectPort: UInt16 = 19307
+    private static let callInjectMagic = Data([0x45, 0x4c, 0x4d, 0x41])
+    private var injectConnection: NWConnection?
+    private var injectReady = false
+    private var injectBytesSent = 0
+    private var injectLastLogBytes = 0
 
     init(host: String, port: UInt16, localPort: UInt16, mediaKey: Data) {
         self.host = host
@@ -901,22 +955,187 @@ final class LyraDistAudioUplink {
     }
 
     func start() {
+        let parameters = NWParameters.udp
+        // Send from the declared server_port so packets match the SETUP
+        // transport (without this NWConnection uses an ephemeral port).
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: localPort)!
+        )
         let connection = NWConnection(
-            host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .udp
+            host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: parameters
         )
         self.connection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                DiagnosticsLog.info("xiaomi.distaudio.uplink_media_ready host=\(self?.host ?? "") port=\(self?.port ?? 0)")
+            case .failed(let error):
+                DiagnosticsLog.warn("xiaomi.distaudio.uplink_media_failed \(String(describing: error))")
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
+        // A/B probe: /tmp/edgelink-distaudio-no-rtcp disables the RTCP
+        // socket + SRs. Every round so far, the phone's RTP delivery
+        // dies the instant its SECOND kWhatRTPConnect fires (whichever
+        // leg — RTP or RTCP — is second), so test whether the RTCP
+        // connect notification is what corrupts the RTP session.
+        if Self.debugNoRTCP() {
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_rtcp_disabled_by_debug")
+        } else {
+            startRTCP()
+        }
+        startCallInject()
         startCapture()
     }
 
+    private func startCallInject() {
+        let inject = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: Self.callInjectPort)!,
+            using: .tcp
+        )
+        injectConnection = inject
+        inject.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                guard let self, !self.injectReady else { return }
+                self.injectReady = true
+                inject.send(content: Self.callInjectMagic, completion: .contentProcessed { error in
+                    if let error {
+                        DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_handshake_failed \(error)")
+                    } else {
+                        DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_ready host=\(self.host) port=\(Self.callInjectPort)")
+                    }
+                })
+            case .failed(let error):
+                DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_failed \(String(describing: error))")
+                self?.injectReady = false
+            default:
+                break
+            }
+        }
+        inject.start(queue: queue)
+    }
+
+    private func sendCallInjectPCM(_ pcm: Data) {
+        guard injectReady, let injectConnection else { return }
+        injectBytesSent += pcm.count
+        injectConnection.send(content: pcm, completion: .contentProcessed { [weak self] error in
+            if let error {
+                DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_send_failed \(error)")
+                self?.injectReady = false
+                return
+            }
+            guard let self, self.injectBytesSent - self.injectLastLogBytes >= 320_000 else { return }
+            self.injectLastLogBytes = self.injectBytesSent
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_progress bytes=\(self.injectBytesSent)")
+        })
+    }
+
+    static func debugNoRTCP() -> Bool {
+        FileManager.default.fileExists(atPath: "/tmp/edgelink-distaudio-no-rtcp")
+    }
+
+    private func startRTCP() {
+        let rtcpParameters = NWParameters.udp
+        rtcpParameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: localPort &+ 1)!
+        )
+        let rtcp = NWConnection(
+            host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port &+ 1)!, using: rtcpParameters
+        )
+        rtcpConnection = rtcp
+        rtcp.stateUpdateHandler = { [weak self] state in
+            if case .ready = state {
+                DiagnosticsLog.info("xiaomi.distaudio.uplink_rtcp_ready port=\(self?.port ?? 0)")
+            }
+        }
+        rtcp.start(queue: queue)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(200), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            self?.sendRTCPSenderReport()
+        }
+        rtcpTimer = timer
+        timer.resume()
+    }
+
+    private func sendRTCPSenderReport() {
+        guard let rtcpConnection else { return }
+        var packet = Data(capacity: 28)
+        packet.append(0x80)
+        packet.append(200)
+        packet.append(contentsOf: [0x00, 0x06])
+        packet.append(UInt8((ssrc >> 24) & 0xff))
+        packet.append(UInt8((ssrc >> 16) & 0xff))
+        packet.append(UInt8((ssrc >> 8) & 0xff))
+        packet.append(UInt8(ssrc & 0xff))
+        let ntpEpochOffset: TimeInterval = 2_208_988_800
+        let timestamp = Date().timeIntervalSince1970 + ntpEpochOffset
+        let seconds = UInt32(timestamp)
+        let fraction = UInt32((timestamp - floor(timestamp)) * 4_294_967_296)
+        for value in [seconds, fraction, pts90k] {
+            packet.append(UInt8((value >> 24) & 0xff))
+            packet.append(UInt8((value >> 16) & 0xff))
+            packet.append(UInt8((value >> 8) & 0xff))
+            packet.append(UInt8(value & 0xff))
+        }
+        let packets = UInt32(truncatingIfNeeded: sentPackets)
+        let octets = UInt32(truncatingIfNeeded: sentBytes)
+        for value in [packets, octets] {
+            packet.append(UInt8((value >> 24) & 0xff))
+            packet.append(UInt8((value >> 16) & 0xff))
+            packet.append(UInt8((value >> 8) & 0xff))
+            packet.append(UInt8(value & 0xff))
+        }
+        rtcpSRSent += 1
+        let count = rtcpSRSent
+        rtcpConnection.send(content: packet, completion: .contentProcessed { [weak self] error in
+            if let error {
+                DiagnosticsLog.error("xiaomi.distaudio.uplink_rtcp_sr_failed count=\(count)", error)
+            } else if count <= 3 || count % 10 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.distaudio.uplink_rtcp_sr count=\(count) rtpTime=\(self?.pts90k ?? 0) packets=\(packets)"
+                )
+            }
+        })
+    }
+
     func stop() {
+        if let configObserver {
+            NotificationCenter.default.removeObserver(configObserver)
+            self.configObserver = nil
+        }
         queue.async { [weak self] in
+            DiagnosticsLog.info(
+                "xiaomi.distaudio.uplink_stop taps=\(self?.tapInvocations ?? 0) buffers=\(self?.captureBuffers ?? 0) " +
+                    "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0) " +
+                    "injectBytes=\(self?.injectBytesSent ?? 0)"
+            )
             self?.engine?.stop()
             self?.engine?.inputNode.removeTap(onBus: 0)
             self?.engine = nil
+            self?.rtcpTimer?.cancel()
+            self?.rtcpTimer = nil
+            self?.rtcpConnection?.cancel()
+            self?.rtcpConnection = nil
+            self?.injectConnection?.cancel()
+            self?.injectConnection = nil
+            self?.injectReady = false
             self?.connection?.cancel()
         }
     }
+
+    private var captureBuffers = 0
+    private var sentPackets = 0
+    private var sentBytes = 0
+    private var sendFailures = 0
+    private var tapInvocations = 0
+    private var skippedBuffers = 0
+    private var captureRestarts = 0
+    private var configObserver: NSObjectProtocol?
 
     private func startCapture() {
         let engine = AVAudioEngine()
@@ -927,56 +1146,318 @@ final class LyraDistAudioUplink {
             commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true
         )!
         converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        DiagnosticsLog.info(
+            "xiaomi.distaudio.uplink_capture_start inputRate=\(inputFormat.sampleRate) " +
+                "inputChannels=\(inputFormat.channelCount) converter=\(converter != nil) restarts=\(captureRestarts)"
+        )
         input.installTap(onBus: 0, bufferSize: 640, format: inputFormat) { [weak self] buffer, _ in
             self?.handleInput(buffer, targetFormat: targetFormat)
         }
         do {
             try engine.start()
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_capture_running isRunning=\(engine.isRunning)")
         } catch {
             DiagnosticsLog.error("xiaomi.distaudio.uplink_capture_failed", error)
+        }
+        // Route changes (another engine starting, device switches) stop the
+        // engine silently and the tap never fires again — restart it.
+        if configObserver == nil {
+            configObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil
+            ) { [weak self] note in
+                // Only react to OUR capture engine being reconfigured.
+                guard let self, note.object as AnyObject === self.engine else { return }
+                self.handleConfigurationChange()
+            }
+        }
+    }
+
+    private func handleConfigurationChange() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.captureRestarts < 5 else {
+                DiagnosticsLog.warn("xiaomi.distaudio.uplink_capture_restart_gave_up restarts=\(self.captureRestarts)")
+                return
+            }
+            self.captureRestarts += 1
+            DiagnosticsLog.warn(
+                "xiaomi.distaudio.uplink_capture_restart n=\(self.captureRestarts) " +
+                    "isRunning=\(self.engine?.isRunning ?? false) taps=\(self.tapInvocations) buffers=\(self.captureBuffers)"
+            )
+            self.engine?.stop()
+            self.engine?.inputNode.removeTap(onBus: 0)
+            self.engine = nil
+            self.converter = nil
+            self.startCapture()
         }
     }
 
     private func handleInput(_ buffer: AVAudioPCMBuffer, targetFormat: AVAudioFormat) {
+        tapInvocations += 1
+        if tapInvocations % 500 == 0 {
+            DiagnosticsLog.info(
+                "xiaomi.distaudio.uplink_tap_progress taps=\(tapInvocations) buffers=\(captureBuffers) " +
+                    "skipped=\(skippedBuffers) sent=\(sentPackets) engineRunning=\(engine?.isRunning ?? false)"
+            )
+        }
         guard let converter else { return }
+        // Generous capacity: the converter may need several internal passes
+        // (and resampler priming) before it emits frames for one input.
         let frameCount = AVAudioFrameCount(
             Double(buffer.frameLength) * (16000.0 / buffer.format.sampleRate)
-        )
+        ) + 1024
         guard frameCount > 0,
               let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCount)
-        else { return }
-        var consumed = false
-        var conversionError: NSError?
-        converter.convert(to: out, error: &conversionError) { _, status in
-            if consumed {
-                status.pointee = .endOfStream
-                return nil
+        else {
+            skippedBuffers += 1
+            if skippedBuffers <= 3 {
+                DiagnosticsLog.warn(
+                    "xiaomi.distaudio.uplink_skip_buffer reason=frame_count frames=\(buffer.frameLength) rate=\(buffer.format.sampleRate)"
+                )
             }
-            consumed = true
-            status.pointee = .haveData
-            return buffer
+            return
         }
-        guard out.frameLength > 0,
+        // Streaming pattern: feed this tap buffer once, then noDataNow.
+        // NEVER endOfStream — that puts the reused converter into a
+        // terminal state and every later buffer converts to zero frames
+        // (observed live: 1 good packet, then 756 conversion_empty).
+        var supplied = false
+        var conversionError: NSError?
+        let status = converter.convert(to: out, error: &conversionError) { _, outStatus in
+            if !supplied {
+                supplied = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            outStatus.pointee = .noDataNow
+            return nil
+        }
+        guard status != .error, out.frameLength > 0,
               let channelData = out.int16ChannelData?[0]
-        else { return }
+        else {
+            skippedBuffers += 1
+            if skippedBuffers <= 3 {
+                DiagnosticsLog.warn(
+                    "xiaomi.distaudio.uplink_skip_buffer reason=conversion_empty inFrames=\(buffer.frameLength) " +
+                        "status=\(status.rawValue) error=\(String(describing: conversionError))"
+                )
+            }
+            return
+        }
         let byteCount = Int(out.frameLength) * 2
         let pcm = Data(bytes: channelData, count: byteCount)
-        let encrypted = DistAudioECB.encrypt(pcm, key: mediaKey)
-        let packet = buildRTP(payload: encrypted)
-        connection?.send(content: packet, completion: .contentProcessed { _ in })
+        captureBuffers += 1
+        if captureBuffers <= 3 {
+            var nonzero = 0
+            var maxAbs = 0
+            for i in stride(from: 0, to: pcm.count - 1, by: 2) {
+                let sample = Int(Int16(bitPattern: UInt16(pcm[i]) | (UInt16(pcm[i + 1]) << 8)))
+                if sample != 0 { nonzero += 1 }
+                maxAbs = max(maxAbs, abs(sample))
+            }
+            DiagnosticsLog.info(
+                "xiaomi.distaudio.uplink_capture_buffer n=\(captureBuffers) bytes=\(byteCount) " +
+                    "nonzero=\(nonzero) maxAbs=\(maxAbs)"
+            )
+        }
+        pcmCarry.append(pcm)
+        sendCallInjectPCM(pcm)
+        while pcmCarry.count >= Self.pcmFrameBytes {
+            let frame = pcmCarry.prefix(Self.pcmFrameBytes)
+            pcmCarry.removeFirst(Self.pcmFrameBytes)
+            sendAudioFrame(Data(frame))
+        }
     }
 
-    private func buildRTP(payload: Data) -> Data {
-        var packet = Data(count: 12)
-        packet[0] = 0x80
-        packet[1] = 0x60
-        withUnsafeBytes(of: sequence.bigEndian) { packet.replaceSubrange(2..<4, with: $0) }
-        withUnsafeBytes(of: timestamp.bigEndian) { packet.replaceSubrange(4..<8, with: $0) }
-        withUnsafeBytes(of: ssrc.bigEndian) { packet.replaceSubrange(8..<12, with: $0) }
-        sequence &+= 1
-        timestamp &+= UInt32(payload.count / 2)
+    // One RTP packet per 20ms audio frame: payload = [PAT+PMT every 6th
+    // frame] + PES(0xbd) TS packets; the PES payload is the ff02 header +
+    // AES-ECB PCM. The very first packet carries an ff03 format announce
+    // PES. TS parameters (stream_type 0x83, ES pid 0x1100, PMT pid 0x100,
+    // descriptor 83 02 46 2f) mirror the phone's own downlink TS stream
+    // byte-for-byte — the sink's ATSParser ignored our old stream_type 6
+    // stream entirely (pipeline stalled after ~10 RTP packets).
+    private func sendAudioFrame(_ pcm: Data) {
+        let cipher = DistAudioECB.encrypt(pcm, key: mediaKey)
+        var tsPackets: [Data] = []
+        if frameIndex == 0 {
+            // ff03 announce (as observed on the phone's downlink): PES
+            // payload = ff ff ff ff + 14-byte ff03 header.
+            let announce = Data([
+                0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x0e, 0x01,
+                0x10, 0x00, 0x00, 0x3e, 0x80, 0x00, 0x00, 0x08,
+            ])
+            tsPackets.append(contentsOf: packetizeES(makePESPacket(payload: announce, pts: pts90k)))
+        }
+        if frameIndex % 6 == 0 {
+            tsPackets.append(Self.makePSIPacket(section: Self.patSection, continuity: &psiContinuityCounter, pid: 0))
+            tsPackets.append(Self.makePSIPacket(section: Self.pmtSection, continuity: &psiContinuityCounter, pid: 0x100))
+        }
+        let pesPacket = makePESPacket(payload: makeFF02Frame(cipher: cipher), pts: pts90k)
+        tsPackets.append(contentsOf: packetizeES(pesPacket))
+        var payload = Data()
+        for packet in tsPackets { payload.append(packet) }
+
+        var packet = Data(capacity: 12 + payload.count)
+        packet.append(0x80)
+        packet.append(0x60 | 33)  // marker + PT 33 (TS payload, mirror-style)
+        packet.append(UInt8(sequence >> 8))
+        packet.append(UInt8(sequence & 0xff))
+        packet.append(UInt8((pts90k >> 24) & 0xff))
+        packet.append(UInt8((pts90k >> 16) & 0xff))
+        packet.append(UInt8((pts90k >> 8) & 0xff))
+        packet.append(UInt8(pts90k & 0xff))
+        packet.append(UInt8((ssrc >> 24) & 0xff))
+        packet.append(UInt8((ssrc >> 16) & 0xff))
+        packet.append(UInt8((ssrc >> 8) & 0xff))
+        packet.append(UInt8(ssrc & 0xff))
         packet.append(payload)
+        sequence &+= 1
+
+        connection?.send(content: packet, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.sendFailures += 1
+                if self.sendFailures <= 3 {
+                    DiagnosticsLog.error("xiaomi.distaudio.uplink_send_failed n=\(self.sendFailures)", error)
+                }
+                return
+            }
+            self.sentPackets += 1
+            self.sentBytes += packet.count
+            if self.sentPackets <= 3 {
+                DiagnosticsLog.info(
+                    "xiaomi.distaudio.uplink_send_packet n=\(self.sentPackets) bytes=\(packet.count) " +
+                        "head=\(packet.prefix(28).map { String(format: "%02x", $0) }.joined())"
+                )
+            } else if self.sentPackets % 500 == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.distaudio.uplink_send_progress packets=\(self.sentPackets) " +
+                        "bytes=\(self.sentBytes) failures=\(self.sendFailures)"
+                )
+            }
+        })
+        frameIndex &+= 1
+        pts90k &+= 1800
+    }
+
+    private func makePESPacket(payload frame: Data, pts: UInt32) -> Data {
+        let headerData = Self.encodePTS(pts)
+        var pes = Data([0x00, 0x00, 0x01, 0xbd])
+        let packetLength = UInt16(3 + headerData.count + frame.count)
+        pes.append(UInt8(packetLength >> 8))
+        pes.append(UInt8(packetLength & 0xff))
+        pes.append(contentsOf: [0x84, 0x80, UInt8(headerData.count)])
+        pes.append(headerData)
+        pes.append(frame)
+        return pes
+    }
+
+    // ff02 frame as observed on the downlink: magic, u32BE 16, two zero
+    // bytes, cipher length u32 LE at 8, six zero bytes.
+    private func makeFF02Frame(cipher: Data) -> Data {
+        var frame = Data([0xff, 0x02, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00])
+        frame.append(UInt8(cipher.count & 0xff))
+        frame.append(UInt8((cipher.count >> 8) & 0xff))
+        frame.append(UInt8((cipher.count >> 16) & 0xff))
+        frame.append(UInt8((cipher.count >> 24) & 0xff))
+        frame.append(contentsOf: [UInt8](repeating: 0, count: 6))
+        frame.append(cipher)
+        return frame
+    }
+
+    // 5-byte PTS field as observed (pts 0 → 21 00 01 00 01).
+    private static func encodePTS(_ pts: UInt32) -> Data {
+        Data([
+            UInt8(0x21 | ((pts >> 29) & 0x0e)),
+            UInt8((pts >> 22) & 0xff),
+            UInt8(((pts >> 14) & 0xfe) | 0x01),
+            UInt8((pts >> 7) & 0xff),
+            UInt8(((pts << 1) & 0xfe) | 0x01),
+        ])
+    }
+
+    private func packetizeES(_ pes: Data) -> [Data] {
+        var packets: [Data] = []
+        var offset = 0
+        var first = true
+        while offset < pes.count {
+            let remaining = pes.count - offset
+            var packet = Data(count: 188)
+            packet[0] = 0x47
+            packet[1] = (first ? 0x50 : 0x10) | UInt8((0x1100 >> 8) & 0x1f)
+            packet[2] = UInt8(0x1100 & 0xff)
+            if remaining >= 184 {
+                packet[3] = 0x10 | (esContinuityCounter & 0x0f)
+                packet.replaceSubrange(4..<188, with: pes[offset..<offset + 184])
+                offset += 184
+            } else {
+                // Adaptation-field stuffing so the PES ends flush with the
+                // 188-byte grid (observed on the downlink).
+                let stuffing = 183 - remaining
+                packet[3] = 0x30 | (esContinuityCounter & 0x0f)
+                packet[4] = UInt8(stuffing)
+                if stuffing > 0 {
+                    packet[5] = 0x00
+                    for i in 6..<(5 + stuffing) { packet[i] = 0xff }
+                }
+                packet.replaceSubrange(4 + 1 + stuffing..<188, with: pes[offset..<pes.count])
+                offset = pes.count
+            }
+            esContinuityCounter &+= 1
+            first = false
+            packets.append(packet)
+        }
+        return packets
+    }
+
+    private static func makePSIPacket(section: Data, continuity: inout UInt8, pid: UInt16) -> Data {
+        var packet = Data(count: 188)
+        packet[0] = 0x47
+        packet[1] = 0x40 | UInt8((pid >> 8) & 0x1f)
+        packet[2] = UInt8(pid & 0xff)
+        packet[3] = 0x10 | (continuity & 0x0f)
+        packet[4] = 0x00  // pointer_field
+        let bodyLength = 1 + section.count
+        if bodyLength < 184 {
+            for i in (bodyLength..<184) { packet[4 + 1 + i - bodyLength + 0] = 0xff }
+        }
+        packet.replaceSubrange(5..<5 + section.count, with: section)
+        continuity &+= 1
         return packet
+    }
+
+    // PAT exactly as observed on the downlink (program 1 → PMT PID 0x100).
+    private static let patSection = Data([
+        0x00, 0xb0, 0x0d, 0x00, 0x00, 0xc3, 0x00, 0x00,
+        0x00, 0x01, 0xe1, 0x00, 0x2d, 0xf6, 0x52, 0x95,
+    ])
+
+    // PMT copied byte-for-byte from the phone's own downlink TS stream
+    // (program 1, PCR 0x1000, one stream_type 0x83 private stream at
+    // 0x1100 with the 83 02 46 2f descriptor).
+    private static let pmtSection: Data = {
+        var section = Data([
+            0x02, 0xb0, 0x16, 0x00, 0x01, 0xc3, 0x00, 0x00,
+            0xf0, 0x00, 0xf0, 0x00,
+            0x83, 0xf1, 0x00, 0xf0, 0x04, 0x83, 0x02, 0x46, 0x2f,
+        ])
+        let crc = mpeg2CRC32(section)
+        section.append(UInt8((crc >> 24) & 0xff))
+        section.append(UInt8((crc >> 16) & 0xff))
+        section.append(UInt8((crc >> 8) & 0xff))
+        section.append(UInt8(crc & 0xff))
+        return section
+    }()
+
+    private static func mpeg2CRC32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xffff_ffff
+        for byte in data {
+            crc ^= UInt32(byte) << 24
+            for _ in 0..<8 {
+                crc = (crc & 0x8000_0000) != 0 ? (crc << 1) ^ 0x04c1_1db7 : crc << 1
+            }
+        }
+        return crc
     }
 }
 
