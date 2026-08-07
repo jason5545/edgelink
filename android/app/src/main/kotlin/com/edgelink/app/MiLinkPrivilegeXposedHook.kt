@@ -282,6 +282,16 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
 
     private fun startAudioMonitorCallInject(classLoader: ClassLoader) {
         callInjectClassLoader = classLoader
+        // The root Shizuku injector owns the 19307 endpoint by default and
+        // writes the PCM into a telephony-routed AudioTrack directly; two
+        // servers cannot bind the same port, so this feed stays dormant
+        // unless the injector has explicitly handed the endpoint back
+        // (mode=hook fallback, which also restarts this process).
+        val callInjectMode = readSystemProperty(CallInjectMode.PROPERTY)
+        if (!CallInjectMode.hookShouldListen(callInjectMode)) {
+            log("audiomonitor call inject deferred: mode=$callInjectMode owned by shizuku injector")
+            return
+        }
         if (!callInjectServerStarted.compareAndSet(false, true)) {
             return
         }

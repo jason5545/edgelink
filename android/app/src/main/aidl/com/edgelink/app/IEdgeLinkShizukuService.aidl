@@ -8,4 +8,8 @@ interface IEdgeLinkShizukuService {
     void startAudioMonitorKeepalive() = 2;
 
     void stopAudioMonitorKeepalive() = 3;
+
+    void startCallUplinkInjector() = 4;
+
+    void stopCallUplinkInjector() = 5;
 }

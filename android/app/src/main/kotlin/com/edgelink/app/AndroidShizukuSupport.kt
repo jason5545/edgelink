@@ -212,6 +212,16 @@ object AndroidShizukuSupport {
             withService(context) { service -> service.stopAudioMonitorKeepalive() }
         }.isSuccess
 
+    suspend fun startCallUplinkInjector(context: Context): Boolean =
+        runCatching {
+            withService(context) { service -> service.startCallUplinkInjector() }
+        }.isSuccess
+
+    suspend fun stopCallUplinkInjector(context: Context): Boolean =
+        runCatching {
+            withService(context) { service -> service.stopCallUplinkInjector() }
+        }.isSuccess
+
     suspend fun probeMiLinkRoot(context: Context): ShizukuOperationResult {
         val state = currentState()
         if (state.uid != 0) {

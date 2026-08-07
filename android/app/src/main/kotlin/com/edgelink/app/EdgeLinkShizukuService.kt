@@ -38,12 +38,26 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
     // service: direct file reads/writes with real state logging.
     private val keepalive = AudioMonitorKeepaliveLoop()
 
+    // No-hook call-uplink inject: this root process owns the 19307 endpoint
+    // and writes the Mac mic PCM into a telephony-routed AudioTrack directly,
+    // bypassing the LSPosed feed inside audiomonitor. Falls back to the hook
+    // (mode property + audiomonitor restart) if the route is refused.
+    private val callUplinkInjector = CallUplinkInjector()
+
     override fun startAudioMonitorKeepalive() {
         keepalive.start()
     }
 
     override fun stopAudioMonitorKeepalive() {
         keepalive.stop()
+    }
+
+    override fun startCallUplinkInjector() {
+        callUplinkInjector.start()
+    }
+
+    override fun stopCallUplinkInjector() {
+        callUplinkInjector.stop()
     }
 
     override fun runCommand(command: Array<String>): String {

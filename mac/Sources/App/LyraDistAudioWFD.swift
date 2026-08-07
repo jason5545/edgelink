@@ -946,6 +946,12 @@ final class LyraDistAudioUplink {
     private var injectReady = false
     private var injectBytesSent = 0
     private var injectLastLogBytes = 0
+    // The 19307 endpoint can be recycled under us mid-call (the phone-side
+    // injector kills the audiomonitor hook's server when it takes over, and
+    // any connection reset used to end inject for the whole call). Retry the
+    // connection until stop().
+    private var injectStopped = false
+    private var injectRetries = 0
 
     init(host: String, port: UInt16, localPort: UInt16, mediaKey: Data) {
         self.host = host
@@ -991,6 +997,7 @@ final class LyraDistAudioUplink {
     }
 
     private func startCallInject() {
+        guard !injectStopped else { return }
         let inject = NWConnection(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: Self.callInjectPort)!,
@@ -1002,6 +1009,7 @@ final class LyraDistAudioUplink {
             case .ready:
                 guard let self, !self.injectReady else { return }
                 self.injectReady = true
+                self.injectRetries = 0
                 inject.send(content: Self.callInjectMagic, completion: .contentProcessed { error in
                     if let error {
                         DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_handshake_failed \(error)")
@@ -1012,11 +1020,24 @@ final class LyraDistAudioUplink {
             case .failed(let error):
                 DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_failed \(String(describing: error))")
                 self?.injectReady = false
+                self?.scheduleInjectRetry()
             default:
                 break
             }
         }
         inject.start(queue: queue)
+    }
+
+    private func scheduleInjectRetry() {
+        guard !injectStopped, injectRetries < 30 else { return }
+        injectRetries += 1
+        injectConnection?.cancel()
+        injectConnection = nil
+        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, !self.injectStopped else { return }
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_retry attempt=\(self.injectRetries)")
+            self.startCallInject()
+        }
     }
 
     private func sendCallInjectPCM(_ pcm: Data) {
@@ -1114,6 +1135,7 @@ final class LyraDistAudioUplink {
                     "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0) " +
                     "injectBytes=\(self?.injectBytesSent ?? 0)"
             )
+            self?.injectStopped = true
             self?.engine?.stop()
             self?.engine?.inputNode.removeTap(onBus: 0)
             self?.engine = nil
