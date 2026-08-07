@@ -231,26 +231,8 @@ final class LyraDistAudioWFDClient {
     private var statsBytes = 0
     private var localIP: String?
     private var localPort: UInt16 = 0
-    // Media arrives as KCP PUSH segments (conv 0x00001234, cmd 0x51). The
-    // length field offset is inconsistent across segments (the first push
-    // carries one extra byte), so frame by the 0xdeadbeef marker that
-    // terminates every push payload's 12-byte framing header instead of
-    // trusting the length. The phone retransmits and stalls unless we ACK
-    // every push, so run a minimal in-order receiver answering with ACKs.
-    private static let kcpHeaderLength = 24
-    private static let kcpCommandPush: UInt8 = 0x51
-    private static let kcpCommandACK: UInt8 = 0x52
-    private static let kcpFrameMarker = Data([0xde, 0xad, 0xbe, 0xef])
-    private var kcpConv: UInt32?
-    private var kcpExpectedSN: UInt32 = 0
-    private var kcpInitialized = false
-    private var kcpPending: [UInt32: Data] = [:]
     private var mediaConnection: NWConnection?
-    // Carries PES fragments across TS packets / KCP segments.
-    private var tsCarry = Data()
-    private var pesBuffer = Data()
-    private var pesExpectedLength: Int?
-    private var pesCount = 0
+    private var mediaDecoder: LyraDistAudioMediaDecoder?
 
     init(host: String, port: UInt16, mediaKeyBase64: String) {
         self.host = host
@@ -517,6 +499,33 @@ final class LyraDistAudioWFDClient {
         let player = LyraDistAudioPlayer(sampleRate: 16000)
         self.player = player
         player.start()
+        let decoder = LyraDistAudioMediaDecoder(mediaKey: mediaKey)
+        decoder.onPCM = { [weak self] pcm in
+            guard let self else { return }
+            self.statsBytes += pcm.count
+            if self.statsBytes - pcm.count == 0 {
+                DiagnosticsLog.info(
+                    "xiaomi.distaudio.downlink_pcm_first bytes=\(pcm.count) " +
+                        "prefix=\(pcm.prefix(16).map { String(format: "%02x", $0) }.joined())"
+                )
+            }
+            self.player?.write(pcm)
+        }
+        decoder.onSendACK = { [weak self] packet in
+            self?.mediaConnection?.send(content: packet, completion: .contentProcessed { _ in })
+        }
+        decoder.onWarn = { message in
+            DiagnosticsLog.warn(message)
+        }
+        decoder.onPushPayload = { [weak self] sn, payload in
+            guard let self, self.mediaDumpRemaining > 0 else { return }
+            self.mediaDumpRemaining -= 1
+            DiagnosticsLog.info(
+                "xiaomi.distaudio.downlink_media sn=\(sn) bytes=\(payload.count) " +
+                    "head=\(payload.prefix(48).map { String(format: "%02x", $0) }.joined())"
+            )
+        }
+        mediaDecoder = decoder
         do {
             let listener = try NWListener(using: .udp, on: NWEndpoint.Port(rawValue: clientMediaPort)!)
             mediaListener = listener
@@ -535,205 +544,12 @@ final class LyraDistAudioWFDClient {
         connection.receiveMessage { [weak self] data, _, _, error in
             guard let self else { return }
             if let data, !data.isEmpty {
-                handleMediaDatagram(data)
+                mediaDecoder?.feed(datagram: data)
             }
             if error == nil, stage == .established {
                 receiveMedia(connection)
             }
         }
-    }
-
-    private func handleMediaDatagram(_ datagram: Data) {
-        // One KCP PUSH segment per datagram in practice. conv@0, cmd@4,
-        // ts@8, sn@12 are stable across all observed segments.
-        guard datagram.count > Self.kcpHeaderLength,
-              let ts = distAudioReadUInt32LE(datagram, at: 8),
-              let sn = distAudioReadUInt32LE(datagram, at: 12)
-        else { return }
-        let command = datagram[4]
-        if kcpConv == nil {
-            kcpConv = distAudioReadUInt32LE(datagram, at: 0)
-        }
-        guard command == Self.kcpCommandPush else { return }
-        sendKCPACK(ts: ts, sn: sn)
-        guard let markerRange = datagram.range(of: Self.kcpFrameMarker) else {
-            if mediaDumpRemaining > 0 {
-                DiagnosticsLog.warn(
-                    "xiaomi.distaudio.downlink_kcp_no_marker sn=\(sn) bytes=\(datagram.count) " +
-                        "head=\(datagram.prefix(40).map { String(format: "%02x", $0) }.joined())"
-                )
-            }
-            return
-        }
-        ingestKCPPush(sn: sn, payload: Data(datagram[markerRange.upperBound...]))
-    }
-
-    private func sendKCPACK(ts: UInt32, sn: UInt32) {
-        guard let conv = kcpConv, let connection = mediaConnection else { return }
-        var packet = Data(capacity: Self.kcpHeaderLength)
-        distAudioAppendUInt32LE(&packet, conv)
-        packet.append(Self.kcpCommandACK)
-        packet.append(0)
-        distAudioAppendUInt16LE(&packet, 256)
-        distAudioAppendUInt32LE(&packet, ts)
-        distAudioAppendUInt32LE(&packet, sn)
-        distAudioAppendUInt32LE(&packet, kcpExpectedSN)
-        distAudioAppendUInt32LE(&packet, 0)
-        connection.send(content: packet, completion: .contentProcessed { _ in })
-    }
-
-    private func ingestKCPPush(sn: UInt32, payload: Data) {
-        if !kcpInitialized {
-            kcpInitialized = true
-            kcpExpectedSN = sn
-        }
-        if sn == kcpExpectedSN {
-            deliverMediaPayload(payload, sn: sn)
-            kcpExpectedSN &+= 1
-            var next = kcpPending.removeValue(forKey: kcpExpectedSN)
-            while let buffered = next {
-                deliverMediaPayload(buffered, sn: kcpExpectedSN)
-                kcpExpectedSN &+= 1
-                next = kcpPending.removeValue(forKey: kcpExpectedSN)
-            }
-            return
-        }
-        let delta = Int64(Int32(bitPattern: sn &- kcpExpectedSN))
-        if delta > 0, delta <= 256 {
-            kcpPending[sn] = payload
-            return
-        }
-        // Large gap: resync on the newest segment rather than stall.
-        DiagnosticsLog.warn(
-            "xiaomi.distaudio.downlink_kcp_resync sn=\(sn) expected=\(kcpExpectedSN) gap=\(delta)"
-        )
-        kcpPending.removeAll()
-        kcpExpectedSN = sn &+ 1
-        deliverMediaPayload(payload, sn: sn)
-    }
-
-    // Each KCP push payload after the deadbeef marker is a run of
-    // 188-byte MPEG-TS packets carrying the private_stream_1 (0xbd) PES.
-    // The PES payload is the Xiaomi ff02 private-audio format (same as the
-    // mirror MPT audio path): 18-byte header + PCM16. The PCM portion is
-    // AES-128-ECB encrypted with the distAudio RPC media key.
-    private func deliverMediaPayload(_ payload: Data, sn: UInt32) {
-        if mediaDumpRemaining > 0 {
-            mediaDumpRemaining -= 1
-            DiagnosticsLog.info(
-                "xiaomi.distaudio.downlink_media sn=\(sn) bytes=\(payload.count) " +
-                    "head=\(payload.prefix(48).map { String(format: "%02x", $0) }.joined())"
-            )
-        }
-        var stream = tsCarry + payload
-        tsCarry = Data()
-        var cursor = 0
-        while stream.count - cursor >= 188 {
-            guard stream[cursor] == 0x47 else {
-                // Lost sync: rescan for the next sync byte.
-                if let next = stream[(cursor + 1)..<stream.count].firstIndex(of: 0x47) {
-                    cursor = next
-                    continue
-                }
-                break
-            }
-            let packet = stream.subdata(in: cursor..<cursor + 188)
-            cursor += 188
-            ingestTSPacket(packet)
-        }
-        if cursor < stream.count {
-            tsCarry = Data(stream[cursor...])
-        }
-    }
-    private func ingestTSPacket(_ packet: Data) {
-        guard packet.count == 188 else { return }
-        let afc = (packet[3] >> 4) & 0x03
-        var payloadStart = 4
-        if afc == 0x02 {
-            return  // adaptation field only
-        }
-        if afc == 0x03 {
-            let afLength = Int(packet[4])
-            payloadStart = 5 + afLength
-        }
-        guard payloadStart < 188 else { return }
-        let chunk = packet.subdata(in: payloadStart..<188)
-        if chunk.count >= 4, chunk[0] == 0x00, chunk[1] == 0x00, chunk[2] == 0x01, chunk[3] == 0xBD {
-            // New PES: flush the previous one.
-            flushPES()
-            pesBuffer = chunk
-            pesExpectedLength = chunk.count >= 6 ? 6 + (Int(chunk[4]) << 8 | Int(chunk[5])) : nil
-            return
-        }
-        if !pesBuffer.isEmpty {
-            pesBuffer.append(chunk)
-            if let expected = pesExpectedLength, pesBuffer.count >= expected {
-                flushPES()
-            }
-        }
-    }
-
-    private func flushPES() {
-        defer {
-            pesBuffer = Data()
-            pesExpectedLength = nil
-        }
-        guard pesBuffer.count > 9,
-              pesBuffer[0] == 0x00, pesBuffer[1] == 0x00, pesBuffer[2] == 0x01, pesBuffer[3] == 0xBD
-        else { return }
-        let headerDataLength = Int(pesBuffer[8])
-        let payloadStart = 9 + headerDataLength
-        guard payloadStart < pesBuffer.count else { return }
-        let pesPayload = pesBuffer.subdata(in: payloadStart..<pesBuffer.count)
-        pesCount += 1
-        guard pesPayload.count >= 18, pesPayload[0] == 0xFF, pesPayload[1] == 0x02 else {
-            if pesCount <= 5 {
-                DiagnosticsLog.warn(
-                    "xiaomi.distaudio.downlink_pes_unexpected bytes=\(pesPayload.count) " +
-                        "head=\(pesPayload.prefix(24).map { String(format: "%02x", $0) }.joined())"
-                )
-            }
-            return
-        }
-        // ff02 header = 18 bytes; declared PCM length at offset 8 (u32 BE).
-        var declared = (Int(pesPayload[8]) << 24) | (Int(pesPayload[9]) << 16) |
-            (Int(pesPayload[10]) << 8) | Int(pesPayload[11])
-        if declared <= 0 || declared > pesPayload.count - 18 {
-            declared = pesPayload.count - 18
-        }
-        let encrypted = pesPayload.subdata(in: 18..<18 + declared)
-        guard encrypted.count >= 16, encrypted.count % 16 == 0 else {
-            if pesCount <= 5 {
-                DiagnosticsLog.warn(
-                    "xiaomi.distaudio.downlink_pcm_short declared=\(declared) payload=\(pesPayload.count)"
-                )
-            }
-            return
-        }
-        let pcm = DistAudioECB.decrypt(encrypted, key: mediaKey)
-        if isPlausiblePCM(pcm) {
-            statsBytes += pcm.count
-            if statsBytes - pcm.count == 0 {
-                DiagnosticsLog.info(
-                    "xiaomi.distaudio.downlink_pcm_first bytes=\(pcm.count) " +
-                        "prefix=\(pcm.prefix(16).map { String(format: "%02x", $0) }.joined())"
-                )
-            }
-            player?.write(pcm)
-        } else if pesCount <= 5 {
-            DiagnosticsLog.warn(
-                "xiaomi.distaudio.downlink_pcm_implausible pes=\(pesCount) bytes=\(pcm.count) " +
-                    "prefix=\(pcm.prefix(16).map { String(format: "%02x", $0) }.joined()) " +
-                    "cipherHead=\(encrypted.prefix(16).map { String(format: "%02x", $0) }.joined())"
-            )
-        }
-    }
-
-    private func isPlausiblePCM(_ data: Data) -> Bool {
-        guard !data.isEmpty else { return false }
-        var nonzero = 0
-        for byte in data.prefix(64) where byte != 0 { nonzero += 1 }
-        return nonzero > 4
     }
 
     func prepareClientMediaPort() -> UInt16 {
@@ -1161,6 +977,275 @@ final class LyraDistAudioUplink {
         timestamp &+= UInt32(payload.count / 2)
         packet.append(payload)
         return packet
+    }
+}
+
+// Media-plane decoder for the distaudio downlink (mockable: feed raw UDP
+// datagrams, collect PCM + ACK packets via callbacks). The phone sends KCP
+// PUSH segments (conv 0x00001234, cmd 0x51); the length field offset is
+// inconsistent across segments (the first push carries one extra byte), so
+// framing keys off the 0xdeadbeef marker that terminates every push
+// payload's 12-byte framing header instead of trusting the length. After
+// the marker comes a run of 188-byte MPEG-TS packets carrying
+// private_stream_1 (0xbd) PES; the PES payload is the Xiaomi private-audio
+// format (same container as the mirror MPT audio path): ff03 announces the
+// format (32-byte header), ff02 carries PCM (18-byte header). The PCM
+// portion is AES-128-ECB encrypted with the distAudio RPC media key.
+final class LyraDistAudioMediaDecoder {
+    static let kcpHeaderLength = 24
+    static let kcpCommandPush: UInt8 = 0x51
+    static let kcpCommandACK: UInt8 = 0x52
+    static let kcpFrameMarker = Data([0xde, 0xad, 0xbe, 0xef])
+
+    var onPCM: ((Data) -> Void)?
+    var onSendACK: ((Data) -> Void)?
+    var onWarn: ((String) -> Void)?
+    var onPushPayload: ((_ sn: UInt32, _ payload: Data) -> Void)?
+
+    private let mediaKey: Data
+    private var kcpConv: UInt32?
+    private var kcpExpectedSN: UInt32 = 0
+    private var kcpInitialized = false
+    private var kcpPending: [UInt32: Data] = [:]
+    private var tsCarry = Data()
+    private var pesBuffer = Data()
+    private var pesExpectedLength: Int?
+    private(set) var pesCount = 0
+    private(set) var pcmBytesDelivered = 0
+    // Announced by the ff03 format PES.
+    private(set) var announcedSampleRate: UInt32?
+    private(set) var announcedChannels: Int?
+    private(set) var announcedBitsPerSample: Int?
+
+    init(mediaKey: Data) {
+        self.mediaKey = mediaKey
+    }
+
+    static func makeACK(conv: UInt32, ts: UInt32, sn: UInt32, una: UInt32) -> Data {
+        var packet = Data(capacity: kcpHeaderLength)
+        distAudioAppendUInt32LE(&packet, conv)
+        packet.append(kcpCommandACK)
+        packet.append(0)
+        distAudioAppendUInt16LE(&packet, 256)
+        distAudioAppendUInt32LE(&packet, ts)
+        distAudioAppendUInt32LE(&packet, sn)
+        distAudioAppendUInt32LE(&packet, una)
+        distAudioAppendUInt32LE(&packet, 0)
+        return packet
+    }
+
+    func feed(datagram: Data) {
+        // One KCP PUSH segment per datagram in practice. conv@0, cmd@4,
+        // ts@8, sn@12 are stable across all observed segments.
+        guard datagram.count > Self.kcpHeaderLength,
+              let ts = distAudioReadUInt32LE(datagram, at: 8),
+              let sn = distAudioReadUInt32LE(datagram, at: 12)
+        else { return }
+        let command = datagram[4]
+        if kcpConv == nil {
+            kcpConv = distAudioReadUInt32LE(datagram, at: 0)
+        }
+        guard command == Self.kcpCommandPush else { return }
+        if let conv = kcpConv {
+            onSendACK?(Self.makeACK(conv: conv, ts: ts, sn: sn, una: kcpExpectedSN))
+        }
+        guard let markerRange = datagram.range(of: Self.kcpFrameMarker) else {
+            onWarn?(
+                "xiaomi.distaudio.downlink_kcp_no_marker sn=\(sn) bytes=\(datagram.count) " +
+                    "head=\(datagram.prefix(40).map { String(format: "%02x", $0) }.joined())"
+            )
+            return
+        }
+        ingestKCPPush(sn: sn, payload: Data(datagram[markerRange.upperBound...]))
+    }
+
+    private func ingestKCPPush(sn: UInt32, payload: Data) {
+        if !kcpInitialized {
+            kcpInitialized = true
+            kcpExpectedSN = sn
+        }
+        if sn == kcpExpectedSN {
+            deliverMediaPayload(payload, sn: sn)
+            kcpExpectedSN &+= 1
+            var next = kcpPending.removeValue(forKey: kcpExpectedSN)
+            while let buffered = next {
+                deliverMediaPayload(buffered, sn: kcpExpectedSN)
+                kcpExpectedSN &+= 1
+                next = kcpPending.removeValue(forKey: kcpExpectedSN)
+            }
+            return
+        }
+        let delta = Int64(Int32(bitPattern: sn &- kcpExpectedSN))
+        if delta > 0, delta <= 256 {
+            kcpPending[sn] = payload
+            return
+        }
+        // Large gap: resync on the newest segment rather than stall.
+        onWarn?(
+            "xiaomi.distaudio.downlink_kcp_resync sn=\(sn) expected=\(kcpExpectedSN) gap=\(delta)"
+        )
+        kcpPending.removeAll()
+        kcpExpectedSN = sn &+ 1
+        deliverMediaPayload(payload, sn: sn)
+    }
+
+    private func deliverMediaPayload(_ payload: Data, sn: UInt32) {
+        onPushPayload?(sn, payload)
+        var stream = tsCarry + payload
+        tsCarry = Data()
+        var cursor = 0
+        while stream.count - cursor >= 188 {
+            guard stream[cursor] == 0x47 else {
+                // Lost sync: rescan for the next sync byte.
+                if let next = stream[(cursor + 1)..<stream.count].firstIndex(of: 0x47) {
+                    cursor = next
+                    continue
+                }
+                break
+            }
+            let packet = stream.subdata(in: cursor..<cursor + 188)
+            cursor += 188
+            ingestTSPacket(packet)
+        }
+        if cursor < stream.count {
+            tsCarry = Data(stream[cursor...])
+        }
+        // The final TS packet of a PES can sit split into tsCarry even
+        // when the PES itself is already complete — flush it here or it
+        // waits for the next push (which may start a new PES and flush
+        // it late, or never come at all for the last frame of a call).
+        if let expected = pesExpectedLength, pesBuffer.count >= expected {
+            flushPES()
+        }
+    }
+
+    private func ingestTSPacket(_ packet: Data) {
+        guard packet.count == 188 else { return }
+        let afc = (packet[3] >> 4) & 0x03
+        var payloadStart = 4
+        if afc == 0x02 {
+            return  // adaptation field only
+        }
+        if afc == 0x03 {
+            let afLength = Int(packet[4])
+            payloadStart = 5 + afLength
+        }
+        guard payloadStart < 188 else { return }
+        let chunk = packet.subdata(in: payloadStart..<188)
+        if chunk.count >= 4, chunk[0] == 0x00, chunk[1] == 0x00, chunk[2] == 0x01, chunk[3] == 0xBD {
+            // New PES: flush the previous one.
+            flushPES()
+            pesBuffer = chunk
+            pesExpectedLength = chunk.count >= 6 ? 6 + (Int(chunk[4]) << 8 | Int(chunk[5])) : nil
+            return
+        }
+        if !pesBuffer.isEmpty {
+            pesBuffer.append(chunk)
+            if let expected = pesExpectedLength, pesBuffer.count >= expected {
+                flushPES()
+            }
+        }
+    }
+
+    private func flushPES() {
+        defer {
+            pesBuffer = Data()
+            pesExpectedLength = nil
+        }
+        guard pesBuffer.count > 9,
+              pesBuffer[0] == 0x00, pesBuffer[1] == 0x00, pesBuffer[2] == 0x01, pesBuffer[3] == 0xBD
+        else { return }
+        let headerDataLength = Int(pesBuffer[8])
+        let payloadStart = 9 + headerDataLength
+        guard payloadStart < pesBuffer.count else { return }
+        let pesPayload = pesBuffer.subdata(in: payloadStart..<pesBuffer.count)
+        pesCount += 1
+        guard pesPayload.count >= 18, pesPayload[0] == 0xFF else {
+            warnUnexpectedPES(pesPayload)
+            return
+        }
+        switch pesPayload[1] {
+        case 0x03:
+            handleFF03(pesPayload)
+        case 0x02:
+            handleFF02(pesPayload)
+        default:
+            warnUnexpectedPES(pesPayload)
+        }
+    }
+
+    private func warnUnexpectedPES(_ pesPayload: Data) {
+        guard pesCount <= 5 else { return }
+        onWarn?(
+            "xiaomi.distaudio.downlink_pes_unexpected bytes=\(pesPayload.count) " +
+                "head=\(pesPayload.prefix(24).map { String(format: "%02x", $0) }.joined())"
+        )
+    }
+
+    // ff03 announces the stream format: 32-byte header, packedFormat u16 BE
+    // at 6 (channels hi / bits lo), sampleRate u32 BE at 8, declaredFrames
+    // u32 BE at 12, bitsPerSample u32 BE at 16, declared payload bytes u32
+    // BE at 20; encrypted PCM follows the header.
+    private func handleFF03(_ pesPayload: Data) {
+        guard pesPayload.count >= 32 else {
+            warnUnexpectedPES(pesPayload)
+            return
+        }
+        let packedFormat = (Int(pesPayload[6]) << 8) | Int(pesPayload[7])
+        let sampleRate = (UInt32(pesPayload[8]) << 24) | (UInt32(pesPayload[9]) << 16) |
+            (UInt32(pesPayload[10]) << 8) | UInt32(pesPayload[11])
+        let bits = (UInt32(pesPayload[16]) << 24) | (UInt32(pesPayload[17]) << 16) |
+            (UInt32(pesPayload[18]) << 8) | UInt32(pesPayload[19])
+        announcedChannels = max(1, (packedFormat >> 8) & 0xff)
+        announcedBitsPerSample = bits > 0 ? Int(bits) : (packedFormat & 0xff)
+        announcedSampleRate = sampleRate > 0 ? sampleRate : nil
+        var declared = (Int(pesPayload[20]) << 24) | (Int(pesPayload[21]) << 16) |
+            (Int(pesPayload[22]) << 8) | Int(pesPayload[23])
+        if declared <= 0 || declared > pesPayload.count - 32 {
+            declared = pesPayload.count - 32
+        }
+        deliverEncryptedPCM(pesPayload.subdata(in: 32..<32 + declared))
+    }
+
+    // ff02 carries PCM: 18-byte header, declared PCM length u32 BE at 8.
+    private func handleFF02(_ pesPayload: Data) {
+        var declared = (Int(pesPayload[8]) << 24) | (Int(pesPayload[9]) << 16) |
+            (Int(pesPayload[10]) << 8) | Int(pesPayload[11])
+        if declared <= 0 || declared > pesPayload.count - 18 {
+            declared = pesPayload.count - 18
+        }
+        deliverEncryptedPCM(pesPayload.subdata(in: 18..<18 + declared))
+    }
+
+    private func deliverEncryptedPCM(_ encrypted: Data) {
+        guard encrypted.count >= 16, encrypted.count % 16 == 0 else {
+            if pesCount <= 5 {
+                onWarn?(
+                    "xiaomi.distaudio.downlink_pcm_short declared=\(encrypted.count) pes=\(pesCount)"
+                )
+            }
+            return
+        }
+        let pcm = DistAudioECB.decrypt(encrypted, key: mediaKey)
+        guard isPlausiblePCM(pcm) else {
+            if pesCount <= 5 {
+                onWarn?(
+                    "xiaomi.distaudio.downlink_pcm_implausible pes=\(pesCount) bytes=\(pcm.count) " +
+                        "prefix=\(pcm.prefix(16).map { String(format: "%02x", $0) }.joined()) " +
+                        "cipherHead=\(encrypted.prefix(16).map { String(format: "%02x", $0) }.joined())"
+                )
+            }
+            return
+        }
+        pcmBytesDelivered += pcm.count
+        onPCM?(pcm)
+    }
+
+    private func isPlausiblePCM(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+        var nonzero = 0
+        for byte in data.prefix(64) where byte != 0 { nonzero += 1 }
+        return nonzero > 4
     }
 }
 
