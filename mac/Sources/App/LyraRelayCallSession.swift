@@ -19,32 +19,38 @@ final class LyraRelayCallSession {
         logiConn: LogiConnFrame,
         endpoint: NWEndpoint,
         sessionKey: SymmetricKey?,
+        channelTransport: LyraChannelDatagramPipe? = nil,
         send: @escaping (LyraMeshPack.Frame, String) -> Void
     ) -> LyraRelayCallSession {
         if let existing = activeRelaySession, existing.connId != logiConn.logiConnId {
             existing.teardown()
             activeRelaySession = nil
         }
-        let session = activeRelaySession ?? LyraRelayCallSession(send: send)
+        let session = activeRelaySession
+            ?? LyraRelayCallSession(send: send, channelTransport: channelTransport)
         activeRelaySession = session
         session.handleSyncInfo(syncInfoData: syncInfoData, logiConn: logiConn, sessionKey: sessionKey)
         return session
     }
 
     private let send: (LyraMeshPack.Frame, String) -> Void
+    // Relay-transport harness: the channel runs over this pipe (cloud-relay
+    // path) instead of a local UDP socket when set.
+    private let channelTransport: LyraChannelDatagramPipe?
     private var connId: UInt32 = 0
     private var peerNetId: UInt32 = 0
     private var sessionKey: SymmetricKey?
     private var responseSent = false
     private var peerPortAwaitingAck = false
     private var peerPortResponseSent = false
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
     private var transKey = Data()
     private var peerChannelId: UInt64 = 0
     private var methodCounter: UInt64 = 0
 
-    init(send: @escaping (LyraMeshPack.Frame, String) -> Void) {
+    init(send: @escaping (LyraMeshPack.Frame, String) -> Void, channelTransport: LyraChannelDatagramPipe? = nil) {
         self.send = send
+        self.channelTransport = channelTransport
     }
 
     func handles(logiConn: LogiConnFrame) -> Bool {
@@ -727,7 +733,7 @@ final class LyraRelayCallSession {
         guard channelSocket == nil else { return }
         transKey = key
         peerChannelId = channelId
-        let socket = LyraChannelSocket()
+        let socket: LyraChannelDatagramPipe = channelTransport ?? LyraChannelSocket()
         socket.onMessage = { [weak self] message, _ in
             self?.handleChannelMessage(message)
         }

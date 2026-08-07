@@ -45,7 +45,7 @@ public final class LyraPhoneMeshServer {
         LyraTrustedDeviceInfo.Service(name: "relayCall", package: "com.android.phone"),
     ]
 
-    private let socket = LyraMeshSocket()
+    private let socket: LyraMeshDatagramPipe
     public var boundPort: UInt16? { socket.boundPort }
 
     // MARK: - Peer state (single active Mac)
@@ -79,9 +79,14 @@ public final class LyraPhoneMeshServer {
     // to this handler before the inbound service handlers.
     public var plaintextCommandHandler: ((Data) -> Bool)?
 
-    public init(identity: LyraPhoneIdentity, oracle: LyraDevRepoOracle) {
+    public init(
+        identity: LyraPhoneIdentity,
+        oracle: LyraDevRepoOracle,
+        meshTransport: LyraMeshDatagramPipe? = nil
+    ) {
         self.identity = identity
         self.oracle = oracle
+        self.socket = meshTransport ?? LyraMeshSocket()
     }
 
     public func start(port: UInt16) throws {

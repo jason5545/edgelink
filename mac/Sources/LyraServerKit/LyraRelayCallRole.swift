@@ -30,15 +30,19 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     public private(set) var lastRingResponse: String?
 
     private let identity: LyraPhoneIdentity
+    // Relay-transport harness: the relayCall channel crosses the relay
+    // session through this pipe instead of dialing the peer port over UDP.
+    private let channelTransport: LyraChannelDatagramPipe?
     private var connId: UInt32 = 0
     private var sessionKey: SymmetricKey?
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
     private var transKey = Data()
     private let clientChannelId: UInt64 = 7
     private var methodCounter: UInt64 = 0
 
-    public init(identity: LyraPhoneIdentity) {
+    public init(identity: LyraPhoneIdentity, channelTransport: LyraChannelDatagramPipe? = nil) {
         self.identity = identity
+        self.channelTransport = channelTransport
     }
 
     // Dials the Mac's relayCall service over the established announce conn
@@ -143,7 +147,7 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     }
 
     private func connectChannel(server: LyraPhoneMeshServer) {
-        let socket = LyraChannelSocket()
+        let socket: LyraChannelDatagramPipe = channelTransport ?? LyraChannelSocket()
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
             self?.state = .channelUp
             self?.onEvent("relayCall channel up serverChannelId=\(serverChannelId) mtu=\(mtu)")

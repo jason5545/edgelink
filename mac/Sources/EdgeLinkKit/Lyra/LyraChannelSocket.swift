@@ -438,7 +438,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
         }
     }
 
-    private static func parseOneOf(_ data: Data) -> (UInt32, [UInt32])? {
+    public static func parseOneOf(_ data: Data) -> (UInt32, [UInt32])? {
         let bytes = Array(data)
         guard bytes.count >= 10,
               bytes[0] == 0x01, bytes[1] == 0x01
@@ -460,7 +460,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
         return (selectedTag, values)
     }
 
-    private static func readUInt32BE(_ data: Data, at offset: Int) -> UInt32 {
+    public static func readUInt32BE(_ data: Data, at offset: Int) -> UInt32 {
         let i = data.index(data.startIndex, offsetBy: offset)
         return (UInt32(data[i]) << 24) | (UInt32(data[i + 1]) << 16) | (UInt32(data[i + 2]) << 8) | UInt32(data[i + 3])
     }

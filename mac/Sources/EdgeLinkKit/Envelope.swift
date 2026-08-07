@@ -86,6 +86,8 @@ public enum EnvelopeType {
     public static let tunnelClose = "tunnel.close"
     public static let tunnelError = "tunnel.error"
     public static let tunnelFlow = "tunnel.flow"
+    public static let relayMeshDatagram = "relay.mesh.datagram"
+    public static let relayChannelDatagram = "relay.channel.datagram"
     public static let batteryStatus = "battery.status"
     public static let photoManifest = "photo.manifest"
     public static let photoRequest = "photo.request"

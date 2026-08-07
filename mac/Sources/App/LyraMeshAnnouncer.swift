@@ -15,7 +15,10 @@ final class LyraMeshAnnouncer {
         case logiSynced
     }
 
-    private let socket = LyraMeshSocket()
+    private let socket: LyraMeshDatagramPipe
+    // Relay-transport harness: adopted relayCall sessions run their channel
+    // over this pipe instead of a local UDP socket (cloud-relay path).
+    var relayCallChannelTransport: LyraChannelDatagramPipe?
     private var host: String?
     private var port: UInt16 = 0
     private var candidatePorts: [UInt16] = []
@@ -117,10 +120,12 @@ final class LyraMeshAnnouncer {
 
     init(
         deviceIdHexProvider: @escaping () -> String?,
-        displayNameProvider: @escaping () -> String
+        displayNameProvider: @escaping () -> String,
+        meshTransport: LyraMeshDatagramPipe? = nil
     ) {
         self.deviceIdHexProvider = deviceIdHexProvider
         self.displayNameProvider = displayNameProvider
+        self.socket = meshTransport ?? LyraMeshSocket()
     }
 
     func start(host: String, port: UInt16) {
@@ -962,7 +967,8 @@ final class LyraMeshAnnouncer {
                         syncInfoData: syncInfoData,
                         logiConn: logiConn,
                         endpoint: endpoint,
-                        sessionKey: meshSessionKey
+                        sessionKey: meshSessionKey,
+                        channelTransport: relayCallChannelTransport
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }

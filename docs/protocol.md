@@ -1167,3 +1167,33 @@ EdgeLink 提供裝置間通用 TCP 隧道，支援 adb over tunnel、任意 port
 - 單一 `tunnel.data` envelope 的 `payload` 最大 48 KB（base64 編碼前）。
 - 超過 48 KB 的 TCP read 切為多個 chunk，各自帶递增 `seq`。
 - 最後一個 chunk 帶 `fin: true`（若該方向已 FIN）。
+
+## 10. Relay Transport Datagrams（Xiaomi mesh / channel over relay）
+
+把 Xiaomi 原生的 mesh 與 relayCall channel datagram 原封不動地搬進 E2EE relay
+session，讓通話接線（announce → relayCall dial → channel → relay:// URI）在
+cloud relay 路徑上跑與 LAN 完全相同的 bytes。目前用於假手機端／假伺服器端的
+通話邏輯驗證；Worker 依然只看得到 frame 大小與時間。
+
+### Envelope 格式
+
+```json
+{"t":"relay.mesh.datagram","b":{"payload":"<base64 UDP datagram>"}}
+{"t":"relay.channel.datagram","b":{"payload":"<base64 UDP datagram>"}}
+```
+
+- `relay.mesh.datagram`：一條 LyraMeshDatagram（KCP segment），內容是
+  length-prefixed LyraMeshPack frame stream（announce、auth、sync push、
+  relayCall quick-conn logi、packType-5 peer port command 都走這裡）。
+- `relay.channel.datagram`：一條 relayCall channel datagram（plaintext 協商
+  TLV，或 trans key 加密的 LyraSocketPacket／LyraChannelFragment）。
+
+### 語義
+
+- 每端一個 mesh flow、一個 channel flow，單 peer，不做 port demux。
+- 發送端必須保持 datagram 順序（KCP sn 依賴有序送達）；EdgeLink 端用串行
+  send chain 保證。
+- 兩端各自維持 KCP sn/una 與 ack，與 UDP 路徑一致。
+- 實作：EdgeLinkKit 的 `LyraVirtualMeshPipe`／`LyraVirtualChannelPipe`
+  （`LyraMeshDatagramPipe`／`LyraChannelDatagramPipe` 傳輸縫）＋ LyraServerKit
+  的 `LyraRelayTransportBridge`。
