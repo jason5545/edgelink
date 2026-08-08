@@ -212,6 +212,27 @@ object AndroidShizukuSupport {
             withService(context) { service -> service.stopCallUplinkInjector() }
         }.isSuccess
 
+    // The mi_connect networking probe binds from the app process (AMS
+    // rejects binds from the root service), but mi_connect's
+    // PermissionChecker refuses our uid — except while the Xiaomi debug gate
+    // lyra.permission.switch=1 is set. Only root can write that property, so
+    // the Shizuku service toggles it around the probe window.
+    internal suspend fun probeMiConnectNetworking(
+        context: Context,
+        request: MiConnectNetworkingProbeRequest
+    ): MiConnectNetworkingProbeResult {
+        withService(context) { service -> service.setMiConnectPermissionSwitch(true) }
+        return try {
+            AndroidMiConnectNetworkingClient(context).probe(request)
+        } finally {
+            runCatching {
+                withService(context) { service -> service.setMiConnectPermissionSwitch(false) }
+            }.onFailure { error ->
+                EdgeLinkLog.warn("shizuku.android.mi_connect_switch_restore_failed", error)
+            }
+        }
+    }
+
     suspend fun probeMiLinkRoot(context: Context): ShizukuOperationResult {
         val state = currentState()
         if (state.uid != 0) {

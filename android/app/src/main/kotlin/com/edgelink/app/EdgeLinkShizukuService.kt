@@ -3,12 +3,14 @@ package com.edgelink.app
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.math.min
 
 private const val COMMAND_TIMEOUT_SECONDS = 10L
 private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
+private const val MI_CONNECT_PERMISSION_SWITCH_PROPERTY = "lyra.permission.switch"
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
 private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
     "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
@@ -42,6 +44,61 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
 
     override fun stopCallUplinkInjector() {
         callUplinkInjector.stop()
+    }
+
+    // Permission gate for the mi_connect networking probe. mi_connect's
+    // PermissionChecker refuses every binder caller except uid 1000, but it
+    // consults a Xiaomi-shipped debug gate first: system property
+    // lyra.permission.switch=1 makes checkPermissions return 0 for everyone
+    // (PermissionSwitch.getPermissionAbility). The probe bind itself runs in
+    // the app process (AMS rejects binds from this root process), so this
+    // method only toggles the global property — on for the probe window,
+    // restored to its previous value when the app turns it off. Root is
+    // required because only root can write the property.
+    private val miConnectSwitchBusy = AtomicBoolean(false)
+
+    @Volatile
+    private var miConnectSwitchPrevious = ""
+
+    override fun setMiConnectPermissionSwitch(enabled: Boolean) {
+        if (enabled) {
+            if (!miConnectSwitchBusy.compareAndSet(false, true)) {
+                android.util.Log.w(
+                    "EdgeLinkShizuku",
+                    "mi_connect permission switch already held, forcing re-arm"
+                )
+            }
+            miConnectSwitchPrevious = readSystemProperty(MI_CONNECT_PERMISSION_SWITCH_PROPERTY)
+            setSystemProperty(MI_CONNECT_PERMISSION_SWITCH_PROPERTY, "1")
+        } else {
+            setSystemProperty(MI_CONNECT_PERMISSION_SWITCH_PROPERTY, miConnectSwitchPrevious)
+            miConnectSwitchBusy.set(false)
+        }
+    }
+
+    private fun readSystemProperty(name: String): String = runCatching {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("get", String::class.java)
+            .invoke(null, name) as? String
+    }.getOrNull().orEmpty()
+
+    private fun setSystemProperty(name: String, value: String) {
+        val ok = runCatching {
+            Class.forName("android.os.SystemProperties")
+                .getMethod("set", String::class.java, String::class.java)
+                .invoke(null, name, value)
+            true
+        }.getOrElse { error ->
+            android.util.Log.w(
+                "EdgeLinkShizuku",
+                "mi_connect probe setprop $name failed: ${error.javaClass.simpleName}: ${error.message}"
+            )
+            false
+        }
+        android.util.Log.i(
+            "EdgeLinkShizuku",
+            "mi_connect probe setprop $name=$value ok=$ok"
+        )
     }
 
     override fun runCommand(command: Array<String>): String {

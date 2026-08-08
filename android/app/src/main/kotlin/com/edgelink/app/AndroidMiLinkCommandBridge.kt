@@ -245,7 +245,20 @@ class AndroidMiLinkCommandBridge(
             servicePackageName = servicePackageName,
             serviceData = serviceData
         )
-        val result = AndroidMiConnectNetworkingClient(appContext).probe(request)
+        val result = runCatching {
+            AndroidShizukuSupport.probeMiConnectNetworking(appContext, request)
+        }.getOrElse { error ->
+            return CommandResult(
+                success = false,
+                route = "xiaomi.mi_connect.shizuku",
+                message = "mi_connect probe unavailable via shizuku: " +
+                    "${error.javaClass.simpleName}:${error.message.orEmpty()}",
+                data = mapOf(
+                    "deviceIds" to deviceIds.joinToString(","),
+                    "addRequested" to request.addServiceInfo.toString()
+                )
+            )
+        }
         val success = result.hasAnySuccessfulMetadataRead &&
             (!request.addServiceInfo || result.addServiceInfo?.ok == true)
         return CommandResult(

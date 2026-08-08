@@ -8,4 +8,6 @@ interface IEdgeLinkShizukuService {
     void startCallUplinkInjector() = 4;
 
     void stopCallUplinkInjector() = 5;
+
+    void setMiConnectPermissionSwitch(boolean enabled) = 6;
 }

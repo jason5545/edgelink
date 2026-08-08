@@ -82,30 +82,14 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
-    fun hooksMiConnectMainProcessForNetworkingMetadata() {
-        assertTrue(
+    fun noLongerHooksMiConnectService() {
+        // The mi_connect permission hook existed only for the networking
+        // metadata probe, which now runs through the root Shizuku service
+        // instead, so the module must not load there anymore.
+        assertFalse(
             MiLinkPrivilegeHookPolicy.shouldHook(
                 packageName = "com.xiaomi.mi_connect_service",
                 processName = "com.xiaomi.mi_connect_service"
-            )
-        )
-        assertTrue(
-            MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(
-                packageName = "com.xiaomi.mi_connect_service",
-                processName = "com.xiaomi.mi_connect_service"
-            )
-        )
-
-        assertFalse(
-            MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(
-                packageName = "com.xiaomi.mi_connect_service",
-                processName = "com.xiaomi.mi_connect_service:remote"
-            )
-        )
-        assertFalse(
-            MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(
-                packageName = "com.xiaomi.mirror",
-                processName = "com.xiaomi.mirror"
             )
         )
     }
@@ -147,35 +131,11 @@ class MiLinkPrivilegeHookPolicyTest {
     fun allowsOnlyEdgeLinkCallerPackage() {
         assertTrue(MiLinkPrivilegeHookPolicy.isAllowedCallerPackage("com.edgelink.app"))
         assertTrue(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(arrayOf("com.edgelink.app")))
-        assertTrue(
-            MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(
-                requestedPackageName = "com.edgelink.app",
-                callerPackages = arrayOf("com.edgelink.app")
-            )
-        )
-        assertTrue(
-            MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(
-                requestedPackageName = null,
-                callerPackages = arrayOf("com.edgelink.app")
-            )
-        )
 
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedCallerPackage("com.android.shell"))
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedCallerPackage("com.milink.service"))
         assertFalse(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(arrayOf("com.android.shell")))
         assertFalse(MiLinkPrivilegeHookPolicy.hasAllowedCallerPackage(null))
-        assertFalse(
-            MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(
-                requestedPackageName = "com.android.shell",
-                callerPackages = arrayOf("com.edgelink.app")
-            )
-        )
-        assertFalse(
-            MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(
-                requestedPackageName = "com.edgelink.app",
-                callerPackages = arrayOf("com.android.shell")
-            )
-        )
     }
 
     @Test

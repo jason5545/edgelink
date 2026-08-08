@@ -361,22 +361,26 @@ internal class CallUplinkInjector {
         runCatching { track.release() }
     }
 
-    private fun resolveContext(): Context? {
-        val current = runCatching {
-            Class.forName("android.app.ActivityThread")
-                .getMethod("currentApplication")
-                .invoke(null) as? Context
-        }.getOrNull()
-        if (current != null) {
-            return current
-        }
-        return runCatching {
-            val activityThread = Class.forName("android.app.ActivityThread")
-                .getMethod("systemMain")
-                .invoke(null)
-            activityThread.javaClass.getMethod("getSystemContext").invoke(activityThread) as? Context
-        }.getOrNull()
+    private fun resolveContext(): Context? = resolveRootServiceContext()
+}
+
+// The root Shizuku service process has no injected Context; pull one out of
+// the activity thread the same way the framework's system services do.
+internal fun resolveRootServiceContext(): Context? {
+    val current = runCatching {
+        Class.forName("android.app.ActivityThread")
+            .getMethod("currentApplication")
+            .invoke(null) as? Context
+    }.getOrNull()
+    if (current != null) {
+        return current
     }
+    return runCatching {
+        val activityThread = Class.forName("android.app.ActivityThread")
+            .getMethod("systemMain")
+            .invoke(null)
+        activityThread.javaClass.getMethod("getSystemContext").invoke(activityThread) as? Context
+    }.getOrNull()
 }
 
 // Shared framing constants for the 19307 call-inject endpoint (Mac sends a

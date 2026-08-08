@@ -13,6 +13,13 @@ import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+// Binds com.xiaomi.mi_connect_service's NetworkingService and reads the
+// INetworkingManager metadata transactions from the app process. mi_connect's
+// PermissionChecker refuses our uid natively (only uid 1000 passes), so the
+// caller must hold the Xiaomi debug gate lyra.permission.switch=1 for the
+// probe window — the root Shizuku service toggles it around this probe
+// (AndroidShizukuSupport.probeMiConnectNetworking).
+
 internal class AndroidMiConnectNetworkingClient(
     context: Context
 ) {
@@ -24,69 +31,82 @@ internal class AndroidMiConnectNetworkingClient(
                 bind()
             }
             try {
-                val binder = bound.binder
-                val trustedDeviceIds = request.deviceIds
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .distinct()
-
-                val local = binder.transactTrustedDevice(
-                    label = "getLocalDeviceInfo",
-                    transaction = transactionGetLocalDeviceInfo
-                )
-                val trustedList = binder.transactTrustedDeviceList(
-                    label = "getTrustedDeviceList",
-                    transaction = transactionGetTrustedDeviceList
-                )
-                val trustedInfos = trustedDeviceIds.associateWith { deviceId ->
-                    binder.transactTrustedDevice(
-                        label = "getTrustedDeviceInfo($deviceId)",
-                        transaction = transactionGetTrustedDeviceInfo
-                    ) { parcel -> parcel.writeString(deviceId) }
-                }
-                val serviceLists = trustedDeviceIds.associateWith { deviceId ->
-                    binder.transactBusinessServiceList(
-                        label = "getServiceInfoList($deviceId)",
-                        transaction = transactionGetServiceInfoList
-                    ) { parcel -> parcel.writeString(deviceId) }
-                }
-                val addService = if (request.addServiceInfo) {
-                    binder.transactInt(
-                        label = "addServiceInfo(${request.serviceName})",
-                        transaction = transactionAddServiceInfo
-                    ) { parcel ->
-                        parcel.writeInt(1)
-                        parcel.writeString(request.serviceName)
-                        parcel.writeString(request.servicePackageName)
-                        parcel.writeByteArray(request.serviceData)
-                        parcel.writeString(edgeLinkPackage)
-                    }
-                } else {
-                    null
-                }
-
-                MiConnectNetworkingProbeResult(
-                    descriptor = binder.descriptorSummary(),
-                    localDevice = local,
-                    trustedDevices = trustedList,
-                    trustedDeviceInfos = trustedInfos,
-                    serviceInfoLists = serviceLists,
-                    addServiceInfo = addService,
-                    requestedServiceName = request.serviceName,
-                    requestedServicePackageName = request.servicePackageName,
-                    serviceDataHex = request.serviceData.toHexString()
-                )
+                runProbe(bound.binder, request)
             } finally {
-                runCatching { appContext.unbindService(bound.connection) }
+                bound.close()
             }
         }
 
+    private fun runProbe(
+        binder: IBinder,
+        request: MiConnectNetworkingProbeRequest
+    ): MiConnectNetworkingProbeResult {
+        val trustedDeviceIds = request.deviceIds
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        val local = binder.transactTrustedDevice(
+            label = "getLocalDeviceInfo",
+            transaction = transactionGetLocalDeviceInfo
+        )
+        val trustedList = binder.transactTrustedDeviceList(
+            label = "getTrustedDeviceList",
+            transaction = transactionGetTrustedDeviceList
+        )
+        val trustedInfos = trustedDeviceIds.associateWith { deviceId ->
+            binder.transactTrustedDevice(
+                label = "getTrustedDeviceInfo($deviceId)",
+                transaction = transactionGetTrustedDeviceInfo
+            ) { parcel -> parcel.writeString(deviceId) }
+        }
+        val serviceLists = trustedDeviceIds.associateWith { deviceId ->
+            binder.transactBusinessServiceList(
+                label = "getServiceInfoList($deviceId)",
+                transaction = transactionGetServiceInfoList
+            ) { parcel -> parcel.writeString(deviceId) }
+        }
+        val addService = if (request.addServiceInfo) {
+            binder.transactInt(
+                label = "addServiceInfo(${request.serviceName})",
+                transaction = transactionAddServiceInfo
+            ) { parcel ->
+                parcel.writeInt(1)
+                parcel.writeString(request.serviceName)
+                parcel.writeString(request.servicePackageName)
+                parcel.writeByteArray(request.serviceData)
+                parcel.writeString(edgeLinkPackage)
+            }
+        } else {
+            null
+        }
+
+        return MiConnectNetworkingProbeResult(
+            descriptor = binder.descriptorSummary(),
+            localDevice = local,
+            trustedDevices = trustedList,
+            trustedDeviceInfos = trustedInfos,
+            serviceInfoLists = serviceLists,
+            addServiceInfo = addService,
+            requestedServiceName = request.serviceName,
+            requestedServicePackageName = request.servicePackageName,
+            serviceDataHex = request.serviceData.toHexString()
+        )
+    }
+
     private suspend fun bind(): BoundMiConnectNetworkingService =
         suspendCancellableCoroutine { continuation ->
+            val connectionRef = java.util.concurrent.atomic.AtomicReference<ServiceConnection>()
             val connection = object : ServiceConnection {
                 override fun onServiceConnected(name: ComponentName, service: IBinder) {
                     if (continuation.isActive) {
-                        continuation.resume(BoundMiConnectNetworkingService(service, this))
+                        continuation.resume(
+                            BoundMiConnectNetworkingService(service) {
+                                connectionRef.get()?.let { conn ->
+                                    runCatching { appContext.unbindService(conn) }
+                                }
+                            }
+                        )
                     }
                 }
 
@@ -106,6 +126,7 @@ internal class AndroidMiConnectNetworkingClient(
                     }
                 }
             }
+            connectionRef.set(connection)
 
             val intent = Intent(networkingServiceAction)
                 .setClassName(miConnectPackage, networkingServiceClass)
@@ -243,8 +264,12 @@ internal class AndroidMiConnectNetworkingClient(
 
     private data class BoundMiConnectNetworkingService(
         val binder: IBinder,
-        val connection: ServiceConnection
-    )
+        val release: () -> Unit = { }
+    ) {
+        fun close() {
+            runCatching { release.invoke() }
+        }
+    }
 
     private companion object {
         const val edgeLinkPackage = "com.edgelink.app"

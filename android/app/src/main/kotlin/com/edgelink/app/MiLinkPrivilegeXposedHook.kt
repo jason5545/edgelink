@@ -27,8 +27,6 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MILINK_RUNTIME_PROCESS = "com.milink.runtime"
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
-    const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
-    const val XIAOMI_MI_CONNECT_PROCESS = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
@@ -63,7 +61,6 @@ internal object MiLinkPrivilegeHookPolicy {
         shouldHookRuntime(packageName, processName) ||
             shouldHookMainService(packageName, processName) ||
             shouldHookXiaomiMirror(packageName, processName) ||
-            shouldHookMiConnectService(packageName, processName) ||
             shouldHookAndroidSystem(packageName, processName) ||
             shouldHookMiShare(packageName, processName)
 
@@ -79,9 +76,6 @@ internal object MiLinkPrivilegeHookPolicy {
     fun shouldHookXiaomiMirror(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MIRROR_PACKAGE && processName == XIAOMI_MIRROR_PROCESS
 
-    fun shouldHookMiConnectService(packageName: String?, processName: String?): Boolean =
-        packageName == XIAOMI_MI_CONNECT_PACKAGE && processName == XIAOMI_MI_CONNECT_PROCESS
-
     fun shouldHookAndroidSystem(packageName: String?, processName: String?): Boolean =
         packageName == ANDROID_PACKAGE &&
             (processName == null ||
@@ -94,13 +88,6 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun hasAllowedCallerPackage(packages: Array<String>?): Boolean =
         packages?.any(::isAllowedCallerPackage) == true
-
-    fun isAllowedMiConnectCallerPackage(requestedPackageName: String?, callerPackages: Array<String>?): Boolean {
-        if (requestedPackageName != null && !isAllowedCallerPackage(requestedPackageName)) {
-            return false
-        }
-        return hasAllowedCallerPackage(callerPackages)
-    }
 
     fun isAllowedMirrorPhoneProviderMethod(method: String?): Boolean =
         method in mirrorPhoneProviderMethods
@@ -180,10 +167,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             installMirrorCastChannelTracker(classLoader)
             hookMirrorOfficialScreenConfiguration(classLoader)
             hookMirrorSourceRecoveryProvider(classLoader)
-        }
-        if (MiLinkPrivilegeHookPolicy.shouldHookMiConnectService(packageName, processName)) {
-            hookMiConnectNetworkingPermission(classLoader)
-            boostMiConnectNativeLogging(classLoader)
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAndroidSystem(packageName, processName)) {
             hookXiaomiMirrorSystemPackageGids(classLoader)
@@ -543,60 +526,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             }
         }.onFailure { error ->
             log("failed to hook mirror call provider check: ${error.javaClass.simpleName}: ${error.message}")
-        }
-    }
-
-    private fun hookMiConnectNetworkingPermission(classLoader: ClassLoader) {
-        hookMiConnectPermissionChecker(
-            classLoader = classLoader,
-            signature = arrayOf(Context::class.java)
-        )
-        hookMiConnectPermissionChecker(
-            classLoader = classLoader,
-            signature = arrayOf(Context::class.java, String::class.java)
-        )
-        hookMiConnectPermissionChecker(
-            classLoader = classLoader,
-            signature = arrayOf(Context::class.java, String::class.java, String::class.java)
-        )
-        hookMiConnectPermissionChecker(
-            classLoader = classLoader,
-            signature = arrayOf(Context::class.java, String::class.java, String::class.java, String::class.java)
-        )
-    }
-
-    private fun hookMiConnectPermissionChecker(classLoader: ClassLoader, signature: Array<Class<*>>) {
-        runCatching {
-            installHook(
-                resolveMethod(
-                    findTargetClass(classLoader, MI_CONNECT_PERMISSION_CHECKER),
-                    "checkPermissions",
-                    *signature
-                )
-            ) { chain ->
-                val context = chain.args.getOrNull(0) as? Context
-                if (context != null) {
-                    val requestedPackage = chain.args.getOrNull(1) as? String
-                    val permission = chain.args.getOrNull(2) as? String
-                    val serviceId = chain.args.getOrNull(3) as? String
-                    val callerUid = Binder.getCallingUid()
-                    val packages = context.packageManager.getPackagesForUid(callerUid)
-                    if (MiLinkPrivilegeHookPolicy.isAllowedMiConnectCallerPackage(requestedPackage, packages)) {
-                        log(
-                            "allowed mi_connect networking permission callerUid=$callerUid " +
-                                "requestedPackage=${requestedPackage ?: "-"} " +
-                                "permission=${permission ?: "-"} serviceId=${serviceId ?: "-"}"
-                        )
-                        return@installHook 0
-                    }
-                }
-                chain.proceed()
-            }
-        }.onFailure { error ->
-            log(
-                "failed to hook mi_connect permission checker args=${signature.size}: " +
-                    "${error.javaClass.simpleName}: ${error.message}"
-            )
         }
     }
 
@@ -1135,20 +1064,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                 .invoke(null, name, "") as? String
         }.getOrNull().orEmpty()
 
-    private fun boostMiConnectNativeLogging(classLoader: ClassLoader) {
-        runCatching {
-            val runtimeNative = findTargetClass(
-                classLoader,
-                "com.xiaomi.continuity.nativelib.ContinuityRuntimeNative"
-            )
-            runtimeNative.getDeclaredMethod("nativeSetLogLevel", Integer.TYPE).invoke(null, 1)
-            log("miconnect: native log level set to 1")
-        }.onFailure {
-            val cause = it.cause ?: it
-            log("miconnect: set native log level failed: ${cause.message}")
-        }
-    }
-
     private fun hookMiShareLyraTrustInjection(classLoader: ClassLoader) {
         runCatching {
             val runtimeNative = findTargetClass(
@@ -1225,7 +1140,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val MIRROR_TRUST_MANAGER_CLASS = "com.xiaomi.mirror.trust.k"
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val MILINK_PRIVILEGED_PACKAGE_MANAGER = "com.milink.base.utils.p"
-        private const val MI_CONNECT_PERMISSION_CHECKER = "com.xiaomi.continuity.util.PermissionChecker"
         private const val XIAOMI_MIRROR_CALL_PROVIDER = "com.xiaomi.mirror.provider.CallProvider"
         private const val MIRROR_KEEP_AWAKE_TAG = "EdgeLink:MirrorKeepAwake"
         private const val MIRROR_KEEP_AWAKE_TIMEOUT_MS = 8 * 60 * 60 * 1000L
