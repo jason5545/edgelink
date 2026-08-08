@@ -98,7 +98,17 @@ actor TunnelManager {
         )
         try await sendEnvelope(EnvelopeType.tunnelOpen, body: openBody)
 
-        guard let port = listener.port?.rawValue else {
+        // NWListener reports its bound port only after it reaches .ready; a
+        // caller dialing the returned port immediately otherwise races a nil/0
+        // port. Wait briefly for the bind to settle.
+        var boundPort = listener.port?.rawValue
+        var attempts = 0
+        while (boundPort == nil || boundPort == 0), attempts < 30 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            boundPort = listener.port?.rawValue
+            attempts += 1
+        }
+        guard let port = boundPort, port != 0 else {
             throw TunnelManagerError.listenerFailed
         }
         onTunnelStateChanged?()
@@ -214,6 +224,15 @@ actor TunnelManager {
             }
         }
         connection.start(queue: .global(qos: .userInitiated))
+        // Prime the peer: the phone dials the local-forward target when the
+        // first tunnel.data for a stream arrives. Server-speaks-first streams
+        // (the Xiaomi mirror WFD RTSP dialog) never send client bytes before
+        // expecting a response, so send an empty priming datagram on open or
+        // the peer never dials and the stream deadlocks.
+        try? await sendEnvelope(
+            EnvelopeType.tunnelData,
+            body: TunnelDataBody(tunnelId: tunnelId, streamId: streamId, seq: 0, payload: "", fin: false)
+        )
         readFromLocalSocket(tunnelId: tunnelId, streamId: streamId)
         onTunnelStateChanged?()
     }

@@ -202,6 +202,13 @@ final class EdgeLinkRuntime: ObservableObject {
     private var didAutoQueryXiaomiMirrorDevices = false
     private var phoneBatteryLatestTs: Int64 = 0
 
+    // Native Xiaomi transport over the cloud relay: when the paired phone is
+    // only reachable through the relay session (no LAN), the announce/cast
+    // mesh datagrams and the relayCall/cast channel datagrams ride the E2EE
+    // session as relay.mesh.datagram / relay.channel.datagram envelopes.
+    private var lyraRelayBridge: LyraRelayTransportBridge?
+    private var lyraRelayAnnouncer: LyraMeshAnnouncer?
+
     private struct PendingXiaomiScreenFallback {
         let requestId: String
         let command: String
@@ -841,14 +848,27 @@ final class EdgeLinkRuntime: ObservableObject {
             )
             return
         }
+        let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
+        xiaomiMirrorCastSessionId = sessionId
+        if lyraRelayBridge != nil {
+            // Relay-connected: OPEN rides the relay-carried cast channel. The
+            // phone's WFD source cannot reach the Mac directly (no LAN), so the
+            // media rides the TURN/WS cloud bridge (§6): the Android app dials
+            // the phone's own RTSP source locally and carries the KCP media
+            // over milink.mirror.rtc.*. Negotiate that transport now.
+            session.sendScreenAction(.openMirrorScreen(sessionId: sessionId))
+            startXiaomiMirrorRelayCloudMedia(reason: "screen_open_relay")
+            DiagnosticsLog.info(
+                "xiaomi.mac.screen_open_sent sessionId=\(sessionId) generation=\(startGeneration) route=relay media=cloud"
+            )
+            return
+        }
         guard let phoneHost = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints().first?.host else {
             DiagnosticsLog.warn(
                 "xiaomi.mac.screen_open_no_phone_host generation=\(startGeneration)"
             )
             return
         }
-        let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
-        xiaomiMirrorCastSessionId = sessionId
         session.sendScreenAction(.openMirrorScreen(sessionId: sessionId))
         startXiaomiMirrorWFDClient(phoneHost: phoneHost)
         DiagnosticsLog.info(
@@ -856,22 +876,79 @@ final class EdgeLinkRuntime: ObservableObject {
         )
     }
 
+    // Relay-carried mirror media (§6): the phone's WFD source cannot reach
+    // the Mac without LAN, so the Android app dials the phone's own RTSP
+    // source locally and carries the KCP media over the TURN/WS cloud bridge.
+    // Reuses the startMainDisplay route selection: with no LAN probe args the
+    // probe cannot succeed; with both sides advertising mirrorTurnDataChannel
+    // the bridge picks TURN (WS/TCP fallback otherwise). The command result
+    // (mediaTransport=turn/cloudflare) arms the TURN session + KCP receiver.
+    private func startXiaomiMirrorRelayCloudMedia(reason: String) {
+        let command = "xiaomi.mirror.startMainDisplay"
+        guard let cloudSessionId = startNewXiaomiMirrorCloudflareSessionIfEnabled(reason: reason) else {
+            DiagnosticsLog.warn("xiaomi.mac.relay_media_disabled reason=\(reason)")
+            return
+        }
+        // peerPort = the phone's WFD RTSP port the OPEN just brought up; the
+        // Android bridge dials it on loopback (falling back to the fake-pad
+        // source port). mediaBridgeOnly routes straight to the media bridge:
+        // the relay announcer registers this Mac as a real mirror remote, and
+        // the native start route would otherwise hijack the command into a
+        // phone-side mirror attempt against the Mac.
+        var args: [String: String] = ["peerPort": "7236", "mediaBridgeOnly": "1"]
+        addXiaomiMirrorCloudflareArgs(to: &args, sessionId: cloudSessionId)
+        guard let requestId = sendMiLinkCommand(command: command, args: args) else {
+            activeXiaomiMirrorCloudflareSessionId = nil
+            DiagnosticsLog.warn("xiaomi.mac.relay_media_command_failed reason=\(reason)")
+            return
+        }
+        xiaomiMirrorRTSPDiagnosticSource.startCloudflareMirrorRTPReceiver(
+            sessionId: cloudSessionId,
+            lifetime: Self.xiaomiMirrorRTSPDiagnosticLifetimeSeconds,
+            reason: "relay_media_start"
+        )
+        armPendingXiaomiScreenCommand(
+            requestId: requestId,
+            command: command,
+            route: "xiaomi.mirror.active",
+            timeoutMs: 12_000
+        )
+        DiagnosticsLog.info(
+            "xiaomi.mac.relay_media_negotiate reason=\(reason) sessionId=\(cloudSessionId) requestId=\(requestId)"
+        )
+    }
+
+    // The phone's source is already torn down by closeScreen; a startMainDisplay
+    // without cloud args resolves to a direct transport on the phone, which
+    // stops the cloud bridge. Fire-and-forget: the result is not tracked.
+    private func stopXiaomiMirrorRelayCloudMedia(reason: String) {
+        _ = sendMiLinkCommand(
+            command: "xiaomi.mirror.startMainDisplay",
+            args: ["mediaStop": reason, "mediaBridgeOnly": "1"]
+        )
+        DiagnosticsLog.info("xiaomi.mac.relay_media_stop_sent reason=\(reason)")
+    }
+
     // Official PC-client route step 2: dial the phone's WFD RTSP server
     // (created in response to OPEN_MIRROR_SCREEN) and run the M1-M8 dialog.
     // When SETUP/PLAY completes the phone dials UDP MPT video to us.
     private func startXiaomiMirrorWFDClient(phoneHost: String) {
+        startXiaomiMirrorWFDClient(host: phoneHost, rtspPort: 7236)
+    }
+
+    private func startXiaomiMirrorWFDClient(host: String, rtspPort: UInt16) {
         xiaomiMirrorWFDClient?.stop(reason: "replace")
         let client = XiaomiMirrorWFDClient()
         client.onSessionEstablished = { [weak self] serverPort in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.xiaomiMirrorRTSPDiagnosticSource.startOfficialMirrorMediaReceiver(
-                    peerHost: phoneHost,
+                    peerHost: host,
                     clientPort: Self.xiaomiMirrorOfficialClientPort,
                     serverPort: serverPort > 0 ? serverPort : 1
                 )
                 DiagnosticsLog.info(
-                    "xiaomi.mac.wfd_session_established host=\(phoneHost) serverPort=\(serverPort)"
+                    "xiaomi.mac.wfd_session_established host=\(host) serverPort=\(serverPort)"
                 )
             }
         }
@@ -884,7 +961,7 @@ final class EdgeLinkRuntime: ObservableObject {
             DiagnosticsLog.info("xiaomi.mac.wfd_client_closed reason=\(reason)")
         }
         xiaomiMirrorWFDClient = client
-        client.start(host: phoneHost, rtspPort: 7236, clientRTPPort: Self.xiaomiMirrorOfficialClientPort)
+        client.start(host: host, rtspPort: rtspPort, clientRTPPort: Self.xiaomiMirrorOfficialClientPort)
     }
 
     private static let xiaomiMirrorOfficialClientPort: UInt16 = 15_550
@@ -1092,6 +1169,8 @@ final class EdgeLinkRuntime: ObservableObject {
         currentChannelGeneration = nil
         currentChannelTransport = nil
         currentSession = nil
+        stopLyraRelayNativeTransport()
+        lyraRelayBridge = nil
         screenSession.clearSender()
         screenSession.setIceServerConfigs([])
         screenSession.setMicrophoneRelayEnabled(false)
@@ -1396,7 +1475,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func startCastChannelSupervisor() {
         castChannelSupervisorTimer?.invalidate()
-        let timer = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.runCastChannelSupervisorTick()
             }
@@ -1411,8 +1490,22 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func runCastChannelSupervisorTick() {
         // The official client builds the cast channel on demand; there is no
-        // idle pre-build. Supervise only the channel a live mirror rides on.
-        guard xiaomiMirrorFlow.stage == .streaming else { return }
+        // idle pre-build. Supervise the channel a live mirror rides on, and
+        // also the one an in-flight mirror attempt waits on: a channel that
+        // died while "ready" (network switch) otherwise leaves the flow
+        // stuck in 正在連線, sending OPENs into a dead pipe.
+        switch xiaomiMirrorFlow.stage {
+        case .streaming, .connecting, .opening, .unlocking:
+            break
+        default:
+            return
+        }
+        // An active (not yet streaming) attempt gets a much tighter silence
+        // budget: the user is staring at the connecting mask, and a dead
+        // channel there is never legitimate.
+        let streaming = xiaomiMirrorFlow.stage == .streaming
+        let probeAfterMs: Double = streaming ? 45_000 : 8_000
+        let rebuildAfterMs: Double = streaming ? 75_000 : 16_000
         switch macTrustManager.state {
         case .authenticating, .binding, .queryingStatus:
             return
@@ -1427,8 +1520,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 stopPhoneTrustUnlock()
             } else {
                 let quietMs = Date().timeIntervalSince(session.lastInboundAt) * 1000
-                if session.isChannelReady, quietMs > 45_000 {
-                    if quietMs > 75_000, castChannelProbeSentAt != .distantPast,
+                if session.isChannelReady, quietMs > probeAfterMs {
+                    if quietMs > rebuildAfterMs, castChannelProbeSentAt != .distantPast,
                        Date().timeIntervalSince(castChannelProbeSentAt) > 15 {
                         // Probe sent and still no inbound — the conn is dead.
                         DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild silent=\(Int(quietMs))ms")
@@ -1504,7 +1597,25 @@ final class EdgeLinkRuntime: ObservableObject {
             )
             return existing.isChannelReady
         }
-        let endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
+        let endpoints: [(host: String, port: UInt16)]
+        let relayBridge: LyraRelayTransportBridge?
+        let relayCastMesh: LyraVirtualMeshPipe?
+        if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort() {
+            // Relay-connected (no LAN): the cast dial rides its own relay mesh
+            // flow (index 1) so the phone sees a fresh peer and answers phys
+            // sync — the Xiaomi mesh service ignores phys sync from the peer
+            // the announcer already authenticated (flow 0). The announcer
+            // keeps running on flow 0.
+            let castMesh = bridge.meshFlow(index: 1)
+            castMesh.peerPort = phoneMeshPort
+            relayBridge = bridge
+            relayCastMesh = castMesh
+            endpoints = [("127.0.0.1", phoneMeshPort)]
+        } else {
+            relayBridge = nil
+            relayCastMesh = nil
+            endpoints = xiaomiMiShareDiscovery.currentPhoneMeshEndpoints()
+        }
         guard !endpoints.isEmpty,
               let discoveredDeviceId = xiaomiMiShareDiscovery.localDeviceIdHex
         else {
@@ -1518,7 +1629,9 @@ final class EdgeLinkRuntime: ObservableObject {
             endpoints: endpoints,
             deviceIdHex: deviceIdHex,
             displayName: xiaomiMiShareDiscovery.localDisplayName,
-            trustManager: macTrustManager
+            trustManager: macTrustManager,
+            meshTransport: relayCastMesh,
+            channelTransport: relayBridge?.channel
         )
         session.retainPhysAfterAuth = true
         session.duoScreenStatusEnabled = true
@@ -1543,12 +1656,19 @@ final class EdgeLinkRuntime: ObservableObject {
             Task { @MainActor in
                 guard let self, let session, self.lyraCastTrustSession === session else { return }
                 self.lyraCastTrustSession = nil
+                // The announcer kept running on mesh flow 0 while the cast
+                // session owned flow 1; only re-arm if it was torn down in
+                // the meantime (disconnect / transport switch).
+                if self.lyraRelayAnnouncer == nil {
+                    self.startXiaomiRelayAnnouncerIfEnabled()
+                }
             }
         }
         lyraCastTrustSession = session
         session.start()
         DiagnosticsLog.info(
-            "xiaomi.cast.channel_ensure reason=\(reason) existing=false endpoints=\(endpoints.count)"
+            "xiaomi.cast.channel_ensure reason=\(reason) existing=false endpoints=\(endpoints.count) " +
+                "relay=\(relayBridge != nil)"
         )
         return false
     }
@@ -2402,6 +2522,13 @@ final class EdgeLinkRuntime: ObservableObject {
             "recoveryAttempt": String(attempt),
             "recoveryReason": event.reason
         ]
+        if lyraRelayBridge != nil {
+            // Relay-connected: keep the recovery on the media-bridge route
+            // (same as the session rebuild) so the Android bridge re-arms the
+            // cloud session instead of the native remote-device start pulling
+            // the phone's own cross-screen UI to the foreground.
+            args["mediaBridgeOnly"] = "1"
+        }
         applyXiaomiMirrorRemoteArgs(to: &args)
         if let peerHost {
             args["peerHost"] = peerHost
@@ -2488,6 +2615,12 @@ final class EdgeLinkRuntime: ObservableObject {
             "recoveryAttempt": String(attempt),
             "recoveryReason": event.reason
         ]
+        if lyraRelayBridge != nil {
+            // Relay-connected: keep the rebuild on the media-bridge route so
+            // the Android bridge retargets to the new cloud session instead
+            // of the native remote-device start hijacking the command.
+            args["mediaBridgeOnly"] = "1"
+        }
         applyXiaomiMirrorRemoteArgs(to: &args)
         if let peerHost {
             args["peerHost"] = peerHost
@@ -2568,6 +2701,11 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         xiaomiMirrorWFDClient?.stop(reason: reason)
         xiaomiMirrorWFDClient = nil
+        if lyraRelayBridge != nil {
+            // Relay mirror media rides the Android cloud bridge; tell it to
+            // stand down (the phone's source was just closed above).
+            stopXiaomiMirrorRelayCloudMedia(reason: reason)
+        }
         pendingXiaomiScreenFallbackTask?.cancel()
         pendingXiaomiScreenFallbackTask = nil
         pendingXiaomiScreenFallback = nil
@@ -3749,6 +3887,8 @@ final class EdgeLinkRuntime: ObservableObject {
                 if currentChannelGeneration == nil {
                     isConnected = false
                     currentSession = nil
+                    stopLyraRelayNativeTransport()
+                    lyraRelayBridge = nil
                     screenSession.clearSender()
                     screenSession.handleTransportInterrupted()
                     stopPhoneCallRelayAudio(reason: "transport_interrupted")
@@ -3891,6 +4031,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.handleTunnelEnvelope(type: type, plaintext: plaintext)
                         }
                     },
+                    onLyraRelayDatagram: { [weak self] type, plaintext in
+                        Task { @MainActor in
+                            self?.lyraRelayBridge?.handleEnvelope(type: type, plaintext: plaintext)
+                        }
+                    },
                     onStatusCaps: { [weak self] caps in
                         Task { @MainActor in
                             self?.handleStatusCaps(caps)
@@ -3956,6 +4101,7 @@ final class EdgeLinkRuntime: ObservableObject {
                 DiagnosticsLog.info("\(transport).mac.handshake_ok hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
                 currentSession = session
                 lastSecurePongAt = Date()
+                configureLyraRelayBridge(session: session, transport: transport)
                 Task { [weak self] in
                     _ = await self?.ensureTurnCredentials(reason: "relay_connected")
                 }
@@ -4533,6 +4679,75 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
+    // MARK: - Native Xiaomi relay transport (cloud relay)
+
+    // Binds the relay-datagram bridge to this session's send path when the
+    // phone is only reachable through the cloud relay. The LAN UDP announcer /
+    // cast session stay intact as the fallback; the bridge is only populated on
+    // the relay transport.
+    private func configureLyraRelayBridge(session: SecureSessionHost, transport: String) {
+        stopLyraRelayNativeTransport()
+        // A fresh secure session replaces the relay bridge object; a cast
+        // session riding the old bridge's pipes is dead even though
+        // isChannelReady stays true (live 2026-08-08: OPEN_MIRROR_SCREEN was
+        // sent into the dead channel and the mirror start churned phone-side
+        // cloud sessions until the WebRTC teardown crashed the app). Drop it
+        // so the mirror flow redials on the fresh transport.
+        if let existing = lyraCastTrustSession, existing.isRelayRouted {
+            DiagnosticsLog.info("xiaomi.cast.session_invalidated reason=relay_bridge_reconfigured")
+            existing.cancel()
+            lyraCastTrustSession = nil
+            xiaomiMirrorFlow.notifyChannelReleased()
+        }
+        guard transport == "relay" else {
+            lyraRelayBridge = nil
+            return
+        }
+        let bridge = LyraRelayTransportBridge(sendHandler: { data in
+            try await session.sendPlaintext(data)
+        }, log: { DiagnosticsLog.info("xiaomi.relaybridge.\($0)") })
+        lyraRelayBridge = bridge
+        DiagnosticsLog.info("xiaomi.relaybridge.mac.configured transport=\(transport)")
+        startXiaomiRelayAnnouncerIfEnabled()
+    }
+
+    private func stopLyraRelayNativeTransport() {
+        lyraRelayAnnouncer?.stop()
+        lyraRelayAnnouncer = nil
+    }
+
+    // Reproduces the LAN announce dial over the relay-carried mesh pipe so the
+    // phone registers this Mac as an online relayCall device (gated the same way
+    // as the LAN announcer).
+    private func startXiaomiRelayAnnouncerIfEnabled() {
+        guard let bridge = lyraRelayBridge else { return }
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
+        guard relayCallEnabled else { return }
+        guard let phoneMeshPort = Self.reportedPhoneMeshPort() else {
+            DiagnosticsLog.info("xiaomi.relayannouncer.mac.deferred reason=no_phone_mesh_port")
+            return
+        }
+        // The announcer pins its dial port from the inbound endpoint; point the
+        // relay mesh pipe at the phone's announced mesh port before starting.
+        bridge.mesh.peerPort = phoneMeshPort
+        let announcer = lyraRelayAnnouncer ?? LyraMeshAnnouncer(
+            deviceIdHexProvider: { [weak self] in self?.xiaomiMiShareDiscovery.localDeviceIdHex },
+            displayNameProvider: { [weak self] in self?.xiaomiMiShareDiscovery.localDisplayName ?? "EdgeLink Mac" },
+            meshTransport: bridge.mesh
+        )
+        announcer.relayCallChannelTransport = bridge.channel
+        lyraRelayAnnouncer = announcer
+        announcer.start(host: "127.0.0.1", port: phoneMeshPort)
+        DiagnosticsLog.info("xiaomi.relayannouncer.mac.started port=\(phoneMeshPort)")
+    }
+
+    private static func reportedPhoneMeshPort() -> UInt16? {
+        let reported = (UserDefaults.standard.array(forKey: "lyraReportedPhoneMeshPorts") as? [Int]) ?? []
+        let ports = reported.compactMap { UInt16(exactly: $0) }
+        let ordered = ports.contains(43495) ? [43495] : ports
+        return ordered.first
+    }
+
     func enableAdbTunnel() {
         Task {
             do {
@@ -4575,6 +4790,9 @@ final class EdgeLinkRuntime: ObservableObject {
             UserDefaults.standard.set(ports, forKey: "lyraReportedPhoneMeshPorts")
             DiagnosticsLog.info("milink.mac.lyra_mesh_ports ports=\(ports)")
             xiaomiMiShareDiscovery.startMeshAnnouncerOnKnownPhoneEndpoint()
+            // Relay-connected: the phone's mesh port may land after the bridge
+            // was configured; (re)arm the relay-carried announce dial now.
+            startXiaomiRelayAnnouncerIfEnabled()
         }
         autoWarmXiaomiServicesIfNeeded(status)
         reconcileOrphanXiaomiMirrorIfNeeded(status)

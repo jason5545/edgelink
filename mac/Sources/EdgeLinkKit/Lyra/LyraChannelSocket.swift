@@ -214,7 +214,7 @@ public final class LyraChannelSocket: @unchecked Sendable {
                 let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
                 self.onRawDatagram?(content, endpoint)
                 if let segment = try? LyraMeshDatagram.decodeSegment(content),
-                   segment.command == LyraMeshDatagram.commandPush
+                   !segment.payload.isEmpty
                 {
                     var state = self.sessions[id] ?? SessionState()
                     let isDuplicate = segment.sn < state.recvUna

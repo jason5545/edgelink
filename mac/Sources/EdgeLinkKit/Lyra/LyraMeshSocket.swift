@@ -223,7 +223,7 @@ public final class LyraMeshSocket: @unchecked Sendable {
                 let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
                 self.onRawDatagram?(content, endpoint)
                 if let segment = try? LyraMeshDatagram.decodeSegment(content),
-                   segment.command == LyraMeshDatagram.commandPush
+                   !segment.payload.isEmpty
                 {
                     lastActivityByConnection[id] = Date()
                     var state = self.sessionStates[id] ?? KcpSessionState()

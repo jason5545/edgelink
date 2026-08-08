@@ -470,9 +470,18 @@ public enum LyraMeshDatagram {
     }
 
     public static func encode(tick: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data {
+        encode(command: commandPush, tick: tick, sn: sn, una: una, payload: payload)
+    }
+
+    // The phone's mesh service answers some dials with an ack-command datagram
+    // carrying the response payload (0x52 + data) instead of a push; the
+    // receiver treats any payload-bearing segment as data regardless of the
+    // command byte. Senders default to push; tests flip this to reproduce the
+    // phone's ack-framed responses.
+    public static func encode(command: UInt8, tick: UInt32, sn: UInt32, una: UInt32, payload: Data) -> Data {
         var data = Data(capacity: headerLength + payload.count)
         data.append(contentsOf: [0x78, 0x56, 0x34, 0x12])
-        data.append(contentsOf: [0x51, 0x00, 0x00, 0x10])
+        data.append(contentsOf: [command, 0x00, 0x00, 0x10])
         data.append(contentsOf: [
             UInt8(tick & 0xFF),
             UInt8((tick >> 8) & 0xFF),

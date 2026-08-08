@@ -129,20 +129,22 @@ class AndroidMirrorTurnSession(
         statsHandler = null
         statsHandlerThread?.quitSafely()
         statsHandlerThread = null
-        dataChannel?.let { channel ->
-            runCatching { channel.unregisterObserver() }
-            runCatching { channel.close() }
-            runCatching { channel.dispose() }
+        // Graceful close now, native free deferred: dispose() while libwebrtc's
+        // signaling thread still drains the close-time state changes aborts the
+        // process (destroyed mutex, live 2026-08-08). See WebRtcSafeDisposer.
+        val channel = dataChannel
+        channel?.let {
+            runCatching { it.unregisterObserver() }
+            runCatching { it.close() }
         }
         dataChannel = null
         dataChannelObserver = null
-        peerConnection?.let { pc ->
-            runCatching { pc.close() }
-            runCatching { pc.dispose() }
-        }
+        val pc = peerConnection
+        pc?.let { runCatching { it.close() } }
         peerConnection = null
-        factory?.let { runCatching { it.dispose() } }
+        val localFactory = factory
         factory = null
+        WebRtcSafeDisposer.disposeLater(channel, pc, localFactory)
     }
 
     private fun ensurePeerConnection(): PeerConnection? {

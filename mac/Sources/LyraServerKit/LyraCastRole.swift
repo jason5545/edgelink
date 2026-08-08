@@ -51,19 +51,25 @@ public final class LyraCastRole: LyraServiceHandler {
     private let identity: LyraPhoneIdentity
     private weak var server: LyraPhoneMeshServer?
     private let queue = DispatchQueue(label: "LyraCastRole")
+    // Relay-transport harness: the cast channel rides this pipe (cloud-relay
+    // path) instead of the local UDP listener when set.
+    private let channelTransport: LyraChannelDatagramPipe?
+    private var channelTransportStarted = false
 
     public init(
         identity: LyraPhoneIdentity,
         castChannelPort: UInt16 = 0,
         wfdPort: UInt16 = 7236,
         clientVideoPort: UInt16 = 15_550,
-        locked: Bool = true
+        locked: Bool = true,
+        channelTransport: LyraChannelDatagramPipe? = nil
     ) {
         self.identity = identity
         self.castChannelPort = castChannelPort
         self.wfdPort = wfdPort
         self.clientVideoPort = clientVideoPort
         self.locked = locked
+        self.channelTransport = channelTransport
     }
 
     // MARK: - Conn state
@@ -182,6 +188,7 @@ public final class LyraCastRole: LyraServiceHandler {
                     default: break
                     }
                 }
+                startChannelTransportIfNeeded()
             }
             guard let scKey = channelKeySC else { return }
             var responseData = Data()
@@ -209,6 +216,16 @@ public final class LyraCastRole: LyraServiceHandler {
               let (header, commandBody) = try? LyraChannelProtocol.decode(command),
               header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue
         else { return false }
+        // The same channelId/transKey also ride the logi request; parse them
+        // here too so the relay-carried channel starts whichever lands first.
+        for field in (try? LyraProtoReader.readFields(from: commandBody)) ?? [] {
+            switch field.number {
+            case 1: castChannelId = field.varintValue ?? castChannelId
+            case 4: castTransKey = field.lengthDelimitedValue ?? castTransKey
+            default: break
+            }
+        }
+        startChannelTransportIfNeeded()
         var responseBody = Data()
         LyraProtoWriter.appendVarintField(2, value: castChannelId, to: &responseBody)
         LyraProtoWriter.appendVarintField(3, value: UInt64(effectiveCastChannelPort), to: &responseBody)
@@ -224,7 +241,16 @@ public final class LyraCastRole: LyraServiceHandler {
     }
 
     private var effectiveCastChannelPort: UInt16 {
-        castChannelPort != 0 ? castChannelPort : (channelListener?.port?.rawValue ?? 0)
+        if castChannelPort != 0 {
+            return castChannelPort
+        }
+        // Relay-carried channel: the port is decorative (the Mac dials through
+        // the transport pipe, not a real UDP port) — report the pipe's bound
+        // port so the peer-port answer is non-zero.
+        if channelTransportStarted, let pipePort = channelTransport?.boundPort {
+            return pipePort
+        }
+        return channelListener?.port?.rawValue ?? 0
     }
 
     // Simulates the phone releasing the cast logi conn mid-stream (the
@@ -245,8 +271,41 @@ public final class LyraCastRole: LyraServiceHandler {
     private var channelRecvUna: UInt32 = 0
     private var stopped = false
 
+    // Starts the relay-carried channel pipe once the trans key is known
+    // (logi request or packType-5 peer-port request). The pipe answers the
+    // plaintext negotiation TLV itself; decoded channel frames land in
+    // handleChannelPipeMessage.
+    private func startChannelTransportIfNeeded() {
+        guard let transport = channelTransport, !channelTransportStarted,
+              !castTransKey.isEmpty
+        else { return }
+        channelTransportStarted = true
+        transport.onNegotiated = { [weak self] channelId, mtu in
+            self?.onEvent("cast channel negotiated channelId=\(channelId) mtu=\(mtu)")
+        }
+        transport.onMessage = { [weak self] message, _ in
+            self?.handleChannelPipeMessage(message)
+        }
+        do {
+            try transport.start(socketKey: castTransKey, serverChannelId: UInt32(castChannelId))
+            onEvent("cast channel transport started")
+        } catch {
+            channelTransportStarted = false
+            onEvent("cast channel transport start failed: \(error)")
+        }
+    }
+
+    private func handleChannelPipeMessage(_ message: Data) {
+        guard let (tag, child) = try? LyraExpressTLVParser.parseOneOf(message), tag == 1,
+              let payloadNode = LyraExpressTLVParser.firstChild(
+                  0, in: LyraExpressTLVParser.children(of: child)
+              )
+        else { return }
+        handleDecodedChannelFrame(payloadNode.payload)
+    }
+
     private func listenCastChannel() {
-        guard channelListener == nil else { return }
+        guard channelListener == nil, channelTransport == nil else { return }
         let nwPort = castChannelPort != 0 ? NWEndpoint.Port(rawValue: castChannelPort) : nil
         let listener = try? NWListener(using: .udp, on: nwPort ?? .any)
         listener?.newConnectionHandler = { [weak self] connection in
@@ -317,7 +376,10 @@ public final class LyraCastRole: LyraServiceHandler {
                   0, in: LyraExpressTLVParser.children(of: child)
               )
         else { return }
-        let message = payloadNode.payload
+        handleDecodedChannelFrame(payloadNode.payload)
+    }
+
+    private func handleDecodedChannelFrame(_ message: Data) {
         guard let (type, framePayload) = try? LyraCastMessageCodec.decodeFrame(message) else { return }
         switch type {
         case LyraCastMessageType.trust:
@@ -359,6 +421,10 @@ public final class LyraCastRole: LyraServiceHandler {
 
     private func sendChannelMessage(type: UInt8, payload: Data) {
         let frame = LyraChannelSocket.wrapChannelFrame(LyraCastMessageCodec.encodeFrame(type: type, payload: payload))
+        if let transport = channelTransport, channelTransportStarted {
+            try? transport.sendVariant(channelFrame: frame, key: castTransKey, singleLayer: true)
+            return
+        }
         guard let packet = try? LyraSocketPacket.encode(
             plaintext: frame, key: SymmetricKey(data: castTransKey)
         ) else { return }
@@ -616,6 +682,10 @@ public final class LyraCastRole: LyraServiceHandler {
             stopped = true
             channelListener?.cancel()
             channelConnection?.cancel()
+            if channelTransportStarted {
+                channelTransport?.stop()
+                channelTransportStarted = false
+            }
             tearDownWFDServer()
         }
     }

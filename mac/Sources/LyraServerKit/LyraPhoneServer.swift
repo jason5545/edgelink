@@ -29,14 +29,19 @@ public final class LyraPhoneServer {
         castChannelPort: UInt16 = 0,
         wfdPort: UInt16 = 7236,
         meshTransport: LyraMeshDatagramPipe? = nil,
-        relayCallChannelTransport: LyraChannelDatagramPipe? = nil
+        relayCallChannelTransport: LyraChannelDatagramPipe? = nil,
+        castChannelTransport: LyraChannelDatagramPipe? = nil,
+        clientVideoPort: UInt16 = 15_550
     ) {
         self.identity = identity
         oracle = LyraDevRepoOracle()
         mesh = LyraPhoneMeshServer(identity: identity, oracle: oracle, meshTransport: meshTransport)
         syncTask = LyraSyncTaskRole(identity: identity, oracle: oracle)
         relayCall = LyraRelayCallRole(identity: identity, channelTransport: relayCallChannelTransport)
-        cast = LyraCastRole(identity: identity, castChannelPort: castChannelPort, wfdPort: wfdPort)
+        cast = LyraCastRole(
+            identity: identity, castChannelPort: castChannelPort, wfdPort: wfdPort,
+            clientVideoPort: clientVideoPort, channelTransport: castChannelTransport
+        )
         mesh.register(cast)
         mesh.onEvent = { [weak self] event in
             self?.handleMeshEvent(event)

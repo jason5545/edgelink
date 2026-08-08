@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class AndroidTunnelManager(
     private val scope: CoroutineScope,
-    private val sendEnvelope: suspend (String, Any) -> Unit
+    private val sendEnvelope: suspend (String, Any) -> Unit,
+    private val log: (String) -> Unit = { EdgeLinkLog.info(it) }
 ) {
     private sealed interface StreamWrite {
         data class Data(val bytes: ByteArray) : StreamWrite
@@ -57,6 +58,15 @@ class AndroidTunnelManager(
 
     private companion object {
         const val STREAM_WRITE_QUEUE_CAPACITY = 64
+        // Dial retry: the Xiaomi mirror WFD RTSP listener comes up
+        // asynchronously after the phone processes OPEN_MIRROR_SCREEN, so the
+        // first dial can legitimately land before it listens. Retry only
+        // connection-refused; targets that never listen still fail fast on
+        // the attempt budget. Mirrors the LAN path, where the Mac's WFD
+        // client provides the retries.
+        const val DIAL_RETRY_ATTEMPTS = 12
+        const val DIAL_RETRY_DELAY_MS = 500L
+        const val DIAL_CONNECT_TIMEOUT_MS = 1500
     }
 
     // MARK: - Inbound Envelope Handling
@@ -117,7 +127,7 @@ class AndroidTunnelManager(
                 tunnelId = body.tunnelId,
                 ok = true
             ))
-            EdgeLinkLog.info("tunnel.android.open_accepted tunnelId=${body.tunnelId} target=${body.targetHost}:${body.targetPort}")
+            log("tunnel.android.open_accepted tunnelId=${body.tunnelId} target=${body.targetHost}:${body.targetPort}")
         } else {
             // Remote forward: Android listens, Mac dials
             startRemoteForward(body)
@@ -164,7 +174,7 @@ class AndroidTunnelManager(
                     // Server socket closed
                 }
             }
-            EdgeLinkLog.info("tunnel.android.remote_listen tunnelId=${body.tunnelId} port=$listenPort")
+            log("tunnel.android.remote_listen tunnelId=${body.tunnelId} port=$listenPort")
         } catch (e: Exception) {
             sendEnvelope(EnvelopeTypes.TUNNEL_ERROR, TunnelErrorBody(
                 tunnelId = body.tunnelId,
@@ -247,21 +257,49 @@ class AndroidTunnelManager(
     }
 
     private suspend fun dialTarget(tunnel: TunnelState, streamId: Int): StreamState? {
-        return try {
+        var attempt = 0
+        while (true) {
+            attempt++
             val socket = Socket()
-            socket.connect(InetSocketAddress(tunnel.targetHost, tunnel.targetPort), 5000)
-            socket.tcpNoDelay = true
+            val connected = try {
+                socket.connect(InetSocketAddress(tunnel.targetHost, tunnel.targetPort), DIAL_CONNECT_TIMEOUT_MS)
+                socket.tcpNoDelay = true
+                true
+            } catch (e: java.net.ConnectException) {
+                // Connection refused: the target listener may still be
+                // starting (mirror WFD RTSP). Retry while the tunnel lives.
+                if (attempt >= DIAL_RETRY_ATTEMPTS || tunnels[tunnel.tunnelId] == null) {
+                    log(
+                        "tunnel.android.dial_failed tunnelId=${tunnel.tunnelId} stream=$streamId " +
+                            "attempts=$attempt error=${e.message}"
+                    )
+                    try { socket.close() } catch (_: Exception) {}
+                    return null
+                }
+                log(
+                    "tunnel.android.dial_retry tunnelId=${tunnel.tunnelId} stream=$streamId " +
+                        "attempt=$attempt target=${tunnel.targetHost}:${tunnel.targetPort}"
+                )
+                try { socket.close() } catch (_: Exception) {}
+                delay(DIAL_RETRY_DELAY_MS)
+                continue
+            } catch (e: Exception) {
+                log("tunnel.android.dial_failed tunnelId=${tunnel.tunnelId} stream=$streamId error=${e.message}")
+                try { socket.close() } catch (_: Exception) {}
+                return null
+            }
+            if (!connected) return null
             val readJob = scope.launch(Dispatchers.IO) {
                 readFromSocket(tunnel.tunnelId, streamId, socket)
             }
             val (writeChannel, writeJob) = launchStreamWriter(tunnel.tunnelId, streamId, socket)
             val stream = StreamState(socket = socket, readJob = readJob, writeChannel = writeChannel, writeJob = writeJob)
             tunnel.streams[streamId] = stream
-            EdgeLinkLog.info("tunnel.android.dial_ok tunnelId=${tunnel.tunnelId} stream=$streamId target=${tunnel.targetHost}:${tunnel.targetPort}")
-            stream
-        } catch (e: Exception) {
-            EdgeLinkLog.warn("tunnel.android.dial_failed tunnelId=${tunnel.tunnelId} stream=$streamId error=${e.message}")
-            null
+            log(
+                "tunnel.android.dial_ok tunnelId=${tunnel.tunnelId} stream=$streamId " +
+                    "attempts=$attempt target=${tunnel.targetHost}:${tunnel.targetPort}"
+            )
+            return stream
         }
     }
 
@@ -335,7 +373,7 @@ class AndroidTunnelManager(
     }
 
     private suspend fun handleTunnelError(body: TunnelErrorBody) {
-        EdgeLinkLog.warn("tunnel.android.error tunnelId=${body.tunnelId} stream=${body.streamId} code=${body.code} msg=${body.message}")
+        log("tunnel.android.error tunnelId=${body.tunnelId} stream=${body.streamId} code=${body.code} msg=${body.message}")
         if (body.streamId != null) {
             closeStream(body.tunnelId, body.streamId)
         }
@@ -350,7 +388,7 @@ class AndroidTunnelManager(
 
     private suspend fun handleTunnelOpenResult(body: TunnelOpenResultBody) {
         if (!body.ok) {
-            EdgeLinkLog.warn("tunnel.android.open_rejected tunnelId=${body.tunnelId} error=${body.error}")
+            log("tunnel.android.open_rejected tunnelId=${body.tunnelId} error=${body.error}")
             tunnels.remove(body.tunnelId)
         }
     }

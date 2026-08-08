@@ -60,7 +60,14 @@ final class LyraCastTrustSession {
     private let deviceIdHex: String
     private let displayName: String
 
-    private let socket = LyraMeshSocket()
+    // Relay-transport harness: the mesh dial and the cast channel ride these
+    // pipes (cloud-relay path) instead of local UDP sockets when set.
+    private let socket: LyraMeshDatagramPipe
+    private let channelTransport: LyraChannelDatagramPipe?
+    // True when the dial rides relay pipes instead of a local UDP socket; a
+    // relay bridge reconfigure leaves such a session's pipes dangling even
+    // though isChannelReady stays true.
+    var isRelayRouted: Bool { !(socket is LyraMeshSocket) }
     private var stage: Stage = .physSync
     private var lastProgress = Date()
     var lastInboundAt: Date { lastProgress }
@@ -88,7 +95,7 @@ final class LyraCastTrustSession {
     private var transKey = Data()
     private var transRandom = Data()
 
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
     private var channelReady = false
     var isChannelReady: Bool { channelReady }
     var onChannelReady: (() -> Void)?
@@ -159,13 +166,22 @@ final class LyraCastTrustSession {
         0xdb, 0xa6, 0x2c, 0x5a, 0x67, 0x06, 0xe6, 0x18
     ])
 
-    init(endpoints: [(host: String, port: UInt16)], deviceIdHex: String, displayName: String, trustManager: MacTrustManager) {
+    init(
+        endpoints: [(host: String, port: UInt16)],
+        deviceIdHex: String,
+        displayName: String,
+        trustManager: MacTrustManager,
+        meshTransport: LyraMeshDatagramPipe? = nil,
+        channelTransport: LyraChannelDatagramPipe? = nil
+    ) {
         self.endpoints = endpoints
         self.host = endpoints.first?.host ?? ""
         self.port = endpoints.first?.port ?? 0
         self.deviceIdHex = deviceIdHex
         self.displayName = displayName
         self.trustManager = trustManager
+        self.socket = meshTransport ?? LyraMeshSocket()
+        self.channelTransport = channelTransport
         syncTaskServer.syncPayloadProvider = {
             LyraSyncReply.payload(deviceIdHex: deviceIdHex, displayName: displayName)
         }
@@ -184,7 +200,7 @@ final class LyraCastTrustSession {
                 )
             }
             do {
-                try self.socket.start()
+                try self.socket.start(preferredPort: nil)
             } catch {
                 self.fail(String(localized: "mesh socket 啟動失敗"))
                 return
@@ -1502,7 +1518,11 @@ final class LyraCastTrustSession {
             if stage == .physSync {
                 if let separator = endpoint.debugDescription.lastIndex(of: ":") {
                     let replyHost = String(endpoint.debugDescription[endpoint.debugDescription.startIndex..<separator])
-                    if !Self.isExpectedPhoneHost(replyHost) {
+                    // Relay-carried mesh: the pipe presents the peer as a
+                    // virtual endpoint (127.0.0.1), which never matches the
+                    // LAN-pinned phone IP. The relay session's identity pin
+                    // already authenticates the peer, so skip the host pin.
+                    if socket is LyraMeshSocket, !Self.isExpectedPhoneHost(replyHost) {
                         DiagnosticsLog.info("xiaomi.cast.trust_endpoint_ignored host=\(replyHost) (not the EdgeLink phone)")
                         return
                     }
@@ -1975,13 +1995,15 @@ final class LyraCastTrustSession {
         self.serverChannelId = UInt32(serverChannelId)
         progress(.channelNegotiate, String(localized: "通道協商…"))
         DiagnosticsLog.info("xiaomi.cast.trust_peer_port port=\(port) serverChannelId=\(serverChannelId)")
-        let socket = LyraChannelSocket()
-        socket.suppressNegotiationReply = true
-        socket.debugHandler = { message in
-            DiagnosticsLog.info("xiaomi.cast.trust_channel.\(message)")
-        }
-        socket.onDecryptFailure = { reason in
-            DiagnosticsLog.warn("xiaomi.cast.trust_channel_decrypt_failed \(reason)")
+        let socket: LyraChannelDatagramPipe = channelTransport ?? LyraChannelSocket()
+        if let nativeSocket = socket as? LyraChannelSocket {
+            nativeSocket.suppressNegotiationReply = true
+            nativeSocket.debugHandler = { message in
+                DiagnosticsLog.info("xiaomi.cast.trust_channel.\(message)")
+            }
+            nativeSocket.onDecryptFailure = { reason in
+                DiagnosticsLog.warn("xiaomi.cast.trust_channel_decrypt_failed \(reason)")
+            }
         }
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
             guard let self else { return }

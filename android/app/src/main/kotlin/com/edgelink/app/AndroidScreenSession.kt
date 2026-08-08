@@ -392,10 +392,14 @@ class AndroidScreenSession(
             audioSource?.dispose()
             audioSource = null
             peerConnection?.close()
-            peerConnection?.dispose()
+            // Native free deferred past libwebrtc's close-time thread drain;
+            // synchronous dispose here raced the signaling thread (destroyed
+            // mutex SIGABRT, live 2026-08-08). See WebRtcSafeDisposer.
+            val stoppedPeerConnection = peerConnection
             peerConnection = null
-            factory?.dispose()
+            val stoppedFactory = factory
             factory = null
+            WebRtcSafeDisposer.disposeLater(null, stoppedPeerConnection, stoppedFactory)
             audioDeviceModule?.release()
             audioDeviceModule = null
             playbackAudioCapture?.stop()

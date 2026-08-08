@@ -87,6 +87,8 @@ object EnvelopeTypes {
     const val PHOTO_STATUS = "photo.status"
     const val XIAOMI_TRUST_STATUS = "xiaomi.trustStatus"
     const val XIAOMI_TRUST_BIND = "xiaomi.trustBind"
+    const val RELAY_MESH_DATAGRAM = "relay.mesh.datagram"
+    const val RELAY_CHANNEL_DATAGRAM = "relay.channel.datagram"
 }
 
 object EnvelopeCodec {

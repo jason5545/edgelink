@@ -47,6 +47,47 @@ data class MirrorMediaRouteSelection(
     val cloudSessionId: String?
 )
 
+// Pure mirror media route decision (unit-testable without Android deps).
+// LAN-first: the Mac announces its probe endpoint; when it answers, the
+// source dials the Mac's own RTSP listener directly (the official path)
+// instead of bridging through the cloud — the Mac stands down its cloud
+// receiver when the result carries mediaTransport=lan_direct. Relay-connected
+// Macs send no probe args, so they land on TURN (both caps true) or the
+// WS/TCP cloudflare fallback.
+fun selectMirrorMediaRouteFor(
+    args: Map<String, String>,
+    lanProbeReachable: Boolean,
+    peerMirrorTurnSupported: Boolean
+): MirrorMediaRouteSelection {
+    val cloudSessionId = args["mirrorSessionId"]
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() && args["mediaTransport"] == "cloudflare" }
+    val hasProbeArgs = args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() } != null &&
+        args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 } != null
+    if (cloudSessionId != null && hasProbeArgs && lanProbeReachable) {
+        return MirrorMediaRouteSelection(MirrorMediaTransport.LAN_DIRECT, cloudSessionId = null)
+    }
+    if (cloudSessionId != null && args["mirrorTurn"] == "1" && peerMirrorTurnSupported) {
+        return MirrorMediaRouteSelection(MirrorMediaTransport.TURN, cloudSessionId)
+    }
+    if (cloudSessionId != null) {
+        return MirrorMediaRouteSelection(MirrorMediaTransport.CLOUDFLARE, cloudSessionId)
+    }
+    return MirrorMediaRouteSelection(MirrorMediaTransport.LEGACY_DIRECT, cloudSessionId = null)
+}
+
+// Decides whether a startMainDisplay-shaped command goes straight to the
+// media bridge instead of the native remote-device route. Besides
+// mediaBridgeOnly (relay-carried mirror start), source-recovery-only
+// commands must land here too: recovery refreshes the media transport of an
+// already-open mirror session, and the native route would register a fresh
+// phone-side mirror attempt against the Mac and pull com.xiaomi.mirror's
+// cross-screen UI (PhoneMainMirrorActivity) to the foreground for the whole
+// session — live 2026-08-08, on both the relay and the LAN path.
+fun shouldUseMediaBridgeRouteForMirrorStart(args: Map<String, String>): Boolean =
+    args["mediaBridgeOnly"] == "1" || args["sourceRecoveryOnly"] == "true"
+
+
 class AndroidMiLinkCommandBridge(
     context: Context,
     private val onMirrorCloudBridgeRequested: (AndroidMiLinkMirrorCloudBridgeRequest) -> Unit = {},
@@ -84,6 +125,11 @@ class AndroidMiLinkCommandBridge(
                     COMMAND_MIRROR_QUERY_REMOTE_DEVICES -> queryMirrorRemoteDevices(body)
                     COMMAND_MIRROR_LOCK_STATE -> queryMirrorLockState()
                     COMMAND_MIRROR_START_MAIN_DISPLAY -> startMirrorMainDisplay(body)
+                    // Mac-side stall recovery uses the same media-bridge
+                    // re-arm semantics as startMainDisplay; without this alias
+                    // the relay path had no recovery at all (the command used
+                    // to fall through to "unsupported").
+                    COMMAND_MIRROR_SOURCE_RECOVERY -> startMirrorMainDisplay(body)
                     COMMAND_MIRROR_GLOBAL -> sendMirrorGlobal(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
                     COMMAND_SYNERGY_STATUS -> querySynergyStatus()
@@ -336,6 +382,17 @@ class AndroidMiLinkCommandBridge(
     }
 
     private suspend fun startMirrorMainDisplay(body: MiLinkCommandBody): CommandResult {
+        // Relay-carried official mirror: the mirror screen is already open
+        // (OPEN_MIRROR_SCREEN over the relay cast channel); the Mac only needs
+        // the media transport negotiated and the cloud bridge armed. Skip the
+        // native remote-device start entirely — the relay announcer registers
+        // the Mac as a real mirror remote, and the native route would hijack
+        // this command into a phone-side mirror attempt against the Mac.
+        // Source recovery (stall watchdog) shares this guard: it must re-arm
+        // the media bridge, never launch the phone's own mirror UI.
+        if (shouldUseMediaBridgeRouteForMirrorStart(body.args)) {
+            return startFakeMirrorMainDisplay(body)
+        }
         val requestedDeviceId = body.args["remoteDeviceId"].orEmpty().trim()
         val requestedFakeRemote = MiLinkPrivilegeHookPolicy.isFakeMirrorRemoteId(requestedDeviceId)
         val forceFakeRemote = body.args["forceFakeRemote"] == "true"
@@ -759,7 +816,16 @@ class AndroidMiLinkCommandBridge(
             onMirrorCloudBridgeStopRequested("transport_${transport.name.lowercase()}")
         }
         val startedAtMs = System.currentTimeMillis()
-        val castChannelWait = awaitMirrorCastChannelReady(startedAtMs)
+        // Source recovery rides an already-live cast channel whose
+        // confirmation is older than the freshness window, so the wait would
+        // spin out the full timeout and report a bogus pending state. The
+        // channel's liveness is implied by the media that triggered the
+        // recovery; only the media transport needs re-arming.
+        val castChannelWait = if (body.args["sourceRecoveryOnly"] == "true") {
+            "ready device=sourceRecoveryOnly skipped=cast_channel_wait"
+        } else {
+            awaitMirrorCastChannelReady(startedAtMs)
+        }
         EdgeLinkLog.info("xiaomi.mirror.android.cast_channel_wait $castChannelWait")
         val sourceListenHost = preferredLocalIPv4Address().orEmpty()
         val sourceListenPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 } ?: 7_102
@@ -840,45 +906,22 @@ class AndroidMiLinkCommandBridge(
         body: MiLinkCommandBody,
         reason: String
     ): MirrorMediaRouteSelection {
-        val cloudSessionId = body.args["mirrorSessionId"]
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() && body.args["mediaTransport"] == "cloudflare" }
         val peerHost = body.args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() }
         val peerPort = body.args["peerPort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
         val probePort = body.args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
-        // LAN-first: the Mac announces its probe endpoint; when it answers, the
-        // source can dial the Mac's own RTSP listener directly (the official
-        // path) instead of bridging through the cloud. The Mac stands down its
-        // cloud receiver when the result carries mediaTransport=lan_direct.
-        if (cloudSessionId != null && peerHost != null && probePort != null &&
+        val probeReachable = peerHost != null && probePort != null &&
             LANTransport.isReachable(peerHost, probePort)
-        ) {
-            EdgeLinkLog.info(
-                "xiaomi.mirror.android.media_route reason=$reason " +
-                    "transport=lan_direct peer=$peerHost:$peerPort probePort=$probePort"
-            )
-            return MirrorMediaRouteSelection(MirrorMediaTransport.LAN_DIRECT, cloudSessionId = null)
-        }
-        val mirrorTurnRequested = body.args["mirrorTurn"] == "1"
-        if (cloudSessionId != null && mirrorTurnRequested && peerMirrorTurnDataChannelSupported()) {
-            EdgeLinkLog.info(
-                "xiaomi.mirror.android.media_route reason=$reason " +
-                    "transport=turn peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
-            )
-            return MirrorMediaRouteSelection(MirrorMediaTransport.TURN, cloudSessionId)
-        }
-        if (cloudSessionId != null) {
-            EdgeLinkLog.info(
-                "xiaomi.mirror.android.media_route reason=$reason " +
-                    "transport=cloudflare peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
-            )
-            return MirrorMediaRouteSelection(MirrorMediaTransport.CLOUDFLARE, cloudSessionId)
-        }
+        val selection = selectMirrorMediaRouteFor(
+            args = body.args,
+            lanProbeReachable = probeReachable,
+            peerMirrorTurnSupported = peerMirrorTurnDataChannelSupported()
+        )
         EdgeLinkLog.info(
             "xiaomi.mirror.android.media_route reason=$reason " +
-                "transport=direct peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+                "transport=${selection.transport.name.lowercase()} " +
+                "peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
         )
-        return MirrorMediaRouteSelection(MirrorMediaTransport.LEGACY_DIRECT, cloudSessionId = null)
+        return selection
     }
 
     private fun callMirrorDeviceProviderWithDeadline(
@@ -1557,6 +1600,7 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MI_CONNECT_NETWORKING_REGISTER = "xiaomi.mi_connect.registerLyraService"
         const val COMMAND_MIRROR_QUERY_REMOTE_DEVICES = "xiaomi.mirror.queryRemoteDevices"
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
+        const val COMMAND_MIRROR_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_LOCK_STATE = "xiaomi.mirror.lockState"
         const val COMMAND_MIRROR_GLOBAL = "xiaomi.mirror.global"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"

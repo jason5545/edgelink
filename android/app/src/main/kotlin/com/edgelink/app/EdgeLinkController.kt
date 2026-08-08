@@ -24,6 +24,7 @@ import com.edgelink.core.StatusCapsBody
 import com.edgelink.core.StatusPingBody
 import com.edgelink.core.StatusPongBody
 import com.edgelink.core.PhoneLockStateBody
+import com.edgelink.core.RelayDatagramBody
 import com.edgelink.core.CtrlGlobalBody
 import com.edgelink.core.CtrlKeyBody
 import com.edgelink.core.CtrlPointerBody
@@ -124,6 +125,8 @@ private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
 private const val MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
 private const val MILINK_COMMAND_MIRROR_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
+private const val MESH_PORT_PREFS = "edgelink_mesh_ports"
+private const val KEY_LAST_RESPONSIVE_MESH_PORT = "lastResponsiveMeshPort"
 private const val DEBUG_SMS_SEND_TIMEOUT_MS = 12_000L
 private const val CALL_RELAY_BRIDGE_DIAL_DELAY_MS = 2_000L
 private const val CALL_RELAY_BRIDGE_ANSWER_DELAY_MS = 750L
@@ -320,6 +323,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onTunnelEnvelope = { type, body ->
             tunnelManager.handleEnvelope(type, body)
         },
+        onLyraRelayDatagram = { type, body ->
+            lyraRelayBridge.handleEnvelope(type, body)
+        },
         onStatusCaps = { caps ->
             handleStatusCaps(caps)
         },
@@ -353,6 +359,19 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         scope = scope,
         sendEnvelope = { type, body ->
             sendTunnelEnvelope(type, body)
+        }
+    )
+
+    // Native Xiaomi mesh/channel datagrams carried over the relay session.
+    // Active only while connected via the cloud relay; on LAN the Mac reaches
+    // the phone's Xiaomi endpoints directly.
+    private val lyraRelayBridge = AndroidLyraRelayTransportBridge(
+        scope = scope,
+        sendEnvelope = { type, body ->
+            sendLyraRelayEnvelope(type, body)
+        },
+        onMeshTargetResponsive = { port ->
+            recordResponsiveMeshPort(port)
         }
     )
 
@@ -623,12 +642,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         if (!result.success && !startPending) {
             return
         }
-        when (body.command) {
-            MILINK_COMMAND_MIRROR_START_MAIN_DISPLAY,
-            MILINK_COMMAND_MIRROR_SOURCE_RECOVERY -> scope.launch {
-                miLinkScreenPowerGuard.onSharingStarted()
-            }
-        }
+        // The mirror now runs the native path end to end (cast channel
+        // OPEN_MIRROR_SCREEN + the phone's real WFD source); HyperOS owns the
+        // screen/dim/hangup behavior. Do NOT engage the EdgeLink screen power
+        // guard here: its 5s dim throttles the MirrorControl encoder into slow
+        // motion (observed 0.5x media clock + video starvation on the relay
+        // path), and its rapid start/stop raced ScreenPowerForegroundService
+        // into FGS-timeout crashes.
     }
 
     private fun stopMiLinkScreenPowerGuard() {
@@ -748,6 +768,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         latestTurnCredentials = null
         session?.close()
         session = null
+        lyraRelayBridge.stop()
         AndroidMiLinkMirrorMediaBridge.stop("disconnect")
         closeMirrorTurnSession("disconnect")
         stopMiLinkScreenPowerGuard()
@@ -977,7 +998,22 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 "stdoutLen=${result?.stdout?.length} stderr=${result?.stderr?.take(80)}"
         )
         if (result != null && result.success) {
-            val ports = LyraMeshPortProbe.parse(result.stdout.lines(), uid)
+            val uidPorts = LyraMeshPortProbe.parse(result.stdout.lines(), uid)
+            // The UID filter can't tell the Lyra processes apart (all share
+            // android.uid.system): rank by owning process via ss so the main
+            // mi_connect_service mesh dial sorts first. 2026-08-08: the
+            // Mirror app's 9876/10158 sockets out-sorted the real mesh port
+            // 50426 and the relay-cast phys sync went to a dead endpoint.
+            val ssResult = AndroidShizukuSupport.runShellCommand(
+                appContext,
+                arrayOf("sh", "-c", "ss -ulpn")
+            )
+            val ranked = if (ssResult != null && ssResult.success) {
+                LyraMeshPortProbe.parseSs(ssResult.stdout.lines())
+            } else {
+                emptyList()
+            }
+            val ports = ranked.filter { it in uidPorts } + uidPorts.filter { it !in ranked }
             EdgeLinkLog.info("lyra.android.mesh_ports source=shizuku ports=$ports")
             return ports
         }
@@ -1514,6 +1550,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         screenSession.stop()
         session?.close()
         session = null
+        lyraRelayBridge.stop()
         stateFlow.update {
             it.copy(
                 connectionStatus = if (reason == "manual") "Reconnecting" else it.connectionStatus,
@@ -2545,9 +2582,48 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     "mediaRelayCandidates=${sourcedStatus.phoneMediaRelayCandidateCount} " +
                     "mirrorScreenRemoteActive=${sourcedStatus.mirrorScreenRemoteActive}"
             )
+            startLyraRelayMeshFlowIfReady(sourcedStatus)
         }.onFailure { error ->
             EdgeLinkLog.error("milink.android.status_send_failed", error)
         }
+    }
+
+    // When the relay session is up and the phone's native mesh port is known,
+    // serve it through relay.mesh.datagram envelopes (the Mac dials it over
+    // the relay instead of LAN). The probe list mixes every Lyra-process
+    // socket (all share android.uid.system), and its order is numeric — the
+    // Mirror app's transient ports can sort ahead of the real mesh dial
+    // (2026-08-08: 9876/10158 beat 50426 and the cast phys sync went to a
+    // dead endpoint). Prefer the port that last produced inbound traffic.
+    private fun startLyraRelayMeshFlowIfReady(status: MiLinkStatusBody) {
+        val candidates = orderedMeshPortCandidates(status.lyraMeshPorts)
+        val meshPort = candidates.firstOrNull() ?: return
+        lyraRelayBridge.setMeshProbePorts(candidates)
+        lyraRelayBridge.startMesh("127.0.0.1", meshPort)
+    }
+
+    private fun orderedMeshPortCandidates(ports: List<Int>): List<Int> {
+        val valid = ports.filter { it in 1..65_535 }
+        val responsive = lastResponsiveMeshPort()
+        return if (responsive != null && responsive in valid) {
+            listOf(responsive) + valid.filter { it != responsive }
+        } else {
+            valid
+        }
+    }
+
+    private fun lastResponsiveMeshPort(): Int? =
+        appContext.getSharedPreferences(MESH_PORT_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_LAST_RESPONSIVE_MESH_PORT, 0)
+            .takeIf { it in 1..65_535 }
+
+    private fun recordResponsiveMeshPort(port: Int) {
+        if (port == lastResponsiveMeshPort()) return
+        appContext.getSharedPreferences(MESH_PORT_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_LAST_RESPONSIVE_MESH_PORT, port)
+            .apply()
+        EdgeLinkLog.info("lyra.android.mesh_port_responsive port=$port")
     }
 
     private suspend fun miLinkMessengerLoop(activeSession: SecureSessionClient, identity: LocalIdentity) {
@@ -2629,6 +2705,20 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         sendPlaintext(payload)
     }
 
+    // Relay-carried Xiaomi datagrams must preserve order (KCP sn depends on
+    // ordered delivery), so this awaits the session send instead of launching
+    // a detached coroutine; the bridge's per-flow receive loop serializes calls.
+    private suspend fun sendLyraRelayEnvelope(type: String, body: Any) {
+        val payload = when (body) {
+            is RelayDatagramBody -> EnvelopeCodec.encode(type, body)
+            else -> return
+        }
+        val activeSession = session ?: return
+        runCatching {
+            activeSession.sendPlaintext(payload)
+        }
+    }
+
     private fun sendPlaintext(plaintext: ByteArray) {
         val activeSession = session ?: return
         scope.launch(Dispatchers.IO) {
@@ -2671,6 +2761,7 @@ private class AndroidCommandDispatcher(
     private val onMiLinkMirrorRtcOffer: suspend (MiLinkMirrorRtcOfferBody) -> Unit = {},
     private val onMiLinkMirrorRtcIce: (MiLinkMirrorRtcIceBody) -> Unit = {},
     private val onTunnelEnvelope: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> },
+    private val onLyraRelayDatagram: suspend (String, kotlinx.serialization.json.JsonObject) -> Unit = { _, _ -> },
     private val onStatusCaps: (StatusCapsBody) -> Unit = {},
     private val onClipboardHistoryResponse: (ClipboardHistoryResponseBody) -> Unit = {},
     private val onClipboardBlobRequest: (ClipboardBlobRequestBody) -> Unit = {},
@@ -2919,6 +3010,13 @@ private class AndroidCommandDispatcher(
                 val envelope = EnvelopeCodec.json.decodeFromString<kotlinx.serialization.json.JsonObject>(plaintext.decodeToString())
                 val body = envelope["b"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())
                 onTunnelEnvelope(type, body)
+                null
+            }
+            EnvelopeTypes.RELAY_MESH_DATAGRAM, EnvelopeTypes.RELAY_CHANNEL_DATAGRAM -> {
+                val type = EnvelopeCodec.type(plaintext)
+                val envelope = EnvelopeCodec.json.decodeFromString<kotlinx.serialization.json.JsonObject>(plaintext.decodeToString())
+                val body = envelope["b"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())
+                onLyraRelayDatagram(type, body)
                 null
             }
             else -> null

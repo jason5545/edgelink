@@ -1036,6 +1036,24 @@ object AndroidMiLinkMirrorMediaBridge {
             if (sentPLAY) {
                 return
             }
+            if (turnMode && !turnFallbackTriggered) {
+                // The official source emits its HEVC parameter sets + first
+                // IDR at stream start and does not re-send them on IDR
+                // request, so any media produced before the data channel
+                // opens is unrecoverable on the Mac. Hold PLAY until the
+                // channel is attached (or the WS fallback decision lands).
+                val waitedStartMs = android.os.SystemClock.elapsedRealtime()
+                while (currentCoroutineContext().isActive &&
+                    !turnDataChannelActive && !turnFallbackTriggered
+                ) {
+                    delay(100)
+                }
+                EdgeLinkLog.info(
+                    "mirror.turn.play_gate sessionId=$sessionId reason=$reason " +
+                        "dcActive=$turnDataChannelActive fallback=$turnFallbackTriggered " +
+                        "waitedMs=${android.os.SystemClock.elapsedRealtime() - waitedStartMs}"
+                )
+            }
             sentPLAY = true
             playSentAtMs = android.os.SystemClock.elapsedRealtime()
             val headers = sessionHeader?.let { listOf("Session" to it) } ?: emptyList()

@@ -588,6 +588,17 @@ channel 媒體路線，與 `edgelink-screen` 的 `rtc.*` session 完全分開：
 - 逾時與降級：data channel 建立逾時 8 秒（或 ICE/協商失敗、TURN credential 取不到）
   時，雙端各自落回現行 WS/TCP cloudflare 路線（手機 bridge 切回終結 KCP +
   `rtp_payload_batch` envelope），不需額外協商。
+- Relay-carried 官方鏡像（無 LAN）：Mac 先經 relay cast channel 送
+  OPEN_MIRROR_SCREEN（手機帶起 WFD source，RTSP 在手機本機 7236），隨後送
+  `milink.command xiaomi.mirror.startMainDisplay`，args 帶
+  `mediaBridgeOnly=1` + `peerPort=7236` + cloudflare media args（**不帶**
+  peerHost／lanProbePort，probe 不可能過）。`mediaBridgeOnly=1` 讓 Android
+  直接走 media bridge 選路，跳過 native remote-device 啟動（relay announcer
+  會把 Mac 註冊成真實 mirror remote，native 路線會把這個 command 劫持成
+  「手機反向鏡像 Mac」的嘗試）。選路落到 TURN／cloudflare 後，cloud bridge
+  在手機本機 dial 自己的 7236 RTSP source，把 KCP 媒體送過 data channel；
+  Mac 端由 command result（`mediaTransport=turn|cloudflare`）啟動 TURN session
+  與 KCP sink receiver。RTSP 不走 route-b tunnel：媒體面唯一出路是這條 bridge。
 - 加密：小米 TS 層 AES-CBC（不變）+ WebRTC DTLS-SCTP；媒體不進 secure frame，
   control/signaling 維持原 E2EE envelope。
 
@@ -1170,30 +1181,67 @@ EdgeLink 提供裝置間通用 TCP 隧道，支援 adb over tunnel、任意 port
 
 ## 10. Relay Transport Datagrams（Xiaomi mesh / channel over relay）
 
-把 Xiaomi 原生的 mesh 與 relayCall channel datagram 原封不動地搬進 E2EE relay
-session，讓通話接線（announce → relayCall dial → channel → relay:// URI）在
-cloud relay 路徑上跑與 LAN 完全相同的 bytes。目前用於假手機端／假伺服器端的
-通話邏輯驗證；Worker 依然只看得到 frame 大小與時間。
+把 Xiaomi 原生的 mesh 與 channel datagram 原封不動地搬進 E2EE relay
+session，讓通話接線（announce → relayCall dial → channel → relay:// URI）與
+鏡像控制面（cast dial → peer port → channel → duo.screen / OPEN_MIRROR_SCREEN）
+在 cloud relay 路徑上跑與 LAN 完全相同的 bytes。Worker 依然只看得到 frame
+大小與時間。
 
 ### Envelope 格式
 
 ```json
-{"t":"relay.mesh.datagram","b":{"payload":"<base64 UDP datagram>"}}
+{"t":"relay.mesh.datagram","b":{"payload":"<base64 UDP datagram>","f":0}}
 {"t":"relay.channel.datagram","b":{"payload":"<base64 UDP datagram>"}}
 ```
 
+- `f`（只用於 `relay.mesh.datagram`）：邏輯 mesh flow index，省略或 `0`
+  代表 flow 0。手機端每個 flow index 綁一個獨立 UDP socket（不同 source
+  port），Xiaomi mesh service 因此把每個 flow 當成不同 peer。
+- `p`（只用於 `relay.channel.datagram`）：Mac 端 channel socket dial 的
+  手機本機 Xiaomi channel port。手機端 bridge 不知道該把 channel flow 轉給
+  哪個 listener，所以由 Mac 在 envelope 上帶目標 port；bridge 收到第一顆
+  datagram 時 lazy bind，port 改變時 rebind（relayCall 與 cast 的 channel
+  listener port 不同）。
 - `relay.mesh.datagram`：一條 LyraMeshDatagram（KCP segment），內容是
   length-prefixed LyraMeshPack frame stream（announce、auth、sync push、
-  relayCall quick-conn logi、packType-5 peer port command 都走這裡）。
-- `relay.channel.datagram`：一條 relayCall channel datagram（plaintext 協商
-  TLV，或 trans key 加密的 LyraSocketPacket／LyraChannelFragment）。
+  relayCall quick-conn logi、cast dial、packType-5 peer port command 都走這裡）。
+- `relay.channel.datagram`：一條 channel datagram（relayCall 或 cast channel），
+  與真實 UDP channel socket 相同的 KCP segment framing（sn/una + ack），內容是
+  plaintext 協商 TLV，或 trans key 加密的 LyraSocketPacket／LyraChannelFragment。
+
+### Mesh flow 分配
+
+- **flow 0**：announce／relayCall dial（`LyraMeshAnnouncer` 與 relayCall
+  quick-conn）。
+- **flow 1**：cast trust dial（`LyraCastTrustSession` 的 phys sync → cookie →
+  sync auth → upgrade → logi）。原因：Xiaomi mesh service 以 source endpoint
+  區分 peer，且不會對「已通過 auth 的 peer」回應第二次 phys sync；LAN 上
+  cast session 用自己的 UDP socket（新 peer），relay 路徑必須重現同樣語義，
+  所以 cast dial 走獨立 flow，讓手機端 bridge 用新 socket 轉送。
 
 ### 語義
 
-- 每端一個 mesh flow、一個 channel flow，單 peer，不做 port demux。
-- 發送端必須保持 datagram 順序（KCP sn 依賴有序送達）；EdgeLink 端用串行
-  send chain 保證。
+- 每端每個 mesh flow index 一條 flow、加一條 channel flow，單 peer，不做
+  port demux。relayCall 與 cast 不會同時佔用同一條 relay channel flow。
+  announce（flow 0）與 cast（flow 1）可同時存在，互不干擾。
+- 發送端必須保持同一 flow 內的 datagram 順序（KCP sn 依賴有序送達）；
+  EdgeLink 端用串行 send chain 保證。
 - 兩端各自維持 KCP sn/una 與 ack，與 UDP 路徑一致。
-- 實作：EdgeLinkKit 的 `LyraVirtualMeshPipe`／`LyraVirtualChannelPipe`
-  （`LyraMeshDatagramPipe`／`LyraChannelDatagramPipe` 傳輸縫）＋ LyraServerKit
-  的 `LyraRelayTransportBridge`。
+- 接收端不得以 command byte 過濾資料：真機 mesh service 在 relay 路徑上
+  會用 ack-command datagram 夾帶回應 payload（0x52 + data，例如 phys sync
+  回應），與 push（0x51）混用；凡是帶 payload 的 segment 都當資料處理
+  （sn 排序 + 回 ack），無 payload 的純 ack 才忽略。2026-08-08 實測：
+  push-only 過濾會把 phys sync 回應丟掉，cast dial 卡死在 physSync。
+- 手機端 bridge 在 flow 尚未綁定目標時（relay 重連後 milink status 還沒
+  補上 mesh port 的空窗）必須 buffer datagram 而不是丟棄，startMesh 補上
+  目標後 flush；socket 死亡（send/recv failure）時保留 target，下一顆
+  datagram 觸發 rebind。
+- Mac 實作：EdgeLinkKit 的 `LyraVirtualMeshPipe`／`LyraVirtualChannelPipe`
+  （`LyraMeshDatagramPipe`／`LyraChannelDatagramPipe` 傳輸縫）＋
+  `LyraRelayTransportBridge`（relay-connected 時由 `EdgeLinkRuntime` 綁到
+  session send path，並驅動 announcer／relayCall 與 cast trust session；LAN UDP
+  路徑保留為 fallback）。
+- Android 實作：`AndroidLyraRelayTransportBridge` 把 relay datagram 原樣轉給
+  手機本機的 Xiaomi mesh endpoint／cast channel（不終結 KCP），回應送回 relay；
+  只在 relay session 連線時啟用，LAN 可達時 Mac 直接走 LAN。WFD RTSP 走
+  既有 route b TCP tunnel（§9），媒體走 §6 的 `milink.mirror.rtc.*` TURN 路線。

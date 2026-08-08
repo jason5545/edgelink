@@ -5,6 +5,10 @@ import Network
 public actor LyraTunnelBridge {
     public typealias SendHandler = @Sendable (Data) async throws -> Void
 
+    // Connection-refused dial budget (500 ms apart): long enough to cover the
+    // phone's async WFD RTSP listener startup after OPEN_MIRROR_SCREEN.
+    private let dialRetryAttempts: Int
+
     private struct StreamState {
         let connection: NWConnection
         var recvCredit: Int = TunnelConstants.initialCredit
@@ -32,10 +36,12 @@ public actor LyraTunnelBridge {
 
     public init(
         sendHandler: @escaping SendHandler,
-        log: @escaping @Sendable (String) -> Void = { _ in }
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        dialRetryAttempts: Int = 12
     ) {
         self.sendHandler = sendHandler
         self.log = log
+        self.dialRetryAttempts = dialRetryAttempts
     }
 
     public static func handles(_ type: String) -> Bool {
@@ -257,17 +263,30 @@ public actor LyraTunnelBridge {
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
             return false
         }
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
-        let ready = await waitForReady(connection, timeout: 5)
-        guard ready else {
+        // Retry connection-refused: the Xiaomi mirror WFD RTSP listener comes
+        // up asynchronously after the phone processes OPEN_MIRROR_SCREEN, so
+        // the first dial can land before it listens (the LAN path tolerates
+        // this via the Mac WFD client's connect retries). Give up when the
+        // tunnel is torn down or the attempt budget runs out.
+        var attempt = 0
+        while attempt < dialRetryAttempts {
+            attempt += 1
+            let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+            let ready = await waitForReady(connection, timeout: 1.5)
+            if ready {
+                tunnels[tunnelId]?.streams[streamId] = StreamState(connection: connection)
+                startReadLoop(tunnelId: tunnelId, streamId: streamId, connection: connection)
+                log("tunnel.phone.dial_ok tunnelId=\(tunnelId) stream=\(streamId) attempts=\(attempt) target=\(host):\(port)")
+                return true
+            }
             connection.cancel()
-            log("tunnel.phone.dial_failed tunnelId=\(tunnelId) stream=\(streamId) target=\(host):\(port)")
-            return false
+            guard tunnels[tunnelId] != nil else { return false }
+            guard attempt < dialRetryAttempts else { break }
+            log("tunnel.phone.dial_retry tunnelId=\(tunnelId) stream=\(streamId) attempt=\(attempt) target=\(host):\(port)")
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
-        tunnels[tunnelId]?.streams[streamId] = StreamState(connection: connection)
-        startReadLoop(tunnelId: tunnelId, streamId: streamId, connection: connection)
-        log("tunnel.phone.dial_ok tunnelId=\(tunnelId) stream=\(streamId) target=\(host):\(port)")
-        return true
+        log("tunnel.phone.dial_failed tunnelId=\(tunnelId) stream=\(streamId) attempts=\(attempt) target=\(host):\(port)")
+        return false
     }
 
     private func startReadLoop(tunnelId: String, streamId: Int, connection: NWConnection) {

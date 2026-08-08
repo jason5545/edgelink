@@ -112,9 +112,12 @@ final class LyraTunnelBridgeTests: XCTestCase {
         )
 
         let clientSessionRef = SessionRef()
+        // Retry budget 1: this test pins the fast error path (the production
+        // default retries connection-refused while the phone's RTSP listener
+        // starts up — covered by LyraMirrorOverRelayTests).
         let tunnelBridge = LyraTunnelBridge(sendHandler: { data in
             try await clientSessionRef.session?.sendPlaintext(data)
-        })
+        }, dialRetryAttempts: 1)
         let clientSession = LyraRelaySession(
             channel: pair.clientSide,
             identity: clientIdentity,

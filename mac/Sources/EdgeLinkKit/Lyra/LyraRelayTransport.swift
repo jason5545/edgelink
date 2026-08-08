@@ -11,9 +11,20 @@ import Network
 
 public struct RelayDatagramBody: Codable, Equatable, Sendable {
     public let payload: String
+    // Logical flow index within the envelope type (nil/absent = 0). The cast
+    // trust dial rides a second mesh flow (f=1) so the phone sees a fresh
+    // peer for its phys sync, exactly like a brand-new LAN UDP socket; the
+    // announce / relayCall dial stays on flow 0. Omitted on the wire when 0.
+    public let f: Int?
+    // Channel-only: the local Xiaomi port the phone side should dial for
+    // this flow (the peer port the Mac's channel socket dialed). Lets the
+    // phone bridge bind the channel flow lazily on first datagram.
+    public let p: Int?
 
-    public init(payload: String) {
+    public init(payload: String, f: Int? = nil, p: Int? = nil) {
         self.payload = payload
+        self.f = f
+        self.p = p
     }
 }
 
@@ -71,6 +82,11 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
 
     public private(set) var boundPort: UInt16?
 
+    // Command byte stamped on outbound data segments (default push). Tests
+    // flip this to commandAck to reproduce the real phone's ack-framed
+    // responses (0x52 + payload).
+    public var dataCommand: UInt8 = LyraMeshDatagram.commandPush
+
     private let queue = DispatchQueue(label: "edgelink.lyra.virtualmesh", qos: .userInitiated)
     private var outbound: DatagramHandler?
     private var nextSendSn: UInt32 = 0
@@ -105,7 +121,11 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
     }
 
     public func stop() {
-        queue.sync {
+        // Async: frame handlers run on this queue (deliver → onFrame), and
+        // LyraCastTrustSession.finishLocked() stops the pipe from inside such
+        // a handler — a sync stop deadlocked the queue (SIGTRAP). The state
+        // clear is idempotent and ordering is preserved by the serial queue.
+        queue.async { [self] in
             boundPort = nil
             nextSendSn = 0
             recvUna = 0
@@ -136,6 +156,7 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
         while offset < encoded.count {
             let end = min(offset + Self.maxSegmentPayload, encoded.count)
             let datagram = LyraMeshDatagram.encode(
+                command: dataCommand,
                 tick: tick,
                 sn: nextSendSn,
                 una: recvUna,
@@ -150,8 +171,12 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
     private func handleDatagramOnQueue(_ datagram: Data) {
         let endpoint = peerEndpoint()
         onRawDatagram?(datagram, endpoint)
+        // Accept any payload-bearing segment as data: the phone's mesh service
+        // answers some dials with an ack-command datagram carrying the
+        // response (0x52 + payload) instead of a push. Pure acks (no payload)
+        // carry no data and are ignored.
         guard let segment = try? LyraMeshDatagram.decodeSegment(datagram),
-              segment.command == LyraMeshDatagram.commandPush
+              !segment.payload.isEmpty
         else { return }
         let isDuplicate = segment.sn < recvUna
         if !isDuplicate {
@@ -204,8 +229,10 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
 }
 
 // MARK: - Virtual channel pipe
-// LyraChannelSocket stand-in for the relayCall channel: plaintext negotiation
-// TLVs plus trans-key encrypted packets (LyraSocketPacket + LyraChannelFragment)
+// LyraChannelSocket stand-in for relay-carried channels (relayCall, cast):
+// plaintext negotiation TLVs plus trans-key encrypted packets
+// (LyraSocketPacket + LyraChannelFragment), wrapped in the same KCP
+// segment framing (sn/una + acks) the real UDP channel socket uses, and
 // exchanged through the relay session instead of UDP.
 
 public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked Sendable {
@@ -217,12 +244,24 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     // Endpoint the peer's datagrams appear to arrive from (log surface only).
     public var peerHost = "127.0.0.1"
     public var peerPort: UInt16 = 40201
+    // Set by connect(): the dialed Xiaomi channel port (the relay bridge
+    // stamps it onto outbound envelopes so the phone can bind its local
+    // forward).
+    private var dialedPeerPort: UInt16?
+
+    // Command byte stamped on outbound data segments (default push). Tests
+    // flip this to commandAck to reproduce the real phone's ack-framed
+    // responses (0x52 + payload).
+    public var dataCommand: UInt8 = LyraMeshDatagram.commandPush
 
     public private(set) var boundPort: UInt16?
 
     private let queue = DispatchQueue(label: "edgelink.lyra.virtualchannel", qos: .userInitiated)
     private var outbound: DatagramHandler?
     private var socketKey: SymmetricKey?
+    private var nextSendSn: UInt32 = 0
+    private var recvUna: UInt32 = 0
+    private var announced = false
     private var packetBuffer = Data()
     private var fragments: [Int: Data] = [:]
     private var fragmentExpectedTotal = 0
@@ -244,6 +283,7 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
 
     public func start(socketKey: Data, serverChannelId: UInt32) throws {
         queue.sync {
+            resetStateLocked()
             self.socketKey = SymmetricKey(data: socketKey)
             boundPort = defaultPort
         }
@@ -251,9 +291,37 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
 
     public func connect(host: String, port: UInt16, socketKey: Data) throws {
         queue.sync {
+            resetStateLocked()
             self.socketKey = SymmetricKey(data: socketKey)
+            self.peerPort = port
+            self.dialedPeerPort = port
         }
         onPeerConnected?(peerEndpoint())
+    }
+
+    // The port the most recent connect() dialed (nil before the first dial).
+    // The relay bridge stamps it onto outbound channel envelopes so the peer
+    // can bind its local forward to the right Xiaomi channel port.
+    public var currentDialedPeerPort: UInt16? {
+        queue.sync { dialedPeerPort }
+    }
+
+    // Same value, but only callable from the pipe's own queue — the bridge
+    // reads it inside the outbound handler (a queue.sync here would deadlock
+    // against the delivery queue).
+    func dialedPeerPortOnQueue() -> UInt16? {
+        dialedPeerPort
+    }
+
+    // Mirrors LyraChannelSocket.stop(): a fresh start/connect begins a new KCP
+    // session (redials must not carry stale sn/una into the peer's new socket).
+    private func resetStateLocked() {
+        nextSendSn = 0
+        recvUna = 0
+        announced = false
+        packetBuffer.removeAll()
+        fragments.removeAll()
+        fragmentExpectedTotal = 0
     }
 
     public func sendClientNegotiation(channelId: UInt32, version: UInt32, mtu: UInt32) throws {
@@ -284,24 +352,56 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     }
 
     public func stop() {
-        queue.sync {
+        // Async: message handlers run on this queue (deliver → onMessage), and
+        // session teardown stops the pipe from inside such handlers — a sync
+        // stop deadlocks the queue. State clear is idempotent.
+        queue.async { [self] in
             socketKey = nil
             boundPort = nil
+            nextSendSn = 0
+            recvUna = 0
+            announced = false
             packetBuffer.removeAll()
             fragments.removeAll()
             fragmentExpectedTotal = 0
         }
     }
 
+    // KCP segment exit — same framing the real channel socket emits on UDP.
     private func sendDatagram(_ payload: Data) {
         queue.async { [weak self] in
-            self?.outbound?(payload)
+            self?.sendPayloadOnQueue(payload)
         }
     }
 
+    private func sendPayloadOnQueue(_ payload: Data) {
+        guard let outbound else { return }
+        let datagram = LyraMeshDatagram.encode(
+            command: dataCommand,
+            tick: LyraMeshSocket.tick(),
+            sn: nextSendSn,
+            una: recvUna,
+            payload: payload
+        )
+        nextSendSn &+= 1
+        outbound(datagram)
+    }
+
     private func handleDatagramOnQueue(_ datagram: Data) {
-        packetBuffer.append(datagram)
         let endpoint = peerEndpoint()
+        // Accept any payload-bearing segment as data (see the mesh pipe note:
+        // the phone can frame responses as ack + payload). Pure acks ignored.
+        guard let segment = try? LyraMeshDatagram.decodeSegment(datagram),
+              !segment.payload.isEmpty
+        else { return }
+        if !announced {
+            announced = true
+            onPeerConnected?(endpoint)
+        }
+        packetBuffer.append(segment.payload)
+        recvUna = segment.sn &+ 1
+        let ack = LyraMeshDatagram.encodeAck(tick: LyraMeshSocket.tick(), sn: segment.sn, una: recvUna)
+        outbound?(ack)
         guard socketKey != nil else { return }
         while packetBuffer.count >= 2 {
             let first = packetBuffer[packetBuffer.startIndex]
@@ -351,7 +451,7 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
                     LyraExpressTLV.int32Node(tag: 1, value: 0xFF00)
                 ])
             )
-            outbound?(reply)
+            sendPayloadOnQueue(reply)
             onNegotiated?(peerChannelId, mtu)
         } else if selectedTag == 4, !children.isEmpty {
             onNegotiated?(children[0], children.count > 1 ? children[1] : 0)

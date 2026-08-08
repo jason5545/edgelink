@@ -91,6 +91,40 @@ private struct XiaomiMirrorHEVCParameterSets {
     let pps: Data
 }
 
+// Frame-watchdog verdict for an MPT sink that still sees media packets but
+// no decoded frames. The official WFD source emits zero video frames while
+// the phone content is static (confirmed live behavior; audio keeps flowing
+// as silent PCM). That state must not trigger source recovery: recovery
+// cannot change what the encoder emits, and over the relay the recovery
+// command re-runs the phone-side mirror start path (live 2026-08-08: it
+// pulled the phone's own cross-screen UI to the foreground for the whole
+// session). Before the first decoded frame the relay-carried stream also
+// needs a longer settle window (initial KCP burst reordering +
+// parameter-set/IDR wait), so the steady-state no-frame threshold would
+// false-positive right after attach.
+enum XiaomiMirrorMPTFrameWatchdogVerdict: Equatable {
+    case healthy
+    case staticScreenVideoSilent
+    case frameStalled
+}
+
+func xiaomiMirrorMPTFrameWatchdogVerdict(
+    elapsedFrameSeconds: Double,
+    decodedFrames: UInt64,
+    videoESStaleSeconds: Double,
+    steadyStateThresholdSeconds: Double,
+    initialSyncThresholdSeconds: Double,
+    videoESAbsentThresholdSeconds: Double
+) -> XiaomiMirrorMPTFrameWatchdogVerdict {
+    let threshold = decodedFrames > 0
+        ? steadyStateThresholdSeconds
+        : initialSyncThresholdSeconds
+    guard elapsedFrameSeconds >= threshold else { return .healthy }
+    return videoESStaleSeconds >= videoESAbsentThresholdSeconds
+        ? .staticScreenVideoSilent
+        : .frameStalled
+}
+
 final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     var onDecodedFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onRecoveryRequired: ((XiaomiMirrorRTSPRecoveryEvent) -> Void)?
@@ -3426,42 +3460,81 @@ private final class XiaomiMirrorRTPMediaSender {
             onMPTMediaStalled?(stall)
             return
         }
-        if let elapsedFrameSeconds,
-           elapsedFrameSeconds >= Self.mptSinkNoFrameTimeoutSeconds,
-           elapsedMediaSeconds < 2 {
+        if let elapsedFrameSeconds, elapsedMediaSeconds < 2 {
             // Distinguish a real decode/bitstream stall from the source simply
             // not emitting a video elementary stream (paused encoder, static
-            // or dimmed screen). Rebuilding the session cannot fix the latter,
-            // so it gets its own reason and only source-recovery IDR kicks.
+            // or dimmed screen). Rebuilding the session cannot fix the latter
+            // — the official source emits zero video frames while the phone
+            // content is static and audio PES keeps flowing — so a silent
+            // static screen only gets a throttled log, never source recovery.
             let videoESStaleSeconds = lastMPTVideoPESUptimeNanoseconds > 0
                 ? Self.elapsedSeconds(since: lastMPTVideoPESUptimeNanoseconds, now: now)
                 : Double.infinity
-            let stallReason = videoESStaleSeconds >= Self.mptSinkVideoESAbsentThresholdSeconds
-                ? "video_es_absent"
-                : "decoded_frame_stalled_beyond_threshold"
-            let stall = mptStallSnapshot(
-                reason: stallReason,
-                elapsedMediaSeconds: elapsedMediaSeconds,
-                elapsedFrameSeconds: elapsedFrameSeconds
+            let verdict = xiaomiMirrorMPTFrameWatchdogVerdict(
+                elapsedFrameSeconds: elapsedFrameSeconds,
+                decodedFrames: mptSinkDecodedFrames,
+                videoESStaleSeconds: videoESStaleSeconds,
+                steadyStateThresholdSeconds: Self.mptSinkNoFrameTimeoutSeconds,
+                initialSyncThresholdSeconds: Self.mptSinkInitialSyncNoFrameTimeoutSeconds,
+                videoESAbsentThresholdSeconds: Self.mptSinkVideoESAbsentThresholdSeconds
             )
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.no_frame_timeout session=\(sessionID.uuidString) " +
-                    "elapsedFrameSeconds=\(String(format: "%.2f", elapsedFrameSeconds)) " +
-                    "thresholdSeconds=\(Self.mptSinkNoFrameTimeoutSeconds) " +
-                    "elapsedMediaSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) " +
-                    "videoESStaleSeconds=\(videoESStaleSeconds == .infinity ? "none" : String(format: "%.2f", videoESStaleSeconds)) " +
-                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
-                    "decodedFrames=\(mptSinkDecodedFrames) officialAction=fast_source_recovery_keep_rtsp"
-            )
-            if stallReason != "video_es_absent" {
+            switch verdict {
+            case .healthy:
+                break
+            case .staticScreenVideoSilent:
+                logStaticScreenVideoSilentOnceInAWhile(
+                    elapsedFrameSeconds: elapsedFrameSeconds,
+                    videoESStaleSeconds: videoESStaleSeconds,
+                    now: now
+                )
+            case .frameStalled:
+                // videoESStaleSeconds < absent threshold here: the video
+                // elementary stream is still arriving, so this is a real
+                // decode/bitstream stall (the static-screen case is handled
+                // by .staticScreenVideoSilent above and never recovers).
+                let stall = mptStallSnapshot(
+                    reason: "decoded_frame_stalled_beyond_threshold",
+                    elapsedMediaSeconds: elapsedMediaSeconds,
+                    elapsedFrameSeconds: elapsedFrameSeconds
+                )
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.no_frame_timeout session=\(sessionID.uuidString) " +
+                        "elapsedFrameSeconds=\(String(format: "%.2f", elapsedFrameSeconds)) " +
+                        "thresholdSeconds=\(Self.mptSinkNoFrameTimeoutSeconds) " +
+                        "elapsedMediaSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) " +
+                        "videoESStaleSeconds=\(videoESStaleSeconds == .infinity ? "none" : String(format: "%.2f", videoESStaleSeconds)) " +
+                        "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                        "decodedFrames=\(mptSinkDecodedFrames) officialAction=fast_source_recovery_keep_rtsp"
+                )
                 resetMPTSinkDecoderAfterFrameStallIfNeeded(
                     elapsedFrameSeconds: elapsedFrameSeconds,
                     elapsedMediaSeconds: elapsedMediaSeconds,
                     now: now
                 )
+                onMPTMediaStalled?(stall)
             }
-            onMPTMediaStalled?(stall)
         }
+    }
+
+    private var mptStaticScreenSilenceLoggedUptimeNanoseconds: UInt64 = 0
+
+    private func logStaticScreenVideoSilentOnceInAWhile(
+        elapsedFrameSeconds: Double,
+        videoESStaleSeconds: Double,
+        now: UInt64
+    ) {
+        let lastLog = mptStaticScreenSilenceLoggedUptimeNanoseconds
+        if lastLog > 0, Self.elapsedSeconds(since: lastLog, now: now) < 60 {
+            return
+        }
+        mptStaticScreenSilenceLoggedUptimeNanoseconds = now
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.static_screen_video_silent session=\(sessionID.uuidString) " +
+                "elapsedFrameSeconds=\(String(format: "%.2f", elapsedFrameSeconds)) " +
+                "videoESStaleSeconds=\(videoESStaleSeconds == .infinity ? "none" : String(format: "%.2f", videoESStaleSeconds)) " +
+                "decodedFrames=\(mptSinkDecodedFrames) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                "officialBehavior=hold_last_frame_no_recovery"
+        )
     }
 
     private func mptStallSnapshot(
@@ -4104,6 +4177,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let officialMPTSocketBufferBytes: Int32 = 6_291_456
     private static let mptSinkNoPacketTimeoutSeconds: Double = 6
     private static let mptSinkNoFrameTimeoutSeconds: Double = 2
+    private static let mptSinkInitialSyncNoFrameTimeoutSeconds: Double = 10
     private static let mptSinkVideoESAbsentThresholdSeconds: Double = 5
     private static let mptSinkFrameStallDecoderResetMinIntervalSeconds: Double = 1.5
     private static let mptSinkSoftLossMaxMissingPackets = 2

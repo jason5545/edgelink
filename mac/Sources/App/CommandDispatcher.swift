@@ -26,6 +26,7 @@ final class CommandDispatcher {
     private let onPhoneLockState: @Sendable (PhoneLockStateBody) -> Void
     private let onXiaomiTrustBind: @Sendable () -> Void
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
+    private let onLyraRelayDatagram: @Sendable (String, Data) -> Void
     private let onStatusCaps: @Sendable (StatusCapsBody) -> Void
     private let onClipboardHistoryResponse: @Sendable (ClipboardHistoryResponseBody) -> Void
     private let onClipboardBlobRequest: @Sendable (ClipboardBlobRequestBody) -> Void
@@ -61,6 +62,7 @@ final class CommandDispatcher {
         onPhoneLockState: @escaping @Sendable (PhoneLockStateBody) -> Void = { _ in },
         onXiaomiTrustBind: @escaping @Sendable () -> Void = {},
         onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
+        onLyraRelayDatagram: @escaping @Sendable (String, Data) -> Void = { _, _ in },
         onStatusCaps: @escaping @Sendable (StatusCapsBody) -> Void = { _ in },
         onClipboardHistoryResponse: @escaping @Sendable (ClipboardHistoryResponseBody) -> Void = { _ in },
         onClipboardBlobRequest: @escaping @Sendable (ClipboardBlobRequestBody) -> Void = { _ in },
@@ -93,6 +95,7 @@ final class CommandDispatcher {
         self.onPhoneLockState = onPhoneLockState
         self.onXiaomiTrustBind = onXiaomiTrustBind
         self.onTunnelEnvelope = onTunnelEnvelope
+        self.onLyraRelayDatagram = onLyraRelayDatagram
         self.onStatusCaps = onStatusCaps
         self.onClipboardHistoryResponse = onClipboardHistoryResponse
         self.onClipboardBlobRequest = onClipboardBlobRequest
@@ -300,6 +303,9 @@ final class CommandDispatcher {
         case EnvelopeType.tunnelOpen, EnvelopeType.tunnelOpenResult, EnvelopeType.tunnelData,
              EnvelopeType.tunnelClose, EnvelopeType.tunnelError, EnvelopeType.tunnelFlow:
             onTunnelEnvelope(header.t, plaintext)
+            return nil
+        case EnvelopeType.relayMeshDatagram, EnvelopeType.relayChannelDatagram:
+            onLyraRelayDatagram(header.t, plaintext)
             return nil
         default:
             return nil

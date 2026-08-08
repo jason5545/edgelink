@@ -1,0 +1,442 @@
+package com.edgelink.app
+
+import com.edgelink.core.EnvelopeCodec
+import com.edgelink.core.EnvelopeTypes
+import com.edgelink.core.RelayDatagram
+import com.edgelink.core.RelayDatagramBody
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.encodeToJsonElement
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import kotlin.concurrent.thread
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
+
+/**
+ * Unit tests for [AndroidLyraRelayTransportBridge]. The phone's real Xiaomi
+ * mesh/channel endpoint is stand-in'ed by a loopback UDP echo server, so the
+ * bridge's relay <-> local datagram plumbing is validated without a device.
+ */
+class AndroidLyraRelayTransportBridgeTest {
+
+    private fun startEchoUdpServer(): DatagramSocket {
+        val server = DatagramSocket(0, InetAddress.getLoopbackAddress())
+        thread(isDaemon = true) {
+            val buffer = ByteArray(65_535)
+            while (!server.isClosed) {
+                val packet = DatagramPacket(buffer, buffer.size)
+                try {
+                    server.receive(packet)
+                } catch (_: Exception) {
+                    break
+                }
+                val echo = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
+                try {
+                    server.send(DatagramPacket(echo, echo.size, packet.address, packet.port))
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+        return server
+    }
+
+    private fun waitFor(timeoutMs: Long = 3_000, condition: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) return true
+            Thread.sleep(10)
+        }
+        return condition()
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private fun relayBody(datagram: ByteArray, flow: Int = 0): JsonObject =
+        EnvelopeCodec.json.encodeToJsonElement(RelayDatagram.encode(datagram, flow)) as JsonObject
+
+    @Test
+    fun meshFlowStatsExposeCastDialSilenceAndRebindRecovers() = runBlocking {
+        // Wrong-port scenario (2026-08-08): the mesh dial targets a dead
+        // endpoint — flow 1 (cast) sends datagrams, zero inbound. The
+        // watchdog reads these stats, rebinds to the next candidate, and the
+        // responsive callback reports the recovered port.
+        val deadEnd = DatagramSocket(0, InetAddress.getLoopbackAddress()) // never answers
+        val echo = startEchoUdpServer()
+        val responsivePorts = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            onMeshTargetResponsive = { responsivePorts.add(it) },
+            sendEnvelope = { _, body ->
+                val relayBody = body as RelayDatagramBody
+                RelayDatagram.decode(relayBody)?.let { emitted.add(it) }
+            }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", deadEnd.localPort)
+            repeat(3) {
+                bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x31), flow = 1))
+            }
+            assertTrue("outbound should land on the dead endpoint", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.outboundCount > 0 } == true
+            })
+            Thread.sleep(200)
+            val silent = bridge.meshFlowStats().first { it.flowIndex == 1 }
+            assertEquals(0, silent.inboundCount)
+
+            bridge.rebindMesh("127.0.0.1", echo.localPort)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x32), flow = 1))
+
+            assertTrue("echo after rebind", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.inboundCount > 0 } == true
+            })
+            assertTrue("responsive port reported", waitFor { responsivePorts.isNotEmpty() })
+            assertEquals(echo.localPort, responsivePorts.first())
+        } finally {
+            bridge.stop()
+            deadEnd.close()
+            echo.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun handlesOnlyRelayDatagramTypes() {
+        assertTrue(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.RELAY_MESH_DATAGRAM))
+        assertTrue(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM))
+        assertFalse(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.TUNNEL_DATA))
+        assertFalse(AndroidLyraRelayTransportBridge.handles("milink.status"))
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    @Test
+    fun relayDatagramWireFormatRoundTrip() {
+        val datagram = byteArrayOf(0x78, 0x56, 0x34, 0x12, 0x51, 0x00, 0x00)
+        val body = RelayDatagram.encode(datagram)
+        assertEquals(Base64.encode(datagram), body.payload)
+        val decoded = RelayDatagram.decode(body)
+        assertNotNull(decoded)
+        assertTrue(datagram.contentEquals(decoded))
+    }
+
+    @Test
+    fun meshFlowRelaysDatagramToEndpointAndEmitsResponse() = runBlocking {
+        val server = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<Pair<String, ByteArray>>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { type, body ->
+                val relayBody = body as RelayDatagramBody
+                emitted.add(type to (RelayDatagram.decode(relayBody) ?: ByteArray(0)))
+            }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", server.localPort)
+            val payload = byteArrayOf(1, 2, 3, 4, 5)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(payload))
+
+            assertTrue("expected the echoed datagram back over the relay", waitFor { emitted.isNotEmpty() })
+            val (type, datagram) = emitted[0]
+            assertEquals(EnvelopeTypes.RELAY_MESH_DATAGRAM, type)
+            assertTrue(payload.contentEquals(datagram))
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun channelFlowIsIndependentFromMeshFlow() = runBlocking {
+        val meshServer = startEchoUdpServer()
+        val channelServer = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<Pair<String, ByteArray>>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { type, body ->
+                val relayBody = body as RelayDatagramBody
+                emitted.add(type to (RelayDatagram.decode(relayBody) ?: ByteArray(0)))
+            }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", meshServer.localPort)
+            bridge.startChannel("127.0.0.1", channelServer.localPort)
+
+            val meshPayload = byteArrayOf(10, 11, 12)
+            val channelPayload = byteArrayOf(20, 21, 22)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(meshPayload))
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, relayBody(channelPayload))
+
+            assertTrue(
+                "expected both flows to echo back",
+                waitFor { emitted.size >= 2 }
+            )
+            val meshResponses = emitted.filter { it.first == EnvelopeTypes.RELAY_MESH_DATAGRAM }
+            val channelResponses = emitted.filter { it.first == EnvelopeTypes.RELAY_CHANNEL_DATAGRAM }
+            assertEquals(1, meshResponses.size)
+            assertEquals(1, channelResponses.size)
+            assertTrue(meshPayload.contentEquals(meshResponses[0].second))
+            assertTrue(channelPayload.contentEquals(channelResponses[0].second))
+        } finally {
+            bridge.stop()
+            meshServer.close()
+            channelServer.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun meshFlowPreservesDatagramOrder() = runBlocking {
+        val server = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body ->
+                val relayBody = body as RelayDatagramBody
+                RelayDatagram.decode(relayBody)?.let { emitted.add(it) }
+            }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", server.localPort)
+            val count = 40
+            repeat(count) { index ->
+                // Distinct first byte encodes the send position.
+                bridge.handleEnvelope(
+                    EnvelopeTypes.RELAY_MESH_DATAGRAM,
+                    relayBody(byteArrayOf(index.toByte(), 0x42, 0x42))
+                )
+            }
+            assertTrue(
+                "expected all $count datagrams echoed back",
+                waitFor(timeoutMs = 5_000) { emitted.size >= count }
+            )
+            for (index in 0 until count) {
+                assertEquals(
+                    "datagram $index out of order",
+                    index.toByte(),
+                    emitted[index][0]
+                )
+            }
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun deliverBeforeStartIsDropped() = runBlocking {
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body ->
+                val relayBody = body as RelayDatagramBody
+                RelayDatagram.decode(relayBody)?.let { emitted.add(it) }
+            }
+        )
+        try {
+            // No startMesh/startChannel: the envelope has nowhere to go yet —
+            // it is buffered, but nothing emits until a target is known.
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(1, 2, 3)))
+            Thread.sleep(100)
+            assertTrue(emitted.isEmpty())
+        } finally {
+            bridge.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun datagramsBeforeMeshTargetAreBufferedAndFlushedOnStartMesh() = runBlocking {
+        // Production ordering after a relay reconnect: the Mac's cast dial
+        // (flow 1) can land before the milink status re-announces the mesh
+        // port. The datagrams must be buffered, not dropped, and flushed once
+        // startMesh supplies the target — or the phys-sync handshake dies.
+        val server = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        try {
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x21), flow = 1))
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x22), flow = 1))
+            Thread.sleep(100)
+            assertTrue("nothing can emit before the target is known", emitted.isEmpty())
+
+            bridge.startMesh("127.0.0.1", server.localPort)
+
+            assertTrue("expected buffered datagrams flushed after startMesh", waitFor { emitted.size >= 2 })
+            val responses = emitted.mapNotNull { body ->
+                RelayDatagram.decode(body)?.let { (body.f ?: 0) to it }
+            }.filter { it.first == 1 }
+            assertEquals(2, responses.size)
+            assertEquals(0x21.toByte(), responses[0].second[0])
+            assertEquals(0x22.toByte(), responses[1].second[0])
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun channelFlowBuffersUntilStampedTargetPortArrives() = runBlocking {
+        // A channel datagram without a stamped port ("p") and no explicit
+        // startChannel is buffered; when the first stamped envelope arrives,
+        // the flow binds and flushes in order.
+        val server = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body ->
+                val relayBody = body as RelayDatagramBody
+                RelayDatagram.decode(relayBody)?.let { emitted.add(it) }
+            }
+        )
+        try {
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, relayBody(byteArrayOf(40, 41)))
+            Thread.sleep(100)
+            assertTrue(emitted.isEmpty())
+
+            val stamped = EnvelopeCodec.json.encodeToJsonElement(
+                RelayDatagram.encode(byteArrayOf(42, 43)).copy(p = server.localPort)
+            ) as JsonObject
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, stamped)
+
+            assertTrue("expected buffered + stamped datagrams echoed in order", waitFor { emitted.size >= 2 })
+            assertEquals(40, emitted[0][0].toInt())
+            assertEquals(42, emitted[1][0].toInt())
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun channelFlowBindsLazilyFromStampedTargetPort() = runBlocking {
+        // No explicit startChannel: the channel flow must bind lazily to the
+        // target port stamped ("p") on the first channel envelope — the
+        // production ordering (the Mac dials the cast channel port after the
+        // peer-port answer, then the negotiation datagrams flow).
+        val server = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<Pair<String, ByteArray>>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { type, body ->
+                val relayBody = body as RelayDatagramBody
+                emitted.add(type to (RelayDatagram.decode(relayBody) ?: ByteArray(0)))
+            }
+        )
+        try {
+            val payload = byteArrayOf(30, 31, 32)
+            val body = EnvelopeCodec.json.encodeToJsonElement(
+                RelayDatagram.encode(payload).copy(p = server.localPort)
+            ) as JsonObject
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, body)
+
+            assertTrue(
+                "expected the channel flow to lazy-bind and echo back",
+                waitFor { emitted.isNotEmpty() }
+            )
+            val (type, datagram) = emitted[0]
+            assertEquals(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, type)
+            assertTrue(payload.contentEquals(datagram))
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun meshFlowIndexGetsDistinctSourcePortAndTaggedResponses() = runBlocking {
+        // Echo server whose reply is the sender's source port (big-endian
+        // UInt16) followed by the request payload — lets the test observe
+        // which local socket each mesh flow index is presented from.
+        val server = DatagramSocket(0, InetAddress.getLoopbackAddress())
+        thread(isDaemon = true) {
+            val buffer = ByteArray(65_535)
+            while (!server.isClosed) {
+                val packet = DatagramPacket(buffer, buffer.size)
+                try {
+                    server.receive(packet)
+                } catch (_: Exception) {
+                    break
+                }
+                val payload = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
+                val reply = byteArrayOf(
+                    (packet.port ushr 8).toByte(),
+                    (packet.port and 0xFF).toByte()
+                ) + payload
+                try {
+                    server.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        try {
+            // Only flow 0 is started explicitly; flow 1 (the cast dial) starts
+            // lazily against the remembered mesh target when its first
+            // datagram arrives — exactly the production ordering.
+            bridge.startMesh("127.0.0.1", server.localPort)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x11), flow = 0))
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x22), flow = 1))
+
+            assertTrue(
+                "expected both mesh flows to echo back",
+                waitFor { emitted.size >= 2 }
+            )
+            val responses = emitted.mapNotNull { body ->
+                RelayDatagram.decode(body)?.let { (body.f ?: 0) to it }
+            }
+            val flow0 = responses.firstOrNull { it.first == 0 && it.second.size >= 3 && it.second[2] == 0x11.toByte() }
+            val flow1 = responses.firstOrNull { it.first == 1 && it.second.size >= 3 && it.second[2] == 0x22.toByte() }
+            assertNotNull("flow 0 response missing", flow0)
+            assertNotNull("flow 1 response missing", flow1)
+            val port0 = ((flow0!!.second[0].toInt() and 0xFF) shl 8) or (flow0.second[1].toInt() and 0xFF)
+            val port1 = ((flow1!!.second[0].toInt() and 0xFF) shl 8) or (flow1.second[1].toInt() and 0xFF)
+            assertTrue("each mesh flow must present its own source port", port0 != port1)
+        } finally {
+            bridge.stop()
+            server.close()
+            scope.cancel()
+        }
+    }
+}
