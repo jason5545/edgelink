@@ -25,7 +25,6 @@ internal object MiLinkPrivilegeHookPolicy {
     const val MILINK_PACKAGE = "com.milink.service"
     const val MILINK_MAIN_PROCESS = "com.milink.service"
     const val MILINK_RUNTIME_PROCESS = "com.milink.runtime"
-    const val MILINK_DISTRIBUTED_HARDWARE_PROCESS = "com.milink.service:distributedHardware"
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
@@ -63,7 +62,6 @@ internal object MiLinkPrivilegeHookPolicy {
     fun shouldHook(packageName: String?, processName: String?): Boolean =
         shouldHookRuntime(packageName, processName) ||
             shouldHookMainService(packageName, processName) ||
-            shouldHookDistributedHardware(packageName, processName) ||
             shouldHookXiaomiMirror(packageName, processName) ||
             shouldHookMiConnectService(packageName, processName) ||
             shouldHookAndroidSystem(packageName, processName) ||
@@ -77,9 +75,6 @@ internal object MiLinkPrivilegeHookPolicy {
 
     fun shouldHookMainService(packageName: String?, processName: String?): Boolean =
         packageName == MILINK_PACKAGE && processName == MILINK_MAIN_PROCESS
-
-    fun shouldHookDistributedHardware(packageName: String?, processName: String?): Boolean =
-        packageName == MILINK_PACKAGE && processName == MILINK_DISTRIBUTED_HARDWARE_PROCESS
 
     fun shouldHookXiaomiMirror(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MIRROR_PACKAGE && processName == XIAOMI_MIRROR_PROCESS

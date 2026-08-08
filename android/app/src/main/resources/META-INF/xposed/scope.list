@@ -2,8 +2,4 @@ system
 com.milink.service
 com.xiaomi.mirror
 com.xiaomi.mi_connect_service
-com.android.incallui
-com.android.phone
-com.android.server.telecom
 com.miui.mishare.connectivity
-com.xiaomi.trustservice
