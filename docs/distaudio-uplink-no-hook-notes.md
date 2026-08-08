@@ -1,7 +1,9 @@
 # distaudio uplink: why the native runtime never delivers, and the no-hook path
 
-Status as of 2026-08-07. **No-hook path verified live and now the default.**
-Companion to `mac/Sources/App/LyraDistAudioWFD.swift` +
+Status as of 2026-08-08. **No-hook path verified live and now the only
+path** — the audiomonitor LSPosed hook, its fallback arbitration and the
+keepalive loop were removed. Companion to
+`mac/Sources/App/LyraDistAudioWFD.swift` +
 `android/app/src/main/kotlin/com/edgelink/app/CallUplinkInjector.kt`.
 
 ## Question
@@ -58,13 +60,23 @@ hand decoded audio to the call stream?
 ## Consequence: no-hook design (implemented and verified live 2026-08-07)
 
 `CallUplinkInjector` (runs inside the root Shizuku service): owns TCP :19307
-(same ELMA framing), builds the audiomonitor-identical AudioTrack
+(ELMA framing), builds the audiomonitor-identical AudioTrack
 (USAGE_VOICE_COMMUNICATION, flags 2304, 16k mono s16,
-setPreferredDevice(TYPE_TELEPHONY)) and writes the PCM directly. This is now
-the DEFAULT path — no debug gate. Endpoint ownership is arbitrated
-internally by `debug.edgelink.call_inject_mode` (set only by the injector);
-the audiomonitor hook defers by default and exists purely as the automatic
-fallback if the root route is ever refused.
+setPreferredDevice(TYPE_TELEPHONY)) and writes the PCM directly. This is the
+ONLY path — no debug gate, no arbitration property, no fallback.
+
+**2026-08-08: hook and fallback removed.** The old LSPosed feed inside
+`com.miui.audiomonitor` (TCP server → AES-ECB →
+`DistAudioStream.playCastAudioData`), the `debug.edgelink.call_inject_mode`
+arbitration (`CallInjectMode`), the audiomonitor kill/restart in the
+injector, and the `AudioMonitorKeepalive` chain (service-side cgroup loop,
+AIDL methods, connector start/stop) are all deleted. The module no longer
+hooks `com.miui.audiomonitor` (`MiLinkPrivilegeHookPolicy.shouldHook`
+returns false for it; remove it from the LSPosed module scope). Accepted
+risk: if a future MIUI update refuses the uid-0 telephony route, call uplink
+is broken for that call — the injector retries every 2s for the whole call
+and logs a heartbeat, so the refusal is visible evidence to fix the route,
+not a silent fallback trigger.
 
 Live verification (IVR call, 2026-08-07 21:07–21:09):
 `telephony device found` → `setPreferredDevice=true` → `track playing` →

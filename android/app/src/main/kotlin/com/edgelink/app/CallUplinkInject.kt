@@ -9,10 +9,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 // Lifecycle driver for the no-hook call-uplink inject. During a relayed call
 // the root Shizuku service owns the 19307 endpoint and writes the Mac mic
-// PCM into a telephony-routed AudioTrack; the LSPosed feed inside
-// audiomonitor stays dormant (debug.edgelink.call_inject_mode=shizuku). If
-// the root route is refused the injector restores mode=hook and restarts
-// audiomonitor, so the hook path resumes without any extra wiring here.
+// PCM into a telephony-routed AudioTrack. There is no hook fallback anymore;
+// a refused route retries for the whole call with heartbeat logging.
 object CallUplinkInject {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val active = AtomicBoolean(false)

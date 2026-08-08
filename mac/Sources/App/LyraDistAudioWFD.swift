@@ -941,9 +941,8 @@ final class LyraDistAudioUplink {
     // by the EdgeLink root Shizuku injector (CallUplinkInjector, uid 0),
     // which writes it into a USAGE_VOICE_COMMUNICATION AudioTrack pinned at
     // TYPE_TELEPHONY (modem uplink) — no hook, no distaudio session. The
-    // LSPosed feed inside com.miui.audiomonitor (playCastAudioData →
-    // TELEPHONY_TX) stays dormant unless the injector hands the endpoint
-    // back (debug.edgelink.call_inject_mode=hook).
+    // old LSPosed feed inside com.miui.audiomonitor and its fallback
+    // arbitration were removed; the injector is the only endpoint owner.
     private static let callInjectPort: UInt16 = 19307
     private static let callInjectMagic = Data([0x45, 0x4c, 0x4d, 0x41])
     private var injectConnection: NWConnection?
@@ -951,9 +950,9 @@ final class LyraDistAudioUplink {
     private var injectBytesSent = 0
     private var injectLastLogBytes = 0
     // The 19307 endpoint can be recycled under us mid-call (the phone-side
-    // injector kills the audiomonitor hook's server when it takes over, and
-    // any connection reset used to end inject for the whole call). Retry the
-    // connection until stop().
+    // injector restarts its server across calls, and any connection reset
+    // used to end inject for the whole call). Retry the connection until
+    // stop().
     private var injectStopped = false
     private var injectRetries = 0
 

@@ -6,7 +6,6 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
-import java.io.File
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -15,23 +14,24 @@ import kotlin.concurrent.thread
 
 // No-hook call-uplink inject. Runs inside the root Shizuku service process
 // (uid 0) for the duration of a relayed call: takes the Mac mic PCM over TCP
-// (same 4-byte "ELMA" magic + raw 16k s16le mono framing the audiomonitor
-// hook uses) and writes it into a VOICE_COMMUNICATION AudioTrack pinned at
-// the TYPE_TELEPHONY sink — the exact terminal path audiomonitor's
-// DistAudioStream.createAudioDownlinkStream uses (same usage/flags/sample
-// rate, same setPreferredDevice(TYPE_TELEPHONY)). audiomonitor can do this
-// because it runs as android.uid.system with MODIFY_PHONE_STATE; this
-// process is uid 0, which framework permission checks also grant, so no
-// LSPosed hook and no active distaudio session are required.
+// (4-byte "ELMA" magic + raw 16k s16le mono framing) and writes it into a
+// VOICE_COMMUNICATION AudioTrack pinned at the TYPE_TELEPHONY sink — the
+// exact terminal path audiomonitor's DistAudioStream.createAudioDownlinkStream
+// uses (same usage/flags/sample rate, same setPreferredDevice(TYPE_TELEPHONY)).
+// audiomonitor can do this because it runs as android.uid.system with
+// MODIFY_PHONE_STATE; this process is uid 0, which framework permission
+// checks also grant, so no LSPosed hook and no active distaudio session are
+// required.
 //
 // Every gate is logged (device presence, track state, setPreferredDevice
-// result, head position) so a failed route is evidence, not silence. If the
-// route cannot be established the injector hands the endpoint back to the
-// hook (mode=hook + audiomonitor restart) and exits.
+// result, head position) so a failed route is evidence, not silence. There
+// is no fallback anymore (the audiomonitor LSPosed feed is gone): if the
+// route is refused the injector retries every 2s for the whole call with a
+// periodic heartbeat log, so a MIUI update breaking the route shows up in
+// the logs instead of being papered over.
 internal class CallUplinkInjector {
     private companion object {
         const val TAG = "EdgeLinkShizuku"
-        const val AUDIOMONITOR_PACKAGE = "com.miui.audiomonitor"
         const val PORT = 19_307
         const val READ_BUFFER_BYTES = 8_192
         const val SAMPLE_RATE = 16_000
@@ -39,10 +39,8 @@ internal class CallUplinkInjector {
         // Mirrors DistAudioStream.createAudioDownlinkStream: flags 2304
         // (FLAG_LOW_LATENCY | FLAG_CONTENT_IS_SPATIALIZED).
         const val AUDIO_ATTRIBUTE_FLAGS = 2304
-        const val BIND_RETRY_DELAY_MS = 1_500L
-        const val MAX_BIND_ATTEMPTS = 4
-        const val SINK_RETRY_DELAY_MS = 2_000L
-        const val MAX_SINK_ATTEMPTS = 6
+        const val RETRY_DELAY_MS = 2_000L
+        const val HEARTBEAT_ATTEMPTS = 15 // one log line every ~30s of retrying
         const val PROGRESS_LOG_BYTES = 320_000L
     }
 
@@ -70,7 +68,6 @@ internal class CallUplinkInjector {
         if (!running.compareAndSet(false, true)) {
             return
         }
-        setMode(CallInjectMode.MODE_SHIZUKU)
         serverThread = thread(name = "edgelink-call-inject", isDaemon = true) { runServer() }
     }
 
@@ -78,11 +75,6 @@ internal class CallUplinkInjector {
         if (!running.compareAndSet(true, false)) {
             return
         }
-        // Clear the arbitration property (NOT mode=hook): a normal stop must
-        // not strand the endpoint in fallback ownership — the hook server is
-        // only alive after an explicit fallback kill, and leaving mode=hook
-        // here would make the next call's hook-less endpoint bind nothing.
-        setMode("")
         runCatching { activeClient?.close() }
         runCatching { serverSocket?.close() }
         serverThread?.interrupt()
@@ -95,7 +87,7 @@ internal class CallUplinkInjector {
             TAG,
             "call inject (shizuku) starting uid=${android.os.Process.myUid()}"
         )
-        val server = bindWithFallback() ?: return
+        val server = bindServer() ?: return
         serverSocket = server
         android.util.Log.i(TAG, "call inject (shizuku) listening port=$PORT")
         try {
@@ -135,38 +127,34 @@ internal class CallUplinkInjector {
         }
     }
 
-    // The audiomonitor hook binds the same port at process load. If it got
-    // there before the mode property flipped, kill it: on restart it reads
-    // mode=shizuku and stays out, freeing the port for us.
-    private fun bindWithFallback(): ServerSocket? {
+    // Nothing else binds this port anymore (the audiomonitor hook is gone),
+    // so contention can only be transient. Never give up: sleep 2s and retry
+    // for the whole call, with a heartbeat so a stuck bind stays visible.
+    private fun bindServer(): ServerSocket? {
         var attempt = 0
-        while (running.get() && attempt < MAX_BIND_ATTEMPTS) {
+        while (running.get()) {
             attempt += 1
             val server = runCatching {
                 ServerSocket(PORT, 4, InetAddress.getByName("0.0.0.0"))
             }.getOrElse { error ->
-                android.util.Log.w(
-                    TAG,
-                    "call inject (shizuku) bind attempt=$attempt failed: " +
-                        "${error.javaClass.simpleName}: ${error.message}"
-                )
+                if (attempt == 1 || attempt % HEARTBEAT_ATTEMPTS == 0) {
+                    android.util.Log.w(
+                        TAG,
+                        "call inject (shizuku) bind attempt=$attempt failed: " +
+                            "${error.javaClass.simpleName}: ${error.message}"
+                    )
+                }
                 null
             }
             if (server != null) {
                 return server
             }
-            killAudioMonitor("port contention attempt=$attempt")
             try {
-                Thread.sleep(BIND_RETRY_DELAY_MS)
+                Thread.sleep(RETRY_DELAY_MS)
             } catch (_: InterruptedException) {
                 return null
             }
         }
-        android.util.Log.w(
-            TAG,
-            "call inject (shizuku) bind failed after $MAX_BIND_ATTEMPTS attempts; restoring hook mode"
-        )
-        fallbackToHook("bind-failed")
         return null
     }
 
@@ -226,21 +214,20 @@ internal class CallUplinkInjector {
                 if (activeTrack == null) {
                     sinkFailures += 1
                     bytesDropped += read
-                    if (bytesDropped == read.toLong() || bytesDropped % PROGRESS_LOG_BYTES < read) {
+                    // No fallback exists: keep retrying for the whole call
+                    // (2s cadence) and keep logging so a refused route is
+                    // evidence, not silence.
+                    if (sinkFailures == 1 || sinkFailures % HEARTBEAT_ATTEMPTS == 0 ||
+                        bytesDropped % PROGRESS_LOG_BYTES < read
+                    ) {
                         android.util.Log.w(
                             TAG,
-                            "call inject (shizuku) no telephony sink yet, dropped=$bytesDropped"
+                            "call inject (shizuku) no telephony sink yet, retrying " +
+                                "attempt=$sinkFailures dropped=$bytesDropped"
                         )
                     }
-                    if (sinkFailures >= MAX_SINK_ATTEMPTS && running.get()) {
-                        // The device never appeared for this whole call: hand
-                        // the endpoint back to the hook instead of dropping
-                        // the mic silently.
-                        fallbackToHook("no-telephony-device")
-                        break
-                    }
                     try {
-                        Thread.sleep(SINK_RETRY_DELAY_MS)
+                        Thread.sleep(RETRY_DELAY_MS)
                     } catch (_: InterruptedException) {
                         break
                     }
@@ -283,18 +270,16 @@ internal class CallUplinkInjector {
     // Mirrors DistAudioStream.createAudioDownlinkStream: USAGE_VOICE_COMMUNICATION
     // 16k mono s16 track pinned at the TYPE_TELEPHONY output. Returns null
     // (with evidence logged) when the device is absent or the route is
-    // refused — callers treat that as "fall back to the hook".
+    // refused — callers keep retrying for the whole call.
     private fun buildTelephonyTrack(): AudioTrack? {
         val context = resolveContext()
         if (context == null) {
             android.util.Log.w(TAG, "call inject (shizuku) no context for AudioManager")
-            fallbackToHook("no-context")
             return null
         }
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         if (audioManager == null) {
             android.util.Log.w(TAG, "call inject (shizuku) no AudioManager")
-            fallbackToHook("no-audiomanager")
             return null
         }
         val outputs = runCatching {
@@ -341,13 +326,11 @@ internal class CallUplinkInjector {
                 TAG,
                 "call inject (shizuku) track build failed: ${error.javaClass.simpleName}: ${error.message}"
             )
-            fallbackToHook("track-build-failed")
             return null
         }
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             android.util.Log.w(TAG, "call inject (shizuku) track not initialized state=${track.state}")
             releaseTrack(track)
-            fallbackToHook("track-uninitialized")
             return null
         }
         val routed = runCatching { track.setPreferredDevice(telephony) }.getOrElse { error ->
@@ -359,10 +342,10 @@ internal class CallUplinkInjector {
         }
         android.util.Log.i(TAG, "call inject (shizuku) setPreferredDevice=$routed")
         if (!routed) {
-            // Decisive negative evidence: uid 0 is refused the telephony
-            // route. Hand the endpoint back to the hook.
+            // uid 0 was refused the telephony route. There is no fallback
+            // anymore; release and let the caller retry so the refusal stays
+            // visible in the logs for the whole call.
             releaseTrack(track)
-            fallbackToHook("route-refused")
             return null
         }
         track.play()
@@ -376,57 +359,6 @@ internal class CallUplinkInjector {
         }
         runCatching { track.stop() }
         runCatching { track.release() }
-    }
-
-    private fun fallbackToHook(reason: String) {
-        if (!running.compareAndSet(true, false)) {
-            return
-        }
-        android.util.Log.w(TAG, "call inject (shizuku) fallback to hook reason=$reason")
-        setMode(CallInjectMode.MODE_HOOK)
-        // Restart audiomonitor so its hook re-reads mode=hook and rebinds the
-        // endpoint; without this the endpoint stays ownerless for the call.
-        killAudioMonitor("fallback reason=$reason")
-        runCatching { activeClient?.close() }
-        runCatching { serverSocket?.close() }
-    }
-
-    private fun setMode(mode: String) {
-        val ok = runCatching {
-            Class.forName("android.os.SystemProperties")
-                .getMethod("set", String::class.java, String::class.java)
-                .invoke(null, CallInjectMode.PROPERTY, mode)
-            true
-        }.getOrElse { error ->
-            android.util.Log.w(
-                TAG,
-                "call inject (shizuku) setprop failed: ${error.javaClass.simpleName}: ${error.message}"
-            )
-            false
-        }
-        android.util.Log.i(TAG, "call inject (shizuku) mode=$mode setprop_ok=$ok")
-    }
-
-    private fun killAudioMonitor(reason: String) {
-        val pid = findPid(AUDIOMONITOR_PACKAGE)
-        if (pid == null) {
-            android.util.Log.i(TAG, "call inject (shizuku) audiomonitor not running ($reason)")
-            return
-        }
-        runCatching { android.system.Os.kill(pid, android.system.OsConstants.SIGKILL) }
-        android.util.Log.i(TAG, "call inject (shizuku) killed audiomonitor pid=$pid ($reason)")
-    }
-
-    private fun findPid(packageName: String): Int? {
-        val proc = File("/proc")
-        for (entry in proc.listFiles().orEmpty()) {
-            val pid = entry.name.toIntOrNull() ?: continue
-            val cmdline = runCatching { File(entry, "cmdline").readText() }.getOrNull() ?: continue
-            if (cmdline.trim('\u0000') == packageName) {
-                return pid
-            }
-        }
-        return null
     }
 
     private fun resolveContext(): Context? {

@@ -84,7 +84,6 @@ object DistAudioConnector {
     fun onCallEnded(deviceId: String?) {
         connectingDeviceId = null
         CallUplinkInject.stop()
-        AudioMonitorKeepalive.stop()
         val route = connectedRoute ?: return
         if (deviceId != null && route.deviceId != deviceId) return
         disconnectLocked(route)
@@ -113,10 +112,6 @@ object DistAudioConnector {
         EdgeLinkLog.info("phone.android.distaudio.connect_result=$ok device=$deviceId")
         if (ok) {
             connectedRoute = ConnectedRoute(device.first, device.second, device.third)
-            // The call-inject hook inside audiomonitor must stay schedulable
-            // for the whole call; MIUI's background cgroup otherwise stalls
-            // it and the mic PCM only arrives at hangup.
-            appContext?.let { AudioMonitorKeepalive.start(it) }
         }
     }
 

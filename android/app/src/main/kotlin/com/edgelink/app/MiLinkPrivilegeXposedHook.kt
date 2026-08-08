@@ -15,9 +15,6 @@ import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
-import java.net.InetAddress
-import java.net.ServerSocket
-import java.net.Socket
 import java.util.ArrayList
 import java.util.Collections
 import java.util.HashMap
@@ -34,7 +31,6 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MI_CONNECT_PROCESS = "com.xiaomi.mi_connect_service"
     const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
-    const val AUDIOMONITOR_PACKAGE = "com.miui.audiomonitor"
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
@@ -71,11 +67,7 @@ internal object MiLinkPrivilegeHookPolicy {
             shouldHookXiaomiMirror(packageName, processName) ||
             shouldHookMiConnectService(packageName, processName) ||
             shouldHookAndroidSystem(packageName, processName) ||
-            shouldHookMiShare(packageName, processName) ||
-            shouldHookAudioMonitor(packageName, processName)
-
-    fun shouldHookAudioMonitor(packageName: String?, processName: String?): Boolean =
-        packageName == AUDIOMONITOR_PACKAGE
+            shouldHookMiShare(packageName, processName)
 
     fun shouldHookMiShare(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MISHARE_PACKAGE
@@ -204,9 +196,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         if (MiLinkPrivilegeHookPolicy.shouldHookMiShare(packageName, processName)) {
             hookMiShareLyraTrustInjection(classLoader)
         }
-        if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(packageName, processName)) {
-            startAudioMonitorCallInject(classLoader)
-        }
     }
 
     private fun installMirrorCastChannelTracker(classLoader: ClassLoader) {
@@ -260,254 +249,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
     private fun log(message: String) {
         xposed.log(Log.INFO, LOG_TAG, message)
     }
-
-    // Minimal call-uplink injection. The Mac mic PCM arrives over TCP
-    // (4-byte "ELMA" magic, then raw 16k s16le mono) and is fed into
-    // IDistAudioManager.mDistAudioStream.playCastAudioData — the same feed
-    // the official distaudio path uses; doPlay writes it to the
-    // VOICE_COMMUNICATION AudioTrack routed at TELEPHONY_TX (modem uplink).
-    // The phone's own miplaycast runtime never delivers our uplink
-    // session audio to that stream (RuntimeToClient shared memory stays
-    // empty, the track drains 0 frames for a whole call), so this direct
-    // feed is the minimum viable hook. No fake device seeding: the native
-    // distaudio connect already creates mDistAudioStream during a call.
-    private val callInjectServerStarted = java.util.concurrent.atomic.AtomicBoolean(false)
-    @Volatile private var callInjectClassLoader: ClassLoader? = null
-    // Only one call injects at a time; a new connection evicts the previous
-    // one. Live evidence 2026-08-07: a stale socket from an earlier call
-    // held the single-threaded serve loop for a whole minute while the new
-    // call's connection (and its entire PCM backlog) waited in the accept
-    // queue, so nothing was injected until hangup.
-    @Volatile private var callInjectActiveClient: Socket? = null
-
-    private fun startAudioMonitorCallInject(classLoader: ClassLoader) {
-        callInjectClassLoader = classLoader
-        // The root Shizuku injector owns the 19307 endpoint by default and
-        // writes the PCM into a telephony-routed AudioTrack directly; two
-        // servers cannot bind the same port, so this feed stays dormant
-        // unless the injector has explicitly handed the endpoint back
-        // (mode=hook fallback, which also restarts this process).
-        val callInjectMode = readSystemProperty(CallInjectMode.PROPERTY)
-        if (!CallInjectMode.hookShouldListen(callInjectMode)) {
-            log("audiomonitor call inject deferred: mode=$callInjectMode owned by shizuku injector")
-            return
-        }
-        if (!callInjectServerStarted.compareAndSet(false, true)) {
-            return
-        }
-        // LSPosed can deliver handleLoadPackage twice (one hook-module
-        // classloader per app classloader), so the AtomicBoolean above only
-        // guards one copy. Probe the port: if a listener already answers,
-        // another copy of this server is live and this one must not start.
-        val alreadyListening = runCatching {
-            java.net.Socket().use { probe ->
-                probe.connect(java.net.InetSocketAddress("127.0.0.1", CALL_INJECT_PORT), 400)
-            }
-        }.isSuccess
-        if (alreadyListening) {
-            log("audiomonitor call inject server already present, not starting a second")
-            return
-        }
-        Thread({ runCallInjectServer() }, "EdgeLinkCallInjectServer").apply {
-            isDaemon = true
-            start()
-        }
-        log("audiomonitor call inject server installed")
-    }
-
-    private fun runCallInjectServer() {
-        var server: ServerSocket? = null
-        while (true) {
-            if (server == null) {
-                server = runCatching {
-                    ServerSocket(CALL_INJECT_PORT, 4, InetAddress.getByName("0.0.0.0"))
-                }.getOrElse { error ->
-                    log("audiomonitor call inject bind failed: ${error.javaClass.simpleName}: ${error.message}")
-                    null
-                }
-                if (server == null) {
-                    try {
-                        Thread.sleep(3_000)
-                    } catch (_: InterruptedException) {
-                        return
-                    }
-                    continue
-                }
-                log("audiomonitor call inject listening port=$CALL_INJECT_PORT")
-            }
-            val activeServer = server ?: continue
-            val client = runCatching { activeServer.accept() }.getOrElse { error ->
-                log("audiomonitor call inject accept failed: ${error.javaClass.simpleName}: ${error.message}")
-                runCatching { activeServer.close() }
-                server = null
-                continue
-            }
-            runCatching { client.tcpNoDelay = true }
-            val previous = callInjectActiveClient
-            if (previous != null && previous !== client) {
-                log("audiomonitor call inject evicting previous client")
-                runCatching { previous.close() }
-            }
-            callInjectActiveClient = client
-            Thread({
-                try {
-                    runCallInjectClient(client)
-                } catch (error: Throwable) {
-                    log("audiomonitor call inject client error: ${error.javaClass.simpleName}: ${error.message}")
-                } finally {
-                    runCatching { client.close() }
-                    if (callInjectActiveClient === client) {
-                        callInjectActiveClient = null
-                    }
-                }
-                log("audiomonitor call inject client disconnected")
-            }, "EdgeLinkCallInjectClient").apply {
-                isDaemon = true
-                start()
-            }
-        }
-    }
-
-    private fun runCallInjectClient(socket: Socket) {
-        val input = socket.inputStream
-        val magic = ByteArray(CALL_INJECT_MAGIC.size)
-        var magicRead = 0
-        while (magicRead < magic.size) {
-            val n = input.read(magic, magicRead, magic.size - magicRead)
-            if (n < 0) {
-                return
-            }
-            magicRead += n
-        }
-        if (!magic.contentEquals(CALL_INJECT_MAGIC)) {
-            log("audiomonitor call inject bad magic, dropping connection")
-            return
-        }
-        log("audiomonitor call inject client accepted")
-        val buffer = ByteArray(CALL_INJECT_READ_BUFFER_BYTES)
-        var activeStream: Any? = null
-        var playMethod: Method? = null
-        var pts = SystemClock.elapsedRealtimeNanos() / 1_000
-        var bytesInjected = 0L
-        var lastLogBytes = 0L
-        var bytesDropped = 0L
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) {
-                break
-            }
-            if (read == 0) {
-                continue
-            }
-            val stream = resolveDistAudioStream()
-            if (stream == null) {
-                bytesDropped += read
-                if (bytesDropped == read.toLong() || bytesDropped % 320_000L < read) {
-                    log("audiomonitor call inject no dist stream yet, dropped=$bytesDropped")
-                }
-                continue
-            }
-            if (activeStream !== stream) {
-                activeStream = stream
-                playMethod = runCatching {
-                    stream.javaClass.getMethod(
-                        "playCastAudioData",
-                        ByteArray::class.java,
-                        java.lang.Long.TYPE
-                    )
-                }.getOrNull()
-                pts = SystemClock.elapsedRealtimeNanos() / 1_000
-                bytesInjected = 0
-                lastLogBytes = 0
-                if (playMethod == null) {
-                    log("audiomonitor call inject stream has no playCastAudioData")
-                }
-            }
-            val method = playMethod ?: continue
-            // doPlay AES-ECB-decrypts every frame with the session's remote
-            // key before writing it to the VOICE_COMMUNICATION AudioTrack,
-            // so raw PCM fed directly NPEs inside AesEcbPkcd5Util.decrypt.
-            // Encrypt with the live remote key instead.
-            val remoteKey = resolveRemoteKey()
-            if (remoteKey == null) {
-                bytesDropped += read
-                if (bytesDropped == read.toLong() || bytesDropped % 320_000L < read) {
-                    log("audiomonitor call inject no remote key yet, dropped=$bytesDropped")
-                }
-                continue
-            }
-            val cipher = runCatching {
-                encryptAesEcbPkcs5(buffer.copyOf(read), remoteKey)
-            }.getOrElse { error ->
-                log("audiomonitor call inject encrypt failed: ${error.javaClass.simpleName}: ${error.message}")
-                bytesDropped += read
-                continue
-            }
-            runCatching {
-                method.invoke(stream, cipher, pts)
-            }.onFailure { error ->
-                val cause = error.cause ?: error
-                log("audiomonitor call inject play failed: ${cause.javaClass.simpleName}: ${cause.message}")
-            }
-            pts += read / 2 * 1_000_000L / CALL_INJECT_SAMPLE_RATE
-            bytesInjected += read
-            if (bytesInjected - lastLogBytes >= 320_000L) {
-                lastLogBytes = bytesInjected
-                log("audiomonitor call inject injected=$bytesInjected dropped=$bytesDropped")
-            }
-        }
-        log("audiomonitor call inject client done injected=$bytesInjected dropped=$bytesDropped")
-    }
-
-    private fun resolveDistAudioStream(): Any? {
-        val classLoader = callInjectClassLoader ?: return null
-        val context = currentApplication() ?: return null
-        return runCatching {
-            val managerClass = Class.forName(
-                "com.miui.audiomonitor.distaudio.service.IDistAudioManager",
-                false,
-                classLoader
-            )
-            val manager = managerClass
-                .getMethod("getInstance", Context::class.java)
-                .invoke(null, context)
-                ?: return@runCatching null
-            managerClass.getField("mDistAudioStream").get(manager)
-        }.getOrNull()
-    }
-
-    private fun resolveRemoteKey(): ByteArray? {
-        val classLoader = callInjectClassLoader ?: return null
-        val context = currentApplication() ?: return null
-        // ResourceManager is a public singleton of its own; go straight to it
-        // (IDistAudioManager.mResourceManager is private, getField throws).
-        return runCatching {
-            val resourceClass = Class.forName(
-                "com.miui.audiomonitor.distaudio.resource.ResourceManager",
-                false,
-                classLoader
-            )
-            val resourceManager = resourceClass
-                .getMethod("getInstance", Context::class.java)
-                .invoke(null, context)
-                ?: return@runCatching null
-            resourceClass.getMethod("getRemoteKey").invoke(resourceManager) as? ByteArray
-        }.getOrElse { error ->
-            log("audiomonitor call inject resolveRemoteKey failed: ${error.javaClass.simpleName}: ${error.message}")
-            null
-        }
-    }
-
-    private fun encryptAesEcbPkcs5(data: ByteArray, key: ByteArray): ByteArray {
-        val cipher = javax.crypto.Cipher.getInstance("AES/ECB/PKCS5Padding")
-        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"))
-        return cipher.doFinal(data)
-    }
-
-    private fun currentApplication(): Context? = runCatching {
-        val activityThreadClass = Class.forName("android.app.ActivityThread")
-        activityThreadClass.getMethod("currentApplication").invoke(null) as? Context
-    }.getOrNull()
 
     private fun hookXiaomiMirrorSystemPackageGids(classLoader: ClassLoader) {
         hookXiaomiMirrorPackageGidsMethod(classLoader, "com.android.server.pm.ComputerEngine")
@@ -1493,10 +1234,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val XIAOMI_MIRROR_CALL_PROVIDER = "com.xiaomi.mirror.provider.CallProvider"
         private const val MIRROR_KEEP_AWAKE_TAG = "EdgeLink:MirrorKeepAwake"
         private const val MIRROR_KEEP_AWAKE_TIMEOUT_MS = 8 * 60 * 60 * 1000L
-        private const val CALL_INJECT_PORT = 19_307
-        private val CALL_INJECT_MAGIC = byteArrayOf('E'.code.toByte(), 'L'.code.toByte(), 'M'.code.toByte(), 'A'.code.toByte())
-        private const val CALL_INJECT_READ_BUFFER_BYTES = 8_192
-        private const val CALL_INJECT_SAMPLE_RATE = 16_000
         private const val XIAOMI_MIRROR_APPLICATION = "com.xiaomi.mirror.Mirror"
         private const val XIAOMI_MIRROR_MESSAGE_MANAGER = "com.xiaomi.mirror.message.MessageManagerImpl"
         private const val XIAOMI_MIRROR_SCREEN_CONFIGURATION_MESSAGE =

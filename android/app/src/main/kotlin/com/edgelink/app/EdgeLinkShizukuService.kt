@@ -1,10 +1,8 @@
 package com.edgelink.app
 
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.math.min
@@ -32,25 +30,11 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
         System.exit(0)
     }
 
-    // In-service keepalive for com.miui.audiomonitor during distaudio calls.
-    // The earlier sh -c poll hid its own failures (forced exit 0) and MIUI
-    // may re-freeze between polls, so the loop now lives here in the root
-    // service: direct file reads/writes with real state logging.
-    private val keepalive = AudioMonitorKeepaliveLoop()
-
     // No-hook call-uplink inject: this root process owns the 19307 endpoint
-    // and writes the Mac mic PCM into a telephony-routed AudioTrack directly,
-    // bypassing the LSPosed feed inside audiomonitor. Falls back to the hook
-    // (mode property + audiomonitor restart) if the route is refused.
+    // and writes the Mac mic PCM into a telephony-routed AudioTrack directly.
+    // The old LSPosed feed inside audiomonitor is gone; if the route is
+    // refused the injector retries for the whole call and logs a heartbeat.
     private val callUplinkInjector = CallUplinkInjector()
-
-    override fun startAudioMonitorKeepalive() {
-        keepalive.start()
-    }
-
-    override fun stopAudioMonitorKeepalive() {
-        keepalive.stop()
-    }
 
     override fun startCallUplinkInjector() {
         callUplinkInjector.start()
@@ -316,101 +300,4 @@ internal object EdgeLinkShizukuCommandPolicy {
         ) to setOf(null),
         ("content://com.milink.service.public" to "milink_casting") to setOf(null)
     )
-}
-
-// Runs inside the root Shizuku service process for the duration of a
-// distaudio call: every 2s it checks com.miui.audiomonitor's cgroup state
-// and clears the v2 freezer / lifts the process out of the background
-// cpuset+cpuctl groups so the in-process call-inject thread keeps running.
-// Every state change and a periodic heartbeat are logged — the previous
-// sh -c variant forced exit 0 and masked whether anything actually happened.
-internal class AudioMonitorKeepaliveLoop {
-    private companion object {
-        const val TAG = "EdgeLinkShizuku"
-        const val TARGET_PACKAGE = "com.miui.audiomonitor"
-        const val POLL_INTERVAL_MS = 2_000L
-    }
-
-    private val running = AtomicBoolean(false)
-
-    @Volatile
-    private var worker: Thread? = null
-
-    fun start() {
-        if (!running.compareAndSet(false, true)) {
-            return
-        }
-        worker = thread(name = "edgelink-am-keepalive", isDaemon = true) { loop() }
-    }
-
-    fun stop() {
-        running.set(false)
-        worker?.interrupt()
-        worker = null
-    }
-
-    private fun loop() {
-        android.util.Log.i(TAG, "audiomonitor keepalive started")
-        var iteration = 0
-        while (running.get()) {
-            iteration += 1
-            runCatching { tick(iteration) }
-                .onFailure { android.util.Log.w(TAG, "audiomonitor keepalive tick failed: ${it.message}") }
-            try {
-                Thread.sleep(POLL_INTERVAL_MS)
-            } catch (_: InterruptedException) {
-                break
-            }
-        }
-        android.util.Log.i(TAG, "audiomonitor keepalive stopped")
-    }
-
-    private fun tick(iteration: Int) {
-        val pid = findPid(TARGET_PACKAGE)
-        if (pid == null) {
-            if (iteration == 1 || iteration % 15 == 0) {
-                android.util.Log.i(TAG, "audiomonitor keepalive iter=$iteration target not running")
-            }
-            return
-        }
-        val cgroupLines = runCatching { File("/proc/$pid/cgroup").readText() }.getOrDefault("")
-            .lines()
-        val v2Path = cgroupLines.firstOrNull { it.startsWith("0::") }?.removePrefix("0::")
-        var unfrozen = false
-        if (v2Path != null) {
-            val freezeFile = File("/sys/fs/cgroup$v2Path/cgroup.freeze")
-            if (freezeFile.exists() && freezeFile.readText().trim() == "1") {
-                freezeFile.writeText("0")
-                unfrozen = true
-            }
-        }
-        val cpusetPath = cgroupLines
-            .firstOrNull { it.split(':').getOrNull(1)?.contains("cpuset") == true }
-            ?.split(':')?.getOrNull(2)
-            .orEmpty()
-        var lifted = false
-        if (cpusetPath.startsWith("/background")) {
-            lifted = listOf("/dev/cpuset/foreground/tasks", "/dev/cpuctl/foreground/tasks")
-                .map { File(it) }
-                .all { file -> runCatching { file.appendText("$pid\n") }.isSuccess }
-        }
-        if (unfrozen || lifted || iteration == 1 || iteration % 15 == 0) {
-            android.util.Log.i(
-                TAG,
-                "audiomonitor keepalive iter=$iteration pid=$pid unfrozen=$unfrozen lifted=$lifted cpuset=$cpusetPath"
-            )
-        }
-    }
-
-    private fun findPid(packageName: String): Int? {
-        val proc = File("/proc")
-        for (entry in proc.listFiles().orEmpty()) {
-            val pid = entry.name.toIntOrNull() ?: continue
-            val cmdline = runCatching { File(entry, "cmdline").readText() }.getOrNull() ?: continue
-            if (cmdline.trim('\u0000') == packageName) {
-                return pid
-            }
-        }
-        return null
-    }
 }
