@@ -18,6 +18,14 @@ class MiLinkMirrorKcpSink(
         const val COMMAND_WINS = 0x54
         private const val RECEIVE_BUFFER_LIMIT = 256
         private const val RECEIVE_MAX_GAP = 512L
+        // A backward sequence jump larger than this cannot be reordering or
+        // retransmission — it is a restarted KCP stream (the WFD source
+        // restarts its conversation with sn=0 on every RTSP reconnect while
+        // this sink object survives across cloud sessions). Resync instead
+        // of dropping the whole new stream as "duplicates" (live 2026-08-08:
+        // expected=113855 from a previous session silently black-holed an
+        // entire fresh mirror stream).
+        private const val RESTART_BACKWARD_JUMP = 256L
     }
 
     private var conversationId: Long = -1
@@ -41,6 +49,24 @@ class MiLinkMirrorKcpSink(
         private set
     var malformed = 0L
         private set
+
+    // New source connection: the WFD source restarts its KCP conversation
+    // (typically sn=0, sometimes a new conv id). Drop all per-stream state
+    // so the fresh stream is not judged against the previous session's
+    // sequence window.
+    @Synchronized
+    fun resetForNewStream() {
+        conversationId = -1
+        nextReceiveSn = 0
+        conversationSeen = false
+        receiveBuffer.clear()
+        pushReceived = 0
+        acksSent = 0
+        duplicateDropped = 0
+        outOfOrderBuffered = 0
+        waskReceived = 0
+        winsSent = 0
+    }
 
     @Synchronized
     fun receiveDatagram(data: ByteArray) {
@@ -93,7 +119,21 @@ class MiLinkMirrorKcpSink(
             )
         }
         if (conv != conversationId) {
-            return
+            // A different conversation id means the source restarted its KCP
+            // session mid-cloud-session (source recovery / RTSP reconnect):
+            // adopt it instead of silently dropping the new stream.
+            if (command == COMMAND_PUSH && conversationSeen) {
+                conversationId = conv
+                nextReceiveSn = sn
+                receiveBuffer.clear()
+                resyncCount += 1
+                logWarn(
+                    "xiaomi.mirror.android.kcp_conversation_restart sessionId=${sessionId()} " +
+                        "conv=0x${conv.toString(16)} sn=$sn resyncs=$resyncCount"
+                )
+            } else {
+                return
+            }
         }
         when (command) {
             COMMAND_PUSH -> handlePush(ts, sn, data, offset + HEADER_LENGTH, payloadLength)
@@ -124,6 +164,21 @@ class MiLinkMirrorKcpSink(
             return
         }
         if (delta < 0) {
+            if (-delta > RESTART_BACKWARD_JUMP) {
+                // Conversation restart with the same conv id (source keeps
+                // its conv but rewinds sn to 0): resync, do not black-hole.
+                resyncCount += 1
+                receiveBuffer.clear()
+                logWarn(
+                    "xiaomi.mirror.android.kcp_stream_restart sessionId=${sessionId()} " +
+                        "sn=$sn expected=$nextReceiveSn jump=$delta resyncs=$resyncCount"
+                )
+                nextReceiveSn = sn
+                deliver(data, payloadOffset, payloadLength, sn)
+                nextReceiveSn = (nextReceiveSn + 1) and 0xFFFFFFFFL
+                sendSegment(COMMAND_ACK, ts, sn)
+                return
+            }
             duplicateDropped += 1
             sendSegment(COMMAND_ACK, ts, sn)
             if (duplicateDropped <= 5 || duplicateDropped % 50 == 0L) {

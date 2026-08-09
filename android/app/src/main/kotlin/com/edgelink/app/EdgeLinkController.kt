@@ -611,6 +611,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             AndroidMiLinkMirrorMediaBridge.switchToWebSocketFallback("no_turn_credentials")
             return
         }
+        val turnSessionRef = arrayOfNulls<AndroidMirrorTurnSession>(1)
         val turnSession = AndroidMirrorTurnSession(
             context = appContext,
             sessionId = body.sessionId,
@@ -620,18 +621,33 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 AndroidMiLinkMirrorMediaBridge.handleTurnDatagram(data)
             },
             onDataChannelOpen = {
-                val attached = AndroidMiLinkMirrorMediaBridge.attachTurnDataChannel(body.sessionId) { data ->
-                    mirrorTurnSession?.send(data)
-                }
+                val attached = AndroidMiLinkMirrorMediaBridge.attachTurnDataChannel(
+                    sessionId = body.sessionId,
+                    sendDatagram = { data -> mirrorTurnSession?.send(data) ?: false },
+                    dcBufferedBytes = { mirrorTurnSession?.bufferedAmount() ?: 0L }
+                )
                 if (!attached) {
                     mirrorTurnSession?.close("bridge_attach_rejected")
                 }
             },
             onFailed = { reason ->
-                AndroidMiLinkMirrorMediaBridge.switchToWebSocketFallback("signal_$reason")
+                // Guard against stale sessions: when a new cloud session
+                // replaces this one, close() fires dc_failed asynchronously;
+                // by then the bridge is retargeted to the new session and a
+                // fallback signal here would poison it (live 2026-08-08:
+                // the old dc's close flipped the retargeted bridge into WS
+                // fallback and its fresh TURN channel was attach_rejected).
+                if (mirrorTurnSession === turnSessionRef[0]) {
+                    AndroidMiLinkMirrorMediaBridge.switchToWebSocketFallback("signal_$reason")
+                } else {
+                    EdgeLinkLog.info(
+                        "mirror.turn.dc_failed_stale sessionId=${body.sessionId} reason=$reason"
+                    )
+                }
             }
         )
         mirrorTurnSession = turnSession
+        turnSessionRef[0] = turnSession
         turnSession.handleOffer(body)
     }
 

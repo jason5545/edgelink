@@ -103,10 +103,10 @@ class AndroidMirrorTurnSession(
         peerConnection?.addIceCandidate(IceCandidate(body.mid, body.index, body.candidate))
     }
 
-    fun send(datagram: ByteArray) {
-        val channel = dataChannel ?: return
+    fun send(datagram: ByteArray): Boolean {
+        val channel = dataChannel ?: return false
         if (!dataChannelOpen) {
-            return
+            return false
         }
         datagramsSent += 1
         datagramsSentBytes += datagram.size
@@ -115,8 +115,15 @@ class AndroidMirrorTurnSession(
                 "mirror.turn.dc_out sessionId=$sessionId datagrams=$datagramsSent bytes=$datagramsSentBytes"
             )
         }
-        channel.send(DataChannel.Buffer(ByteBuffer.wrap(datagram), true))
+        // send() returns false when libwebrtc's SCTP buffer is full; the
+        // datagram is silently lost in that case. Callers must see the
+        // failure (live 2026-08-08: untracked send losses surfaced as KCP
+        // gaps and repeated video freezes on the Mac).
+        return runCatching { channel.send(DataChannel.Buffer(ByteBuffer.wrap(datagram), true)) }
+            .getOrDefault(false)
     }
+
+    fun bufferedAmount(): Long = runCatching { dataChannel?.bufferedAmount() ?: 0L }.getOrDefault(0L)
 
     @Synchronized
     fun close(reason: String) {

@@ -110,11 +110,59 @@ class MiLinkMirrorKcpSinkTest {
     }
 
     @Test
-    fun foreignConversationIgnored() {
+    fun foreignConversationAdoptedAsRestart() {
+        // The WFD source restarts its KCP conversation on every RTSP
+        // reconnect while the sink survives across cloud sessions; the new
+        // conversation must be adopted, not silently dropped.
         val sink = newSink()
         sink.receiveDatagram(push(0x1234, ts = 1, sn = 5, payload = byteArrayOf(1)))
-        sink.receiveDatagram(push(0x7777, ts = 1, sn = 5, payload = byteArrayOf(2)))
-        assertEquals(1, payloads.size)
+        sink.receiveDatagram(push(0x7777, ts = 1, sn = 0, payload = byteArrayOf(2)))
+        assertEquals(2, payloads.size)
+        assertArrayEquals(byteArrayOf(2), payloads[1])
+        assertEquals(1L, sink.resyncCount)
+        // Subsequent pushes on the adopted conversation flow in order.
+        sink.receiveDatagram(push(0x7777, ts = 2, sn = 1, payload = byteArrayOf(3)))
+        assertEquals(3, payloads.size)
+    }
+
+    @Test
+    fun sameConversationRewindResyncsInsteadOfDropping() {
+        // Live 2026-08-08: a fresh stream restarted at sn=0 while the sink
+        // still expected a high sequence from the previous session; every
+        // frame was dropped as "duplicate". A backward jump beyond any
+        // possible reordering must resync.
+        val sink = newSink()
+        sink.receiveDatagram(push(0x1234, ts = 1, sn = 113_855, payload = byteArrayOf(1)))
+        sink.receiveDatagram(push(0x1234, ts = 2, sn = 0, payload = byteArrayOf(2)))
+        assertEquals(2, payloads.size)
+        assertArrayEquals(byteArrayOf(2), payloads[1])
+        assertEquals(1L, sink.resyncCount)
+        assertEquals(0L, sink.duplicateDropped)
+        sink.receiveDatagram(push(0x1234, ts = 3, sn = 1, payload = byteArrayOf(3)))
+        assertEquals(3, payloads.size)
+    }
+
+    @Test
+    fun smallBackwardJumpStillDuplicate() {
+        val sink = newSink()
+        sink.receiveDatagram(push(0x1234, ts = 1, sn = 10, payload = byteArrayOf(1)))
+        sink.receiveDatagram(push(0x1234, ts = 2, sn = 11, payload = byteArrayOf(2)))
+        // Retransmission of an unacked frame: a small backward jump.
+        sink.receiveDatagram(push(0x1234, ts = 3, sn = 10, payload = byteArrayOf(1)))
+        assertEquals(2, payloads.size)
+        assertEquals(1L, sink.duplicateDropped)
+        assertEquals(0L, sink.resyncCount)
+    }
+
+    @Test
+    fun resetForNewStreamReprimesFromNextPush() {
+        val sink = newSink()
+        sink.receiveDatagram(push(0x1234, ts = 1, sn = 500, payload = byteArrayOf(1)))
+        sink.resetForNewStream()
+        sink.receiveDatagram(push(0x1234, ts = 2, sn = 0, payload = byteArrayOf(2)))
+        assertEquals(2, payloads.size)
+        assertArrayEquals(byteArrayOf(2), payloads[1])
+        assertEquals(0L, sink.duplicateDropped)
     }
 
     @Test
