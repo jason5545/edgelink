@@ -128,7 +128,11 @@ final class LyraCastTrustSession {
     private var srvServerRandom = Data()
     private var srvKeyCS: SymmetricKey?
     private var srvKeySC: SymmetricKey?
-    private var srvChannelSocket: LyraChannelSocket?
+    private var srvChannelSocket: LyraChannelDatagramPipe?
+    // The relay bridge this session rides (nil on LAN) and the bridge port of
+    // the mitrust server pipe, so teardown can unregister it.
+    private let relayBridge: LyraRelayTransportBridge?
+    private var srvChannelBridgePort: UInt16?
     private var srvReuseKey: SymmetricKey?
     private var srvChannelId: UInt32 = 0
     private var srvTransKey = Data()
@@ -177,7 +181,8 @@ final class LyraCastTrustSession {
         displayName: String,
         trustManager: MacTrustManager,
         meshTransport: LyraMeshDatagramPipe? = nil,
-        channelTransport: LyraChannelDatagramPipe? = nil
+        channelTransport: LyraChannelDatagramPipe? = nil,
+        relayBridge: LyraRelayTransportBridge? = nil
     ) {
         self.endpoints = endpoints
         self.host = endpoints.first?.host ?? ""
@@ -187,6 +192,7 @@ final class LyraCastTrustSession {
         self.trustManager = trustManager
         self.socket = meshTransport ?? LyraMeshSocket()
         self.channelTransport = channelTransport
+        self.relayBridge = relayBridge
         syncTaskServer.syncPayloadProvider = {
             LyraSyncReply.payload(deviceIdHex: deviceIdHex, displayName: displayName)
         }
@@ -249,6 +255,18 @@ final class LyraCastTrustSession {
         finishLocked()
     }
 
+    // Stops the mitrust server channel and unregisters its bridge pipe (when
+    // the session is relay-routed) so late datagrams for the stale port fall
+    // back to the cast pipe instead of a dead pipe.
+    private func teardownServerChannelLocked() {
+        srvChannelSocket?.stop()
+        srvChannelSocket = nil
+        if let port = srvChannelBridgePort {
+            relayBridge?.removeChannelPipe(port: port)
+            srvChannelBridgePort = nil
+        }
+    }
+
     private func finishLocked() {
         cancelled = true
         if LyraCastTrustSession.activeTrustSession === self {
@@ -258,8 +276,7 @@ final class LyraCastTrustSession {
         watchdog = nil
         channelSocket?.stop()
         channelSocket = nil
-        srvChannelSocket?.stop()
-        srvChannelSocket = nil
+        teardownServerChannelLocked()
         socket.stop()
         DispatchQueue.main.async { [weak self] in
             self?.trustManager.stop()
@@ -281,8 +298,7 @@ final class LyraCastTrustSession {
         watchdog = nil
         channelSocket?.stop()
         channelSocket = nil
-        srvChannelSocket?.stop()
-        srvChannelSocket = nil
+        teardownServerChannelLocked()
         socket.stop()
     }
 
@@ -685,8 +701,7 @@ final class LyraCastTrustSession {
             // The phone reopened the mitrustservice conn (retry/new phys).
             // Its latest conn wins — drop the stale channel state so the new
             // requestOfPeerPort isn't ignored.
-            srvChannelSocket?.stop()
-            srvChannelSocket = nil
+            teardownServerChannelLocked()
             mitrustAuth = nil
             srvTransKey = Data()
             mitrustPeerPortChannelId = 0
@@ -1324,15 +1339,23 @@ final class LyraCastTrustSession {
             self?.sendMitrustChannelMessage(jsonData)
         }
         mitrustAuth = authService
-        let socket = LyraChannelSocket()
+        // Relay-routed session: the phone cannot reach a Mac UDP socket (its
+        // channel client dials the relay bridge's loopback forward), so the
+        // mitrust server listens on a virtual channel pipe attached to the
+        // bridge. The advertised port is the bridge demux key: the phone
+        // bridge snoops it from the responseOfPeerPort and stamps it onto the
+        // phone-dialed datagrams. LAN sessions keep the real UDP socket.
+        let socket: LyraChannelDatagramPipe
+        if let relayBridge {
+            let bridgePort = relayBridge.allocateChannelPort()
+            socket = relayBridge.channelPipe(port: bridgePort)
+            srvChannelBridgePort = bridgePort
+        } else {
+            socket = LyraChannelSocket()
+            srvChannelBridgePort = nil
+        }
         socket.onMessage = { [weak self] message, _ in
             self?.handleMitrustChannelMessage(message)
-        }
-        socket.onRawDatagram = { datagram, from in
-            DiagnosticsLog.info("xiaomi.cast.mitrust_socket_raw from=\(from.debugDescription) bytes=\(datagram.count)")
-        }
-        socket.onDecryptFailure = { reason in
-            DiagnosticsLog.warn("xiaomi.cast.mitrust_socket_decrypt_failed \(reason)")
         }
         socket.onPeerConnected = { from in
             DiagnosticsLog.info("xiaomi.cast.mitrust_socket_peer from=\(from.debugDescription)")
@@ -1340,20 +1363,33 @@ final class LyraCastTrustSession {
         socket.onNegotiated = { serverChannelId, mtu in
             DiagnosticsLog.info("xiaomi.cast.mitrust_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
         }
+        if let udpSocket = socket as? LyraChannelSocket {
+            udpSocket.onRawDatagram = { datagram, from in
+                DiagnosticsLog.info("xiaomi.cast.mitrust_socket_raw from=\(from.debugDescription) bytes=\(datagram.count)")
+            }
+            udpSocket.onDecryptFailure = { reason in
+                DiagnosticsLog.warn("xiaomi.cast.mitrust_socket_decrypt_failed \(reason)")
+            }
+        }
         do {
             try socket.start(socketKey: transKey, serverChannelId: 6)
             srvChannelSocket = socket
             srvChannelId = 6
         } catch {
             DiagnosticsLog.error("xiaomi.cast.mitrust_channel_start_failed", error)
+            if let port = srvChannelBridgePort {
+                relayBridge?.removeChannelPipe(port: port)
+                srvChannelBridgePort = nil
+            }
             return
         }
         guard let port = socket.boundPort ?? {
+            guard let udpSocket = socket as? LyraChannelSocket else { return nil }
             let semaphore = DispatchSemaphore(value: 0)
             var bound: UInt16?
-            socket.onStateChanged = { state in
+            udpSocket.onStateChanged = { state in
                 if case .ready = state {
-                    bound = socket.boundPort
+                    bound = udpSocket.boundPort
                     semaphore.signal()
                 }
             }
@@ -1361,6 +1397,11 @@ final class LyraCastTrustSession {
             return bound
         }() else {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_channel_no_port")
+            srvChannelSocket = nil
+            if let bridgePort = srvChannelBridgePort {
+                relayBridge?.removeChannelPipe(port: bridgePort)
+                srvChannelBridgePort = nil
+            }
             return
         }
         mitrustPeerPortChannelId = channelId

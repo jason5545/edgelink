@@ -45,12 +45,26 @@ class AndroidLyraRelayTransportBridge(
     // Fired (once per target) when a mesh flow's target produces its first
     // inbound datagram — the controller persists it as the known-good mesh
     // port and prefers it on later dials.
-    private val onMeshTargetResponsive: (Int) -> Unit = {}
+    private val onMeshTargetResponsive: (Int) -> Unit = {},
+    // Host the channel flow dials for its local Xiaomi channel endpoint. The
+    // default loopback keeps the phone's Mirror source loopback-bound (it
+    // binds its RTSP server to the control connection's local address); the
+    // controller supplies the phone's LAN IPv4 so a relay-carried cast
+    // channel still presents a LAN peer and the source stays LAN-reachable
+    // for lan_direct media.
+    private val channelTargetHost: () -> String = { "127.0.0.1" }
 ) {
     private val lock = Any()
     private var meshTarget: Pair<String, Int>? = null
     private var meshProbePorts: List<Int> = emptyList()
     private val meshFlows = HashMap<Int, DatagramFlow>()
+    private val peerPortSnoopers = HashMap<Int, MeshPeerPortSnooper>()
+    // Reverse channel listeners keyed by the Mac-side port snooped from a
+    // responseOfPeerPort: the phone's channel client dials that port on the
+    // mesh peer's address (this host), and the listener forwards the
+    // datagrams over the relay stamped with p=port so the Mac bridge can
+    // demux them off the cast channel stream.
+    private val reverseChannelFlows = HashMap<Int, ReverseChannelFlow>()
     // Cast flow indexes retired by the fresh-dial replacement in meshFlow().
     // Late datagrams of a dead dial (relay reordering) must not recreate its
     // flow — the recreation would kill the LIVE dial's socket, and the two
@@ -78,11 +92,22 @@ class AndroidLyraRelayTransportBridge(
         when (type) {
             EnvelopeTypes.RELAY_MESH_DATAGRAM -> meshFlow(index, ensureStarted = true)?.deliver(data)
             EnvelopeTypes.RELAY_CHANNEL_DATAGRAM -> {
-                // The Mac stamps the Xiaomi channel port it dialed ("p") onto
-                // channel envelopes; bind (or rebind, when the cast channel
-                // port differs from the relayCall one) before delivering.
                 val port = relayBody.p
-                if (port != null) channelFlow.startOrRebind("127.0.0.1", port)
+                if (port != null) {
+                    // A Mac server channel answered on a port the phone
+                    // dialed: deliver back to the phone's channel client.
+                    // (The channelFlow's own target wins the port on the
+                    // astronomically unlikely collision with a snooped port.)
+                    val reverse = synchronized(lock) { reverseChannelFlows[port] }
+                    if (reverse != null && port != channelFlow.currentTargetPort) {
+                        reverse.deliver(data)
+                        return
+                    }
+                    // Otherwise the Mac stamped the Xiaomi channel port it
+                    // dialed ("p"); bind (or rebind, when the cast channel
+                    // port differs from the relayCall one) before delivering.
+                    channelFlow.startOrRebind(channelTargetHost(), port)
+                }
                 channelFlow.deliver(data)
             }
         }
@@ -135,6 +160,9 @@ class AndroidLyraRelayTransportBridge(
             meshFlows.values.forEach { it.stop() }
             meshFlows.clear()
             meshTarget = null
+            peerPortSnoopers.clear()
+            reverseChannelFlows.values.forEach { it.stop() }
+            reverseChannelFlows.clear()
         }
         channelFlow.stop()
     }
@@ -154,6 +182,7 @@ class AndroidLyraRelayTransportBridge(
             // KCP ACKs, never a phys sync reply).
             val stale = meshFlows.keys.filter { it != 0 }
             stale.forEach { meshFlows.remove(it)?.stop() }
+            stale.forEach { peerPortSnoopers.remove(it) }
             if (stale.isNotEmpty()) {
                 retiredCastFlowIndexes.addAll(stale)
                 while (retiredCastFlowIndexes.size > 8) retiredCastFlowIndexes.removeFirst()
@@ -163,7 +192,13 @@ class AndroidLyraRelayTransportBridge(
         val flow = meshFlows.getOrPut(index) {
             DatagramFlow(EnvelopeTypes.RELAY_MESH_DATAGRAM, index, scope, ::emitDatagram, log) { port ->
                 onMeshTargetResponsive(port)
-            }.also { it.setProbePorts(meshProbePorts) }
+            }.also {
+                it.setProbePorts(meshProbePorts)
+                val snooper = peerPortSnoopers.getOrPut(index) {
+                    MeshPeerPortSnooper(::onPeerPortSnooped)
+                }
+                it.snoop = { datagram -> snooper.onDatagram(datagram) }
+            }
         }
         if (ensureStarted) {
             val target = meshTarget
@@ -175,6 +210,37 @@ class AndroidLyraRelayTransportBridge(
     private suspend fun emitDatagram(type: String, flow: Int, datagram: ByteArray) {
         sendEnvelope(type, RelayDatagram.encode(datagram, flow))
     }
+
+    private suspend fun emitReverseDatagram(port: Int, datagram: ByteArray) {
+        sendEnvelope(
+            EnvelopeTypes.RELAY_CHANNEL_DATAGRAM,
+            RelayDatagram.encode(datagram, 0, p = port)
+        )
+    }
+
+    // A snooped responseOfPeerPort maps a Mac server channel (mitrustservice)
+    // to a Mac-side port. Bind the reverse listener the phone's channel
+    // client is about to dial.
+    private fun onPeerPortSnooped(clientChannelId: Long, port: Int) {
+        synchronized(lock) {
+            if (reverseChannelFlows.containsKey(port)) return
+            if (reverseChannelFlows.size >= 8) {
+                val oldest = reverseChannelFlows.keys.firstOrNull()
+                if (oldest != null) reverseChannelFlows.remove(oldest)?.stop()
+            }
+            val flow = ReverseChannelFlow(port, scope, ::emitReverseDatagram, log)
+            if (flow.start()) {
+                reverseChannelFlows[port] = flow
+                log(
+                    "xiaomi.relaybridge.android.peer_port_snooped " +
+                        "clientChannelId=$clientChannelId port=$port"
+                )
+            }
+        }
+    }
+
+    // Ports with a live reverse listener (test surface).
+    fun reverseChannelPorts(): Set<Int> = synchronized(lock) { reverseChannelFlows.keys.toSet() }
 
     /**
      * A single datagram flow bound to one local Xiaomi endpoint. Each flow
@@ -215,6 +281,9 @@ class AndroidLyraRelayTransportBridge(
         private val probeSockets = HashMap<Int, DatagramSocket>()
         private val probeJobs = HashMap<Int, Job>()
         private var lockedToTarget = false
+        // Tap observing every relay→local datagram (used by the mesh flows to
+        // snoop plaintext channel commands like responseOfPeerPort).
+        var snoop: ((ByteArray) -> Unit)? = null
         // Relay -> local writes are serialized to preserve KCP segment order.
         private val outbound = Channel<ByteArray>(Channel.UNLIMITED)
         // Datagrams that arrived before the flow had a target (relay session
@@ -236,6 +305,9 @@ class AndroidLyraRelayTransportBridge(
 
         val hasPending: Boolean
             @Synchronized get() = socket == null && pending.isNotEmpty()
+
+        val currentTargetPort: Int
+            @Synchronized get() = targetPort
 
         @Synchronized
         fun setProbePorts(ports: List<Int>) {
@@ -299,6 +371,7 @@ class AndroidLyraRelayTransportBridge(
         }
 
         fun deliver(datagram: ByteArray) {
+            snoop?.invoke(datagram)
             val restartTarget: Pair<String, Int>? = synchronized(this) {
                 if (socket != null && lockedToTarget) {
                     outbound.trySend(datagram)
@@ -497,6 +570,224 @@ class AndroidLyraRelayTransportBridge(
                     log("xiaomi.relaybridge.android.flow_emit_failed type=$envelopeType flow=$flowIndex error=${e.message}")
                 }
             }
+        }
+    }
+
+    /**
+     * Reverse channel listener: stands in for a Mac server channel (e.g.
+     * mitrustservice) the phone dialed while the session is relay-carried.
+     * Bound to the wildcard address on the Mac-advertised port, so the
+     * phone's channel client reaches it whether it dials the mesh peer's
+     * loopback or LAN address. Phone→Mac datagrams leave stamped with p=port;
+     * Mac→phone datagrams are written back to the client's source endpoint.
+     */
+    private class ReverseChannelFlow(
+        private val port: Int,
+        private val scope: CoroutineScope,
+        private val emit: suspend (Int, ByteArray) -> Unit,
+        private val log: (String) -> Unit
+    ) {
+        private var socket: DatagramSocket? = null
+        private var receiveJob: Job? = null
+        private var clientEndpoint: InetSocketAddress? = null
+
+        @Synchronized
+        fun start(): Boolean {
+            if (socket != null) return true
+            val listenPort = port
+            val sock = try {
+                DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(listenPort))
+                }
+            } catch (e: Exception) {
+                log("xiaomi.relaybridge.android.reverse_bind_failed port=$listenPort error=${e.message}")
+                return false
+            }
+            socket = sock
+            receiveJob = scope.launch(Dispatchers.IO) { receiveLoop(sock) }
+            log("xiaomi.relaybridge.android.reverse_started port=$port")
+            return true
+        }
+
+        fun deliver(datagram: ByteArray) {
+            val (sock, endpoint) = synchronized(this) { (socket ?: return) to (clientEndpoint ?: return) }
+            try {
+                sock.send(DatagramPacket(datagram, datagram.size, endpoint))
+            } catch (e: Exception) {
+                log("xiaomi.relaybridge.android.reverse_send_failed port=$port error=${e.message}")
+            }
+        }
+
+        @Synchronized
+        fun stop() {
+            receiveJob?.cancel()
+            receiveJob = null
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
+            clientEndpoint = null
+        }
+
+        private suspend fun receiveLoop(sock: DatagramSocket) {
+            val buffer = ByteArray(65_535)
+            while (scope.coroutineContext.isActive) {
+                val packet = DatagramPacket(buffer, buffer.size)
+                val read = try {
+                    sock.receive(packet)
+                    packet.length
+                } catch (_: Exception) {
+                    break
+                }
+                if (read <= 0) continue
+                synchronized(this) {
+                    clientEndpoint = InetSocketAddress(packet.address, packet.port)
+                }
+                val datagram = packet.data.copyOfRange(packet.offset, packet.offset + read)
+                try {
+                    emit(port, datagram)
+                } catch (e: Exception) {
+                    log("xiaomi.relaybridge.android.reverse_emit_failed port=$port error=${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Snoops the Mac→phone mesh stream for plaintext packType-5 channel
+     * commands and extracts responseOfPeerPort (clientChannelId → Mac port).
+     * Reassembles the KCP segment stream (sn-ordered) and parses LyraMeshPack
+     * frames; only flag=0 (no AES layer) payloads are readable, which is
+     * exactly how servers fire responseOfPeerPort.
+     */
+    private class MeshPeerPortSnooper(
+        private val onPeerPort: (clientChannelId: Long, port: Int) -> Unit
+    ) {
+        private var nextSn: Long = -1
+        private val pending = HashMap<Long, ByteArray>()
+        private var stream = ByteArray(0)
+
+        @Synchronized
+        fun onDatagram(datagram: ByteArray) {
+            val segment = decodeSegment(datagram) ?: return
+            if (segment.payload.isEmpty()) return
+            if (nextSn < 0) nextSn = segment.sn
+            if (segment.sn < nextSn) return
+            pending[segment.sn] = segment.payload
+            if (pending.size > 64) {
+                pending.clear()
+                stream = ByteArray(0)
+                nextSn = -1
+                return
+            }
+            var sn = nextSn
+            while (true) {
+                val payload = pending.remove(sn) ?: break
+                stream += payload
+                sn = (sn + 1) and 0xFFFF_FFFFL
+            }
+            nextSn = sn
+            if (stream.size > 1_000_000) stream = ByteArray(0)
+            parseFrames()
+        }
+
+        private fun parseFrames() {
+            while (stream.size >= 4) {
+                val packType = (stream[0].toInt() and 0xFF) ushr 3
+                val headerLength = stream[1].toInt() and 0x0F
+                val totalLength = ((stream[2].toInt() and 0xFF) shl 8) or (stream[3].toInt() and 0xFF)
+                if (headerLength < 4 || totalLength < headerLength) {
+                    stream = stream.copyOfRange(1, stream.size)
+                    continue
+                }
+                if (stream.size < totalLength) return
+                val payload = stream.copyOfRange(headerLength, totalLength)
+                stream = stream.copyOfRange(totalLength, stream.size)
+                if (packType == 5) parseChannelPayload(payload)
+            }
+        }
+
+        // packType-5 payload: netId(1) + flag(1) + command(s). flag=0 marks
+        // plaintext (no AES layer); anything else is unreadable here.
+        private fun parseChannelPayload(payload: ByteArray) {
+            if (payload.size < 3 || payload[1].toInt() != 0) return
+            var offset = 2
+            while (offset + 16 <= payload.size) {
+                if (payload[offset].toInt() != 0x10 || payload[offset + 1].toInt() != 0x00) return
+                val type = payload[offset + 2].toInt() and 0xFF
+                val totalLength = ((payload[offset + 4].toInt() and 0xFF) shl 8) or
+                    (payload[offset + 5].toInt() and 0xFF)
+                if (totalLength < 16 || offset + totalLength > payload.size) return
+                if (type == COMMAND_RESPONSE_OF_PEER_PORT) {
+                    parsePeerPortResponse(payload.copyOfRange(offset + 16, offset + totalLength))
+                }
+                offset += totalLength
+            }
+        }
+
+        private fun parsePeerPortResponse(body: ByteArray) {
+            var clientChannelId: Long? = null
+            var port: Int? = null
+            var index = 0
+            while (index < body.size) {
+                val tag = readVarint(body, index) ?: return
+                index = tag.second
+                val field = (tag.first ushr 3).toInt()
+                when ((tag.first and 0x7).toInt()) {
+                    0 -> {
+                        val value = readVarint(body, index) ?: return
+                        index = value.second
+                        if (field == 1) clientChannelId = value.first
+                        if (field == 3) port = value.first.toInt()
+                    }
+                    2 -> {
+                        val length = readVarint(body, index) ?: return
+                        index = length.second + length.first.toInt()
+                        if (index > body.size) return
+                    }
+                    else -> return
+                }
+            }
+            val channelId = clientChannelId ?: return
+            val peerPort = port?.takeIf { it in 1..65_535 } ?: return
+            onPeerPort(channelId, peerPort)
+        }
+
+        private data class Segment(val sn: Long, val payload: ByteArray)
+
+        private fun decodeSegment(datagram: ByteArray): Segment? {
+            if (datagram.size < 24) return null
+            if (datagram[0].toInt() != 0x78 || datagram[1].toInt() != 0x56 ||
+                datagram[2].toInt() != 0x34 || datagram[3].toInt() != 0x12
+            ) return null
+            val sn = (datagram[12].toLong() and 0xFF) or
+                ((datagram[13].toLong() and 0xFF) shl 8) or
+                ((datagram[14].toLong() and 0xFF) shl 16) or
+                ((datagram[15].toLong() and 0xFF) shl 24)
+            val length = (datagram[20].toInt() and 0xFF) or
+                ((datagram[21].toInt() and 0xFF) shl 8) or
+                ((datagram[22].toInt() and 0xFF) shl 16) or
+                ((datagram[23].toInt() and 0xFF) shl 24)
+            if (datagram.size < 24 + length) return null
+            return Segment(sn, datagram.copyOfRange(24, 24 + length))
+        }
+
+        private fun readVarint(data: ByteArray, start: Int): Pair<Long, Int>? {
+            var result = 0L
+            var shift = 0
+            var index = start
+            while (index < data.size) {
+                val byte = data[index].toInt()
+                index += 1
+                result = result or ((byte and 0x7F).toLong() shl shift)
+                if (byte and 0x80 == 0) return result to index
+                shift += 7
+                if (shift >= 64) return null
+            }
+            return null
+        }
+
+        companion object {
+            private const val COMMAND_RESPONSE_OF_PEER_PORT = 3
         }
     }
 }

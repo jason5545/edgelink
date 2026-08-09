@@ -228,6 +228,13 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             castChannelTransport: clientBridge.channel,
             clientVideoPort: clientVideoPort
         )
+        // The real phone's mitrust channel dial crosses the relay too: the
+        // phone bridge's reverse listener stamps the advertised Mac port onto
+        // every envelope, and the Mac bridge routes by that stamp. Mimic it
+        // with a bridge channel pipe keyed by the dialed port.
+        phone.cast.mitrustChannelFactory = { [weak clientBridge] port in
+            clientBridge?.channelPipe(port: port)
+        }
         phone.cast.setLocked(locked)
         phone.onEvent = { event in
             if case .log(let text) = event {
@@ -291,7 +298,8 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             displayName: "EdgeLinkMacTests",
             trustManager: trustManager,
             meshTransport: hostBridge.meshFlow(index: 1),
-            channelTransport: hostBridge.channel
+            channelTransport: hostBridge.channel,
+            relayBridge: hostBridge
         )
         session.retainPhysAfterAuth = true
         session.duoScreenStatusEnabled = true
@@ -579,6 +587,24 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         }
         try await waitFor("controller streaming") {
             controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
+    // Demux proof: the mitrust channel is dialed while the cast channel is
+    // alive, and after the unlock completes the cast channel still carries
+    // CLOSE_SCREEN — the p-stamped mitrust datagrams must not bleed into the
+    // cast pipe (they fail cast transKey decryption and vanish silently).
+    func testTrustUnlockOverCloudRelayKeepsCastChannelAlive() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        try await driveUnlockToStreaming()
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+
+        session.sendScreenAction(.closeScreen(sessionId: 1))
+
+        try await waitFor("CLOSE_SCREEN still lands on the cast channel after unlock") {
+            phone.cast.closeScreenCount == 1
         }
     }
 

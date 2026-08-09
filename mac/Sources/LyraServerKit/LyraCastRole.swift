@@ -532,6 +532,13 @@ public final class LyraCastRole: LyraServiceHandler {
     private let mitrustClientChannelId: UInt64 = 13
     private var mitrustServerPort: UInt16 = 0
     private var mitrustConnection: NWConnection?
+    // Relay-path mitrust channel: when set, the mitrust channel client rides
+    // a virtual channel pipe from this factory (keyed by the advertised
+    // server port) instead of a loopback UDP socket — the exact route the
+    // real phone takes when the session is relay-carried (the phone bridge's
+    // reverse listener stamps the dialed port onto each envelope).
+    public var mitrustChannelFactory: ((UInt16) -> LyraChannelDatagramPipe?)?
+    private var mitrustPipe: LyraChannelDatagramPipe?
     private var mitrustSendSn: UInt32 = 0
     private var mitrustRecvUna: UInt32 = 0
     private var mitrustSessionKeyHex: String?
@@ -551,6 +558,8 @@ public final class LyraCastRole: LyraServiceHandler {
         // sequence state so a re-locked phone can unlock again.
         mitrustConnection?.cancel()
         mitrustConnection = nil
+        mitrustPipe?.stop()
+        mitrustPipe = nil
         mitrustServerPort = 0
         mitrustSendSn = 0
         mitrustRecvUna = 0
@@ -702,6 +711,10 @@ public final class LyraCastRole: LyraServiceHandler {
     // MARK: - mitrust channel client (595/546/562)
 
     private func connectMitrustChannel() {
+        if let pipe = mitrustChannelFactory.flatMap({ $0(mitrustServerPort) }) {
+            connectMitrustChannelViaPipe(pipe)
+            return
+        }
         guard mitrustServerPort != 0, mitrustConnection == nil else { return }
         let port = NWEndpoint.Port(rawValue: mitrustServerPort)!
         let connection = NWConnection(host: "127.0.0.1", port: port, using: .udp)
@@ -715,6 +728,30 @@ public final class LyraCastRole: LyraServiceHandler {
         }
         connection.start(queue: queue)
         receiveMitrust(on: connection)
+    }
+
+    // Relay-path dial: the pipe stands in for the phone bridge's reverse
+    // listener + the Mac's mitrust pipe — negotiation TLV and trans-key
+    // packets cross the relay session as p-stamped channel envelopes.
+    private func connectMitrustChannelViaPipe(_ pipe: LyraChannelDatagramPipe) {
+        guard mitrustServerPort != 0, mitrustPipe == nil else { return }
+        mitrustPipe = pipe
+        pipe.onNegotiated = { [weak self] _, _ in
+            self?.queue.async {
+                self?.sendMitrustJSON(["event_name": 595, "client_hello": "client_hello"])
+            }
+        }
+        pipe.onMessage = { [weak self] message, _ in
+            self?.queue.async { self?.handleMitrustChannelFrame(message) }
+        }
+        do {
+            try pipe.connect(host: "127.0.0.1", port: mitrustServerPort, socketKey: mitrustTransKey)
+            try pipe.sendClientNegotiation(
+                channelId: UInt32(mitrustClientChannelId), version: 1, mtu: 0xFF00
+            )
+        } catch {
+            onEvent("mitrust pipe dial failed: \(error)")
+        }
     }
 
     private func sendMitrustNegotiation() {
@@ -744,6 +781,12 @@ public final class LyraCastRole: LyraServiceHandler {
     private func sendMitrustJSON(_ object: [String: Any]) {
         guard let json = try? JSONSerialization.data(withJSONObject: object) else { return }
         let frame = LyraChannelSocket.wrapChannelFrame(json)
+        if let pipe = mitrustPipe {
+            try? pipe.sendVariant(
+                channelFrame: frame, key: mitrustTransKey, singleLayer: true
+            )
+            return
+        }
         guard let packet = try? LyraSocketPacket.encode(
             plaintext: frame, key: SymmetricKey(data: mitrustTransKey)
         ) else { return }
@@ -778,8 +821,16 @@ public final class LyraCastRole: LyraServiceHandler {
         guard bytes[0] == 0x81, bytes[1] == 0x04,
               let decodedPacket = try? LyraSocketPacket.decode(
                   Data(payload), key: SymmetricKey(data: mitrustTransKey)
-              ),
-              let (tag, child) = try? LyraExpressTLVParser.parseOneOf(decodedPacket.plaintext), tag == 1,
+              )
+        else { return }
+        handleMitrustChannelFrame(decodedPacket.plaintext)
+    }
+
+    // Handles one decrypted channel frame (wrapChannelFrame-wrapped JSON),
+    // from either the UDP socket (after LyraSocketPacket.decode) or the
+    // relay-path channel pipe (already decrypted by the pipe).
+    private func handleMitrustChannelFrame(_ frame: Data) {
+        guard let (tag, child) = try? LyraExpressTLVParser.parseOneOf(frame), tag == 1,
               let payloadNode = LyraExpressTLVParser.firstChild(
                   0, in: LyraExpressTLVParser.children(of: child)
               ),
@@ -1026,6 +1077,10 @@ public final class LyraCastRole: LyraServiceHandler {
             stopped = true
             channelListener?.cancel()
             channelConnection?.cancel()
+            mitrustConnection?.cancel()
+            mitrustConnection = nil
+            mitrustPipe?.stop()
+            mitrustPipe = nil
             if channelTransportStarted {
                 channelTransport?.stop()
                 channelTransportStarted = false

@@ -1654,7 +1654,8 @@ final class EdgeLinkRuntime: ObservableObject {
             displayName: xiaomiMiShareDiscovery.localDisplayName,
             trustManager: macTrustManager,
             meshTransport: relayCastMesh,
-            channelTransport: relayBridge?.channel
+            channelTransport: relayBridge?.channel,
+            relayBridge: relayBridge
         )
         session.retainPhysAfterAuth = true
         session.duoScreenStatusEnabled = true

@@ -575,4 +575,177 @@ class AndroidLyraRelayTransportBridgeTest {
             scope.cancel()
         }
     }
+
+    // MARK: - responseOfPeerPort snoop + reverse channel routing
+
+    private fun appendVarint(value: Long, to: MutableList<Byte>) {
+        var remaining = value
+        while (remaining > 0x7F) {
+            to.add(((remaining and 0x7F) or 0x80).toByte())
+            remaining = remaining ushr 7
+        }
+        to.add((remaining and 0x7F).toByte())
+    }
+
+    // Builds the Mac→phone mesh datagram (KCP segment wrapping a packType-5
+    // plaintext responseOfPeerPort command) exactly as LyraCastTrustSession
+    // emits it: peerPortResponseBody f1=clientChannelId, f3=port, f5=1.
+    private fun meshDatagramWithPeerPortResponse(sn: Long, clientChannelId: Long, port: Int): ByteArray {
+        val body = mutableListOf<Byte>()
+        body.add(0x08) // f1 varint
+        appendVarint(clientChannelId, body)
+        body.add(0x18) // f3 varint
+        appendVarint(port.toLong(), body)
+        body.add(0x28) // f5 varint
+        body.add(0x01)
+        val command = mutableListOf<Byte>(0x10, 0x00, 0x03, 0x10)
+        val totalLength = 16 + body.size
+        command.add(((totalLength ushr 8) and 0xFF).toByte())
+        command.add((totalLength and 0xFF).toByte())
+        repeat(10) { command.add(0) }
+        command.addAll(body)
+        val framePayload = mutableListOf<Byte>(0x01, 0x00) // netId + flag=plaintext
+        framePayload.addAll(command)
+        val frameTotal = 4 + framePayload.size
+        val frame = mutableListOf(
+            (0x01 or (5 shl 3)).toByte(),
+            0x04.toByte(),
+            ((frameTotal ushr 8) and 0xFF).toByte(),
+            (frameTotal and 0xFF).toByte()
+        )
+        frame.addAll(framePayload)
+        val segment = mutableListOf(
+            0x78.toByte(), 0x56, 0x34, 0x12,
+            0x51, 0x00, 0x00, 0x10,
+            0, 0, 0, 0, // tick
+            (sn and 0xFF).toByte(),
+            ((sn ushr 8) and 0xFF).toByte(),
+            ((sn ushr 16) and 0xFF).toByte(),
+            ((sn ushr 24) and 0xFF).toByte(),
+            0, 0, 0, 0, // una
+            (frame.size and 0xFF).toByte(),
+            ((frame.size ushr 8) and 0xFF).toByte(),
+            0, 0
+        )
+        segment.addAll(frame)
+        return segment.toByteArray()
+    }
+
+    @Test
+    fun snoopedPeerPortBindsReverseListenerAndStampsDialedPort() = runBlocking {
+        // The Mac's mitrust responseOfPeerPort crosses a mesh flow as a
+        // plaintext packType-5 command; the bridge must snoop it, bind a
+        // reverse listener on the advertised port, and stamp p=<port> onto
+        // the phone-dialed channel datagrams so the Mac bridge can demux
+        // them off the cast channel stream.
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        val dialedPort = 54_321
+        try {
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_MESH_DATAGRAM,
+                relayBody(meshDatagramWithPeerPortResponse(sn = 0, clientChannelId = 13, port = dialedPort), flow = 1)
+            )
+            assertTrue(
+                "reverse listener should be bound for the snooped port",
+                waitFor { bridge.reverseChannelPorts().contains(dialedPort) }
+            )
+            // The phone's channel client dials the advertised port.
+            val client = DatagramSocket(0, InetAddress.getLoopbackAddress())
+            try {
+                val negotiation = byteArrayOf(0x01, 0x01, 0xAA.toByte(), 0xBB.toByte())
+                client.send(DatagramPacket(negotiation, negotiation.size, InetAddress.getLoopbackAddress(), dialedPort))
+                assertTrue(
+                    "phone-dialed datagram should be emitted with p=$dialedPort",
+                    waitFor {
+                        emitted.any { body ->
+                            body.p == dialedPort &&
+                                (RelayDatagram.decode(body)?.contentEquals(negotiation) == true)
+                        }
+                    }
+                )
+            } finally {
+                client.close()
+            }
+        } finally {
+            bridge.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun reverseFlowDeliversMacRepliesToTheDialingClient() = runBlocking {
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        val dialedPort = 54_322
+        try {
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_MESH_DATAGRAM,
+                relayBody(meshDatagramWithPeerPortResponse(sn = 0, clientChannelId = 13, port = dialedPort), flow = 1)
+            )
+            assertTrue(waitFor { bridge.reverseChannelPorts().contains(dialedPort) })
+            val client = DatagramSocket(0, InetAddress.getLoopbackAddress())
+            try {
+                client.soTimeout = 3_000
+                val hello = byteArrayOf(0x55)
+                client.send(DatagramPacket(hello, hello.size, InetAddress.getLoopbackAddress(), dialedPort))
+                assertTrue("client registration datagram not relayed", waitFor { emitted.isNotEmpty() })
+                // Mac's reply arrives stamped with the dialed port and must
+                // land back on the phone client's socket.
+                val reply = byteArrayOf(0x66, 0x67)
+                val body = EnvelopeCodec.json.encodeToJsonElement(
+                    RelayDatagram.encode(reply, 0, p = dialedPort)
+                ) as JsonObject
+                bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, body)
+                val buffer = ByteArray(1_024)
+                val packet = DatagramPacket(buffer, buffer.size)
+                client.receive(packet)
+                assertEquals(2, packet.length)
+                assertTrue(packet.data.copyOfRange(0, 2).contentEquals(reply))
+            } finally {
+                client.close()
+            }
+        } finally {
+            bridge.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun castChannelEmissionsStayUnstampedForCompatibility() = runBlocking {
+        // The Mac-dialed cast channel (no snoop involved) must keep emitting
+        // without a port stamp so the Mac bridge's legacy fallback keeps
+        // routing it to the cast pipe.
+        val echo = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        try {
+            val payload = byteArrayOf(0x51, 0x52)
+            val body = EnvelopeCodec.json.encodeToJsonElement(
+                RelayDatagram.encode(payload, 0, p = echo.localPort)
+            ) as JsonObject
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, body)
+            assertTrue("cast echo should be emitted", waitFor { emitted.isNotEmpty() })
+            assertTrue(emitted.all { it.p == null })
+        } finally {
+            bridge.stop()
+            echo.close()
+            scope.cancel()
+        }
+    }
 }

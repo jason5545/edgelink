@@ -22,6 +22,11 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
     private let lock = NSLock()
     private var lastSend: Task<Void, Never>?
     private var meshFlows: [Int: LyraVirtualMeshPipe] = [:]
+    // Server channel pipes keyed by their advertised port (the mitrustservice
+    // channel on a relay-routed session). Inbound channel envelopes stamped
+    // with "p" route here; unstamped envelopes keep landing on `channel` (the
+    // Mac-dialed cast/relayCall pipe) for backward compatibility.
+    private var channelPipes: [Int: LyraVirtualChannelPipe] = [:]
 
     public init(
         mesh: LyraVirtualMeshPipe = LyraVirtualMeshPipe(),
@@ -69,6 +74,41 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
         type == EnvelopeType.relayMeshDatagram || type == EnvelopeType.relayChannelDatagram
     }
 
+    // The channel pipe for a phone-dialed server channel (mitrustservice on a
+    // relay-routed session). The pipe's outbound envelopes are stamped with
+    // the port so the phone bridge can route the datagrams to the local
+    // reverse listener that the phone's channel client dialed.
+    public func channelPipe(port: UInt16) -> LyraVirtualChannelPipe {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = channelPipes[Int(port)] { return existing }
+        let pipe = LyraVirtualChannelPipe(defaultPort: port)
+        channelPipes[Int(port)] = pipe
+        pipe.attachOutbound { [weak self] datagram in
+            self?.enqueue(EnvelopeType.relayChannelDatagram, datagram, flow: 0, dialPort: port)
+        }
+        return pipe
+    }
+
+    // Drops a server channel pipe when its channel is torn down so late
+    // datagrams for the port fall back to `channel` instead of a dead pipe.
+    public func removeChannelPipe(port: UInt16) {
+        lock.lock()
+        channelPipes.removeValue(forKey: Int(port))
+        lock.unlock()
+    }
+
+    // Allocates a port for a new server channel pipe: unique within this
+    // bridge and outside the well-known Xiaomi service ranges.
+    public func allocateChannelPort() -> UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        while true {
+            let candidate = UInt16.random(in: 20_000...60_999)
+            if channelPipes[Int(candidate)] == nil { return candidate }
+        }
+    }
+
     public func handleEnvelope(type: String, plaintext: Data) {
         guard let envelope = try? JSONDecoder().decode(Envelope<RelayDatagramBody>.self, from: plaintext),
               let datagram = Data(base64Encoded: envelope.b.payload), !datagram.isEmpty
@@ -81,6 +121,19 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
         case EnvelopeType.relayMeshDatagram:
             meshFlow(index: flow).deliver(datagram: datagram)
         case EnvelopeType.relayChannelDatagram:
+            // The phone bridge stamps the Mac-side port it dialed ("p") onto
+            // phone-initiated channel envelopes; route those to the matching
+            // server pipe. Unstamped (or unknown-port) envelopes keep the
+            // legacy behavior: everything lands on the Mac-dialed pipe.
+            if let port = envelope.b.p {
+                lock.lock()
+                let pipe = channelPipes[port]
+                lock.unlock()
+                if let pipe {
+                    pipe.deliver(datagram: datagram)
+                    return
+                }
+            }
             channel.deliver(datagram: datagram)
         default:
             break
