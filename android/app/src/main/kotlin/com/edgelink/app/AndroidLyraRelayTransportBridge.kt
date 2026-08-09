@@ -134,6 +134,20 @@ class AndroidLyraRelayTransportBridge(
     }
 
     private fun meshFlow(index: Int, ensureStarted: Boolean): DatagramFlow = synchronized(lock) {
+        if (index != 0 && !meshFlows.containsKey(index)) {
+            // A previously unseen non-zero flow index is a fresh cast dial:
+            // the Mac randomizes the index per session because the Xiaomi
+            // mesh service ignores phys sync from a source endpoint it has
+            // seen before. Each flow owns one UDP socket (= one peer), so
+            // the previous cast flows' sockets must be dropped, not reused
+            // (live 2026-08-08: redials on the reused flow-1 socket got only
+            // KCP ACKs, never a phys sync reply).
+            val stale = meshFlows.keys.filter { it != 0 }
+            stale.forEach { meshFlows.remove(it)?.stop() }
+            if (stale.isNotEmpty()) {
+                log("xiaomi.relaybridge.android.cast_flow_replaced stale=$stale new=$index")
+            }
+        }
         val flow = meshFlows.getOrPut(index) {
             DatagramFlow(EnvelopeTypes.RELAY_MESH_DATAGRAM, index, scope, ::emitDatagram, log) { port ->
                 onMeshTargetResponsive(port)

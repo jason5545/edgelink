@@ -114,8 +114,47 @@ class AndroidLyraRelayTransportBridgeTest {
     }
 
     @Test
-    fun handlesOnlyRelayDatagramTypes() {
-        assertTrue(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.RELAY_MESH_DATAGRAM))
+    fun freshCastFlowIndexReplacesPreviousCastFlow() = runBlocking {
+        // Live 2026-08-08: the first relay cast dial worked, but every
+        // redial on the reused flow-1 socket got only KCP ACKs — the Xiaomi
+        // mesh service ignores phys sync from a source endpoint it has seen
+        // before. A new flow index (the Mac randomizes it per dial) must
+        // drop the previous cast flow's socket so the redial presents a
+        // fresh peer; the announcer's flow 0 stays untouched.
+        val echo = startEchoUdpServer()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, _ -> }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", echo.localPort)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x31), flow = 1))
+            assertTrue("flow 1 started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.outboundCount > 0 } == true
+            })
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x32), flow = 2))
+            assertTrue("flow 2 started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 2 }?.let { it.outboundCount > 0 } == true
+            })
+            assertTrue(
+                "previous cast flow socket dropped",
+                bridge.meshFlowStats().none { it.flowIndex == 1 }
+            )
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x33), flow = 0))
+            assertTrue("announcer flow 0 survives", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 0 }?.let { it.outboundCount > 0 } == true
+            })
+        } finally {
+            bridge.stop()
+            echo.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun handlesOnlyRelayDatagramTypes() {        assertTrue(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.RELAY_MESH_DATAGRAM))
         assertTrue(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM))
         assertFalse(AndroidLyraRelayTransportBridge.handles(EnvelopeTypes.TUNNEL_DATA))
         assertFalse(AndroidLyraRelayTransportBridge.handles("milink.status"))
