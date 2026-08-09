@@ -52,6 +52,27 @@ class AndroidLyraRelayTransportBridgeTest {
         return server
     }
 
+    private fun startFixedReplyUdpServer(reply: ByteArray): DatagramSocket {
+        val server = DatagramSocket(0, InetAddress.getLoopbackAddress())
+        thread(isDaemon = true) {
+            val buffer = ByteArray(65_535)
+            while (!server.isClosed) {
+                val packet = DatagramPacket(buffer, buffer.size)
+                try {
+                    server.receive(packet)
+                } catch (_: Exception) {
+                    break
+                }
+                try {
+                    server.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+        return server
+    }
+
     private fun waitFor(timeoutMs: Long = 3_000, condition: () -> Boolean): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
@@ -98,7 +119,12 @@ class AndroidLyraRelayTransportBridgeTest {
             assertEquals(0, silent.inboundCount)
 
             bridge.rebindMesh("127.0.0.1", echo.localPort)
-            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x32), flow = 1))
+            // Push-framed (cmd 0x51 at offset 4): only a data segment marks
+            // the target responsive — bare ACKs must not.
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_MESH_DATAGRAM,
+                relayBody(byteArrayOf(0x78, 0x56, 0x34, 0x12, 0x51, 0x00), flow = 1)
+            )
 
             assertTrue("echo after rebind", waitFor {
                 bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.inboundCount > 0 } == true
@@ -146,6 +172,77 @@ class AndroidLyraRelayTransportBridgeTest {
             assertTrue("announcer flow 0 survives", waitFor {
                 bridge.meshFlowStats().firstOrNull { it.flowIndex == 0 }?.let { it.outboundCount > 0 } == true
             })
+        } finally {
+            bridge.stop()
+            echo.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun probeLocksOnlyOnDataSegmentNotBareAck() = runBlocking {
+        // Live 2026-08-09: wrong Lyra service sockets (37067/56666/57777)
+        // answered the fan-out with bare KCP ACKs and won the probe, but
+        // never answered phys sync — the cast dial timed out. Only a DATA
+        // segment (cmd 0x51) may win the lock.
+        val ackFrame = byteArrayOf(0x78, 0x56, 0x34, 0x12, 0x52, 0x00)
+        val pushFrame = byteArrayOf(0x78, 0x56, 0x34, 0x12, 0x51, 0x00, 0x01)
+        val ackOnly = startFixedReplyUdpServer(ackFrame)
+        val pusher = startFixedReplyUdpServer(pushFrame)
+        val responsivePorts = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            onMeshTargetResponsive = { responsivePorts.add(it) },
+            sendEnvelope = { _, _ -> }
+        )
+        try {
+            bridge.setMeshProbePorts(listOf(ackOnly.localPort, pusher.localPort))
+            repeat(3) {
+                bridge.handleEnvelope(
+                    EnvelopeTypes.RELAY_MESH_DATAGRAM,
+                    relayBody(byteArrayOf(0x78, 0x56, 0x34, 0x12, 0x51, 0x00), flow = 1)
+                )
+            }
+            assertTrue("data-answering port wins", waitFor { responsivePorts.isNotEmpty() })
+            assertEquals(pusher.localPort, responsivePorts.first())
+        } finally {
+            bridge.stop()
+            ackOnly.close()
+            pusher.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun retiredCastFlowStaysDeadOnLateDatagrams() = runBlocking {
+        // Live 2026-08-09: after flow 480906435 was replaced by 735712576,
+        // its late relay datagrams recreated it — the recreation killed the
+        // live dial's socket and the two flows flip-flopped within 300ms.
+        val echo = startEchoUdpServer()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, _ -> }
+        )
+        try {
+            bridge.startMesh("127.0.0.1", echo.localPort)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x31), flow = 1))
+            assertTrue("flow 1 started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.outboundCount > 0 } == true
+            })
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x32), flow = 2))
+            assertTrue("flow 2 started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 2 }?.let { it.outboundCount > 0 } == true
+            })
+            // Late datagram of the retired dial: must be dropped, not
+            // resurrect the flow (and must not kill flow 2).
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x33), flow = 1))
+            Thread.sleep(200)
+            assertTrue("retired flow stays dead", bridge.meshFlowStats().none { it.flowIndex == 1 })
+            assertTrue("live flow survives", bridge.meshFlowStats().any { it.flowIndex == 2 })
         } finally {
             bridge.stop()
             echo.close()

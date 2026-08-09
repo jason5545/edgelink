@@ -51,6 +51,12 @@ class AndroidLyraRelayTransportBridge(
     private var meshTarget: Pair<String, Int>? = null
     private var meshProbePorts: List<Int> = emptyList()
     private val meshFlows = HashMap<Int, DatagramFlow>()
+    // Cast flow indexes retired by the fresh-dial replacement in meshFlow().
+    // Late datagrams of a dead dial (relay reordering) must not recreate its
+    // flow — the recreation would kill the LIVE dial's socket, and the two
+    // dials' interleaved envelopes then kill each other in a loop (live
+    // 2026-08-09: flows 480906435/735712576 flip-flopped within 300ms).
+    private val retiredCastFlowIndexes = ArrayDeque<Int>()
     private val channelFlow = DatagramFlow(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, 0, scope, ::emitDatagram, log)
 
     // Per-flow traffic counters for the wrong-port watchdog: a cast dial
@@ -70,7 +76,7 @@ class AndroidLyraRelayTransportBridge(
         val data = RelayDatagram.decode(relayBody) ?: return
         val index = relayBody.f ?: 0
         when (type) {
-            EnvelopeTypes.RELAY_MESH_DATAGRAM -> meshFlow(index, ensureStarted = true).deliver(data)
+            EnvelopeTypes.RELAY_MESH_DATAGRAM -> meshFlow(index, ensureStarted = true)?.deliver(data)
             EnvelopeTypes.RELAY_CHANNEL_DATAGRAM -> {
                 // The Mac stamps the Xiaomi channel port it dialed ("p") onto
                 // channel envelopes; bind (or rebind, when the cast channel
@@ -92,7 +98,7 @@ class AndroidLyraRelayTransportBridge(
             meshTarget = host to port
             meshFlows.values.filter { it.hasPending }
         }
-        meshFlow(index, ensureStarted = false).start(host, port)
+        meshFlow(index, ensureStarted = false)?.start(host, port)
         pendingFlows.forEach { it.start(host, port) }
     }
 
@@ -133,8 +139,12 @@ class AndroidLyraRelayTransportBridge(
         channelFlow.stop()
     }
 
-    private fun meshFlow(index: Int, ensureStarted: Boolean): DatagramFlow = synchronized(lock) {
+    private fun meshFlow(index: Int, ensureStarted: Boolean): DatagramFlow? = synchronized(lock) {
         if (index != 0 && !meshFlows.containsKey(index)) {
+            if (retiredCastFlowIndexes.contains(index)) {
+                // Zombie datagram of an already-replaced cast dial: drop it.
+                return null
+            }
             // A previously unseen non-zero flow index is a fresh cast dial:
             // the Mac randomizes the index per session because the Xiaomi
             // mesh service ignores phys sync from a source endpoint it has
@@ -145,6 +155,8 @@ class AndroidLyraRelayTransportBridge(
             val stale = meshFlows.keys.filter { it != 0 }
             stale.forEach { meshFlows.remove(it)?.stop() }
             if (stale.isNotEmpty()) {
+                retiredCastFlowIndexes.addAll(stale)
+                while (retiredCastFlowIndexes.size > 8) retiredCastFlowIndexes.removeFirst()
                 log("xiaomi.relaybridge.android.cast_flow_replaced stale=$stale new=$index")
             }
         }
@@ -214,6 +226,12 @@ class AndroidLyraRelayTransportBridge(
 
         companion object {
             const val PENDING_CAPACITY = 64
+            // Lyra KCP segment command offset/values (header: conv4 cmd1 …).
+            private const val KCP_COMMAND_OFFSET = 4
+            private const val KCP_COMMAND_PUSH: Byte = 0x51
+
+            fun isLyraDataSegment(data: ByteArray, offset: Int, length: Int): Boolean =
+                length > KCP_COMMAND_OFFSET && data[offset + KCP_COMMAND_OFFSET] == KCP_COMMAND_PUSH
         }
 
         val hasPending: Boolean
@@ -444,12 +462,23 @@ class AndroidLyraRelayTransportBridge(
                 }
                 if (read <= 0) continue
                 inboundCount++
+                // A bare KCP ACK only proves some Lyra service listens on
+                // the port — the real mesh dial answers phys sync with a
+                // DATA segment. Locking onto an ACK-only port strands the
+                // cast dial (live 2026-08-09: ports 37067/56666/57777 ACKed
+                // and won the probe; phys sync was never answered).
+                val isData = envelopeType != EnvelopeTypes.RELAY_MESH_DATAGRAM ||
+                    isLyraDataSegment(packet.data, packet.offset, read)
                 val promote = synchronized(this) {
                     if (!lockedToTarget && probeSockets[port] === sock) {
-                        promoteProbeLocked(port)
-                        true
+                        if (isData) {
+                            promoteProbeLocked(port)
+                            true
+                        } else {
+                            false
+                        }
                     } else {
-                        if (!isProbe && !responsiveReported) {
+                        if (!isProbe && !responsiveReported && isData) {
                             responsiveReported = true
                             lockedToTarget = true
                             val current = targetPort
