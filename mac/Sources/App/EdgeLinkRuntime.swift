@@ -4732,40 +4732,44 @@ final class EdgeLinkRuntime: ObservableObject {
     // Binds the relay-datagram bridge to this session's send path when the
     // phone is only reachable through the cloud relay. The LAN UDP announcer /
     // cast session stay intact as the fallback; the bridge is only populated on
-    // the relay transport.
+    // the relay transport. Decision logic lives in LyraRelayTransportGlue
+    // (unit-tested); this wires the runtime's state into it.
     private func configureLyraRelayBridge(session: SecureSessionHost, transport: String) {
-        stopLyraRelayNativeTransport()
-        // A fresh secure session replaces the relay bridge object; a cast
-        // session riding the old bridge's pipes is dead even though
-        // isChannelReady stays true (live 2026-08-08: OPEN_MIRROR_SCREEN was
-        // sent into the dead channel and the mirror start churned phone-side
-        // cloud sessions until the WebRTC teardown crashed the app). The
-        // same applies when the transport FLIPPED: a LAN-routed session
-        // whose phone left the LAN keeps its stale isChannelReady and the
-        // flow sends OPEN into a dead pipe — the phone never opens its WFD
-        // source and the bridge loops on ECONNREFUSED (live 2026-08-09:
-        // phone switched to 5G, castChannel=timeout, zero media). Only a
-        // LAN session with the transport still on LAN survives (its mesh
-        // socket is independent of the secure session).
-        if let existing = lyraCastTrustSession,
-           existing.isRelayRouted || transport == "relay" {
-            DiagnosticsLog.info(
-                "xiaomi.cast.session_invalidated reason=relay_bridge_reconfigured relayRouted=\(existing.isRelayRouted) transport=\(transport)"
-            )
-            existing.cancel()
-            lyraCastTrustSession = nil
-            xiaomiMirrorFlow.notifyChannelReleased()
-        }
-        guard transport == "relay" else {
-            lyraRelayBridge = nil
-            return
-        }
-        let bridge = LyraRelayTransportBridge(sendHandler: { data in
-            try await session.sendPlaintext(data)
-        }, log: { DiagnosticsLog.info("xiaomi.relaybridge.\($0)") })
-        lyraRelayBridge = bridge
-        DiagnosticsLog.info("xiaomi.relaybridge.mac.configured transport=\(transport)")
-        startXiaomiRelayAnnouncerIfEnabled()
+        LyraRelayTransportGlue.configureRelayBridge(
+            transport: transport,
+            context: relayBridgeGlueContext(sendPlaintext: { try await session.sendPlaintext($0) })
+        )
+    }
+
+    private func relayBridgeGlueContext(
+        sendPlaintext: ((_ data: Data) async throws -> Void)? = nil
+    ) -> LyraRelayTransportGlue.Context {
+        LyraRelayTransportGlue.Context(
+            hasExistingCastSession: { [weak self] in self?.lyraCastTrustSession != nil },
+            existingCastSessionIsRelayRouted: { [weak self] in
+                self?.lyraCastTrustSession?.isRelayRouted ?? false
+            },
+            invalidateCastSession: { [weak self] in
+                guard let self, let existing = self.lyraCastTrustSession else { return }
+                DiagnosticsLog.info("xiaomi.cast.session_invalidated reason=relay_bridge_reconfigured")
+                existing.cancel()
+                self.lyraCastTrustSession = nil
+                self.xiaomiMirrorFlow.notifyChannelReleased()
+            },
+            stopAnnouncer: { [weak self] in self?.stopLyraRelayNativeTransport() },
+            setBridge: { [weak self] in self?.lyraRelayBridge = $0 },
+            currentBridge: { [weak self] in self?.lyraRelayBridge },
+            setAnnouncer: { [weak self] in self?.lyraRelayAnnouncer = $0 },
+            currentAnnouncer: { [weak self] in self?.lyraRelayAnnouncer },
+            sendPlaintext: sendPlaintext ?? { _ in },
+            relayCallAdvertiseEnabled: {
+                UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
+            },
+            reportedPhoneMeshPort: { Self.reportedPhoneMeshPort() },
+            deviceIdHex: { [weak self] in self?.xiaomiMiShareDiscovery.localDeviceIdHex },
+            displayName: { [weak self] in self?.xiaomiMiShareDiscovery.localDisplayName ?? "EdgeLink Mac" },
+            log: { DiagnosticsLog.info("xiaomi.relayglue.\($0)") }
+        )
     }
 
     private func stopLyraRelayNativeTransport() {
@@ -4777,25 +4781,7 @@ final class EdgeLinkRuntime: ObservableObject {
     // phone registers this Mac as an online relayCall device (gated the same way
     // as the LAN announcer).
     private func startXiaomiRelayAnnouncerIfEnabled() {
-        guard let bridge = lyraRelayBridge else { return }
-        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
-        guard relayCallEnabled else { return }
-        guard let phoneMeshPort = Self.reportedPhoneMeshPort() else {
-            DiagnosticsLog.info("xiaomi.relayannouncer.mac.deferred reason=no_phone_mesh_port")
-            return
-        }
-        // The announcer pins its dial port from the inbound endpoint; point the
-        // relay mesh pipe at the phone's announced mesh port before starting.
-        bridge.mesh.peerPort = phoneMeshPort
-        let announcer = lyraRelayAnnouncer ?? LyraMeshAnnouncer(
-            deviceIdHexProvider: { [weak self] in self?.xiaomiMiShareDiscovery.localDeviceIdHex },
-            displayNameProvider: { [weak self] in self?.xiaomiMiShareDiscovery.localDisplayName ?? "EdgeLink Mac" },
-            meshTransport: bridge.mesh
-        )
-        announcer.relayCallChannelTransport = bridge.channel
-        lyraRelayAnnouncer = announcer
-        announcer.start(host: "127.0.0.1", port: phoneMeshPort)
-        DiagnosticsLog.info("xiaomi.relayannouncer.mac.started port=\(phoneMeshPort)")
+        LyraRelayTransportGlue.startRelayAnnouncerIfEnabled(context: relayBridgeGlueContext())
     }
 
     private static func reportedPhoneMeshPort() -> UInt16? {

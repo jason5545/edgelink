@@ -161,6 +161,7 @@ targets:
       - path: Sources/App/TunnelManager.swift
       - path: Sources/App/LyraRelayCallSession.swift
       - path: Sources/App/LyraRelayCallDialer.swift
+      - path: Sources/App/LyraRelayTransportGlue.swift
       - path: Sources/App/LyraDistHardwareSession.swift
       - path: Sources/App/LyraDistAudioRpcSession.swift
       - path: Sources/App/LyraDistAudioWFD.swift
