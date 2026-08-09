@@ -903,6 +903,149 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(phone.authActionCount, 0)
     }
 
+    // Live 2026-08-08 relay session: the phone's mitrustservice dropped
+    // EVERY status query (not even placeholders) right after channel-ready.
+    // The nudge loop re-sent the query but simply stopped after the budget,
+    // leaving the manager in queryingStatus forever — the mirror window
+    // stayed on 正在連線 while video already played. Nudge exhaustion must
+    // fall back to the Android KeyguardManager report and clear the mask.
+    func testUnansweredStatusQueriesFallBackAfterNudges() async throws {
+        establishedNotifiesVideoFrame = false
+        try makeEnvironment(locked: false)
+        phone.silentStatusQueries = true
+        trustManager.statusNudgeDelay = 0.1
+        trustManager.maxStatusNudges = 2
+        trustManager.externalLockState = { (locked: false, at: Date()) }
+        session.start()
+        controller.start()
+
+        try await waitFor("nudge-exhausted fallback resolved unlocked", timeout: 5) { [self] in
+            if case .ready(let locked) = self.trustManager.state { return !locked }
+            return false
+        }
+        try await waitFor("mask cleared without any phone reply") { [self] in
+            self.controller.mask == nil && self.controller.stage == .streaming
+        }
+        XCTAssertGreaterThanOrEqual(
+            phone.statusActionCount, 3,
+            "initial query plus every nudge must have been sent before falling back"
+        )
+        XCTAssertEqual(biometricCallCount, 0)
+        XCTAssertEqual(phone.authActionCount, 0)
+    }
+
+    // Companion boundary for the nudge-exhausted fallback: with no usable
+    // external report the fallback stays conservative (locked), so the lock
+    // mask — and the unlock entry — remain reachable.
+    func testUnansweredStatusQueriesFallBackConservativeWithoutExternalReport() async throws {
+        try makeEnvironment(locked: false)
+        phone.silentStatusQueries = true
+        trustManager.statusNudgeDelay = 0.1
+        trustManager.maxStatusNudges = 2
+        session.start()
+        controller.start()
+
+        try await waitFor("conservative fallback resolved locked", timeout: 5) { [self] in
+            if case .ready(let locked) = self.trustManager.state { return locked }
+            return false
+        }
+        try await waitFor("lock mask kept without any phone reply") { [self] in
+            self.controller.mask == .locked
+        }
+    }
+
+    // Live 2026-08-08 relay session: video played behind the 正在連線 mask
+    // for ~16s because the status query went unanswered and only the nudge
+    // budget exhaustion resolved it. Once media flows, the trust state must
+    // resolve immediately from the phone's KeyguardManager report and the
+    // mask must clear — long before the nudges run out.
+    func testFlowingMediaResolvesUnansweredStatusEarly() async throws {
+        establishedNotifiesVideoFrame = false
+        try makeEnvironment(locked: false)
+        phone.silentStatusQueries = true
+        trustManager.statusNudgeDelay = 30
+        trustManager.maxStatusNudges = 2
+        trustManager.externalLockState = { (locked: false, at: Date()) }
+        controller.hasRemoteVideo = { false }
+        controller.hasRemoteMedia = { true }
+        session.start()
+        controller.start()
+
+        try await waitFor("media flow resolved the mask early", timeout: 5) { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(
+            phone.statusActionCount, 1,
+            "early resolution must not wait for the nudge loop (30s away in this test)"
+        )
+        XCTAssertEqual(biometricCallCount, 0)
+        XCTAssertEqual(phone.authActionCount, 0)
+    }
+
+    // Live 2026-08-08 relay session: the phone's native stack dropped the
+    // OPEN_MIRROR_SCREEN sent right on channel-ready (channel object not
+    // created yet — "ChannelNotCreatedYet"), and the flow only ever sent
+    // OPEN once, so the phone never started its WFD source and the session
+    // deadlocked. The open timeout must resend OPEN exactly once when no
+    // video ever arrives, and the resend must recover the flow.
+    func testDroppedOpenRecoveredByResend() async throws {
+        try makeEnvironment(locked: false)
+        phone.droppedOpens = 1
+        controller.openTimeout = 0.5
+        session.start()
+        controller.start()
+
+        try await waitFor("OPEN resent after the dropped first attempt") { [self] in
+            self.phone.openMirrorScreenCount >= 2
+        }
+        try await waitFor("flow recovered to streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
+    // Live 2026-08-08 relay cascade: the phone screen was static, so the
+    // official encoder emitted audio-only media (zero video frames is the
+    // documented static-screen behavior). The flow interpreted "no decoded
+    // frames" as a failed OPEN, resent it, and the rebuild storm bricked
+    // the whole path. With media flowing, the open timeout must treat the
+    // mirror as established — no resend, no connect-failed.
+    func testStaticScreenMediaOnlyEstablishesWithoutOpenResend() async throws {
+        establishedNotifiesVideoFrame = false
+        try makeEnvironment(locked: false)
+        controller.openTimeout = 0.5
+        controller.hasRemoteVideo = { false }
+        controller.hasRemoteMedia = { true }
+        // Keep the WFD video out of the open-timeout window so the decision
+        // really rides the media-only path (static screen: audio, no video).
+        phone.wfdServerStartupDelay = 3.0
+        session.start()
+        controller.start()
+
+        try await waitFor("mirror established on audio-only media", timeout: 5) { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(
+            phone.openMirrorScreenCount, 1,
+            "a healthy audio-only stream must never trigger an OPEN resend"
+        )
+    }
+
+    // Companion boundary: when the resend is lost too, the flow gives up to
+    // the retryable connect-failed mask — and resends exactly once (no OPEN
+    // storm; duplicates make the real phone tear down its RTSP server).
+    func testDroppedOpenExhaustsToConnectFailed() async throws {
+        try makeEnvironment(locked: false)
+        phone.droppedOpens = 2
+        controller.openTimeout = 0.3
+        session.start()
+        controller.start()
+
+        try await waitFor("connect-failed after the resend was dropped too", timeout: 5) { [self] in
+            self.controller.mask == .connectFailed
+        }
+        XCTAssertEqual(phone.openMirrorScreenCount, 2, "exactly one resend, no open storm")
+    }
+
     // Regression (2026-08-04 live): phone re-locked, then mirror stop ->
     // quick restart. The Android KeyguardManager push still said "unlocked"
     // (heartbeat from before the lock; the SCREEN_OFF push had not landed),

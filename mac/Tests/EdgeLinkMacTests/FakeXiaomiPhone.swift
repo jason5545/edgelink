@@ -43,6 +43,15 @@ final class FakeXiaomiPhone {
     // resolve, the answer carries enableStatus=enabled and a TRUTHFUL
     // keyguard (official captures, 2026-07-31).
     var conflictingStatus = false
+    // The phone's mitrustservice never answers status queries at all
+    // (relay path right after channel-ready, live 2026-08-08): every query
+    // is dropped without a reply, placeholders included.
+    var silentStatusQueries = false
+    // The phone's native stack drops channel data that arrives before its
+    // channel object is created ("ChannelNotCreatedYet", live 2026-08-08):
+    // the OPEN is never processed (no WFD server) and the phone is unaware
+    // of it — so a dropped OPEN also has no duplicate-OPEN teardown effect.
+    var droppedOpens = 0
     // If set, the first N status queries get the placeholder (lie) treatment
     // and later ones the truthful answer — models the phone's slow
     // getSupportStatus resolving under the official-style retry.
@@ -566,6 +575,10 @@ final class FakeXiaomiPhone {
                 if action.action == LyraCastScreenAction.Action.openMirrorScreen.rawValue {
                     openMirrorScreenCount += 1
                     openMirrorScreenTotal += 1
+                    if droppedOpens > 0 {
+                        droppedOpens -= 1
+                        return
+                    }
                     if releaseChannelAfterOpenCount > 0 {
                         releaseChannelAfterOpenCount -= 1
                         queue.asyncAfter(deadline: .now() + releaseChannelAfterOpenDelay) { [weak self] in
@@ -636,6 +649,9 @@ final class FakeXiaomiPhone {
         switch msg {
         case .statusAction:
             statusActionCount += 1
+            if silentStatusQueries {
+                return
+            }
             if notBoundViaPlaceholder {
                 sendStatusEvent(
                     sessionID: trust.sessionID,

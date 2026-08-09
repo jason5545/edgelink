@@ -38,6 +38,15 @@ final class MacTrustManager: ObservableObject {
     var maxStatusRetries = 5
     private var statusRetryCount = 0
     private var statusQueryEpoch: UInt64 = 0
+    // The placeholder retry loop only runs once the phone answers; a query
+    // dropped without any reply (phone-side mitrustservice not connected
+    // yet — live 2026-08-08 relay session: status_action_sent, then silence
+    // for minutes) would leave the flow in queryingStatus forever and the
+    // mirror window stuck on 正在連線 while video already plays. Re-send
+    // unanswered queries a few times before giving up to the fallback.
+    var statusNudgeDelay: TimeInterval = 4.0
+    var maxStatusNudges = 3
+    private var statusNudgeCount = 0
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
@@ -119,6 +128,7 @@ final class MacTrustManager: ObservableObject {
         sessionID = UInt64.random(in: 1...UInt64.max)
         statusQueryEpoch &+= 1
         statusRetryCount = 0
+        statusNudgeCount = 0
         keyguardInfoConfirmed = false
         // A new flow must re-verify: a 562 unlock confirmed in a previous
         // flow says nothing about the phone's current keyguard (the user may
@@ -126,6 +136,7 @@ final class MacTrustManager: ObservableObject {
         unlockConfirmed = false
         state = .queryingStatus
         sendStatusQuery()
+        scheduleStatusQueryNudge()
     }
 
     private func sendStatusQuery() {
@@ -138,6 +149,63 @@ final class MacTrustManager: ObservableObject {
         action.authMethods = [UInt32(DuoScreenTrustAuthMethod.password), UInt32(DuoScreenTrustAuthMethod.fingerprint)]
         send(.statusAction(action))
         DiagnosticsLog.info("trust.mac.status_action_sent")
+    }
+
+    private func scheduleStatusQueryNudge() {
+        let epoch = statusQueryEpoch
+        let delay = statusNudgeDelay
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self,
+                  self.statusQueryEpoch == epoch,
+                  self.state == .queryingStatus,
+                  self.statusEvent == nil else { return }
+            guard self.statusNudgeCount < self.maxStatusNudges else {
+                // Every query went unanswered (phone-side mitrustservice not
+                // attached yet on the relay path, live 2026-08-08). Staying
+                // in queryingStatus keeps the loading mask forever while
+                // video already plays — fall back exactly like the exhausted
+                // placeholder retries do.
+                self.enterStatusFallback(reason: "nudge_exhausted")
+                return
+            }
+            self.statusNudgeCount += 1
+            DiagnosticsLog.info("trust.mac.status_query_nudge count=\(self.statusNudgeCount)")
+            self.sendStatusQuery()
+            self.scheduleStatusQueryNudge()
+        }
+    }
+
+    // Gave up on duo.screen status: fall back to the phone's own
+    // KeyguardManager report when we have a usable one (duo.screen polls lie
+    // on om1); otherwise stay conservative (locked unless a confirmed
+    // unlock) so the unlock entry stays reachable.
+    private func enterStatusFallback(reason: String) {
+        let externalFallback = usableExternalLockState()
+        let fallbackLocked = externalFallback ?? !unlockConfirmed
+        DiagnosticsLog.info(
+            "trust.mac.status_query_fallback locked=\(fallbackLocked) source=\(externalFallback != nil ? "phone_lock_push" : "conservative") reason=\(reason)"
+        )
+        state = .ready(locked: fallbackLocked)
+        if autoUnlockOnReady {
+            autoUnlockOnReady = false
+            Task { await self.requestUnlock() }
+        }
+    }
+
+    // Media is already flowing while the status query is still unanswered
+    // (relay path: mitrustservice attaches late and drops every query). The
+    // mirror clearly opened, so resolve from the phone's own KeyguardManager
+    // report now instead of holding the loading mask for the whole nudge
+    // budget (live 2026-08-08: video played behind 正在連線 for ~16s).
+    // Returns true when the state was resolved. Without a usable external
+    // report nothing changes — the nudge loop keeps its fallback timing.
+    @discardableResult
+    func resolveStatusEarlyForFlowingMedia() -> Bool {
+        guard state == .queryingStatus,
+              usableExternalLockState() != nil else { return false }
+        enterStatusFallback(reason: "media_flowing")
+        return true
     }
 
     func stop() {
@@ -291,20 +359,7 @@ final class MacTrustManager: ObservableObject {
                 }
             } else {
                 // Placeholders exhausted the official-style retry budget.
-                // Fall back to the phone's own KeyguardManager report when we
-                // have a usable one (duo.screen polls lie on om1); otherwise
-                // stay conservative (locked unless a confirmed unlock) so the
-                // unlock entry stays reachable.
-                let externalFallback = usableExternalLockState()
-                let fallbackLocked = externalFallback ?? !unlockConfirmed
-                DiagnosticsLog.info(
-                    "trust.mac.status_query_fallback locked=\(fallbackLocked) source=\(externalFallback != nil ? "phone_lock_push" : "conservative")"
-                )
-                state = .ready(locked: fallbackLocked)
-                if autoUnlockOnReady {
-                    autoUnlockOnReady = false
-                    Task { await self.requestUnlock() }
-                }
+                enterStatusFallback(reason: "placeholder_retries_exhausted")
             }
             return
         }

@@ -159,6 +159,16 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private var officialMirrorFirstFrameNotified = false
     var onOfficialMirrorFirstFrame: (() -> Void)?
 
+    // Any parsed mirror media (video OR audio) on either receiver. Read by
+    // the mirror flow to distinguish "OPEN never processed" from a healthy
+    // static-screen stream (audio-only, zero video frames).
+    var hasReceivedMPTMedia: Bool {
+        queue.sync {
+            (cloudflareMirrorReceiver?.hasReceivedMPTMedia ?? false)
+                || (officialMirrorReceiver?.hasReceivedMPTMedia ?? false)
+        }
+    }
+
     private let sourceRTPPort: UInt16 = 19_002
     private let officialMPTClientPort: UInt16 = 15_550
     private let officialMPTMaxRTSPRetries = 3
@@ -3046,6 +3056,15 @@ private final class XiaomiMirrorRTPMediaSender {
     private var lastMPTFrameStallDecoderResetUptimeNanoseconds: UInt64 = 0
     private var mptSinkFrameStallDecoderResetCount: UInt64 = 0
     private var externalRTPReceiverStarted = false
+    // Session-scoped latch: set on the first parsed RTP packet (video OR
+    // audio). Lets the mirror flow distinguish "OPEN never processed"
+    // (nothing arrives) from "phone screen is static" (audio-only stream,
+    // zero video frames — the official encoder idles on static content).
+    private var mptMediaReceivedUptime: UInt64 = 0
+
+    var hasReceivedMPTMedia: Bool {
+        queue.sync { mptMediaReceivedUptime > 0 }
+    }
     private var stopped = false
     var onExternalDatagramSend: ((Data) -> Void)?
     var onExternalDatagramBatchSend: (([Data]) -> Void)? {
@@ -3894,6 +3913,9 @@ private final class XiaomiMirrorRTPMediaSender {
             return
         }
         mptSinkRTPPacketsReceived += 1
+        if mptMediaReceivedUptime == 0 {
+            mptMediaReceivedUptime = DispatchTime.now().uptimeNanoseconds
+        }
         let tsInfo = Self.inspectMPEGTS(packet.payload)
         mptSinkTSPacketsReceived += UInt64(tsInfo.packetCount)
         if tsInfo.sync {
@@ -3937,10 +3959,18 @@ private final class XiaomiMirrorRTPMediaSender {
         }
         if delta > 1 {
             mptSinkRTPSequenceGapCount += 1
-            resetMPTSinkAfterTransportLoss(
-                reason: "rtp_sequence_gap",
-                detail: "seq=\(packet.sequenceNumber) expected=\(lastSequence &+ 1) gap=\(delta - 1)"
-            )
+            let missing = delta - 1
+            let detail = "seq=\(packet.sequenceNumber) expected=\(lastSequence &+ 1) gap=\(missing)"
+            if missing <= Self.mptSinkSoftLossMaxMissingPackets {
+                // Small loss: drop the partial AU and keep decoding instead
+                // of freezing on a wait for the next IDR (relay paths lose
+                // individual segments routinely; the source does not resend
+                // parameter sets, so hard resyncs turn every tiny loss into
+                // a multi-second video freeze, live 2026-08-08).
+                noteMPTSinkSoftTransportLoss(reason: "rtp_sequence_gap_soft", detail: detail)
+            } else {
+                resetMPTSinkAfterTransportLoss(reason: "rtp_sequence_gap", detail: detail)
+            }
         }
         mptSinkLastRTPSequenceNumber = packet.sequenceNumber
         return true
@@ -4126,6 +4156,7 @@ private final class XiaomiMirrorRTPMediaSender {
         }
         stopped = true
         externalRTPReceiverStarted = false
+        mptMediaReceivedUptime = 0
         frameTimer?.cancel()
         frameTimer = nil
         rtcpTimer?.cancel()
@@ -4180,7 +4211,11 @@ private final class XiaomiMirrorRTPMediaSender {
     private static let mptSinkInitialSyncNoFrameTimeoutSeconds: Double = 10
     private static let mptSinkVideoESAbsentThresholdSeconds: Double = 5
     private static let mptSinkFrameStallDecoderResetMinIntervalSeconds: Double = 1.5
-    private static let mptSinkSoftLossMaxMissingPackets = 2
+    // RTP gaps are exact (unlike TS CC), but relay-leg burst losses
+    // routinely span more than a couple of packets (KCP attach bursts, data
+    // channel backpressure drops); anything short of a truly broken stream
+    // still salvages better at the next AU boundary than with an IDR wait.
+    private static let mptSinkSoftLossMaxMissingPackets = 128
     private static let rtspInterleavedMagic: UInt8 = 0x24
     private static let rtspInterleavedHeaderLength = 4
     private static let rtpMinimumHeaderLength = 12
@@ -4836,6 +4871,15 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
     private var audioPESParsed: UInt64 = 0
     private var continuityDiscontinuities: UInt64 = 0
     private var duplicateTSPackets: UInt64 = 0
+    // TS continuity gaps are measured mod 16, so a measured "missing" count
+    // can never distinguish a 3-packet loss from a 19-packet burst. All
+    // CC-detectable gaps are therefore treated as soft loss (salvage at the
+    // next AU boundary): the hard path waits for the next IDR, which the
+    // source only emits every few seconds and never republishes parameter
+    // sets for, so each hard wait freezes video for seconds — the relay
+    // session of 2026-08-08 (gaps of 3-15 missing packets, all previously
+    // hard) froze permanently at 75 decoded frames.
+    private let softContinuityGapMaxMissing = 15
     private var didLogPAT = false
     private var didLogPMT = false
     private var didLogPrivateAudioPMT = false
@@ -5057,14 +5101,32 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             return false
         }
         continuityDiscontinuities += 1
-        noteTransportDiscontinuity(reason: "ts_continuity_gap")
+        // CC wraps mod 16: how many TS packets are actually missing.
+        let missing = (Int(continuityCounter) - Int(expected) + 16) % 16
         continuityCounters[pid] = continuityCounter
-        if continuityDiscontinuities <= 5 || continuityDiscontinuities % 20 == 0 {
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.ts_continuity_gap session=\(sessionID.uuidString) " +
-                    "pid=\(Self.hexPID(pid)) previous=\(previous) expected=\(expected) actual=\(continuityCounter) " +
-                    "pusi=\(payloadUnitStart) gaps=\(continuityDiscontinuities)"
-            )
+        if missing <= softContinuityGapMaxMissing {
+            // Lost TS packets (relay-leg segment loss; CC is mod 16 so the
+            // true size is unknown): salvage the stream at the next AU
+            // boundary instead of dropping everything until the next IDR —
+            // that hard wait is what makes relay losses read as repeated or
+            // permanent video freezes (live 2026-08-08).
+            noteSoftTransportDiscontinuity(reason: "ts_continuity_gap_soft")
+            if continuityDiscontinuities <= 5 || continuityDiscontinuities % 20 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.ts_continuity_gap_soft session=\(sessionID.uuidString) " +
+                        "pid=\(Self.hexPID(pid)) previous=\(previous) expected=\(expected) actual=\(continuityCounter) " +
+                        "missing=\(missing) pusi=\(payloadUnitStart) gaps=\(continuityDiscontinuities)"
+                )
+            }
+        } else {
+            noteTransportDiscontinuity(reason: "ts_continuity_gap")
+            if continuityDiscontinuities <= 5 || continuityDiscontinuities % 20 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.ts_continuity_gap session=\(sessionID.uuidString) " +
+                        "pid=\(Self.hexPID(pid)) previous=\(previous) expected=\(expected) actual=\(continuityCounter) " +
+                        "pusi=\(payloadUnitStart) gaps=\(continuityDiscontinuities)"
+                )
+            }
         }
         return true
     }
@@ -5406,6 +5468,15 @@ private final class XiaomiMirrorHEVCDecoder {
     private var needsRandomAccess = false
     private var droppedUntilRandomAccess: UInt64 = 0
     private var resetOnNextRandomAccessReason: String?
+    // Set by requireRandomAccess; the actual VT session teardown is deferred
+    // to the decode queue (decode()). VTDecompressionSessionInvalidate waits
+    // for the session's output-callback queue to drain, so calling it from
+    // inside an output callback (or while one is executing) deadlocks
+    // VideoToolbox permanently — live 2026-08-09: an error callback called
+    // invalidate, the callback queue blocked on itself, every in-flight
+    // DecodeFrame waited on its callback, and the whole decode pipeline
+    // froze at 16 frames while media kept arriving.
+    private var pendingSessionTearDown = false
     var callbacksReceived: UInt64 = 0
     var callbacksErrorStatus: UInt64 = 0
     var callbacksWithoutImage: UInt64 = 0
@@ -5435,7 +5506,10 @@ private final class XiaomiMirrorHEVCDecoder {
     func requireRandomAccess(reason: String) {
         needsRandomAccess = true
         resetOnNextRandomAccessReason = nil
-        invalidate()
+        // Never invalidate here: this runs on the VT output-callback queue
+        // (decode errors) and on the watchdog queue (jam recovery). The
+        // teardown is applied by decode() on the decode queue.
+        pendingSessionTearDown = true
         DiagnosticsLog.warn(
             "xiaomi.mirror.mpt.hevc_decoder_wait_random_access session=\(sessionID.uuidString) reason=\(reason)"
         )
@@ -5453,6 +5527,12 @@ private final class XiaomiMirrorHEVCDecoder {
     func decode(accessUnit: [Data], pts90k: UInt64?) {
         guard !accessUnit.isEmpty else {
             return
+        }
+        if pendingSessionTearDown {
+            pendingSessionTearDown = false
+            // Safe here: the decode queue sits between DecodeFrame calls and
+            // the VT callback queue is free to drain.
+            invalidate()
         }
         updateParameterSets(from: accessUnit)
         guard accessUnit.contains(where: { XiaomiMirrorHEVCAccessUnitAssembler.isVCLNALType(Self.nalType($0)) }) else {
@@ -5552,6 +5632,9 @@ private final class XiaomiMirrorHEVCDecoder {
         }
     }
 
+    // VT session teardown: must only run on the decode queue, never from a
+    // VT output callback or while one is executing (Invalidate waits for the
+    // callback queue to drain — a reentrant call deadlocks the pipeline).
     func invalidate() {
         if let decompressionSession {
             VTDecompressionSessionInvalidate(decompressionSession)

@@ -289,6 +289,9 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiMirrorFlow.hasRemoteVideo = { [weak self] in
             self?.screenSession.hasRemoteVideo ?? false
         }
+        xiaomiMirrorFlow.hasRemoteMedia = { [weak self] in
+            self?.xiaomiMirrorRTSPDiagnosticSource.hasReceivedMPTMedia ?? false
+        }
         xiaomiMirrorFlow.onChanged = { [weak self] _, mask in
             self?.screenSession.xiaomiMirrorMask = mask
         }
@@ -1542,6 +1545,7 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private var castChannelProbeSentAt = Date.distantPast
+    private var lastCastSessionCreatedAt = Date.distantPast
     // Mirror session id from the official PC-client route: epochMs sent in
     // ScreenActionMessage{OPEN_MIRROR_SCREEN} on the cast channel. Non-nil
     // while a cast-channel mirror is active (xiaomiMirrorRealRemote route).
@@ -1600,13 +1604,32 @@ final class EdgeLinkRuntime: ObservableObject {
         let endpoints: [(host: String, port: UInt16)]
         let relayBridge: LyraRelayTransportBridge?
         let relayCastMesh: LyraVirtualMeshPipe?
+        var relayCastFlowIndex = 0
+        // Single-flight: every new cast dial makes the phone release the
+        // channel it just built, so overlapping sessions steal it from each
+        // other in a loop (live 2026-08-08: supervisor + mirror_flow_rebuild
+        // created concurrent sessions; each ready was followed instantly by
+        // trust_channel_released_by_peer). All creation paths (mirror flow,
+        // rebuild poll, supervisor) funnel through here — refuse a second
+        // session within a few seconds of the last attempt; callers retry.
+        if Date().timeIntervalSince(lastCastSessionCreatedAt) < 3 {
+            DiagnosticsLog.info("xiaomi.cast.channel_ensure_throttled reason=\(reason)")
+            return false
+        }
         if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort() {
             // Relay-connected (no LAN): the cast dial rides its own relay mesh
-            // flow (index 1) so the phone sees a fresh peer and answers phys
-            // sync — the Xiaomi mesh service ignores phys sync from the peer
-            // the announcer already authenticated (flow 0). The announcer
-            // keeps running on flow 0.
-            let castMesh = bridge.meshFlow(index: 1)
+            // flow so the phone sees a fresh peer and answers phys sync —
+            // the Xiaomi mesh service ignores phys sync from the peer the
+            // announcer already authenticated (flow 0). The flow index must
+            // be fresh PER DIAL: the phone bridge binds each index to its own
+            // UDP socket, and the mesh service also ignores phys sync from a
+            // source endpoint it has seen before — a reused index redials
+            // from the same socket and gets only KCP ACKs back (live
+            // 2026-08-08: first relay cast dial worked, every redial on
+            // flow 1 timed out in physSync).
+            let flowIndex = Int.random(in: 1...1_000_000_000)
+            relayCastFlowIndex = flowIndex
+            let castMesh = bridge.meshFlow(index: flowIndex)
             castMesh.peerPort = phoneMeshPort
             relayBridge = bridge
             relayCastMesh = castMesh
@@ -1657,18 +1680,19 @@ final class EdgeLinkRuntime: ObservableObject {
                 guard let self, let session, self.lyraCastTrustSession === session else { return }
                 self.lyraCastTrustSession = nil
                 // The announcer kept running on mesh flow 0 while the cast
-                // session owned flow 1; only re-arm if it was torn down in
-                // the meantime (disconnect / transport switch).
+                // session owned its own flow; only re-arm if it was torn
+                // down in the meantime (disconnect / transport switch).
                 if self.lyraRelayAnnouncer == nil {
                     self.startXiaomiRelayAnnouncerIfEnabled()
                 }
             }
         }
         lyraCastTrustSession = session
+        lastCastSessionCreatedAt = Date()
         session.start()
         DiagnosticsLog.info(
             "xiaomi.cast.channel_ensure reason=\(reason) existing=false endpoints=\(endpoints.count) " +
-                "relay=\(relayBridge != nil)"
+                "relay=\(relayBridge != nil) flow=\(relayCastFlowIndex)"
         )
         return false
     }
@@ -2515,8 +2539,14 @@ final class EdgeLinkRuntime: ObservableObject {
         cloudflareMirrorSessionId: String?
     ) {
         let command = "xiaomi.mirror.requestSourceRecovery"
+        // Relay-connected: the Android bridge interprets peerPort as the
+        // LOCAL WFD source port to dial (same as the initial relay start,
+        // which sends 7236). Passing the Mac-side diagnostic listener port
+        // here made the bridge loop on ECONNREFUSED :7102 forever and
+        // churn recovery attempts against the phone (live 2026-08-08).
+        let effectivePeerPort: UInt16 = lyraRelayBridge != nil ? 7236 : peerPort
         var args: [String: String] = [
-            "peerPort": String(peerPort),
+            "peerPort": String(effectivePeerPort),
             "recovery": "true",
             "sourceRecoveryOnly": "true",
             "recoveryAttempt": String(attempt),
@@ -2608,8 +2638,12 @@ final class EdgeLinkRuntime: ObservableObject {
             return
         }
         let command = "xiaomi.mirror.startMainDisplay"
+        // Relay-connected: peerPort is the phone-local WFD source port the
+        // bridge dials (7236), not the Mac-side listener — see the source
+        // recovery command for the :7102 black-hole this caused.
+        let effectivePeerPort: UInt16 = lyraRelayBridge != nil ? 7236 : peerPort
         var args: [String: String] = [
-            "peerPort": String(peerPort),
+            "peerPort": String(effectivePeerPort),
             "recovery": "true",
             "sessionRecovery": "true",
             "recoveryAttempt": String(attempt),
@@ -4691,10 +4725,19 @@ final class EdgeLinkRuntime: ObservableObject {
         // session riding the old bridge's pipes is dead even though
         // isChannelReady stays true (live 2026-08-08: OPEN_MIRROR_SCREEN was
         // sent into the dead channel and the mirror start churned phone-side
-        // cloud sessions until the WebRTC teardown crashed the app). Drop it
-        // so the mirror flow redials on the fresh transport.
-        if let existing = lyraCastTrustSession, existing.isRelayRouted {
-            DiagnosticsLog.info("xiaomi.cast.session_invalidated reason=relay_bridge_reconfigured")
+        // cloud sessions until the WebRTC teardown crashed the app). The
+        // same applies when the transport FLIPPED: a LAN-routed session
+        // whose phone left the LAN keeps its stale isChannelReady and the
+        // flow sends OPEN into a dead pipe — the phone never opens its WFD
+        // source and the bridge loops on ECONNREFUSED (live 2026-08-09:
+        // phone switched to 5G, castChannel=timeout, zero media). Only a
+        // LAN session with the transport still on LAN survives (its mesh
+        // socket is independent of the secure session).
+        if let existing = lyraCastTrustSession,
+           existing.isRelayRouted || transport == "relay" {
+            DiagnosticsLog.info(
+                "xiaomi.cast.session_invalidated reason=relay_bridge_reconfigured relayRouted=\(existing.isRelayRouted) transport=\(transport)"
+            )
             existing.cancel()
             lyraCastTrustSession = nil
             xiaomiMirrorFlow.notifyChannelReleased()

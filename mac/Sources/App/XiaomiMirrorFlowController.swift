@@ -47,6 +47,11 @@ final class XiaomiMirrorFlowController {
     var stopMirrorMedia: () -> Void = {}
     var activateUI: () -> Void = {}
     var hasRemoteVideo: () -> Bool = { false }
+    // Any parsed mirror media (video OR audio) has arrived. The official
+    // encoder emits zero video frames on a static phone screen while audio
+    // keeps flowing, so "media present, no video" is a HEALTHY mirror, not
+    // a failed OPEN.
+    var hasRemoteMedia: () -> Bool = { false }
     var onChanged: ((_ stage: Stage, _ mask: XiaomiMirrorMask?) -> Void)?
     var onTrustState: ((MacTrustManager.State) -> Void)?
     var log: (String) -> Void = { _ in }
@@ -71,6 +76,18 @@ final class XiaomiMirrorFlowController {
     private static let channelReleaseRapidWindow: TimeInterval = 20
     private var rapidChannelReleases = 0
     private var lastChannelReleaseAt: Date = .distantPast
+
+    // Relay-path OPEN hardening (live 2026-08-08): the phone creates its
+    // channel object asynchronously after confirm (observed binder stall of
+    // 761ms), and its native stack DROPS channel data that arrives before
+    // creation ("ChannelNotCreatedYet"). The OPEN_MIRROR_SCREEN sent right
+    // on channel-ready was lost that way — no open, no WFD source, and the
+    // phone bridge looped on ECONNREFUSED :7236 forever. Mitigations: a
+    // short grace delay before the first OPEN on relay, and a single
+    // guarded resend when the open timeout expires with zero video.
+    var relayOpenGrace: TimeInterval = 0.6
+    var openTimeout: TimeInterval = 20
+    private var openResendAttempted = false
 
     init(trustManager: MacTrustManager) {
         self.trustManager = trustManager
@@ -157,6 +174,9 @@ final class XiaomiMirrorFlowController {
     func notifyChannelReady() {
         switch stage {
         case .connecting, .unlocking, .failed:
+            openMirrorScreenNow()
+        case .opening where !openSent:
+            // A pending OPEN resend was waiting on the channel.
             openMirrorScreenNow()
         default:
             break
@@ -288,6 +308,7 @@ final class XiaomiMirrorFlowController {
     func stop() {
         flowGeneration &+= 1
         openSent = false
+        openResendAttempted = false
         lastStopAt = Date()
         rapidChannelReleases = 0
         stage = .idle
@@ -304,24 +325,105 @@ final class XiaomiMirrorFlowController {
     private func openMirrorScreenNow() {
         guard !openSent,
               let session = sessionProvider(), session.isChannelReady,
-              stage != .opening, stage != .streaming else { return }
-        openSent = true
-        stage = .opening
-        // Re-opening from a failed state must re-arm the open timeout,
-        // which only fires under the loading/no mask.
-        if mask == .connectFailed {
-            mask = .loading
+              stage != .streaming else { return }
+        if stage != .opening {
+            stage = .opening
+            // Re-opening from a failed state must re-arm the open timeout,
+            // which only fires under the loading/no mask.
+            if mask == .connectFailed {
+                mask = .loading
+            }
+            trustManager.start()
         }
-        openMirrorScreen(session)
-        trustManager.start()
+        openSent = true
         let generation = flowGeneration
+        if session.isRelayRouted && relayOpenGrace > 0 {
+            // Relay path: hold the OPEN briefly so the phone finishes
+            // creating its channel object first — data sent before that is
+            // dropped by the native stack (ChannelNotCreatedYet, live
+            // 2026-08-08: the whole session deadlocked on it).
+            openSent = false
+            Task { @MainActor [weak self] in
+                let grace = self?.relayOpenGrace ?? 0
+                try? await Task.sleep(nanoseconds: UInt64(grace * 1_000_000_000))
+                guard let self, generation == self.flowGeneration,
+                      self.stage == .opening, !self.openSent else { return }
+                self.openSent = true
+                self.openMirrorScreen(session)
+                self.armOpenTimeout(generation: generation)
+            }
+        } else {
+            openMirrorScreen(session)
+            armOpenTimeout(generation: generation)
+        }
+    }
+
+    // While the open is in flight and the trust status query is still
+    // unanswered, watch for the first media: a flowing stream proves the
+    // OPEN was processed, so the trust state can resolve early from the
+    // phone's KeyguardManager report instead of holding the loading mask
+    // for the full nudge budget (live 2026-08-08: ~16s of 正在連線 over
+    // playing video).
+    private func armMediaFlowWatch(generation: UInt64) {
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            while let self,
+                  generation == self.flowGeneration,
+                  self.stage == .opening,
+                  self.trustManager.state == .queryingStatus {
+                if self.hasRemoteMedia(),
+                   self.trustManager.resolveStatusEarlyForFlowingMedia() {
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+    }
+
+    private func armOpenTimeout(generation: UInt64) {
+        let timeout = openTimeout
+        armMediaFlowWatch(generation: generation)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard let self,
                   generation == self.flowGeneration,
                   self.stage == .opening,
                   !self.hasRemoteVideo(),
                   self.mask == .loading || self.mask == nil else {
+                return
+            }
+            if self.hasRemoteMedia() {
+                // Media is flowing but the phone screen is static, so the
+                // encoder emits no video (audio-only stream). OPEN was
+                // clearly processed — resending it would tear down the
+                // phone's RTSP server and failing would kill a healthy
+                // session (live 2026-08-08: that resend started a rebuild
+                // cascade that bricked the whole relay path). Treat the
+                // mirror as established and wait for the first video frame.
+                self.log("xiaomi.mac.mirror_open_media_only generation=\(generation)")
+                self.stage = .streaming
+                if case .ready(let locked) = self.trustManager.state {
+                    self.mask = locked ? .locked : nil
+                }
+                return
+            }
+            if !self.openResendAttempted {
+                // Zero video this long after OPEN means the OPEN almost
+                // certainly never reached the phone's message handler (a
+                // processed OPEN starts the WFD source and media within a
+                // couple of seconds). A duplicate OPEN is only dangerous
+                // mid-stream, so resending here is safe — and it is the
+                // only way to recover the dropped-datagram case.
+                self.openResendAttempted = true
+                self.openSent = false
+                self.log("xiaomi.mac.mirror_open_resend generation=\(generation)")
+                if let session = self.sessionProvider(), session.isChannelReady {
+                    self.openMirrorScreen(session)
+                    self.openSent = true
+                    self.armOpenTimeout(generation: generation)
+                } else if self.sessionProvider() == nil {
+                    self.sessionFactory("mirror_open_resend")
+                }
+                // Channel dead: notifyChannelReady re-opens once redialed.
                 return
             }
             self.stage = .failed
@@ -366,7 +468,9 @@ final class XiaomiMirrorFlowController {
                     retryRequested()
                     break
                 }
-                if hasRemoteVideo() {
+                if hasRemoteVideo() || hasRemoteMedia() {
+                    // Media (video, or audio on a static screen) proves the
+                    // OPEN was processed: the mirror is established.
                     stage = .streaming
                     mask = nil
                 } else if stage != .opening {

@@ -2006,7 +2006,12 @@ final class LyraCastTrustSession {
             }
         }
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
-            guard let self else { return }
+            // A cancelled session must not resurrect: pipe teardown is async,
+            // so in-flight datagrams can still complete the negotiation after
+            // cancel() — the ghost "ready" fires onChannelReady into a dead
+            // session and steals the mirror flow from its replacement (live
+            // 2026-08-08: double 通道已建立 in the same second as a release).
+            guard let self, !self.cancelled else { return }
             DiagnosticsLog.info("xiaomi.cast.trust_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
             self.channelReady = true
             self.progress(.ready, String(localized: "通道已建立"))
