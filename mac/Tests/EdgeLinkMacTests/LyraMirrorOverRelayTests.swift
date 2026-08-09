@@ -40,9 +40,16 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     private var clientBridge: LyraRelayTransportBridge?
     private var phoneTunnel: LyraTunnelBridge?
     private var pair: LoopbackChannelPair?
+    private var impairedPair: ImpairedChannelPair?
     private var hostLoop: Task<Void, Error>?
     private var clientLoop: Task<Void, Error>?
     private var savedIsExpectedPhoneHost: ((String) -> Bool)?
+
+    // When set, the relay session pair crosses an impaired link (cloud-relay
+    // conditions) instead of the perfect loopback. Configure before calling
+    // establishRelaySession().
+    var impairmentHostToClient: RelayImpairmentProfile?
+    var impairmentClientToHost: RelayImpairmentProfile?
 
     // Unique port block per test (the WFD TCP listener and the video UDP
     // listener bind real sockets; the previous test's release is async).
@@ -88,6 +95,9 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         pair?.hostSide.close()
         pair?.clientSide.close()
         pair = nil
+        impairedPair?.hostSide.close()
+        impairedPair?.clientSide.close()
+        impairedPair = nil
         hostBridge = nil
         clientBridge = nil
         phoneTunnel = nil
@@ -112,8 +122,22 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     // MARK: - Relay session pair (the cloud relay stand-in)
 
     private func establishRelaySession() async throws {
-        let pair = LoopbackChannelPair()
-        self.pair = pair
+        let hostChannel: ByteChannel
+        let clientChannel: ByteChannel
+        if impairmentHostToClient != nil || impairmentClientToHost != nil {
+            let pair = ImpairedChannelPair(
+                hostToClient: impairmentHostToClient ?? .perfect,
+                clientToHost: impairmentClientToHost ?? .perfect
+            )
+            impairedPair = pair
+            hostChannel = pair.hostSide
+            clientChannel = pair.clientSide
+        } else {
+            let pair = LoopbackChannelPair()
+            self.pair = pair
+            hostChannel = pair.hostSide
+            clientChannel = pair.clientSide
+        }
         let hostIdentity = LocalIdentity(
             deviceId: "123456789", name: "FakeServer",
             signingKey: Curve25519.Signing.PrivateKey()
@@ -131,7 +155,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             try await hostSessionBox.session?.sendPlaintext(data)
         })
         let hostSession = LyraRelaySession(
-            channel: pair.hostSide,
+            channel: hostChannel,
             identity: hostIdentity,
             onEnvelope: { type, plaintext in
                 if LyraRelayTransportBridge.handles(type) {
@@ -154,7 +178,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             try await clientSessionBox.session?.sendPlaintext(data)
         })
         let clientSession = LyraRelaySession(
-            channel: pair.clientSide,
+            channel: clientChannel,
             identity: clientIdentity,
             onEnvelope: { type, plaintext in
                 if LyraRelayTransportBridge.handles(type) {
@@ -174,7 +198,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
 
         async let hostAccept: Void = hostSession.acceptAsHost(pinnedClientPublicKey: clientIdentity.publicKey)
         async let clientConnect: Void = clientSession.connectAsClient(pinnedHostPublicKey: hostIdentity.publicKey)
-        try await (hostAccept, clientConnect)
+        _ = try await (hostAccept, clientConnect)
 
         hostLoop = Task { try await hostSession.receiveLoop() }
         clientLoop = Task { try await clientSession.receiveLoop() }
@@ -205,6 +229,11 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             clientVideoPort: clientVideoPort
         )
         phone.cast.setLocked(locked)
+        phone.onEvent = { event in
+            if case .log(let text) = event {
+                DiagnosticsLog.info("fakephone.\(text)")
+            }
+        }
         // Live-phone behavior: the WFD RTSP listener comes up asynchronously
         // after the phone processes OPEN_MIRROR_SCREEN, so the tunnel's first
         // dial lands before it listens. The phone-side dial must retry
@@ -227,10 +256,17 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         let controller = XiaomiMirrorFlowController(trustManager: trustManager)
         controller.sessionProvider = { [weak self] in self?.session }
         controller.sessionFactory = { [weak self] _ in
-            self?.session?.cancel()
-            self?.session = nil
-            self?.attachSession()
-            self?.session?.start()
+            guard let self else { return }
+            self.session?.cancel()
+            self.session = nil
+            // Production presents a fresh UDP peer per cast dial (641c8da39),
+            // which restarts the phone's KCP sn at 0. Reset both flow pipes
+            // or the phone-side dedupe drops the rebuilt dial's sn=0 frames
+            // behind the old recvUna.
+            self.clientBridge?.meshFlow(index: 1).stop()
+            try? self.clientBridge?.meshFlow(index: 1).start(preferredPort: self.phoneMeshPort)
+            self.attachSession()
+            self.session?.start()
         }
         controller.biometricEvaluate = {}
         controller.openMirrorScreen = { [weak self] session in
@@ -473,6 +509,246 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         }
         XCTAssertEqual(controller.stage, .idle)
         XCTAssertNil(controller.mask)
+    }
+
+    // MARK: - Trust Unlocked over the cloud relay
+
+    // Trust Unlocked over the relay: locked phone, every mesh and channel
+    // datagram crossing the relay session. 解除鎖定 runs Touch ID → the 562
+    // duo.screen authAction rides the relay-carried cast channel → the phone
+    // dials mitrustservice over the relay-carried mesh and drives
+    // 595/546/562 → auth event → mask clears → video streams.
+    func testTrustUnlockOverCloudRelay() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        try await driveUnlockToStreaming()
+    }
+
+    // Same unlock, but at the measured HiNet↔Cloudflare WAN latency: the
+    // mitrust KeyAgree + peer-port + channel exchange adds several WAN round
+    // trips and must still complete inside the flow's patience.
+    func testTrustUnlockOverCloudRelayAtWANLatency() async throws {
+        impairmentHostToClient = .hiNetCloudflareWANOrdered
+        impairmentClientToHost = .hiNetCloudflareWANOrdered
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        try await driveUnlockToStreaming()
+    }
+
+    // Same unlock over an unordered link: reordered relay frames must not
+    // kill the session (sliding-window anti-replay) nor wedge the mitrust
+    // dial's KCP reassembly.
+    func testTrustUnlockOverCloudRelayToleratesReordering() async throws {
+        impairmentHostToClient = .hiNetCloudflareWAN
+        impairmentClientToHost = .hiNetCloudflareWAN
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        try await driveUnlockToStreaming()
+    }
+
+    private func driveUnlockToStreaming() async throws {
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready over relay") { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("lock mask from truthful locked status") {
+            controller.mask == .locked
+        }
+        try await waitFor("OPEN sent even while locked (official)") {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("phone received duo.screen authAction (562) over relay") {
+            phone.cast.authActionCount >= 1
+        }
+        try await waitFor("phone verified auth_token_A (562/563) over relay") {
+            phone.cast.mitrustUnlockCompleted && phone.cast.lastAuthTokenA != nil
+        }
+        try await waitFor("mask cleared via confirmed unlock") {
+            controller.mask == nil
+        }
+        try await waitFor("video datagrams flowing after unlock") {
+            self.videoDatagramsReceived >= 3
+        }
+        try await waitFor("controller streaming") {
+            controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
+    // MARK: - Limit tests: impaired cloud-relay link
+
+    // Measured Mac(HiNet)↔Cloudflare SIN detour (docs/relay-analysis.md):
+    // ~67ms RTT, order preserved. The full mirror control plane must
+    // complete at production WAN latency, not just on a perfect loopback.
+    func testMirrorFlowOverCloudRelayAtWANLatency() async throws {
+        impairmentHostToClient = .hiNetCloudflareWANOrdered
+        impairmentClientToHost = .hiNetCloudflareWANOrdered
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready over WAN relay") { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("OPEN_MIRROR_SCREEN over WAN relay") {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+        try await waitFor("WFD established over the TCP tunnel") {
+            phone.cast.wfdSessionEstablished
+        }
+        try await waitFor("video datagrams flowing") {
+            self.videoDatagramsReceived >= 3
+        }
+        try await waitFor("controller streaming, mask cleared") {
+            controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
+    // The production relay data channel is unordered: jitter makes consecutive
+    // envelopes swap. If a mesh KCP segment arrives after a newer one, the
+    // pipe's sn dedupe drops it and the missing chunk wedges frame reassembly
+    // forever — the dial must still recover (session-level retry), not hang.
+    func testMirrorFlowOverCloudRelayToleratesReordering() async throws {
+        impairmentHostToClient = .hiNetCloudflareWAN
+        impairmentClientToHost = .hiNetCloudflareWAN
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready despite reordering", timeout: 45) { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("OPEN_MIRROR_SCREEN despite reordering", timeout: 45) {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+        try await waitFor("controller streaming despite reordering", timeout: 45) {
+            controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
+    // Frame-loss limit probe. The production relay legs are TCP WebSockets
+    // (lossless), so this documents the boundary: a lost relay frame drops a
+    // KCP segment the mesh pipe never retransmits, so a dial caught in a
+    // loss burst wedges permanently — the production recovery is the
+    // watchdog + session rebuild (transport flips rebuild the relay session
+    // anyway). Assert exactly that: the burst wedges the first dial, and the
+    // rebuild path recovers the flow once the link has healed.
+    func testMirrorFlowOverCloudRelayRecoversAfterBurstyLoss() async throws {
+        impairmentHostToClient = .hiNetCloudflareWANOrdered
+        impairmentClientToHost = .hiNetCloudflareWANOrdered
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+
+        // Burst: 25% loss on both legs for the first 2.5s of the dial.
+        let pair = try XCTUnwrap(impairedPair)
+        pair.hostSide.updateProfile { $0.loss = 0.25 }
+        pair.clientSide.updateProfile { $0.loss = 0.25 }
+
+        session.start()
+        controller.start()
+
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        pair.hostSide.updateProfile { $0.loss = 0 }
+        pair.clientSide.updateProfile { $0.loss = 0 }
+        XCTAssertGreaterThan(pair.hostSide.stats.dropped + pair.clientSide.stats.dropped, 0,
+                             "test must actually drop frames")
+
+        // Give the first dial a chance to prove the wedge, then drive the
+        // production recovery: rebuild the session on the healed link.
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+        controller.sessionFactory("loss_burst_rebuild")
+
+        try await waitFor("cast channel ready after rebuild on healed link", timeout: 60) { [weak self] in
+            self?.session?.isChannelReady == true
+        }
+        try await waitFor("OPEN_MIRROR_SCREEN after rebuild", timeout: 60) {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+        try await waitFor("controller streaming after rebuild", timeout: 60) {
+            controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
+    // WiFi→5G transport flip (live 2026-08-09 root cause): the relay path
+    // drops every datagram for seconds while the phone re-registers. The
+    // session must survive the blackout without crashing or wedging, and the
+    // control plane must answer again once the link heals.
+    func testMirrorFlowOverCloudRelaySurvivesTransportFlipBlackout() async throws {
+        // Perfect baseline link; the blackout is the only impairment.
+        impairmentHostToClient = .perfect
+        impairmentClientToHost = .perfect
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("streaming before the flip") {
+            controller.stage == .streaming && controller.mask == nil
+        }
+
+        let pair = try XCTUnwrap(impairedPair)
+        pair.hostSide.blackout(for: 3)
+        pair.clientSide.blackout(for: 3)
+
+        // During the blackout a user stop must not crash or deadlock the
+        // session; the CLOSE is simply lost.
+        session.sendScreenAction(.closeScreen(sessionId: 99))
+        try await Task.sleep(nanoseconds: 3_500_000_000)
+
+        // Link healed: the channel must still round-trip. Re-drive a status
+        // query by re-arming the flow's trust manager.
+        try await waitFor("channel still ready after blackout") { [weak session] in
+            session?.isChannelReady == true
+        }
+        session.sendScreenAction(.openMirrorScreen(sessionId: 100))
+        try await waitFor("phone answers again after blackout") {
+            phone.cast.openMirrorScreenCount >= 2
+        }
+    }
+
+    // Retired flows were resurrected by late duplicate datagrams on 5G
+    // (fa6d2b5b8): the pipes must dedupe by KCP sn, so heavy duplication
+    // must not corrupt the control plane or double-fire OPEN handling.
+    func testMirrorFlowOverCloudRelayWithDuplicates() async throws {
+        impairmentHostToClient = .hiNetCloudflareWAN
+        var dup = RelayImpairmentProfile.hiNetCloudflareWAN
+        dup.duplicate = 0.2
+        impairmentClientToHost = dup
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("streaming with 20% duplicated datagrams", timeout: 40) {
+            controller.stage == .streaming && controller.mask == nil
+        }
+        XCTAssertEqual(phone.cast.openMirrorScreenCount, 1, "duplicate OPENs must be deduped by the phone's flow guard")
+        let stats = impairedPair?.clientSide.stats
+        XCTAssertGreaterThan(stats?.duplicated ?? 0, 0, "test must actually inject duplicates")
     }
 }
 

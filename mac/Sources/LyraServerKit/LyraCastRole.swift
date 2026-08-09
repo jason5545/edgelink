@@ -31,6 +31,10 @@ public final class LyraCastRole: LyraServiceHandler {
     public private(set) var wfdPlayCount = 0
     public private(set) var videoDatagramsSent = 0
     public private(set) var idrRequestCount = 0
+    public private(set) var mitrustBindCompleted = false
+    public private(set) var mitrustUnlockCompleted = false
+    public private(set) var mitrustUnlockCount = 0
+    public private(set) var lastAuthTokenA: Data?
 
     public var bound = true
     public var conflictingStatus = false
@@ -107,6 +111,10 @@ public final class LyraCastRole: LyraServiceHandler {
     }
 
     public func handleServiceLogiConn(_ logiConn: LogiConnFrame, server: LyraPhoneMeshServer) {
+        if logiConn.logiConnId == mitrustConnId, mitrustConnId != 0 {
+            handleMitrustLogiConn(logiConn, server: server)
+            return
+        }
         if logiConn.flag {
             handleEncryptedLogiConn(logiConn, server: server)
             return
@@ -497,10 +505,346 @@ public final class LyraCastRole: LyraServiceHandler {
                 sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
                     DuoScreenTrust(sessionID: trust.sessionID, msg: .authEvent(event))
                 ))
+            } else {
+                // The real phone's trustservice answers the 562 authAction by
+                // dialing the Mac's mitrustservice and driving the
+                // 595/546/562 JSON auth on the adopted channel.
+                runMitrustUnlock()
             }
         default:
             break
         }
+    }
+
+    // MARK: - mitrustservice adoption (phone-initiated, like the real phone)
+    //
+    // Ported from FakeXiaomiPhone: after the Mac's duo.screen authAction the
+    // phone's trustservice dials com.xiaomi.trustservice:mitrustservice,
+    // upgrades with KeyAgree (P256 ECDH + HKDF), requests a peer port, and
+    // drives the 595/546/562 JSON auth on the adopted channel. On 563 the
+    // phone verifies auth_token_A, unlocks, and reports the auth event.
+
+    private var mitrustConnId: UInt32 = 0
+    private var mitrustKeyAgreePriv: P256.KeyAgreement.PrivateKey?
+    private var mitrustClientRandom = Data()
+    private var mitrustSessionKey: SymmetricKey?
+    private var mitrustTransKey = Data()
+    private let mitrustClientChannelId: UInt64 = 13
+    private var mitrustServerPort: UInt16 = 0
+    private var mitrustConnection: NWConnection?
+    private var mitrustSendSn: UInt32 = 0
+    private var mitrustRecvUna: UInt32 = 0
+    private var mitrustSessionKeyHex: String?
+    private var saidB = Data()
+
+    private func runMitrustUnlock() {
+        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.startMitrustAdoption()
+        }
+    }
+
+    private func startMitrustAdoption() {
+        guard let server else { return }
+        mitrustConnId = UInt32.random(in: 1...UInt32.max)
+        // Each unlock run adopts a fresh mitrustservice conn and dials a fresh
+        // channel on it — drop the previous run's (now stale) connection and
+        // sequence state so a re-locked phone can unlock again.
+        mitrustConnection?.cancel()
+        mitrustConnection = nil
+        mitrustServerPort = 0
+        mitrustSendSn = 0
+        mitrustRecvUna = 0
+        server.adoptOutboundConn(connId: mitrustConnId, handler: self)
+
+        let phoneConnId = randomBytes(8)
+        let phoneKey = Curve25519.KeyAgreement.PrivateKey()
+        var cred = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: phoneConnId, to: &cred)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: phoneKey.publicKey.rawRepresentation, to: &cred)
+        var syncInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(2, value: 48, to: &syncInfo)
+        LyraProtoWriter.appendVarintField(3, value: 1, to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(
+            4, value: Data("com.xiaomi.trustservice:mitrustservice".utf8), to: &syncInfo
+        )
+        LyraProtoWriter.appendLengthDelimitedField(5, value: cred, to: &syncInfo)
+        let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
+        server.sendLogi(connId: mitrustConnId, inner: inner)
+
+        // responseOfPeerPort arrives as a plaintext packType-5 command.
+        let previousHandler = server.plaintextCommandHandler
+        server.plaintextCommandHandler = { [weak self] command in
+            guard let self, self.handleMitrustPlaintextCommand(command) else {
+                return previousHandler?(command) ?? false
+            }
+            return true
+        }
+        onEvent("mitrust adoption dialed connId=\(mitrustConnId)")
+    }
+
+    private func handleMitrustLogiConn(_ logiConn: LogiConnFrame, server: LyraPhoneMeshServer) {
+        if logiConn.flag, let key = mitrustSessionKey,
+           let plaintext = LyraAuthHandshake.gcmOpen(logiConn.inner, using: key),
+           let inner = LogiConnInnerFrame(parsing: plaintext)
+        {
+            // Mac answered our mitrust logi request; ack so it sends its
+            // responseOfPeerPort (it holds the answer until response_ack).
+            if case .response = inner.payload {
+                let ack = LogiConnInnerFrame(frameType: 3, payload: .responseAck(Data()))
+                server.sendLogi(connId: mitrustConnId, inner: ack, encryptWith: key)
+            }
+            return
+        }
+        guard !logiConn.flag, let inner = LogiConnInnerFrame(parsing: logiConn.inner) else { return }
+        switch inner.payload {
+        case .syncInfo:
+            sendMitrustKeyAgree(server: server)
+        case .upgrade(let data):
+            handleMitrustKeyAgreeReply(data, server: server)
+        default:
+            break
+        }
+    }
+
+    private func sendMitrustKeyAgree(server: LyraPhoneMeshServer) {
+        let phoneKey = P256.KeyAgreement.PrivateKey()
+        mitrustKeyAgreePriv = phoneKey
+        let clientRandom = randomBytes(32)
+        mitrustClientRandom = clientRandom
+        var pkMsg = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &pkMsg)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: phoneKey.publicKey.x963Representation, to: &pkMsg)
+        var cipher = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &cipher)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: clientRandom, to: &cipher)
+        LyraProtoWriter.appendVarintField(3, value: 32, to: &cipher)
+        LyraProtoWriter.appendVarintField(4, value: 2, to: &cipher)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: pkMsg, to: &cipher)
+        var clientNotify = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: cipher, to: &clientNotify)
+        var pairFrame = Data()
+        LyraProtoWriter.appendLengthDelimitedField(2, value: clientNotify, to: &pairFrame)
+        var handshake = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &handshake)
+        LyraProtoWriter.appendVarintField(2, value: 6, to: &handshake)
+        LyraProtoWriter.appendLengthDelimitedField(8, value: pairFrame, to: &handshake)
+        var authFrame = Data()
+        LyraProtoWriter.appendVarintField(1, value: UInt64.random(in: 1...UInt64(UInt32.max)), to: &authFrame)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: handshake, to: &authFrame)
+        let inner = LogiConnInnerFrame(frameType: 6, payload: .upgrade(authFrame))
+        server.sendLogi(connId: mitrustConnId, inner: inner)
+    }
+
+    private func handleMitrustKeyAgreeReply(_ data: Data, server: LyraPhoneMeshServer) {
+        guard let handshakeFrame = LyraAuthHandshake.lengthDelimited(2, in: data),
+              let pairFrame = LyraAuthHandshake.lengthDelimited(8, in: handshakeFrame),
+              let serverNotify = LyraAuthHandshake.lengthDelimited(3, in: pairFrame),
+              let cipherSuite = LyraAuthHandshake.lengthDelimited(1, in: serverNotify),
+              let serverRandom = LyraAuthHandshake.lengthDelimited(2, in: cipherSuite),
+              let publicKeyMessage = LyraAuthHandshake.lengthDelimited(5, in: cipherSuite),
+              let publicKey = LyraAuthHandshake.lengthDelimited(2, in: publicKeyMessage),
+              let serverKey = try? P256.KeyAgreement.PublicKey(x963Representation: publicKey),
+              let phoneKey = mitrustKeyAgreePriv,
+              let secret = try? phoneKey.sharedSecretFromKeyAgreement(with: serverKey)
+                .withUnsafeBytes({ Data($0) })
+        else {
+            onEvent("mitrust keyagree_reply_parse_failed")
+            return
+        }
+        mitrustSessionKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: secret),
+            salt: LyraMeshHkdf.salt,
+            info: mitrustClientRandom + serverRandom,
+            outputByteCount: 32
+        )
+        // Send the mitrustservice logi request (encrypted) with our
+        // requestOfPeerPort embedded in UserInfo f10, like the real phone.
+        mitrustTransKey = randomBytes(32)
+        var peerPortRequest = Data()
+        LyraProtoWriter.appendVarintField(1, value: mitrustClientChannelId, to: &peerPortRequest)
+        LyraProtoWriter.appendLengthDelimitedField(4, value: mitrustTransKey, to: &peerPortRequest)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: randomBytes(32), to: &peerPortRequest)
+        var userInfo = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &userInfo)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data("com.xiaomi.trustservice".utf8), to: &userInfo)
+        LyraProtoWriter.appendLengthDelimitedField(
+            3, value: Data(Self.colonHex(randomBytes(32)).utf8), to: &userInfo
+        )
+        LyraProtoWriter.appendLengthDelimitedField(10, value: peerPortRequest, to: &userInfo)
+        var requestData = Data()
+        LyraProtoWriter.appendVarintField(1, value: 1, to: &requestData)
+        LyraProtoWriter.appendLengthDelimitedField(
+            2, value: Data("com.xiaomi.trustservice:mitrustservice".utf8), to: &requestData
+        )
+        LyraProtoWriter.appendLengthDelimitedField(3, value: userInfo, to: &requestData)
+        let request = LogiConnInnerFrame(frameType: 1, payload: .request(requestData))
+        guard let key = mitrustSessionKey else { return }
+        server.sendLogi(connId: mitrustConnId, inner: request, encryptWith: key)
+    }
+
+    private func handleMitrustPlaintextCommand(_ command: Data) -> Bool {
+        guard let (header, body) = try? LyraChannelProtocol.decode(command),
+              header.type == LyraChannelProtocol.CommandType.responseOfPeerPort.rawValue
+        else { return false }
+        let fields = (try? LyraProtoReader.readFields(from: body)) ?? []
+        var port: UInt16 = 0
+        for field in fields where field.number == 3 {
+            port = UInt16(field.varintValue ?? 0)
+        }
+        guard port != 0 else { return false }
+        mitrustServerPort = port
+        onEvent("mitrust peer_port port=\(port)")
+        connectMitrustChannel()
+        return true
+    }
+
+    // MARK: - mitrust channel client (595/546/562)
+
+    private func connectMitrustChannel() {
+        guard mitrustServerPort != 0, mitrustConnection == nil else { return }
+        let port = NWEndpoint.Port(rawValue: mitrustServerPort)!
+        let connection = NWConnection(host: "127.0.0.1", port: port, using: .udp)
+        mitrustConnection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            self?.queue.async {
+                if case .ready = state {
+                    self?.sendMitrustNegotiation()
+                }
+            }
+        }
+        connection.start(queue: queue)
+        receiveMitrust(on: connection)
+    }
+
+    private func sendMitrustNegotiation() {
+        let tlv = LyraExpressTLV.oneOfNode(
+            tag: 0xFFFF,
+            selectedTag: 0,
+            child: LyraExpressTLV.containerNode(tag: 0, children: [
+                LyraExpressTLV.int32Node(tag: 0, value: UInt32(mitrustClientChannelId)),
+                LyraExpressTLV.int32Node(tag: 1, value: 1),
+                LyraExpressTLV.int32Node(tag: 2, value: 0xFF00)
+            ])
+        )
+        sendMitrustPacket(tlv)
+        queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.sendMitrustJSON(["event_name": 595, "client_hello": "client_hello"])
+        }
+    }
+
+    private func sendMitrustPacket(_ payload: Data) {
+        let datagram = LyraMeshDatagram.encode(
+            tick: LyraMeshSocket.tick(), sn: mitrustSendSn, una: mitrustRecvUna, payload: payload
+        )
+        mitrustSendSn &+= 1
+        mitrustConnection?.send(content: datagram, completion: .idempotent)
+    }
+
+    private func sendMitrustJSON(_ object: [String: Any]) {
+        guard let json = try? JSONSerialization.data(withJSONObject: object) else { return }
+        let frame = LyraChannelSocket.wrapChannelFrame(json)
+        guard let packet = try? LyraSocketPacket.encode(
+            plaintext: frame, key: SymmetricKey(data: mitrustTransKey)
+        ) else { return }
+        sendMitrustPacket(packet)
+    }
+
+    private func receiveMitrust(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] content, _, _, error in
+            guard let self else { return }
+            if let content, !content.isEmpty,
+               let segment = try? LyraMeshDatagram.decodeSegment(content),
+               segment.command == LyraMeshDatagram.commandPush
+            {
+                let isDuplicate = segment.sn < self.mitrustRecvUna
+                if !isDuplicate {
+                    self.mitrustRecvUna = segment.sn &+ 1
+                    self.queue.async { self.handleMitrustPacket(segment.payload) }
+                }
+            }
+            if error == nil {
+                self.receiveMitrust(on: connection)
+            }
+        }
+    }
+
+    private func handleMitrustPacket(_ payload: Data) {
+        let bytes = Array(payload)
+        guard bytes.count >= 2 else { return }
+        if bytes[0] == 0x01, bytes[1] == 0x01 {
+            return // negotiation reply
+        }
+        guard bytes[0] == 0x81, bytes[1] == 0x04,
+              let decodedPacket = try? LyraSocketPacket.decode(
+                  Data(payload), key: SymmetricKey(data: mitrustTransKey)
+              ),
+              let (tag, child) = try? LyraExpressTLVParser.parseOneOf(decodedPacket.plaintext), tag == 1,
+              let payloadNode = LyraExpressTLVParser.firstChild(
+                  0, in: LyraExpressTLVParser.children(of: child)
+              ),
+              let object = try? JSONSerialization.jsonObject(with: payloadNode.payload) as? [String: Any],
+              let eventName = (object["event_name"] as? NSNumber)?.intValue
+        else { return }
+        onEvent("mitrust rx event=\(eventName)")
+        switch eventName {
+        case 593:
+            guard let key = object["sessionkey"] as? String else { return }
+            mitrustSessionKeyHex = key
+            sendMitrustJSON(["event_name": 594, "sessionkey": key, "client_key_exchange": "client_key_exchange"])
+            sendMitrustJSON(["event_name": 546, "shared_auth_id_B": saidBHex()])
+        case 547:
+            mitrustBindCompleted = true
+            var tokenB = Data([0x01])
+            tokenB.append(0x12)
+            var length = UInt32(32).littleEndian
+            tokenB.append(Data(bytes: &length, count: 4))
+            tokenB.append(randomBytes(32))
+            sendMitrustJSON([
+                "event_name": 562,
+                "shared_auth_id_B": saidBHex(),
+                "auth_token_B": tokenB.map { String(format: "%02x", $0) }.joined(),
+                "auth_type": 5,
+                "auth_level": 2
+            ])
+        case 563:
+            guard let tokenAHex = object["auth_token_A"] as? String,
+                  let tokenA = Self.data(fromHex: tokenAHex) else { return }
+            lastAuthTokenA = tokenA
+            mitrustUnlockCompleted = true
+            mitrustUnlockCount += 1
+            locked = false
+            onEvent("mitrust unlocked")
+            let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
+            sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                DuoScreenTrust(sessionID: 0, msg: .authEvent(event))
+            ))
+        default:
+            break
+        }
+    }
+
+    private func saidBHex() -> String {
+        if saidB.isEmpty {
+            saidB = randomBytes(32)
+        }
+        return saidB.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func colonHex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined(separator: ":")
+    }
+
+    private static func data(fromHex hex: String) -> Data? {
+        var data = Data()
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        return data
     }
 
     // MARK: - WFD RTSP server
