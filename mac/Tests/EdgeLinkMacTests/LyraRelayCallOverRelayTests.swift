@@ -43,8 +43,15 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
     private var hostBridge: LyraRelayTransportBridge?
     private var clientBridge: LyraRelayTransportBridge?
     private var pair: LoopbackChannelPair?
+    private var impairedPair: ImpairedChannelPair?
     private var hostLoop: Task<Void, Error>?
     private var clientLoop: Task<Void, Error>?
+
+    // When set, the relay session pair crosses an impaired link (cloud-relay
+    // conditions) instead of the perfect loopback. Configure before calling
+    // establishRelaySession().
+    var impairmentHostToClient: RelayImpairmentProfile?
+    var impairmentClientToHost: RelayImpairmentProfile?
 
     override func setUp() {
         super.setUp()
@@ -81,6 +88,9 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
         pair?.hostSide.close()
         pair?.clientSide.close()
         pair = nil
+        impairedPair?.hostSide.close()
+        impairedPair?.clientSide.close()
+        impairedPair = nil
         announcer?.stop()
         announcer = nil
         phone?.stop()
@@ -104,8 +114,22 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
     // MARK: - Relay session pair (the cloud relay stand-in)
 
     private func establishRelaySession() async throws {
-        let pair = LoopbackChannelPair()
-        self.pair = pair
+        let hostChannel: ByteChannel
+        let clientChannel: ByteChannel
+        if impairmentHostToClient != nil || impairmentClientToHost != nil {
+            let pair = ImpairedChannelPair(
+                hostToClient: impairmentHostToClient ?? .perfect,
+                clientToHost: impairmentClientToHost ?? .perfect
+            )
+            impairedPair = pair
+            hostChannel = pair.hostSide
+            clientChannel = pair.clientSide
+        } else {
+            let pair = LoopbackChannelPair()
+            self.pair = pair
+            hostChannel = pair.hostSide
+            clientChannel = pair.clientSide
+        }
         let hostIdentity = LocalIdentity(
             deviceId: "123456789", name: "FakeServer",
             signingKey: Curve25519.Signing.PrivateKey()
@@ -120,7 +144,7 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
             try await hostSessionBox.session?.sendPlaintext(data)
         })
         let hostSession = LyraRelaySession(
-            channel: pair.hostSide,
+            channel: hostChannel,
             identity: hostIdentity,
             onEnvelope: { type, plaintext in
                 if LyraRelayTransportBridge.handles(type) {
@@ -135,7 +159,7 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
             try await clientSessionBox.session?.sendPlaintext(data)
         })
         let clientSession = LyraRelaySession(
-            channel: pair.clientSide,
+            channel: clientChannel,
             identity: clientIdentity,
             onEnvelope: { type, plaintext in
                 if LyraRelayTransportBridge.handles(type) {
@@ -152,7 +176,7 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
 
         async let hostAccept: Void = hostSession.acceptAsHost(pinnedClientPublicKey: clientIdentity.publicKey)
         async let clientConnect: Void = clientSession.connectAsClient(pinnedHostPublicKey: hostIdentity.publicKey)
-        try await (hostAccept, clientConnect)
+        _ = try await (hostAccept, clientConnect)
 
         hostLoop = Task { try await hostSession.receiveLoop() }
         clientLoop = Task { try await clientSession.receiveLoop() }
@@ -265,6 +289,111 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
         let record = try XCTUnwrap(phone.oracle.records.values.first)
         XCTAssertEqual(record.trustedType, 0)
         XCTAssertFalse(phone.dialRelayCallIfOnline())
+    }
+
+    // MARK: - Limit tests: impaired cloud-relay link
+
+    // The full registration + ring chain at the measured HiNet↔Cloudflare
+    // WAN latency (ordered, like the production WebSocket relay legs).
+    func testIncomingRingOverCloudRelayAtWANLatency() async throws {
+        impairmentHostToClient = .hiNetCloudflareWANOrdered
+        impairmentClientToHost = .hiNetCloudflareWANOrdered
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        let phone = try XCTUnwrap(self.phone)
+
+        await waitFor("Mac online in oracle at WAN latency", timeout: 30) {
+            phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        await waitFor("relayCall channel up at WAN latency", timeout: 30) {
+            phone.relayCall.state == .channelUp
+        }
+        phone.relayCall.sendRing(number: "0912345678")
+        await waitFor("ring response 200 at WAN latency", timeout: 30) {
+            phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+    }
+
+    // Unordered delivery: reordered relay frames must not kill the session
+    // nor the announce/dial handshake riding it.
+    func testIncomingRingOverCloudRelayToleratesReordering() async throws {
+        impairmentHostToClient = .hiNetCloudflareWAN
+        impairmentClientToHost = .hiNetCloudflareWAN
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        let phone = try XCTUnwrap(self.phone)
+
+        await waitFor("Mac online in oracle despite reordering", timeout: 30) {
+            phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        await waitFor("relayCall channel up despite reordering", timeout: 30) {
+            phone.relayCall.state == .channelUp
+        }
+        phone.relayCall.sendRing(number: "0912345678")
+        await waitFor("ring response 200 despite reordering", timeout: 30) {
+            phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+    }
+
+    // Heavy duplication (5G late-datagram redelivery): the pipes dedupe by
+    // KCP sn and the session by the anti-replay window; the chain completes.
+    func testIncomingRingOverCloudRelayWithDuplicates() async throws {
+        var dup = RelayImpairmentProfile.hiNetCloudflareWAN
+        dup.duplicate = 0.2
+        impairmentHostToClient = .hiNetCloudflareWAN
+        impairmentClientToHost = dup
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        let phone = try XCTUnwrap(self.phone)
+
+        await waitFor("Mac online in oracle with duplicates", timeout: 30) {
+            phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        await waitFor("relayCall channel up with duplicates", timeout: 30) {
+            phone.relayCall.state == .channelUp
+        }
+        phone.relayCall.sendRing(number: "0912345678")
+        await waitFor("ring response 200 with duplicates", timeout: 30) {
+            phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+        XCTAssertGreaterThan(impairedPair?.clientSide.stats.duplicated ?? 0, 0,
+                             "test must actually inject duplicates")
+    }
+
+    // WiFi→5G transport flip mid-call: the relay path drops every datagram
+    // for seconds. The channel must not die, and a ring sent after the link
+    // heals must still round-trip.
+    func testCallRingOverCloudRelaySurvivesTransportFlipBlackout() async throws {
+        impairmentHostToClient = .perfect
+        impairmentClientToHost = .perfect
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        let phone = try XCTUnwrap(self.phone)
+
+        await waitFor("Mac online in oracle before the flip") {
+            phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        await waitFor("relayCall channel up before the flip") {
+            phone.relayCall.state == .channelUp
+        }
+
+        let pair = try XCTUnwrap(impairedPair)
+        pair.hostSide.blackout(for: 3)
+        pair.clientSide.blackout(for: 3)
+        // A ring during the blackout is simply lost — it must not wedge the
+        // channel or crash the session.
+        phone.relayCall.sendRing(number: "0912345678")
+        try await Task.sleep(nanoseconds: 3_500_000_000)
+        XCTAssertNil(phone.relayCall.lastRingResponse, "the blackout ring must stay unanswered")
+
+        phone.relayCall.sendRing(number: "0987654321")
+        await waitFor("ring response 200 after the blackout", timeout: 30) {
+            phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
     }
 }
 
