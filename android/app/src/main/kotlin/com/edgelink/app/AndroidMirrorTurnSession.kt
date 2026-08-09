@@ -59,10 +59,17 @@ class AndroidMirrorTurnSession(
     private var dataChannelOpen = false
     @Volatile
     private var iceDisconnectedRunnable: Runnable? = null
+    // Last observed ICE path: true when either end is a TURN relay candidate,
+    // false once both ends are known non-relay (direct LAN), null while the
+    // nominated pair's candidate types are not known yet.
+    @Volatile
+    private var relayPath: Boolean? = null
     private val createdAtMs = android.os.SystemClock.elapsedRealtime()
     private var datagramsSent = 0L
     private var datagramsSentBytes = 0L
     private var datagramsReceived = 0L
+
+    fun isRelayPath(): Boolean? = relayPath
 
     @Synchronized
     fun handleOffer(body: MiLinkMirrorRtcOfferBody) {
@@ -331,6 +338,9 @@ class AndroidMirrorTurnSession(
         val rttMs = members.statDouble("currentRoundTripTime")?.let { it * 1_000.0 }
         val bitrate = members.statDouble("availableOutgoingBitrate")
             ?: members.statDouble("availableIncomingBitrate")
+        if (localType != null && remoteType != null) {
+            relayPath = localType == "relay" || remoteType == "relay"
+        }
         EdgeLinkLog.info(
             "mirror.turn.stats sessionId=$sessionId open=$dataChannelOpen " +
                 "rttMs=${formatStat1(rttMs)} abwKbps=${formatStatKbps(bitrate)} " +

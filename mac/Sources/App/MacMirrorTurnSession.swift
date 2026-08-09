@@ -115,6 +115,11 @@ final class MacMirrorTurnSession: NSObject, @unchecked Sendable {
             self.peerConnection = peerConnection
 
             let channelConfig = RTCDataChannelConfiguration()
+            // UDP semantics for the KCP tunnel: 5 Mbps video + PCM audio was
+            // verified to flow loss-free over this channel at the paced rate;
+            // KCP retransmits the rare drop end to end. A reliable channel
+            // instead buffered retransmits, inflated RTT to 250ms, and
+            // starved the stream (live 2026-08-09).
             channelConfig.isOrdered = false
             channelConfig.maxRetransmits = 0
             guard let dataChannel = peerConnection.dataChannel(

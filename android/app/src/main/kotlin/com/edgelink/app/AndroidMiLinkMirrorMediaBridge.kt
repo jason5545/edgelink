@@ -35,14 +35,20 @@ object AndroidMiLinkMirrorMediaBridge {
     private const val RTSP_KEEPALIVE_INTERVAL_MS = 30_000L
     private const val TURN_IDR_REQUEST_POLL_MS = 200L
     private const val TURN_PACER_BYTES_PER_SECOND = 600_000.0
-    private const val TURN_PACER_BYTES_PER_NS = TURN_PACER_BYTES_PER_SECOND / 1_000_000_000.0
+    // Direct data-channel paths (host/srflx candidates, no TURN relay in the
+    // leg) are not bound by the ~5-6 Mbps Cloudflare allocation cap; pace
+    // just above the ~5 Mbps video + ~1.5 Mbps PCM audio media rate so the
+    // token bucket only engages on retransmission bursts, never in steady
+    // state (a chronic pace deficit delays source ACKs past their RTO and
+    // ignites a retransmission storm — live 2026-08-09).
+    private const val TURN_PACER_DIRECT_BYTES_PER_SECOND = 900_000.0
     private const val TURN_PACER_BURST_BYTES = 65_536
     private const val TURN_PACER_MAX_DELAY_MS = 30L
     // Data-channel backpressure: once libwebrtc's SCTP buffer grows past the
-    // ceiling, hold the loopback forward loop briefly instead of piling more
-    // into a buffer that starts dropping sends (silent KCP gaps on the Mac).
-    private const val TURN_DC_BUFFERED_CEILING_BYTES = 1_000_000L
-    private const val TURN_DC_BACKPRESSURE_MAX_WAIT_MS = 20L
+    // ceiling, drop instead of piling more into it (bufferbloat inflated RTT
+    // to 250ms at a 1MB ceiling, live 2026-08-09). Withheld ACKs make the
+    // source retransmit the dropped segments once the buffer drains.
+    private const val TURN_DC_BUFFERED_CEILING_BYTES = 262_144L
     private const val RTP_BATCH_MAX_PAYLOAD_BYTES = 6_144
     private const val RTP_BATCH_MAX_DELAY_MS = 3L
     private const val RTP_BATCH_QUEUE_CAPACITY = 1_024
@@ -157,7 +163,8 @@ object AndroidMiLinkMirrorMediaBridge {
     fun attachTurnDataChannel(
         sessionId: String,
         sendDatagram: (ByteArray) -> Boolean,
-        dcBufferedBytes: () -> Long
+        dcBufferedBytes: () -> Long,
+        dcPathIsRelay: () -> Boolean?
     ): Boolean {
         val session = activeSession
         if (session == null || sessionId != activeSessionId) {
@@ -166,7 +173,7 @@ object AndroidMiLinkMirrorMediaBridge {
             )
             return false
         }
-        return session.attachTurnDataChannel(sendDatagram, dcBufferedBytes)
+        return session.attachTurnDataChannel(sendDatagram, dcBufferedBytes, dcPathIsRelay)
     }
 
     fun detachTurnDataChannel(sessionId: String, reason: String) {
@@ -291,11 +298,13 @@ object AndroidMiLinkMirrorMediaBridge {
         private var turnSendDatagram: ((ByteArray) -> Boolean)? = null
         @Volatile
         private var turnDcBufferedBytes: (() -> Long)? = null
+        @Volatile
+        private var turnDcPathIsRelay: (() -> Boolean?)? = null
         private var turnLoopbackIn = 0L
         private var turnLoopbackDropped = 0L
         private var turnMacControlDropped = 0L
         private var turnDcSendFailed = 0L
-        private var turnDcBackpressureWaits = 0L
+        private var turnDcBackpressureDrops = 0L
         private var kcpSink: MiLinkMirrorKcpSink? = null
         private var ackViaLoopback = false
         private var turnPaceTokens = TURN_PACER_BURST_BYTES.toDouble()
@@ -309,7 +318,8 @@ object AndroidMiLinkMirrorMediaBridge {
 
         fun attachTurnDataChannel(
             sendDatagram: (ByteArray) -> Boolean,
-            dcBufferedBytes: () -> Long
+            dcBufferedBytes: () -> Long,
+            dcPathIsRelay: () -> Boolean?
         ): Boolean {
             if (!turnMode || turnFallbackTriggered) {
                 EdgeLinkLog.info(
@@ -319,6 +329,7 @@ object AndroidMiLinkMirrorMediaBridge {
             }
             turnSendDatagram = sendDatagram
             turnDcBufferedBytes = dcBufferedBytes
+            turnDcPathIsRelay = dcPathIsRelay
             turnDataChannelActive = true
             // The source starts streaming on PLAY before the data channel
             // opens, so the first IDR is always dropped pre-attach. Ask for a
@@ -335,6 +346,7 @@ object AndroidMiLinkMirrorMediaBridge {
             turnDataChannelActive = false
             turnSendDatagram = null
             turnDcBufferedBytes = null
+            turnDcPathIsRelay = null
         }
 
         fun switchToWebSocketFallback(reason: String) {
@@ -345,6 +357,7 @@ object AndroidMiLinkMirrorMediaBridge {
             turnDataChannelActive = false
             turnSendDatagram = null
             turnDcBufferedBytes = null
+            turnDcPathIsRelay = null
             EdgeLinkLog.warn(
                 "mirror.turn.ws_fallback sessionId=$sessionId reason=$reason loopbackIn=$turnLoopbackIn dropped=$turnLoopbackDropped"
             )
@@ -630,37 +643,54 @@ object AndroidMiLinkMirrorMediaBridge {
                         )
                     }
                     val forward = turnSendDatagram
-                    var forwarded = false
                     if (turnDataChannelActive && forward != null) {
-                        if (paceTurnDatagram(data.size)) {
-                            awaitTurnSendWindow()
+                        // Conditional ACK on every path: the sink ACKs only
+                        // segments that were actually handed to the data
+                        // channel. Withheld ACKs make the source's KCP
+                        // retransmit drops and — just as important — throttle
+                        // the source down to the rate the dc leg can sustain.
+                        // Unconditional immediate ACKs let the source stream
+                        // at encoder rate regardless of dc capacity: the
+                        // excess either shed inside the unreliable SCTP
+                        // association (40% loss, live 2026-08-09) or pinned
+                        // the reliable SCTP buffer at its ceiling and inflated
+                        // RTT to 250ms while the receive loop stalled behind
+                        // backpressure waits, delaying source ACKs ~400ms and
+                        // igniting a retransmission storm (pcap 2026-08-09).
+                        // Drops below (pacing, backpressure, pre-attach) heal
+                        // themselves via source retransmit.
+                        val buffered = turnDcBufferedBytes?.invoke() ?: 0L
+                        var forwarded = false
+                        if (buffered > TURN_DC_BUFFERED_CEILING_BYTES) {
+                            // Do not pile into a congested SCTP buffer
+                            // (bufferbloat). Dropping here withholds the ACK,
+                            // so the source retransmits once the buffer has
+                            // drained — the dc drain rate becomes the source
+                            // rate.
+                            turnDcBackpressureDrops += 1
+                            if (turnDcBackpressureDrops == 1L || turnDcBackpressureDrops % 500 == 0L) {
+                                EdgeLinkLog.warn(
+                                    "mirror.turn.dc_backpressure_drop sessionId=$sessionId " +
+                                        "count=$turnDcBackpressureDrops bufferedBytes=$buffered"
+                                )
+                            }
+                        } else if (paceTurnDatagram(data.size)) {
                             forwarded = forward(data)
                             if (!forwarded) {
                                 turnDcSendFailed += 1
                                 if (turnDcSendFailed == 1L || turnDcSendFailed % 500 == 0L) {
                                     EdgeLinkLog.warn(
                                         "mirror.turn.dc_send_failed sessionId=$sessionId " +
-                                            "count=$turnDcSendFailed bufferedBytes=${turnDcBufferedBytes?.invoke() ?: -1}"
+                                            "count=$turnDcSendFailed bufferedBytes=$buffered"
                                     )
                                 }
                             }
                         }
+                        if (forwarded) {
+                            ensureKcpSink(socket).receiveDatagram(data)
+                        }
                     } else {
                         turnLoopbackDropped += 1
-                    }
-                    if (forwarded) {
-                        // Terminate the source-facing KCP locally, but ACK
-                        // only what actually left for the Mac: a withheld
-                        // ACK makes the source's KCP retransmit the dropped
-                        // segment (~RTO), so TURN-side drops (dc buffer full
-                        // on scene-change bursts, pacing, pre-attach) heal
-                        // themselves. Unconditional local ACKs turned every
-                        // drop into a permanent KCP gap the Mac could only
-                        // escape via stall-resync + IDR wait — fatal on a
-                        // static screen where no IDR ever comes (live
-                        // 2026-08-08: unlock burst dropped 22 segments,
-                        // video froze for good).
-                        ensureKcpSink(socket).receiveDatagram(data)
                     }
                     continue
                 }
@@ -1019,8 +1049,19 @@ object AndroidMiLinkMirrorMediaBridge {
         // 5 Mbps encoder plus KCP retransmits otherwise overruns the pipe and
         // collapses it. Pace just under the cap; short bursts pass through,
         // sustained excess is delayed up to a bound, then dropped (the
-        // source's KCP retransmits drops).
+        // source's KCP retransmits drops). Direct paths (no TURN relay in
+        // the leg) pace at a rate the encoder never reaches.
+        private fun turnPaceBytesPerNs(): Double {
+            val rate = if (turnDcPathIsRelay?.invoke() == false) {
+                TURN_PACER_DIRECT_BYTES_PER_SECOND
+            } else {
+                TURN_PACER_BYTES_PER_SECOND
+            }
+            return rate / 1_000_000_000.0
+        }
+
         private suspend fun paceTurnDatagram(bytes: Int): Boolean {
+            val bytesPerNs = turnPaceBytesPerNs()
             val now = System.nanoTime()
             if (turnPaceLastRefillNs == 0L) {
                 turnPaceLastRefillNs = now
@@ -1028,14 +1069,14 @@ object AndroidMiLinkMirrorMediaBridge {
             val elapsedNs = now - turnPaceLastRefillNs
             turnPaceTokens = minOf(
                 TURN_PACER_BURST_BYTES.toDouble(),
-                turnPaceTokens + elapsedNs * TURN_PACER_BYTES_PER_NS
+                turnPaceTokens + elapsedNs * bytesPerNs
             )
             turnPaceLastRefillNs = now
             turnPaceTokens -= bytes
             if (turnPaceTokens >= 0) {
                 return true
             }
-            val deficitMs = ((-turnPaceTokens) / TURN_PACER_BYTES_PER_NS / 1_000_000).toLong()
+            val deficitMs = ((-turnPaceTokens) / bytesPerNs / 1_000_000).toLong()
             if (deficitMs <= TURN_PACER_MAX_DELAY_MS) {
                 turnPaceDelayed += 1
                 delay(deficitMs)
@@ -1055,28 +1096,6 @@ object AndroidMiLinkMirrorMediaBridge {
                 )
             }
             return false
-        }
-
-        // Bounded backpressure on the data channel's SCTP buffer: when it
-        // grows past the ceiling, wait briefly for it to drain before
-        // forwarding more. Converts burst losses (send() failures -> KCP gaps
-        // -> video freezes on the Mac) into a few ms of latency.
-        private suspend fun awaitTurnSendWindow() {
-            val buffered = turnDcBufferedBytes ?: return
-            var waitedMs = 0L
-            while (buffered() > TURN_DC_BUFFERED_CEILING_BYTES && waitedMs < TURN_DC_BACKPRESSURE_MAX_WAIT_MS) {
-                delay(2)
-                waitedMs += 2
-            }
-            if (waitedMs > 0) {
-                turnDcBackpressureWaits += 1
-                if (turnDcBackpressureWaits == 1L || turnDcBackpressureWaits % 2_000 == 0L) {
-                    EdgeLinkLog.info(
-                        "mirror.turn.dc_backpressure sessionId=$sessionId count=$turnDcBackpressureWaits " +
-                            "waitedMs=$waitedMs bufferedBytes=${buffered()}"
-                    )
-                }
-            }
         }
 
         private suspend fun turnIdrRequestLoop() {
@@ -1345,7 +1364,7 @@ object AndroidMiLinkMirrorMediaBridge {
 
 private const val XIAOMI_OFFICIAL_HEVC_VIDEO_FORMATS = "40 0 2 10 1ffff 1fffffff 0fff 0 0 0 0 none none"
 private const val XIAOMI_OFFICIAL_VIDEO_BITRATE = 5_000_000
-private const val XIAOMI_TURN_VIDEO_BITRATE = 4_000_000
+private const val XIAOMI_TURN_VIDEO_BITRATE = 5_000_000
 private val OFFICIAL_ALWAYS_RETURNED_PARAMETERS = setOf(
     "wfd_audio_codecs",
     "wfd_audio_codecs_v2",

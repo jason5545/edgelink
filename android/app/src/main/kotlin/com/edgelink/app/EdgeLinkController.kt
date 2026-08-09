@@ -624,7 +624,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 val attached = AndroidMiLinkMirrorMediaBridge.attachTurnDataChannel(
                     sessionId = body.sessionId,
                     sendDatagram = { data -> mirrorTurnSession?.send(data) ?: false },
-                    dcBufferedBytes = { mirrorTurnSession?.bufferedAmount() ?: 0L }
+                    dcBufferedBytes = { mirrorTurnSession?.bufferedAmount() ?: 0L },
+                    dcPathIsRelay = { mirrorTurnSession?.isRelayPath() }
                 )
                 if (!attached) {
                     mirrorTurnSession?.close("bridge_attach_rejected")

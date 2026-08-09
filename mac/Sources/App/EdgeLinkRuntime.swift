@@ -4496,6 +4496,20 @@ final class EdgeLinkRuntime: ObservableObject {
         peerClipboardBlobSupported = caps.clipboardBlob
         peerCapabilityMirrorTurn = caps.mirrorTurnDataChannel
         DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail) blob=\(caps.clipboardBlob) mirrorTurn=\(caps.mirrorTurnDataChannel)")
+        // Answer with our own caps. The phone sends its caps every time its
+        // process reconnects; if our session lived through that restart we
+        // never re-announce, and the phone's view of mirrorTurnDataChannel
+        // stays false — its mirror route then degrades from TURN to the
+        // WS/cloudflare fallback (live 2026-08-09: phone restart left every
+        // startMainDisplay on cloudflare and the mirror stalled mid-stream).
+        // The phone never replies to caps, so there is no ping-pong.
+        if let session = currentSession,
+           let capsData = try? encoder.encode(Envelope(t: EnvelopeType.statusCaps, b: StatusCapsBody(photoSync: photoSyncEnabled, mirrorTurnDataChannel: true))) {
+            Task {
+                try? await session.sendPlaintext(capsData)
+                DiagnosticsLog.info("clipboard.mac.caps_reply_sent")
+            }
+        }
     }
 
     private func handleClipboardHistoryResponse(_ response: ClipboardHistoryResponseBody) {
