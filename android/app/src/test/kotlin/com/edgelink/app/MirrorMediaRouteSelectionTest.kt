@@ -68,10 +68,31 @@ class MirrorMediaRouteSelectionTest {
         val selection = selectMirrorMediaRouteFor(
             args = args,
             lanProbeReachable = true,
+            lanSourceReachable = true,
             peerMirrorTurnSupported = true
         )
         assertEquals(MirrorMediaTransport.LAN_DIRECT, selection.transport)
         assertNull(selection.cloudSessionId)
+    }
+
+    // Live 2026-08-09: relay-carried control session → the phone's Mirror
+    // source is loopback-bound, so the Mac's lan_direct RTSP dial is refused
+    // and the stream stalls ~40s before the fallback. A reachable Mac probe
+    // is not enough — the phone's own source must answer on the LAN too.
+    @Test
+    fun lanProbeReachableButSourceLocalOnlyVetoesDirect() {
+        val args = relayArgs() + mapOf(
+            "peerHost" to "10.0.0.5",
+            "lanProbePort" to "43210"
+        )
+        val selection = selectMirrorMediaRouteFor(
+            args = args,
+            lanProbeReachable = true,
+            lanSourceReachable = false,
+            peerMirrorTurnSupported = true
+        )
+        assertEquals(MirrorMediaTransport.TURN, selection.transport)
+        assertEquals("session-1", selection.cloudSessionId)
     }
 
     @Test

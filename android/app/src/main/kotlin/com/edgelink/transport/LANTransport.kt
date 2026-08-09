@@ -4,8 +4,10 @@ import com.edgelink.app.EdgeLinkLog
 import com.edgelink.core.PhoneActionBody
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 
 object LANTransport {
@@ -15,6 +17,33 @@ object LANTransport {
     private const val PROBE_REQUEST = "EDGELINK-LAN-PROBE/1\n"
     private const val PROBE_RESPONSE = "EDGELINK-LAN-OK/1\n"
     private const val PROBE_TIMEOUT_MS = 750
+
+    // The phone's own LAN IPv4 (wlan0 preferred), null on loopback-only.
+    fun preferredLocalIPv4Address(): String? =
+        runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            var fallback: String? = null
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+                if (!networkInterface.isUp || networkInterface.isLoopback) {
+                    continue
+                }
+                val addresses = networkInterface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is Inet4Address && !address.isLoopbackAddress) {
+                        val host = address.hostAddress
+                        if (networkInterface.name == "wlan0") {
+                            return@runCatching host
+                        }
+                        if (fallback == null) {
+                            fallback = host
+                        }
+                    }
+                }
+            }
+            fallback
+        }.getOrNull()
 
     suspend fun preferLAN(body: PhoneActionBody): PhoneActionBody {
         val lanHost = body.lanHost?.trim()?.takeIf { it.isNotEmpty() } ?: return body
@@ -50,6 +79,22 @@ object LANTransport {
             relaySessionId = null,
             relayControlPort = null
         )
+    }
+
+    // Plain TCP connect check (no probe protocol) — used to verify the
+    // phone's own WFD source actually listens on its LAN address before
+    // telling the Mac to dial it (lan_direct).
+    suspend fun isTcpConnectable(host: String?, port: Int?, timeoutMs: Int = 300): Boolean {
+        val normalizedHost = host?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        val normalizedPort = port?.takeIf { it in 1..65_535 } ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(normalizedHost, normalizedPort), timeoutMs)
+                }
+                true
+            }.getOrDefault(false)
+        }
     }
 
     suspend fun isReachable(host: String?, port: Int?): Boolean {

@@ -372,7 +372,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onMeshTargetResponsive = { port ->
             recordResponsiveMeshPort(port)
-        }
+        },
+        // Present the relay-carried cast channel from the phone's LAN address
+        // (when it has one) so MirrorControl binds its WFD RTSP source to the
+        // LAN interface — that keeps lan_direct media viable even though the
+        // control session rides the cloud relay. Loopback when there is no
+        // LAN (true remote case), matching the pre-LAN behavior.
+        channelTargetHost = { LANTransport.preferredLocalIPv4Address() ?: "127.0.0.1" }
     )
 
     val state: StateFlow<EdgeLinkUiState> = stateFlow

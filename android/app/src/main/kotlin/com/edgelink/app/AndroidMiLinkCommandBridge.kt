@@ -57,6 +57,7 @@ data class MirrorMediaRouteSelection(
 fun selectMirrorMediaRouteFor(
     args: Map<String, String>,
     lanProbeReachable: Boolean,
+    lanSourceReachable: Boolean = false,
     peerMirrorTurnSupported: Boolean
 ): MirrorMediaRouteSelection {
     val cloudSessionId = args["mirrorSessionId"]
@@ -64,7 +65,7 @@ fun selectMirrorMediaRouteFor(
         ?.takeIf { it.isNotEmpty() && args["mediaTransport"] == "cloudflare" }
     val hasProbeArgs = args["peerHost"]?.trim()?.takeIf { it.isNotEmpty() } != null &&
         args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 } != null
-    if (cloudSessionId != null && hasProbeArgs && lanProbeReachable) {
+    if (cloudSessionId != null && hasProbeArgs && lanProbeReachable && lanSourceReachable) {
         return MirrorMediaRouteSelection(MirrorMediaTransport.LAN_DIRECT, cloudSessionId = null)
     }
     if (cloudSessionId != null && args["mirrorTurn"] == "1" && peerMirrorTurnSupported) {
@@ -911,16 +912,35 @@ class AndroidMiLinkCommandBridge(
         val probePort = body.args["lanProbePort"]?.toIntOrNull()?.takeIf { it in 1..65_535 }
         val probeReachable = peerHost != null && probePort != null &&
             LANTransport.isReachable(peerHost, probePort)
+        // lan_direct makes the Mac dial THIS phone's WFD source (peerPort)
+        // over LAN. When the control session rode the relay, MirrorControl
+        // bound its RTSP server to loopback and the Mac's dial is refused
+        // outright (live 2026-08-09: four refused dials, then a 40s stall
+        // before the turn fallback). Veto lan_direct up front in that state.
+        val lanSourceReachable = if (probeReachable && peerPort != null) {
+            val localHost = preferredLocalIPv4Address()
+            localHost != null && LANTransport.isTcpConnectable(localHost, peerPort)
+        } else {
+            false
+        }
         val selection = selectMirrorMediaRouteFor(
             args = body.args,
             lanProbeReachable = probeReachable,
+            lanSourceReachable = lanSourceReachable,
             peerMirrorTurnSupported = peerMirrorTurnDataChannelSupported()
         )
         EdgeLinkLog.info(
             "xiaomi.mirror.android.media_route reason=$reason " +
                 "transport=${selection.transport.name.lowercase()} " +
-                "peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1}"
+                "peer=${peerHost ?: "none"}:${peerPort ?: -1} probePort=${probePort ?: -1} " +
+                "lanSource=${if (lanSourceReachable) "reachable" else "unreachable"}"
         )
+        if (probeReachable && !lanSourceReachable && selection.transport != MirrorMediaTransport.LAN_DIRECT) {
+            EdgeLinkLog.warn(
+                "xiaomi.mirror.android.lan_direct_vetoed reason=source_not_on_lan " +
+                    "port=${peerPort ?: -1} transport=${selection.transport.name.lowercase()}"
+            )
+        }
         return selection
     }
 
