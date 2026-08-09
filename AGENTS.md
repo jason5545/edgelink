@@ -55,6 +55,12 @@
   adb shell "run-as com.edgelink.app tail -60 files/diagnostics.log"
   ```
 
+- Mac diagnostics log：
+
+  ```sh
+  tail -200 ~/Library/Application\ Support/EdgeLink/diagnostics.log
+  ```
+
 - TeleService relay、`RelayLog` 與 call-relay flow 在 radio buffer，不是在一般 main buffer：
 
   ```sh
