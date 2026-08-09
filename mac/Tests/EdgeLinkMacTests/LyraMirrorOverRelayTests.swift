@@ -582,6 +582,71 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         }
     }
 
+    // Transport flip end-to-end: the relay session is torn down wholesale
+    // (worker reconnect / WiFi→5G), then production invalidates everything
+    // riding it (9ddc75ac0) and re-registers from scratch — fresh relay
+    // handshake, fresh mesh/channel pipes, fresh cast dial. The full mirror
+    // flow must come back without any state leaking from the old session.
+    func testMirrorFlowRecoversAfterRelaySessionReplaced() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        try await driveMirrorFlowToStreaming()
+
+        // Wholesale teardown of everything bound to the old relay session.
+        hostLoop?.cancel()
+        clientLoop?.cancel()
+        hostLoop = nil
+        clientLoop = nil
+        controller?.stop()
+        wfdClient?.stop(reason: "transport_flip")
+        videoListener?.cancel()
+        videoListener = nil
+        videoConnection?.cancel()
+        videoConnection = nil
+        videoDatagramsReceived = 0
+        session?.cancel()
+        session = nil
+        phone?.stop()
+        phone = nil
+        pair?.hostSide.close()
+        pair?.clientSide.close()
+        pair = nil
+        hostBridge = nil
+        clientBridge = nil
+        phoneTunnel = nil
+        tunnelManager = nil
+        hostSession = nil
+        clientSession = nil
+
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: false)
+        try await driveMirrorFlowToStreaming()
+    }
+
+    private func driveMirrorFlowToStreaming() async throws {
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready over relay") { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("OPEN_MIRROR_SCREEN over relay") {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+        try await waitFor("WFD established over the TCP tunnel") {
+            phone.cast.wfdSessionEstablished
+        }
+        try await waitFor("video datagrams flowing") {
+            self.videoDatagramsReceived >= 3
+        }
+        try await waitFor("controller streaming, mask cleared") {
+            controller.stage == .streaming && controller.mask == nil
+        }
+    }
+
     // MARK: - Limit tests: impaired cloud-relay link
 
     // Measured Mac(HiNet)↔Cloudflare SIN detour (docs/relay-analysis.md):

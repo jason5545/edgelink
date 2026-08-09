@@ -293,6 +293,53 @@ final class LyraRelayCallOverRelayTests: XCTestCase {
 
     // MARK: - Limit tests: impaired cloud-relay link
 
+    // Transport flip end-to-end: the relay session dies (worker reconnect /
+    // WiFi→5G) and everything on it is rebuilt from scratch — fresh relay
+    // handshake, fresh announce, fresh registration. The Mac must come back
+    // online in the phone's oracle and the ring must round-trip again, like
+    // the live re-registration recoveries of 2026-08-05/06.
+    func testRelayCallReregistersAfterRelaySessionReplaced() async throws {
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        try await driveRingToTwoHundred()
+
+        // Wholesale teardown of everything bound to the old relay session.
+        hostLoop?.cancel()
+        clientLoop?.cancel()
+        hostLoop = nil
+        clientLoop = nil
+        announcer?.stop()
+        announcer = nil
+        phone?.stop()
+        phone = nil
+        pair?.hostSide.close()
+        pair?.clientSide.close()
+        pair = nil
+        hostBridge = nil
+        clientBridge = nil
+        hostSession = nil
+        clientSession = nil
+
+        try await establishRelaySession()
+        try await startCallEnds(registerCert: true)
+        try await driveRingToTwoHundred()
+    }
+
+    private func driveRingToTwoHundred() async throws {
+        let phone = try XCTUnwrap(self.phone)
+        await waitFor("Mac online in oracle", timeout: 30) {
+            phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        await waitFor("relayCall channel up", timeout: 30) {
+            phone.relayCall.state == .channelUp
+        }
+        phone.relayCall.sendRing(number: "0912345678")
+        await waitFor("ring response 200", timeout: 30) {
+            phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+    }
+
     // The full registration + ring chain at the measured HiNet↔Cloudflare
     // WAN latency (ordered, like the production WebSocket relay legs).
     func testIncomingRingOverCloudRelayAtWANLatency() async throws {
