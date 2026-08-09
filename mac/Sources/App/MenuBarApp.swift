@@ -200,17 +200,11 @@ private struct PhoneSection: View {
                 Label("已配對（小米互聯）", systemImage: "checkmark.shield")
                     .foregroundStyle(.secondary)
             case .unpaired:
-                Button {
-                    runtime.requestXiaomiTrustPairing()
-                } label: {
-                    Label("配對手機（小米互聯）", systemImage: "person.badge.key")
-                }
+                Label("未配對（小米互聯）", systemImage: "xmark.shield")
+                    .foregroundStyle(.secondary)
             case .unknown:
-                Button {
-                    runtime.requestXiaomiTrustPairing()
-                } label: {
-                    Label("小米互聯配對…", systemImage: "person.badge.key.questionmark")
-                }
+                Label("小米互聯配對狀態未知", systemImage: "questionmark.shield")
+                    .foregroundStyle(.secondary)
             }
         }
     }

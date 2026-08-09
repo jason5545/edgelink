@@ -33,7 +33,12 @@ final class EdgeLinkRuntime: ObservableObject {
     @Published private(set) var peerName = "No paired Android"
     @Published private(set) var peerDeviceId = ""
     @Published private(set) var connectionStatus = "Starting"
-    @Published private(set) var isConnected = false
+    @Published private(set) var isConnected = false {
+        didSet {
+            guard isConnected != oldValue else { return }
+            handleConnectionStateChanged(connected: isConnected)
+        }
+    }
     @Published private(set) var canDisconnect = false
     @Published private(set) var tunnelAdbPort: Int?
     @Published private(set) var tunnelStatusText = ""
@@ -1501,6 +1506,12 @@ final class EdgeLinkRuntime: ObservableObject {
         case .streaming, .connecting, .opening, .unlocking:
             break
         default:
+            // No live mirror: the supervisor's only job is the InterLink
+            // pairing status query after connect. It retries until the
+            // query resolves or the connection drops (endpoints may not be
+            // discovered yet at the moment the session connects).
+            guard isConnected, xiaomiTrustPairing == .unknown else { return }
+            queryXiaomiTrustPairing(reason: "status_query")
             return
         }
         // An active (not yet streaming) attempt gets a much tighter silence
@@ -1708,15 +1719,32 @@ final class EdgeLinkRuntime: ObservableObject {
         macTrustManager.requestBind()
     }
 
-    // Menu-bar 配對 entry: if a trust session is already reporting needsBind,
-    // kick the bind directly; otherwise open the mirror flow, whose status
-    // query lands on the bind mask when the phone is unpaired.
-    func requestXiaomiTrustPairing() {
-        if macTrustManager.state == .needsBind {
-            macTrustManager.requestBind()
-        } else {
-            viewPhoneScreen()
+    // InterLink (duo.screen) pairing is a live status queried on connect —
+    // not on mirror start — so the menu bar shows it as text and the phone
+    // gets fresh xiaomi.trust.status pushes from the same state.
+    private func handleConnectionStateChanged(connected: Bool) {
+        xiaomiTrustPairing = .unknown
+        guard connected else { return }
+        queryXiaomiTrustPairing(reason: "connected")
+    }
+
+    private func queryXiaomiTrustPairing(reason: String) {
+        if let session = lyraCastTrustSession {
+            if session.isChannelReady {
+                // The channel survived the reconnect (the LAN mesh is
+                // independent of the EdgeLink session): re-query over it
+                // directly. The status event feeds xiaomiTrustPairing via
+                // the mirror flow's onTrustState passthrough.
+                macTrustManager.start()
+            } else if session.channelWasEstablishedBefore {
+                // Phone released the channel; redial just the cast conn like
+                // the mirror flow does — the ready callback runs the query.
+                session.redialCastChannel()
+            }
+            // A mid-dial session runs the query from its own ready callback.
+            return
         }
+        _ = ensureCastTrustChannel(reason: reason)
     }
 
     // Phone-initiated pair request (xiaomi.trustBind): arm auto-bind so the
