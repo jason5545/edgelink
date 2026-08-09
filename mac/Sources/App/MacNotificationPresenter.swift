@@ -54,6 +54,9 @@ final class MacNotificationPresenter: @unchecked Sendable {
                 return
             }
 
+            let remoteSubtitle = (body.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines))
+                .flatMap { $0.isEmpty ? nil : $0 }
+
             do {
                 guard try await center.requestAuthorization(options: [.alert, .sound]) else {
                     DiagnosticsLog.warn("notification.mac.permission_denied id=\(body.id)")
@@ -62,7 +65,13 @@ final class MacNotificationPresenter: @unchecked Sendable {
 
                 let content = UNMutableNotificationContent()
                 content.title = title.isEmpty ? body.app : title
-                content.subtitle = title.isEmpty ? "" : body.app
+                if title.isEmpty {
+                    content.subtitle = remoteSubtitle ?? ""
+                } else if let remoteSubtitle {
+                    content.subtitle = "\(body.app) · \(remoteSubtitle)"
+                } else {
+                    content.subtitle = body.app
+                }
                 content.body = text
                 content.sound = .default
                 content.threadIdentifier = "edgelink.remote.\(body.sourceDeviceId ?? "unknown")"
@@ -183,19 +192,22 @@ final class MacNotificationPresenter: @unchecked Sendable {
         iconPNGData: Data
     ) async throws -> UNNotificationContent {
         let handleValue = body.bundle ?? body.app
+        let senderName = body.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let sender = INPerson(
             personHandle: INPersonHandle(value: handleValue, type: .unknown),
             nameComponents: nil,
-            displayName: body.app,
+            displayName: senderName.isEmpty ? body.app : senderName,
             image: INImage(imageData: iconPNGData),
             contactIdentifier: nil,
             customIdentifier: "edgelink.app.\(handleValue)"
         )
+        let groupName = (body.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap { $0.isEmpty ? nil : $0 }
         let intent = INSendMessageIntent(
             recipients: nil,
             outgoingMessageType: .outgoingMessageText,
             content: base.body,
-            speakableGroupName: nil,
+            speakableGroupName: groupName.map { INSpeakableString(spokenPhrase: $0) },
             conversationIdentifier: "\(base.threadIdentifier).\(handleValue)",
             serviceName: nil,
             sender: sender,

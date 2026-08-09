@@ -175,7 +175,10 @@ class AndroidNotificationListenerService : NotificationListenerService() {
             .ifBlank { notification.extras.messagingText() }
             .ifBlank { notification.extras.textLines() }
             .ifBlank { notification.tickerText?.toString()?.trim().orEmpty() }
-        val subtitle = notification.extras.text(Notification.EXTRA_SUB_TEXT).ifBlank { null }
+        val subtitle = notification.extras.text(Notification.EXTRA_SUB_TEXT)
+            .ifBlank { notification.extras.text(Notification.EXTRA_CONVERSATION_TITLE) }
+            .ifBlank { null }
+            ?.takeIf { it != title }
         if (title.isBlank() && text.isBlank()) {
             return null
         }
