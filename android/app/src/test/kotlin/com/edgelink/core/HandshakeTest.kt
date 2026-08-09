@@ -95,8 +95,33 @@ class HandshakeTest {
         val delivered = initiator.seal("delivered".encodeToByteArray())
 
         assertArrayEquals("delivered".encodeToByteArray(), responder.open(delivered))
+        // A true duplicate of an already-opened frame is still rejected.
+        assertThrows(IllegalArgumentException::class.java) {
+            responder.open(delivered)
+        }
+        // The earlier frame arriving late (unordered relay reorder) opens.
+        assertArrayEquals("dropped".encodeToByteArray(), responder.open(dropped))
+        // And once opened late, its duplicate is rejected too.
         assertThrows(IllegalArgumentException::class.java) {
             responder.open(dropped)
+        }
+    }
+
+    @Test
+    fun secureChannelRejectsFramesOlderThanTheWindow() {
+        val keys = SecureChannelKeys(
+            initiatorToResponder = ByteArray(32) { 0x11 },
+            responderToInitiator = ByteArray(32) { 0x22 }
+        )
+        val initiator = SecureChannel(keys, SecureChannelRole.INITIATOR)
+        val responder = SecureChannel(keys, SecureChannelRole.RESPONDER)
+        val ancient = initiator.seal("ancient".encodeToByteArray())
+        // Push the window far past the first frame.
+        for (index in 1..70) {
+            responder.open(initiator.seal("msg $index".encodeToByteArray()))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            responder.open(ancient)
         }
     }
 

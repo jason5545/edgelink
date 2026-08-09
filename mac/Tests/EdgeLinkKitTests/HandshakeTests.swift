@@ -99,7 +99,27 @@ final class HandshakeTests: XCTestCase {
         let delivered = try initiator.seal(Data("delivered".utf8))
 
         XCTAssertEqual(try responder.open(delivered), Data("delivered".utf8))
+        // A true duplicate of an already-opened frame is still rejected.
+        XCTAssertThrowsError(try responder.open(delivered))
+        // The earlier frame arriving late (unordered relay reorder) opens.
+        XCTAssertEqual(try responder.open(dropped), Data("dropped".utf8))
+        // And once opened late, its duplicate is rejected too.
         XCTAssertThrowsError(try responder.open(dropped))
+    }
+
+    func testSecureChannelRejectsFramesOlderThanTheWindow() throws {
+        let keys = SecureChannelKeys(
+            initiatorToResponder: Data(repeating: 0x11, count: 32),
+            responderToInitiator: Data(repeating: 0x22, count: 32)
+        )
+        var initiator = SecureChannel(keys: keys, role: .initiator)
+        var responder = SecureChannel(keys: keys, role: .responder)
+        let ancient = try initiator.seal(Data("ancient".utf8))
+        // Push the window far past the first frame.
+        for index in 1...70 {
+            _ = try responder.open(try initiator.seal(Data("msg \(index)".utf8)))
+        }
+        XCTAssertThrowsError(try responder.open(ancient))
     }
 
     func testHandshakeWireRoundTrip() throws {

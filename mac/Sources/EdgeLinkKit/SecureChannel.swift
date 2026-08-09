@@ -44,7 +44,16 @@ public struct SecureChannel: Sendable {
     private let sendDirection: SecureChannelDirection
     private let receiveDirection: SecureChannelDirection
     private var sendCounter = FrameCounter()
-    private var receiveCounter = FrameCounter()
+    // Sliding-window anti-replay (IPsec-style): the relay data channel is
+    // unordered, so late frames legitimately arrive below the highest seen
+    // counter. The old single minimumCounter check rejected those as
+    // replays, and the receive loops rethrew — one reorder killed the whole
+    // session. A 64-bit window accepts late frames while still rejecting
+    // true duplicates and ancient replays.
+    private static let receiveWindowBits: UInt64 = 64
+    private var receiveMax: UInt64 = 0
+    private var receiveWindow: UInt64 = 0
+    private var hasReceivedFrame = false
 
     public init(keys: SecureChannelKeys, role: SecureChannelRole) {
         switch role {
@@ -71,14 +80,51 @@ public struct SecureChannel: Sendable {
     }
 
     public mutating func open(_ frame: Data) throws -> Data {
+        let counter = try SecureFrame.versionedCounter(of: frame)
+        if isReplay(counter: counter) {
+            throw SecureFrameError.replayedFrame
+        }
         let opened = try SecureFrame.openVersioned(
             frame: frame,
             key: receiveKey,
             direction: receiveDirection,
-            minimumCounter: receiveCounter.value
+            minimumCounter: 0
         )
-        receiveCounter.advance(to: opened.counter + 1)
+        markReceived(counter: opened.counter)
         return opened.plaintext
+    }
+
+    private func isReplay(counter: UInt64) -> Bool {
+        guard hasReceivedFrame else { return false }
+        if counter > receiveMax { return false }
+        // Bit i tracks counter (receiveMax - i), so bit 0 is the max itself.
+        let delta = receiveMax - counter
+        if delta >= Self.receiveWindowBits { return true }
+        return (receiveWindow & (1 &<< delta)) != 0
+    }
+
+    private mutating func markReceived(counter: UInt64) {
+        if !hasReceivedFrame {
+            hasReceivedFrame = true
+            receiveMax = counter
+            receiveWindow = 1
+            return
+        }
+        if counter > receiveMax {
+            let shift = counter - receiveMax
+            if shift >= Self.receiveWindowBits {
+                receiveWindow = 0
+            } else {
+                receiveWindow &<<= shift
+            }
+            receiveMax = counter
+            receiveWindow |= 1
+            return
+        }
+        let delta = receiveMax - counter
+        if delta < Self.receiveWindowBits {
+            receiveWindow |= (1 &<< delta)
+        }
     }
 }
 
@@ -127,6 +173,15 @@ public enum SecureFrame {
             counter: counter
         )
         return legacyFrame.prefix(4) + counter.bigEndianData + legacyFrame.dropFirst(4)
+    }
+
+    // The counter embedded in a versioned frame (plaintext prefix), for
+    // anti-replay checks before decryption.
+    public static func versionedCounter(of frame: Data) throws -> UInt64 {
+        guard frame.count >= 12 else {
+            throw SecureFrameError.truncatedFrame
+        }
+        return UInt64(bigEndianData: frame.dropFirst(4).prefix(8))
     }
 
     public static func openVersioned(

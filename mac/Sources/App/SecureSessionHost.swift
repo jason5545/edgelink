@@ -99,7 +99,20 @@ actor SecureSessionHost {
             }
 
             var session = try requireEstablished()
-            let plaintext = try session.channel.open(frame)
+            let plaintext: Data
+            do {
+                plaintext = try session.channel.open(frame)
+            } catch {
+                // A stale, duplicated, or corrupt frame must not kill the
+                // receive loop: the old code rethrew here and the loop's
+                // Task died silently, wedging the session inbound forever
+                // (replayedFrame on a late/reordered frame, or an auth
+                // failure on a pre-rehandshake frame). Drop it and continue.
+                DiagnosticsLog.warn(
+                    "secure.mac.frame_dropped reason=open_failed error=\(error.localizedDescription) bytes=\(frame.count)"
+                )
+                continue
+            }
             established = session
             lastInboundActivityAt = Date()
             framesReceived &+= 1

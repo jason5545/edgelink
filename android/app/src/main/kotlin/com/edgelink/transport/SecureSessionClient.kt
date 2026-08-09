@@ -82,7 +82,19 @@ class SecureSessionClient(
         while (true) {
             val frame = channel.receive() ?: return
             val session = established ?: error("Secure session is not established.")
-            val plaintext = session.channel.open(frame)
+            // Stale/duplicated/corrupt frames must not kill the loop:
+            // rethrowing here cancelled the receive coroutine and wedged the
+            // session inbound permanently (replayedFrame on a reordered or
+            // duplicated datagram, auth failure on a pre-rehandshake frame).
+            val plaintext = try {
+                session.channel.open(frame)
+            } catch (error: Exception) {
+                EdgeLinkLog.warn(
+                    "secure.android.frame_dropped reason=open_failed " +
+                            "error=${error.message} bytes=${frame.size}"
+                )
+                continue
+            }
             lastInboundElapsedMs = monotonicMilliseconds()
             framesReceived += 1
             if (framesReceived <= 3 || framesReceived % 100L == 0L) {

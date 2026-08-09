@@ -107,7 +107,17 @@ public actor LyraRelaySession {
             guard var session = established else {
                 continue
             }
-            let plaintext = try session.channel.open(frame)
+            let plaintext: Data
+            do {
+                plaintext = try session.channel.open(frame)
+            } catch {
+                // Stale/duplicated/corrupt frames must not kill the loop:
+                // rethrowing here died the receive Task and wedged the
+                // session inbound permanently (replayedFrame on a reordered
+                // or duplicated datagram). Drop and continue.
+                log("session.frame_dropped error=\(error.localizedDescription) bytes=\(frame.count)")
+                continue
+            }
             established = session
 
             guard let peek = try? JSONDecoder().decode(LyraRelayEnvelopePeek.self, from: plaintext) else {

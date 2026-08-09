@@ -60,7 +60,16 @@ class SecureChannel(
     private val sendDirection: SecureChannelDirection
     private val receiveDirection: SecureChannelDirection
     private val sendCounter = FrameCounter()
-    private val receiveCounter = FrameCounter()
+    // Sliding-window anti-replay (IPsec-style): the relay data channel is
+    // unordered, so late frames legitimately arrive below the highest seen
+    // counter. The old single minimumCounter check rejected those as
+    // replays, and the receive loop rethrew — one reorder killed the whole
+    // session. A 64-bit window accepts late frames while still rejecting
+    // true duplicates and ancient replays. Bit i tracks counter
+    // (receiveMax - i), so bit 0 is the max itself.
+    private var receiveMax: Long = 0
+    private var receiveWindow: Long = 0
+    private var hasReceivedFrame = false
 
     init {
         when (role) {
@@ -83,15 +92,50 @@ class SecureChannel(
         SecureFrame.sealVersioned(plaintext, sendKey, sendDirection, sendCounter.next(), aead)
 
     fun open(frame: ByteArray): ByteArray {
+        val counter = SecureFrame.versionedCounter(frame)
+        if (isReplay(counter)) {
+            throw IllegalArgumentException("Frame counter was replayed (counter=$counter).")
+        }
         val opened = SecureFrame.openVersioned(
             frame = frame,
             key = receiveKey,
             direction = receiveDirection,
-            minimumCounter = receiveCounter.value,
+            minimumCounter = 0,
             aead = aead
         )
-        receiveCounter.advanceTo(opened.counter + 1)
+        markReceived(opened.counter)
         return opened.plaintext
+    }
+
+    private fun isReplay(counter: Long): Boolean {
+        if (!hasReceivedFrame || counter > receiveMax) return false
+        val delta = receiveMax - counter
+        if (delta >= RECEIVE_WINDOW_BITS) return true
+        return (receiveWindow and (1L shl delta.toInt())) != 0L
+    }
+
+    private fun markReceived(counter: Long) {
+        if (!hasReceivedFrame) {
+            hasReceivedFrame = true
+            receiveMax = counter
+            receiveWindow = 1L
+            return
+        }
+        if (counter > receiveMax) {
+            val shift = counter - receiveMax
+            receiveWindow = if (shift >= RECEIVE_WINDOW_BITS) 0L else receiveWindow shl shift.toInt()
+            receiveMax = counter
+            receiveWindow = receiveWindow or 1L
+            return
+        }
+        val delta = receiveMax - counter
+        if (delta < RECEIVE_WINDOW_BITS) {
+            receiveWindow = receiveWindow or (1L shl delta.toInt())
+        }
+    }
+
+    private companion object {
+        const val RECEIVE_WINDOW_BITS = 64
     }
 }
 
@@ -139,6 +183,13 @@ object SecureFrame {
             .putLong(counter)
             .put(legacyFrame, 4, ciphertextLength)
             .array()
+    }
+
+    // The counter embedded in a versioned frame (plaintext prefix), for
+    // anti-replay checks before decryption.
+    fun versionedCounter(frame: ByteArray): Long {
+        require(frame.size >= 12) { "Frame is truncated." }
+        return ByteBuffer.wrap(frame, 4, 8).long
     }
 
     fun openVersioned(
