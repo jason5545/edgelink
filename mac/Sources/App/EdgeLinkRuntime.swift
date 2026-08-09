@@ -5555,6 +5555,7 @@ final class EdgeLinkRuntime: ObservableObject {
                   Date().timeIntervalSince(report.at) < 120 else { return nil }
             return (locked: report.locked, at: report.at)
         }
+        macTrustManager.notifyExternalLockState(locked: body.locked)
         DiagnosticsLog.info("phone.mac.lock_state_rx locked=\(body.locked)")
     }
 

@@ -95,10 +95,13 @@ final class FakeXiaomiPhone {
 
     // The user entered the lock-screen password in the phone's
     // LockScreenUIActivity (the official verify flow): the TA re-provisions
-    // its per-boot auth token and the pending verifyAction is answered.
+    // its per-boot auth token, the password unlocks the phone itself (the
+    // user lands on the home screen), and the pending verifyAction is
+    // answered.
     func completeVerify() {
         queue.async {
             self.quickAuthRiskArmed = false
+            self.locked = false
             let event = TrustVerifyEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
             self.sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
                 DuoScreenTrust(sessionID: 0, msg: .verifyEvent(event))

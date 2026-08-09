@@ -90,10 +90,6 @@ final class MacTrustManager: ObservableObject {
     private var awaitingAuthEvent = false
     private var awaitingBindEvent = false
     private var awaitingVerifyEvent = false
-    // True when the risk was hit mid-unlock (authEvent code 11): after a
-    // successful phone-side password verify, the quick auth retries
-    // immediately (the user already passed Touch ID for this attempt).
-    private var retryUnlockAfterVerify = false
     private let biometric: BiometricAuthManager
 
     init(biometric: BiometricAuthManager = .shared) {
@@ -214,7 +210,6 @@ final class MacTrustManager: ObservableObject {
         awaitingAuthEvent = false
         awaitingBindEvent = false
         awaitingVerifyEvent = false
-        retryUnlockAfterVerify = false
         unlockConfirmed = false
         keyguardInfoConfirmed = false
         statusQueryEpoch &+= 1
@@ -433,8 +428,8 @@ final class MacTrustManager: ObservableObject {
             // verification (matches localRisk=deviceReboot in the shared
             // auth status). Surface the risk mask and kick the official
             // verify flow — the phone shows its own password UI, no rebind
-            // needed.
-            retryUnlockAfterVerify = true
+            // needed. No quick-auth retry afterwards: the verify UI unlocks
+            // the phone itself, so the flow resumes streaming directly.
             enterRiskBlocked(.deviceReboot)
             DiagnosticsLog.info("trust.mac.unlock_risk_auth_required code=\(event.code)")
         default:
@@ -467,23 +462,30 @@ final class MacTrustManager: ObservableObject {
         switch event.code {
         case DuoScreenTrustCode.success:
             DiagnosticsLog.info("trust.mac.verify_success")
-            let retry = retryUnlockAfterVerify
-            retryUnlockAfterVerify = false
-            state = .ready(locked: true)
-            if retry {
-                // Touch ID already passed for this attempt and the phone
-                // verify re-provisioned the TA token — the quick-auth retry
-                // should fly through without a second prompt.
-                touchIdPreauthorized = true
-                Task { await self.requestUnlock() }
-            }
+            // The phone's verify UI (LockScreenUIActivity) unlocks the phone
+            // as the password passes — the user lands on the home screen.
+            // Official resumes streaming from here; a quick-auth retry would
+            // be a redundant second unlock ceremony.
+            unlockConfirmed = true
+            state = .ready(locked: false)
         case DuoScreenTrustCode.userCancel, DuoScreenTrustCode.timeoutCancel:
-            retryUnlockAfterVerify = false
             DiagnosticsLog.info("trust.mac.verify_cancelled code=\(event.code)")
         default:
-            retryUnlockAfterVerify = false
             DiagnosticsLog.warn("trust.mac.verify_failed code=\(event.code)")
         }
+    }
+
+    // The EdgeLink Android app's KeyguardManager push is truthful. While
+    // risk-blocked (post-reboot TA verify), a phone-side unlock — the verify
+    // UI's password, or a plain manual unlock — resolves the flow with no
+    // further Mac-side auth; the verifyEvent may never arrive if the phone
+    // tore the channel down on unlock.
+    func notifyExternalLockState(locked: Bool) {
+        guard !locked, case .riskBlocked = state else { return }
+        awaitingVerifyEvent = false
+        unlockConfirmed = true
+        state = .ready(locked: false)
+        DiagnosticsLog.info("trust.mac.risk_resolved_phone_unlocked")
     }
 
     private func send(_ msg: DuoScreenTrustMessage) {

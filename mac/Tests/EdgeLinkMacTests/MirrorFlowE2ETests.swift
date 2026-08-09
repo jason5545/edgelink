@@ -652,10 +652,11 @@ final class MirrorFlowE2ETests: XCTestCase {
     // "first boot, please auth!"). The official recovery is NOT a rebind:
     // the Mac sends a verifyAction, the phone shows its own lock-screen
     // password UI (LockScreenUIActivity), and the password re-provisions
-    // the TA token. Code 11 must show the risk mask, auto-send the
-    // verifyAction, and a successful verify must retry the quick auth
-    // without a second Touch ID prompt.
-    func testRiskAuthRequiredVerifiesThenRetriesUnlock() async throws {
+    // the TA token. Code 11 must show the risk mask and auto-send the
+    // verifyAction. Entering the password unlocks the phone itself, so the
+    // flow must resume streaming directly — no quick-auth retry, no second
+    // Touch ID (official behavior, 2026-08-09).
+    func testRiskAuthRequiredVerifiesThenStreamsDirectly() async throws {
         try makeEnvironment(locked: true)
         phone.quickAuthRiskArmed = true
         session.start()
@@ -675,15 +676,53 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(phone.mitrustUnlockCount, 0, "risk-refused auth must not run the mitrust unlock")
 
         // User types the lock-screen password in the phone's
-        // LockScreenUIActivity.
+        // LockScreenUIActivity — that unlocks the phone.
         phone.completeVerify()
 
-        try await waitFor("quick auth retried and streaming") { [self] in
+        try await waitFor("streaming after phone-side verify") { [self] in
             self.controller.stage == .streaming && self.controller.mask == nil
         }
-        XCTAssertEqual(phone.mitrustUnlockCount, 1, "verify success must retry the quick auth")
+        XCTAssertEqual(phone.mitrustUnlockCount, 0, "verify success must not retry the quick auth")
         XCTAssertEqual(biometricCallCount, 1, "verify resume must not re-prompt Touch ID")
-        XCTAssertEqual(phone.openMirrorScreenCount, 1, "verify resume must not re-send OPEN")
+        XCTAssertEqual(
+            phone.openMirrorScreenCount, 2,
+            "the risk refusal tore the phone's RTSP server down, so the pipeline reopens"
+        )
+    }
+
+    // Same risk flow, but the user unlocks the phone manually instead of
+    // through the verify UI: no verifyEvent arrives. The Android app's
+    // KeyguardManager push (truthful) must resolve the risk mask straight
+    // into streaming — again with no quick-auth retry and no second
+    // Touch ID.
+    func testRiskMaskResolvesOnManualPhoneUnlock() async throws {
+        try makeEnvironment(locked: true)
+        phone.quickAuthRiskArmed = true
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask + OPEN sent + WFD up") { [self] in
+            self.controller.mask == .locked
+                && self.phone.openMirrorScreenCount == 1
+                && self.phone.wfdSessionEstablished
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("risk mask + verifyAction sent after code 11") { [self] in
+            self.controller.mask == .risk && self.phone.verifyActionCount == 1
+        }
+
+        // Manual unlock on the phone; only the lock-state push reaches us.
+        phone.setLocked(false)
+        trustManager.notifyExternalLockState(locked: false)
+
+        try await waitFor("streaming after manual phone unlock") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(phone.mitrustUnlockCount, 0, "manual unlock must not retry the quick auth")
+        XCTAssertEqual(biometricCallCount, 1, "manual unlock must not re-prompt Touch ID")
+        XCTAssertEqual(phone.openMirrorScreenCount, 2, "the mirror pipeline reopens after the risk refusal")
     }
 
     // myron reports notBound only inside enable=0 placeholder statuses (live
