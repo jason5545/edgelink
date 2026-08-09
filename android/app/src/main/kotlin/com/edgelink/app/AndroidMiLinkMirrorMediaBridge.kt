@@ -307,10 +307,17 @@ object AndroidMiLinkMirrorMediaBridge {
         private var turnDcBackpressureDrops = 0L
         private var kcpSink: MiLinkMirrorKcpSink? = null
         private var ackViaLoopback = false
-        private var turnPaceTokens = TURN_PACER_BURST_BYTES.toDouble()
-        private var turnPaceLastRefillNs = 0L
-        private var turnPaceDelayed = 0L
-        private var turnPaceDropped = 0L
+        private val turnPacer = TurnPacer(
+            rateBytesPerSecond = {
+                if (turnDcPathIsRelay?.invoke() == false) {
+                    TURN_PACER_DIRECT_BYTES_PER_SECOND
+                } else {
+                    TURN_PACER_BYTES_PER_SECOND
+                }
+            },
+            burstBytes = TURN_PACER_BURST_BYTES,
+            maxDelayMs = TURN_PACER_MAX_DELAY_MS
+        )
         @Volatile
         private var turnIdrRequestPending = false
         private var ownAddresses: Set<InetAddress> = emptySet()
@@ -674,15 +681,36 @@ object AndroidMiLinkMirrorMediaBridge {
                                         "count=$turnDcBackpressureDrops bufferedBytes=$buffered"
                                 )
                             }
-                        } else if (paceTurnDatagram(data.size)) {
-                            forwarded = forward(data)
-                            if (!forwarded) {
-                                turnDcSendFailed += 1
-                                if (turnDcSendFailed == 1L || turnDcSendFailed % 500 == 0L) {
-                                    EdgeLinkLog.warn(
-                                        "mirror.turn.dc_send_failed sessionId=$sessionId " +
-                                            "count=$turnDcSendFailed bufferedBytes=$buffered"
-                                    )
+                        } else {
+                            when (val paceWaitMs = turnPacer.admit(data.size)) {
+                                null -> {
+                                    if (turnPacer.droppedCount == 1L || turnPacer.droppedCount % 500 == 0L) {
+                                        EdgeLinkLog.warn(
+                                            "mirror.turn.pace_dropped sessionId=$sessionId " +
+                                                "count=${turnPacer.droppedCount}"
+                                        )
+                                    }
+                                }
+                                else -> {
+                                    if (paceWaitMs > 0) {
+                                        if (turnPacer.delayedCount == 1L || turnPacer.delayedCount % 2_000 == 0L) {
+                                            EdgeLinkLog.info(
+                                                "mirror.turn.pace_delayed sessionId=$sessionId " +
+                                                    "count=${turnPacer.delayedCount} delayMs=$paceWaitMs"
+                                            )
+                                        }
+                                        delay(paceWaitMs)
+                                    }
+                                    forwarded = forward(data)
+                                    if (!forwarded) {
+                                        turnDcSendFailed += 1
+                                        if (turnDcSendFailed == 1L || turnDcSendFailed % 500 == 0L) {
+                                            EdgeLinkLog.warn(
+                                                "mirror.turn.dc_send_failed sessionId=$sessionId " +
+                                                    "count=$turnDcSendFailed bufferedBytes=$buffered"
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1044,60 +1072,8 @@ object AndroidMiLinkMirrorMediaBridge {
             )
         }
 
-        // Token-bucket pacing for the relay leg. Measured Cloudflare TURN
-        // capacity is ~5-6 Mbps per allocation (tools/turn-capacity.py); the
-        // 5 Mbps encoder plus KCP retransmits otherwise overruns the pipe and
-        // collapses it. Pace just under the cap; short bursts pass through,
-        // sustained excess is delayed up to a bound, then dropped (the
-        // source's KCP retransmits drops). Direct paths (no TURN relay in
-        // the leg) pace at a rate the encoder never reaches.
-        private fun turnPaceBytesPerNs(): Double {
-            val rate = if (turnDcPathIsRelay?.invoke() == false) {
-                TURN_PACER_DIRECT_BYTES_PER_SECOND
-            } else {
-                TURN_PACER_BYTES_PER_SECOND
-            }
-            return rate / 1_000_000_000.0
-        }
-
-        private suspend fun paceTurnDatagram(bytes: Int): Boolean {
-            val bytesPerNs = turnPaceBytesPerNs()
-            val now = System.nanoTime()
-            if (turnPaceLastRefillNs == 0L) {
-                turnPaceLastRefillNs = now
-            }
-            val elapsedNs = now - turnPaceLastRefillNs
-            turnPaceTokens = minOf(
-                TURN_PACER_BURST_BYTES.toDouble(),
-                turnPaceTokens + elapsedNs * bytesPerNs
-            )
-            turnPaceLastRefillNs = now
-            turnPaceTokens -= bytes
-            if (turnPaceTokens >= 0) {
-                return true
-            }
-            val deficitMs = ((-turnPaceTokens) / bytesPerNs / 1_000_000).toLong()
-            if (deficitMs <= TURN_PACER_MAX_DELAY_MS) {
-                turnPaceDelayed += 1
-                delay(deficitMs)
-                turnPaceTokens = 0.0
-                turnPaceLastRefillNs = System.nanoTime()
-                if (turnPaceDelayed == 1L || turnPaceDelayed % 2_000 == 0L) {
-                    EdgeLinkLog.info(
-                        "mirror.turn.pace_delayed sessionId=$sessionId count=$turnPaceDelayed delayMs=$deficitMs"
-                    )
-                }
-                return true
-            }
-            turnPaceDropped += 1
-            if (turnPaceDropped == 1L || turnPaceDropped % 500 == 0L) {
-                EdgeLinkLog.warn(
-                    "mirror.turn.pace_dropped sessionId=$sessionId count=$turnPaceDropped deficitMs=$deficitMs"
-                )
-            }
-            return false
-        }
-
+        // Token-bucket pacing lives in TurnPacer (unit-tested); the pacer
+        // decides delay-or-drop and this loop performs the wait and the send.
         private suspend fun turnIdrRequestLoop() {
             while (currentCoroutineContext().isActive) {
                 delay(TURN_IDR_REQUEST_POLL_MS)
