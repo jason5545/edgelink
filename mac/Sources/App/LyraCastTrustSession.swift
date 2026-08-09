@@ -98,6 +98,11 @@ final class LyraCastTrustSession {
     private var channelSocket: LyraChannelDatagramPipe?
     private var channelReady = false
     var isChannelReady: Bool { channelReady }
+    // Sticky: the channel negotiated at least once on this session. The
+    // mirror flow's beginStart redials only a RELEASED channel — a fresh
+    // mid-dial session must not get a redial (it aborts the in-flight
+    // negotiation and strands the OPEN on a stale channelId).
+    private(set) var channelWasEstablishedBefore = false
     var onChannelReady: (() -> Void)?
     var onChannelReleased: (() -> Void)?
     // When true, the phys/logi conn is kept alive after auth completes so a
@@ -2014,6 +2019,7 @@ final class LyraCastTrustSession {
             guard let self, !self.cancelled else { return }
             DiagnosticsLog.info("xiaomi.cast.trust_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
             self.channelReady = true
+            self.channelWasEstablishedBefore = true
             self.progress(.ready, String(localized: "通道已建立"))
             let readyHandler = self.onChannelReady
             DispatchQueue.main.async {

@@ -128,10 +128,14 @@ final class XiaomiMirrorFlowController {
     }
 
     private func beginStart() {
-        if let existing = sessionProvider(), !existing.isChannelReady {
+        if let existing = sessionProvider(), !existing.isChannelReady,
+           existing.channelWasEstablishedBefore
+        {
             // The phone released the cast channel; re-dial just the cast logi
             // conn on the same phys conn, keeping the adopted mitrustservice
-            // conn (and any in-flight auth on it) alive.
+            // conn (and any in-flight auth on it) alive. A fresh mid-dial
+            // session (never established) is left alone — redialing it
+            // aborts the in-flight negotiation.
             existing.redialCastChannel()
         } else if sessionProvider() == nil {
             sessionFactory("mirror_flow")

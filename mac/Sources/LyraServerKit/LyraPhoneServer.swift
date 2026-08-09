@@ -31,10 +31,15 @@ public final class LyraPhoneServer {
         meshTransport: LyraMeshDatagramPipe? = nil,
         relayCallChannelTransport: LyraChannelDatagramPipe? = nil,
         castChannelTransport: LyraChannelDatagramPipe? = nil,
-        clientVideoPort: UInt16 = 15_550
+        clientVideoPort: UInt16 = 15_550,
+        // Dual-transport model: the real phone keeps per-transport mesh peers
+        // but ONE DevRepo. Pass a shared oracle to model a second endpoint
+        // (LAN UDP + relay pipe) of the same phone.
+        oracle: LyraDevRepoOracle? = nil
     ) {
         self.identity = identity
-        oracle = LyraDevRepoOracle()
+        let oracle = oracle ?? LyraDevRepoOracle()
+        self.oracle = oracle
         mesh = LyraPhoneMeshServer(identity: identity, oracle: oracle, meshTransport: meshTransport)
         syncTask = LyraSyncTaskRole(identity: identity, oracle: oracle)
         relayCall = LyraRelayCallRole(identity: identity, channelTransport: relayCallChannelTransport)
