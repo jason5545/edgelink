@@ -165,6 +165,7 @@ targets:
       - path: Sources/App/LyraDistHardwareSession.swift
       - path: Sources/App/LyraDistAudioRpcSession.swift
       - path: Sources/App/LyraDistAudioWFD.swift
+      - path: Sources/App/LyraMirrorCallRelaySession.swift
       - path: Sources/App/XiaomiMirrorWFDClient.swift
       - path: Sources/App/XiaomiMirrorFlowController.swift
       - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift

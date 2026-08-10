@@ -80,6 +80,15 @@ final class MirrorFlowE2ETests: XCTestCase {
 
         controller = XiaomiMirrorFlowController(trustManager: trustManager)
         controller.sessionProvider = { [weak self] in self?.session }
+        // Mirrors production (EdgeLinkRuntime): a channel release stops the
+        // WFD client. Without this the old client keeps retrying into the
+        // phone's post-OPEN RTSP rebuild window and its late ESTABLISHED
+        // lands in the backoff window (stage still .opening), resetting the
+        // storm counter and making the release-storm test timing-flaky.
+        controller.stopMirrorMedia = { [weak self] in
+            self?.wfdClient?.stop(reason: "channel_released")
+            self?.wfdClient = nil
+        }
         // Mirrors production: when the session finishes (peer released the
         // channel with no adopted mitrust conn), the runtime drops it and
         // the flow builds a fresh one on demand.
@@ -619,11 +628,17 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
 
         // Every re-OPEN gets the channel killed — more times than the storm
-        // budget allows.
+        // budget allows. Delay 0 so the kill always lands before the WFD
+        // client rides through the phone's 0.3s RTSP rebuild window; with
+        // the default 0.2s the establish sometimes wins the race, the flow
+        // reaches .streaming, and the rapid-release counter resets (flaky).
         phone.releaseChannelAfterOpenCount = 10
+        phone.releaseChannelAfterOpenDelay = 0
         phone.releaseCastChannel()
 
-        try await waitFor("flow gave up to connect-failed") { [self] in
+        // Four redial-and-release cycles (~11s unloaded) stretch well past
+        // the default 20s when the whole suite shares the machine.
+        try await waitFor("flow gave up to connect-failed", timeout: 45) { [self] in
             self.controller.stage == .failed && self.controller.mask == .connectFailed
         }
         let opensAtGiveUp = phone.openMirrorScreenTotal

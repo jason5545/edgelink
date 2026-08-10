@@ -48,6 +48,10 @@ public final class LyraCastRole: LyraServiceHandler {
         locked = value
     }
 
+    // Raw cast-channel frame hook (type, payload after LyraCastMessageCodec
+    // decode): lets sibling roles (mirror-call relay) ride the same channel.
+    public var onCastFrame: ((UInt8, Data) -> Void)?
+
     public let castChannelPort: UInt16
     public let wfdPort: UInt16
     public let clientVideoPort: UInt16
@@ -389,6 +393,7 @@ public final class LyraCastRole: LyraServiceHandler {
 
     private func handleDecodedChannelFrame(_ message: Data) {
         guard let (type, framePayload) = try? LyraCastMessageCodec.decodeFrame(message) else { return }
+        onCastFrame?(type, framePayload)
         switch type {
         case LyraCastMessageType.trust:
             handleTrustFrame(framePayload)
@@ -424,6 +429,14 @@ public final class LyraCastRole: LyraServiceHandler {
             }
         default:
             break
+        }
+    }
+
+    // Public wrapper so sibling roles (mirror-call relay) can push their own
+    // duo.screen frames over the established cast channel.
+    public func sendCastFrame(type: UInt8, payload: Data) {
+        queue.async { [weak self] in
+            self?.sendChannelMessage(type: type, payload: payload)
         }
     }
 

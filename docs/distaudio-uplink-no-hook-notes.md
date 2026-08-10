@@ -96,3 +96,49 @@ Two failure modes found and fixed during bring-up:
 2. **Mac inject connection had no retry.** Any reset ended inject for the
    rest of the call. Fix: `scheduleInjectRetry` reconnects every 1s until
    stop.
+
+## 2026-08-10: the native path exists — MirrorCallService PHONERELAY sink
+
+Follow-up research (pulled + jadx'd `captures/audiomonitor/`,
+`captures/teleservice/`; disasm libCastService-jni/libmirror-jni) reversed
+the "nobody writes 0x100707" conclusion's practical impact:
+
+1. **0x100707 (`Business_IsPhoneRelay`) has exactly one writer**: Mirror.apk
+   `i2/C0885B` (CallRelayAudioManager) `setAudioSinkOption(6, 1)` — public
+   key 6 → internal 0x100707 via libmirror-jni's option registry — when the
+   phone's `com.xiaomi.mirror.relay.G` (MirrorCallService) starts a
+   `PHONERELAY` audio sink against the pad. Not reachable via any DistAudio
+   RPC (the 8-method `distAudio.*` interface has no setOption/config).
+2. **The trigger chain rides the cast DeviceChannel** (the phone passively
+   accepts our channel on `com.xiaomi.mirror:cast`; live ours-logcat shows
+   `MirrorCallService: sendKeyBytes` → `TYPE_MIRROR_CALL_KEY` to us,
+   unanswered): SimpleEventMessage event 23 = ECDH P-256 KeyData JSON
+   (`{keyBytes: [X509 SPKI as a Gson byte[] int array], p2pIp, port}` —
+   NOT base64: base64 makes the phone's Gson parser throw
+   "Expected BEGIN_ARRAY but was STRING at $.keyBytes" and FCs
+   com.xiaomi.mirror, live 2026-08-10), event 24/31 = call start /
+   sink-start(port), event 25 = stop. ECDH secret → AES key [0..16) + IV
+   [16..32).
+3. **Media plane**: the sink pulls miplaycast RTSP (same dialect as the
+   distaudio server) with LPCM mode 3 = 8 kHz mono
+   (`AudioFormats::mTable` entry 3 = {16, 0x1f40, 1} — no 8 kHz AAC encoder
+   exists on macOS, and the SDK's PCM path is already proven by the
+   distaudio stream). Per-PES IV in PES_private_data; first
+   `min(256, len) & ~15` payload bytes AES-128-CBC with the ECDH key/IV
+   (AESPART, `TSPacketizer::packetize` @0x19c69c, choseType 4).
+4. **Official MIC-as-call-mic verdict**: YES — TeleService
+   `connectDistAudioDevice` is bidirectional; remote mic →
+   `MiCastClient.onReceiveData` → `DistAudioStream.playCastAudioData` →
+   AudioTrack pinned at `TYPE_TELEPHONY`. On this CN build the Mirror.apk
+   PHONERELAY sink is the equivalent native terminal hop for relayed calls.
+
+Implemented Mac-side: `LyraMirrorCallRelaySession` (KeyData exchange, call
+state from relayCall `update_call_state` callState 4) +
+`LyraMirrorCallAudioSource` (RTSP + ff02 PCM TS + AESPART), wired into
+`LyraCastTrustSession` (simpleEvent routing). Loopback-verified against
+`LyraMirrorCallRelayRole` (the LyraServerKit mock phone).
+**Not yet live-verified against the real phone.** CallUplinkInjector stays
+as-is until then; note both paths can be live simultaneously during
+verification (injector writes PCM fed by the distaudio uplink, the phone's
+own sink plays the PHONERELAY stream) — expect double uplink audio on the
+first live call; gate the injector after the native path proves out.

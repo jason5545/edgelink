@@ -118,6 +118,17 @@ final class LyraCastTrustSession {
     // (messageType, payload) after MessageCodec deframing.
     var onCastMessage: ((UInt8, Data) -> Void)?
 
+    // Mirror-call relay (native DistAudio call uplink via the phone's own
+    // MirrorCallService): created when the cast channel negotiates, fed the
+    // simpleEvent frames, driven by call state from the relayCall URI flow.
+    private(set) var mirrorCallRelay: LyraMirrorCallRelaySession?
+
+    // The relayCall URI handler reports call state here (active = the
+    // phone's MirrorCallService sinks our audio source for the call uplink).
+    func notifyMirrorCallActive(_ active: Bool) {
+        mirrorCallRelay?.setCallActive(active)
+    }
+
     private var srvConnId: UInt32 = 0
     private var srvPeerNetId: UInt32 = 0
     private var srvSignKey: Curve25519.KeyAgreement.PrivateKey?
@@ -276,6 +287,8 @@ final class LyraCastTrustSession {
         watchdog = nil
         channelSocket?.stop()
         channelSocket = nil
+        mirrorCallRelay?.teardown()
+        mirrorCallRelay = nil
         teardownServerChannelLocked()
         socket.stop()
         DispatchQueue.main.async { [weak self] in
@@ -298,6 +311,8 @@ final class LyraCastTrustSession {
         watchdog = nil
         channelSocket?.stop()
         channelSocket = nil
+        mirrorCallRelay?.teardown()
+        mirrorCallRelay = nil
         teardownServerChannelLocked()
         socket.stop()
     }
@@ -1727,6 +1742,8 @@ final class LyraCastTrustSession {
                 channelReady = false
                 channelSocket?.stop()
                 channelSocket = nil
+                mirrorCallRelay?.teardown()
+                mirrorCallRelay = nil
                 DiagnosticsLog.info("xiaomi.cast.trust_channel_released_by_peer")
                 let releasedHandler = onChannelReleased
                 DispatchQueue.main.async {
@@ -2061,6 +2078,14 @@ final class LyraCastTrustSession {
             DiagnosticsLog.info("xiaomi.cast.trust_channel_negotiated serverChannelId=\(serverChannelId) mtu=\(mtu)")
             self.channelReady = true
             self.channelWasEstablishedBefore = true
+            if self.mirrorCallRelay == nil {
+                self.mirrorCallRelay = LyraMirrorCallRelaySession { [weak self] type, payload in
+                    self?.sendCastMessage(type: type, payload: payload)
+                }
+                // Official pads send their KeyData proactively on channel
+                // setup; the phone does not always re-send its own.
+                self.mirrorCallRelay?.start()
+            }
             self.progress(.ready, String(localized: "通道已建立"))
             let readyHandler = self.onChannelReady
             DispatchQueue.main.async {
@@ -2168,6 +2193,11 @@ final class LyraCastTrustSession {
                 self?.trustManager.handleFrame(frame)
             }
         } else {
+            if type == LyraCastMessageType.simpleEvent,
+               let event = try? LyraCastSimpleEvent.decode(payload)
+            {
+                mirrorCallRelay?.handleSimpleEvent(event)
+            }
             DispatchQueue.main.async { [weak self] in
                 self?.onCastMessage?(type, payload)
             }
