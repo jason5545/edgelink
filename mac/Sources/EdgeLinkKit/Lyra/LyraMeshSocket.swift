@@ -81,6 +81,14 @@ public final class LyraMeshSocket: @unchecked Sendable {
             connection.cancel()
         }
         outboundConnections.removeAll()
+        // Stale per-connection KCP state must not outlive the connections:
+        // a fresh NWConnection can reuse a deallocated one's address
+        // (ObjectIdentifier), resurrecting its send/recv sequence numbers —
+        // the peer then parks every segment waiting for sns it already
+        // consumed (observed in the call-end-redial E2E: the redial's phys
+        // sync went out with the dead connection's sn and was never
+        // delivered).
+        sessionStates.removeAll()
         boundPort = nil
     }
 
@@ -227,6 +235,14 @@ public final class LyraMeshSocket: @unchecked Sendable {
                 {
                     lastActivityByConnection[id] = Date()
                     var state = self.sessionStates[id] ?? KcpSessionState()
+                    // A redialed session restarts its send sequence at 0 on
+                    // the same 5-tuple (the real phone does this on redial;
+                    // our dialer does after a socket stop/start). Without
+                    // the reset, the whole redialed stream is dropped as
+                    // "duplicates" against the stale recvUna.
+                    if segment.sn == 0, state.recvUna > 0 {
+                        state = KcpSessionState()
+                    }
                     let isDuplicate = segment.sn < state.recvUna
                     if !isDuplicate {
                         state.pendingSegments[segment.sn] = segment.payload

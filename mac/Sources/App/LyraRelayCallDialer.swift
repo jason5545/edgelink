@@ -9,7 +9,8 @@ import Network
 // channel socket negotiation, then relay://dial URI. The phone's
 // handleRelayDialRequest places the cellular call with EXTRA_CALL_RELAYED.
 final class LyraRelayCallDialer {
-    private enum State: Equatable {
+    // Internal (not private) so the E2E tests can wait on terminal states.
+    enum State: Equatable {
         case idle
         case cookie
         case syncAuth
@@ -31,7 +32,7 @@ final class LyraRelayCallDialer {
     private var host: String?
     private var port: UInt16 = 0
     private var candidatePorts: [UInt16] = []
-    private var state: State = .idle
+    private(set) var state: State = .idle
     private var number = ""
     private var physConnId: UInt32 = 0
     private var logiConnId: UInt32 = 0
@@ -681,6 +682,32 @@ final class LyraRelayCallDialer {
     func cancelRedial() {
         queue.async { [weak self] in
             self?.redialStage = 99
+        }
+    }
+
+    // Call ended: close the dial channel now, while no call is in flight.
+    // Left open, the phone holds the relayPhoneCall channel pair until its
+    // post-call idle release (~85s, live 2026-08-10), and that release runs
+    // TeleService's onChannelRelease → setDeviceInRelay(null)
+    // UNCONDITIONALLY — clobbering the NEXT call's relay state when it lands
+    // mid-call (call 2 lost its relay channel and connectRelayAudio 4s after
+    // going active). The logi disconnect makes the phone release the pair
+    // immediately, while idle. The state guard keeps a late call-end event
+    // from killing a new dial's handshake.
+    func callEnded() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.redialStage = 99
+            guard self.state == .done || self.state == .channelUp else { return }
+            // Same shape as the phone's own release (code 33006, observed in
+            // TeleService's onChannelRelease for the relay channel pair).
+            let payload = Data([0x08, 0xEE, 0x81, 0x02])
+            let inner = LogiConnInnerFrame(frameType: 4, payload: .disconnect(payload))
+            self.sendEncrypted(inner: inner, label: "call_end_disconnect")
+            // Let the datagram flush before the socket goes away.
+            self.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.stopLocked()
+            }
         }
     }
 

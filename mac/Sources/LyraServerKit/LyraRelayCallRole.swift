@@ -181,6 +181,14 @@ public final class LyraRelayCallRole: LyraServiceHandler {
         sendURI(method: "call_state_idle", id: methodCounter, kind: "request", query: "{}")
     }
 
+    // TeleService update_call_state push (3 = DIALING, 4 = ACTIVE,
+    // 6 = DISCONNECTED).
+    public func sendUpdateCallState(_ callState: Int, address: String = "800") {
+        methodCounter += 1
+        let json = "{\"callState\":\(callState),\"address\":\"\(address)\",\"requestDeviceId\":\"4995163F\"}"
+        sendURI(method: "update_call_state", id: methodCounter, kind: "request", query: json)
+    }
+
     private func sendURI(method: String, id: UInt64, kind: String, query: String) {
         guard let socket = channelSocket, !transKey.isEmpty else { return }
         let uri = "relay://\(method):\(id)/\(kind)?\(query)"

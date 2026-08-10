@@ -816,6 +816,22 @@ final class LyraRelayCallSession {
             if parsed.method == "update_call_state", parsed.jsonInt("callState") == 3 {
                 LyraRelayCallDialer.activeDialer?.redialForRelayedAudio()
             }
+            // Native mirror-call uplink: 4 = ACTIVE starts the phone's
+            // PHONERELAY sink at our audio source; idle/disconnect stops it.
+            // Call end also closes the dialer's channel so the phone's
+            // relay-channel release lands while no call is in flight
+            // (LyraRelayCallDialer.callEnded).
+            if parsed.method == "call_state_idle" {
+                LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
+                LyraRelayCallDialer.activeDialer?.callEnded()
+            } else if let callState = parsed.jsonInt("callState") {
+                if callState == 4 {
+                    LyraMirrorCallRelaySession.activeSession?.setCallActive(true)
+                } else if callState == 0 || callState == 6 || callState == 7 {
+                    LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
+                    LyraRelayCallDialer.activeDialer?.callEnded()
+                }
+            }
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
         case ("update_call_info", "request"):
             // Caller name/number update mid-call; ack so the phone stops
