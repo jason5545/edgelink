@@ -65,9 +65,9 @@ public final class MiplayKcpTransport {
     }
 
     public struct Configuration {
-        public var receiveWindow: UInt16 = 600
-        public var receiveBufferLimit = 600
-        public var receiveMaxGap: UInt32 = 1_200
+        public var receiveWindow: UInt16 = 2_048
+        public var receiveBufferLimit = 2_048
+        public var receiveMaxGap: UInt32 = 4_096
         public var stallResyncDelayNanoseconds: UInt64 = 900_000_000
         public var stallResyncMaxStallNanoseconds: UInt64 = 2_500_000_000
         public var stallResyncMinGap: Int64 = 128
@@ -294,15 +294,40 @@ public final class MiplayKcpTransport {
 
         if receiveBuffer.count >= configuration.receiveBufferLimit || delta > Int64(configuration.receiveMaxGap) {
             receiveResyncCount += 1
-            receiveBuffer.removeAll(keepingCapacity: true)
-            resetOutOfOrderTracking()
-            notifyTransportLoss(
-                reason: "kcp_receive_resync",
-                detail: "sn=\(segment.sn) expected=\(remoteNextReceiveSN) gap=\(delta)"
-            )
-            remoteNextReceiveSN = segment.sn
-            deliverPush(segment)
-            remoteNextReceiveSN &+= 1
+            if let oldest = receiveBuffer.keys.min() {
+                // Salvage resync: declare lost only the hole before the
+                // oldest buffered segment and deliver the contiguous
+                // buffered run. Jumping to the newest arrival instead would
+                // discard up to receiveBufferLimit healthy segments per
+                // loss, which at high packet rates collapses goodput to a
+                // few percent and stalls the decoder permanently (observed
+                // on the 2026-08-10 high-rate soak: 2% loss at ~3.4k pkt/s
+                // delivered only ~7% of segments).
+                let dropped = Self.sequenceDelta(oldest, from: remoteNextReceiveSN)
+                notifyTransportLoss(
+                    reason: "kcp_receive_resync",
+                    detail: "sn=\(segment.sn) expected=\(remoteNextReceiveSN) gap=\(delta) " +
+                        "salvaged=\(receiveBuffer.count) dropped=\(dropped)"
+                )
+                receiveBuffer[segment.sn] = segment
+                remoteNextReceiveSN = oldest
+                resetOutOfOrderTracking()
+                drainReceiveBuffer()
+                if !receiveBuffer.isEmpty {
+                    outOfOrderStartedUptimeNanoseconds = nowUptimeNanoseconds()
+                    outOfOrderExpectedSN = remoteNextReceiveSN
+                }
+            } else {
+                receiveBuffer.removeAll(keepingCapacity: true)
+                resetOutOfOrderTracking()
+                notifyTransportLoss(
+                    reason: "kcp_receive_resync",
+                    detail: "sn=\(segment.sn) expected=\(remoteNextReceiveSN) gap=\(delta)"
+                )
+                remoteNextReceiveSN = segment.sn
+                deliverPush(segment)
+                remoteNextReceiveSN &+= 1
+            }
             sendACK(responseTo: segment)
             return
         }
@@ -382,6 +407,15 @@ public final class MiplayKcpTransport {
         remoteNextReceiveSN = targetSN
         drainReceiveBuffer()
         sendACK(responseTo: segment)
+        if !receiveBuffer.isEmpty {
+            // Re-arm the stall timer for the next hole: leaving the stale
+            // start time in place makes every later out-of-order arrival
+            // re-trigger a resync instantly, turning one hole episode into
+            // a declaration storm that tears every access unit (observed on
+            // the 2026-08-10 high-rate soak).
+            outOfOrderStartedUptimeNanoseconds = nowUptimeNanoseconds()
+            outOfOrderExpectedSN = remoteNextReceiveSN
+        }
         log(
             .warning,
             "xiaomi.mirror.mpt.kcp_out_of_order_stalled_resync session=\(sessionDescription) " +

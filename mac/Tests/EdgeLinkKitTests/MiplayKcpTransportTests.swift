@@ -105,7 +105,7 @@ final class MiplayKcpTransportTests: XCTestCase {
         XCTAssertEqual(ack.sn, 7)
         XCTAssertEqual(ack.ts, 0x11223344)
         XCTAssertEqual(ack.una, 8)
-        XCTAssertEqual(ack.window, 600)
+        XCTAssertEqual(ack.window, 2_048)
         XCTAssertTrue(ack.payload.isEmpty)
         XCTAssertEqual(transport.acksSent, 1)
     }
@@ -242,11 +242,11 @@ final class MiplayKcpTransportTests: XCTestCase {
         transport.onSendDatagram = { _ in }
         transport.onTransportLoss = { reason, detail in losses.append((reason, detail)) }
         transport.receiveDatagram(push(sn: 7))
-        transport.receiveDatagram(push(sn: 7 + 1300))
+        transport.receiveDatagram(push(sn: 7 + 5000))
         XCTAssertEqual(transport.receiveResyncCount, 1)
         XCTAssertEqual(losses.map(\.0), ["kcp_receive_resync"])
-        XCTAssertEqual(delivered, [Data([7]), Data([UInt8((7 + 1300) & 0xff)])])
-        XCTAssertEqual(transport.remoteNextReceiveSN, 7 + 1301)
+        XCTAssertEqual(delivered, [Data([7]), Data([UInt8((7 + 5000) & 0xff)])])
+        XCTAssertEqual(transport.remoteNextReceiveSN, 7 + 5001)
     }
 
     func testStalledReceiveBufferResyncOnGap() {

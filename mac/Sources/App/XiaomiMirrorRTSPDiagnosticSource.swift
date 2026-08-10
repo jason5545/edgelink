@@ -1778,6 +1778,14 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     self?.noteFirstAudioFrameRendered(id: id)
                 }
             }
+            sender.setMPTSinkIDRRequestHandler { [weak self, weak connection] in
+                self?.queue.async {
+                    guard let self, let connection, self.connections[id] != nil else {
+                        return
+                    }
+                    self.sendIDRRequest(id: id, connection: connection)
+                }
+            }
             state.mediaSender = sender
             state.mediaStartUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
             states[id] = state
@@ -3132,6 +3140,7 @@ private final class XiaomiMirrorRTPMediaSender {
             decoder.onDecodeFailed = { [weak self] in
                 self?.mptDecodeQueue.async {
                     self?.mptSinkDecodeFailedFrames += 1
+                    self?.requestMPTSinkIDRAfterDecodeFailure()
                 }
             }
             let audioPlayer = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: sessionID)
@@ -3169,7 +3178,7 @@ private final class XiaomiMirrorRTPMediaSender {
             self.handleMPTSinkKCPPayload(payload, sn: sn)
         }
         kcpTransport.onTransportLoss = { [weak self] reason, detail in
-            self?.resetMPTSinkAfterTransportLoss(reason: reason, detail: detail)
+            self?.handleMPTSinkTransportLoss(reason: reason, detail: detail)
         }
         kcpTransport.onLog = { level, message in
             switch level {
@@ -3976,6 +3985,22 @@ private final class XiaomiMirrorRTPMediaSender {
         return true
     }
 
+    private func handleMPTSinkTransportLoss(reason: String, detail: String) {
+        switch reason {
+        case "kcp_receive_resync", "kcp_out_of_order_stalled_resync":
+            // Salvage-style resync: only the declared hole was dropped and
+            // the stream resumes at the oldest buffered segment. A hard
+            // wait-for-IDR turns every small hole into a multi-second
+            // freeze (live 2026-08-10 soak: 2% loss at 40Mbps stalled the
+            // decoder for good). Drop the torn AU and keep decoding at the
+            // next AU boundary; the decoder's own error path requests
+            // random access when the bitstream is actually unrecoverable.
+            noteMPTSinkSoftTransportLoss(reason: reason, detail: detail)
+        default:
+            resetMPTSinkAfterTransportLoss(reason: reason, detail: detail)
+        }
+    }
+
     private func resetMPTSinkAfterTransportLoss(reason: String, detail: String) {
         mptSinkInterleavedBuffer.removeAll(keepingCapacity: true)
         mptSinkTSDemuxer?.noteTransportDiscontinuity(reason: reason)
@@ -4083,6 +4108,38 @@ private final class XiaomiMirrorRTPMediaSender {
             )
         }
         onDecodedFrame?(pixelBuffer, width, height)
+    }
+
+    // Decode failures mean the bitstream is corrupt (declared transport
+    // hole mid-GOP). The decoder holds for the next random-access point,
+    // which on the phone's long GOP cadence can be many seconds out; the
+    // official flow shortens that wait by asking the source for an IDR
+    // (wfd_idr_request) instead of rebuilding anything. Throttled so a
+    // corruption burst maps to at most one request per second.
+    private var onMPTSinkIDRRequestNeeded: (() -> Void)?
+    private var lastMPTIDRRequestUptimeNanoseconds: UInt64 = 0
+
+    func setMPTSinkIDRRequestHandler(_ handler: (() -> Void)?) {
+        queue.async {
+            self.onMPTSinkIDRRequestNeeded = handler
+        }
+    }
+
+    private func requestMPTSinkIDRAfterDecodeFailure() {
+        guard let onMPTSinkIDRRequestNeeded else {
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= lastMPTIDRRequestUptimeNanoseconds,
+              now - lastMPTIDRRequestUptimeNanoseconds >= 1_000_000_000 else {
+            return
+        }
+        lastMPTIDRRequestUptimeNanoseconds = now
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.idr_request_on_decode_failure session=\(sessionID.uuidString) " +
+                "decodeFailed=\(mptSinkDecodeFailedFrames) decodedFrames=\(mptSinkDecodedFrames)"
+        )
+        onMPTSinkIDRRequestNeeded()
     }
 
     private func looksLikeRTPPacket(_ data: Data) -> Bool {

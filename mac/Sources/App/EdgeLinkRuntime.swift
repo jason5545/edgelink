@@ -361,6 +361,7 @@ final class EdgeLinkRuntime: ObservableObject {
             Task { @MainActor in
                 self?.xiaomiScreenRecoveryAttempt = 0
                 self?.xiaomiScreenLastSourceRecoveryDecodedFrames = nil
+                self?.xiaomiScreenZeroPacketRecoveryBypassedForRebuild = false
                 self?.xiaomiMirrorFlow.notifyVideoFrame()
                 screenSession.renderXiaomiMirrorFrame(pixelBuffer, width: width, height: height)
             }
@@ -2793,6 +2794,27 @@ final class EdgeLinkRuntime: ObservableObject {
               elapsed < Self.xiaomiScreenSessionRebuildCooldownSeconds else {
             return false
         }
+        // The session built by the last rebuild never delivered a single
+        // packet (live 2026-08-10: the relay rebuild produced a dead
+        // session and the 45s cooldown then suppressed every recovery,
+        // leaving the screen frozen until the user intervened). A
+        // zero-packet stall on a session OTHER than the rebuild's source
+        // means the rebuild itself failed — allow one immediate retry per
+        // rebuild instead of waiting out the cooldown.
+        if event.datagramsReceived == 0,
+           event.pushReceived == 0,
+           event.sessionID != xiaomiScreenLastSessionRebuildSourceSessionID,
+           !xiaomiScreenZeroPacketRecoveryBypassedForRebuild {
+            xiaomiScreenZeroPacketRecoveryBypassedForRebuild = true
+            DiagnosticsLog.warn(
+                "xiaomi.mac.screen_recovery_cooldown_bypassed reason=zero_packets_after_rebuild " +
+                    "phase=\(phase) rtspSession=\(event.sessionID.uuidString) " +
+                    "lastRebuildSession=\(xiaomiScreenLastSessionRebuildSourceSessionID?.uuidString ?? "none") " +
+                    "lastRebuildRequestId=\(xiaomiScreenLastSessionRebuildRequestID ?? "none") " +
+                    "trigger=\(event.trigger) stallReason=\(event.reason)"
+            )
+            return false
+        }
         let remainingMs = Int((Self.xiaomiScreenSessionRebuildCooldownSeconds - elapsed) * 1_000)
         let reason = xiaomiScreenLastSessionRebuildSourceSessionID == event.sessionID ? "stale_session" : "cooldown"
         DiagnosticsLog.info(
@@ -2805,6 +2827,8 @@ final class EdgeLinkRuntime: ObservableObject {
         )
         return true
     }
+
+    private var xiaomiScreenZeroPacketRecoveryBypassedForRebuild = false
 
     private func markXiaomiScreenSessionRebuildStarted(
         requestId: String,
@@ -2825,6 +2849,7 @@ final class EdgeLinkRuntime: ObservableObject {
         xiaomiScreenLastSessionRebuildAt = .distantPast
         xiaomiScreenLastSessionRebuildSourceSessionID = nil
         xiaomiScreenLastSessionRebuildRequestID = nil
+        xiaomiScreenZeroPacketRecoveryBypassedForRebuild = false
         xiaomiScreenLastSourceRecoveryAt = .distantPast
         xiaomiScreenLastSourceRecoverySessionID = nil
         xiaomiScreenLastSourceRecoveryRequestID = nil
