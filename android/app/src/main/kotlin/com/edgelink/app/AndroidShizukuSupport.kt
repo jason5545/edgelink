@@ -202,16 +202,6 @@ object AndroidShizukuSupport {
             withService(context) { service -> service.runCommandResult(command) }
         }.getOrNull()
 
-    suspend fun startCallUplinkInjector(context: Context): Boolean =
-        runCatching {
-            withService(context) { service -> service.startCallUplinkInjector() }
-        }.isSuccess
-
-    suspend fun stopCallUplinkInjector(context: Context): Boolean =
-        runCatching {
-            withService(context) { service -> service.stopCallUplinkInjector() }
-        }.isSuccess
-
     // The mi_connect networking probe binds from the app process (AMS
     // rejects binds from the root service), but mi_connect's
     // PermissionChecker refuses our uid — except while the Xiaomi debug gate

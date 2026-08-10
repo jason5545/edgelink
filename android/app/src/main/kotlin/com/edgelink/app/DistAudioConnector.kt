@@ -58,9 +58,6 @@ object DistAudioConnector {
 
     @Synchronized
     fun onRelayedCallActive(context: Context, deviceId: String) {
-        // No-hook uplink inject first: it is independent of the DistAudio
-        // connect below and can start feeding the modem uplink immediately.
-        CallUplinkInject.start(context)
         if (connectedRoute?.deviceId == deviceId) return
         connectingDeviceId = deviceId
         if (binder != null) {
@@ -83,7 +80,6 @@ object DistAudioConnector {
     @Synchronized
     fun onCallEnded(deviceId: String?) {
         connectingDeviceId = null
-        CallUplinkInject.stop()
         val route = connectedRoute ?: return
         if (deviceId != null && route.deviceId != deviceId) return
         disconnectLocked(route)

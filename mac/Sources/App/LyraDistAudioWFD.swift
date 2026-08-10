@@ -934,27 +934,6 @@ final class LyraDistAudioUplink {
     private var rtcpConnection: NWConnection?
     private var rtcpTimer: DispatchSourceTimer?
     private var rtcpSRSent = 0
-    // Call-uplink injection: the phone's miplaycast runtime never delivers
-    // this session's decoded audio to the DAS call stream (RuntimeToClient
-    // shared memory stays empty), so the mic PCM is also streamed raw over
-    // TCP :19307 ("ELMA" magic, then 16k s16le mono). The endpoint is owned
-    // by the EdgeLink root Shizuku injector (CallUplinkInjector, uid 0),
-    // which writes it into a USAGE_VOICE_COMMUNICATION AudioTrack pinned at
-    // TYPE_TELEPHONY (modem uplink) — no hook, no distaudio session. The
-    // old LSPosed feed inside com.miui.audiomonitor and its fallback
-    // arbitration were removed; the injector is the only endpoint owner.
-    private static let callInjectPort: UInt16 = 19307
-    private static let callInjectMagic = Data([0x45, 0x4c, 0x4d, 0x41])
-    private var injectConnection: NWConnection?
-    private var injectReady = false
-    private var injectBytesSent = 0
-    private var injectLastLogBytes = 0
-    // The 19307 endpoint can be recycled under us mid-call (the phone-side
-    // injector restarts its server across calls, and any connection reset
-    // used to end inject for the whole call). Retry the connection until
-    // stop().
-    private var injectStopped = false
-    private var injectRetries = 0
 
     init(host: String, port: UInt16, localPort: UInt16, mediaKey: Data) {
         self.host = host
@@ -995,67 +974,7 @@ final class LyraDistAudioUplink {
         } else {
             startRTCP()
         }
-        startCallInject()
         startCapture()
-    }
-
-    private func startCallInject() {
-        guard !injectStopped else { return }
-        let inject = NWConnection(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: Self.callInjectPort)!,
-            using: .tcp
-        )
-        injectConnection = inject
-        inject.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                guard let self, !self.injectReady else { return }
-                self.injectReady = true
-                self.injectRetries = 0
-                inject.send(content: Self.callInjectMagic, completion: .contentProcessed { error in
-                    if let error {
-                        DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_handshake_failed \(error)")
-                    } else {
-                        DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_ready host=\(self.host) port=\(Self.callInjectPort)")
-                    }
-                })
-            case .failed(let error):
-                DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_failed \(String(describing: error))")
-                self?.injectReady = false
-                self?.scheduleInjectRetry()
-            default:
-                break
-            }
-        }
-        inject.start(queue: queue)
-    }
-
-    private func scheduleInjectRetry() {
-        guard !injectStopped, injectRetries < 30 else { return }
-        injectRetries += 1
-        injectConnection?.cancel()
-        injectConnection = nil
-        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self, !self.injectStopped else { return }
-            DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_retry attempt=\(self.injectRetries)")
-            self.startCallInject()
-        }
-    }
-
-    private func sendCallInjectPCM(_ pcm: Data) {
-        guard injectReady, let injectConnection else { return }
-        injectBytesSent += pcm.count
-        injectConnection.send(content: pcm, completion: .contentProcessed { [weak self] error in
-            if let error {
-                DiagnosticsLog.warn("xiaomi.distaudio.uplink_inject_send_failed \(error)")
-                self?.injectReady = false
-                return
-            }
-            guard let self, self.injectBytesSent - self.injectLastLogBytes >= 320_000 else { return }
-            self.injectLastLogBytes = self.injectBytesSent
-            DiagnosticsLog.info("xiaomi.distaudio.uplink_inject_progress bytes=\(self.injectBytesSent)")
-        })
     }
 
     static func debugNoRTCP() -> Bool {
@@ -1135,10 +1054,8 @@ final class LyraDistAudioUplink {
         queue.async { [weak self] in
             DiagnosticsLog.info(
                 "xiaomi.distaudio.uplink_stop taps=\(self?.tapInvocations ?? 0) buffers=\(self?.captureBuffers ?? 0) " +
-                    "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0) " +
-                    "injectBytes=\(self?.injectBytesSent ?? 0)"
+                    "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0)"
             )
-            self?.injectStopped = true
             self?.engine?.stop()
             self?.engine?.inputNode.removeTap(onBus: 0)
             self?.engine = nil
@@ -1146,9 +1063,6 @@ final class LyraDistAudioUplink {
             self?.rtcpTimer = nil
             self?.rtcpConnection?.cancel()
             self?.rtcpConnection = nil
-            self?.injectConnection?.cancel()
-            self?.injectConnection = nil
-            self?.injectReady = false
             self?.connection?.cancel()
         }
     }
@@ -1286,7 +1200,6 @@ final class LyraDistAudioUplink {
             )
         }
         pcmCarry.append(pcm)
-        sendCallInjectPCM(pcm)
         while pcmCarry.count >= Self.pcmFrameBytes {
             let frame = pcmCarry.prefix(Self.pcmFrameBytes)
             pcmCarry.removeFirst(Self.pcmFrameBytes)

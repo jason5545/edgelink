@@ -14,7 +14,7 @@ import Network
 // (Business_IsPhoneRelay): when we answer its event-23 KeyData and signal a
 // call (event 24 + event 31), it startSinks against our advertised endpoint
 // with mIsPhoneRelay=1, and the phone's own runtime delivers our uplink
-// audio into the call (the official terminal hop) — no CallUplinkInjector.
+// audio into the call (the official terminal hop).
 //
 // Wire contract (all verified against jadx + live logs 2026-08-09):
 //   - event 23 MIRROR_CALL_KEY: KeyData JSON {"keyBytes": [int array of the

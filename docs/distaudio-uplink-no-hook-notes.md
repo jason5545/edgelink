@@ -137,8 +137,9 @@ state from relayCall `update_call_state` callState 4) +
 `LyraMirrorCallAudioSource` (RTSP + ff02 PCM TS + AESPART), wired into
 `LyraCastTrustSession` (simpleEvent routing). Loopback-verified against
 `LyraMirrorCallRelayRole` (the LyraServerKit mock phone).
-**Not yet live-verified against the real phone.** CallUplinkInjector stays
-as-is until then; note both paths can be live simultaneously during
-verification (injector writes PCM fed by the distaudio uplink, the phone's
-own sink plays the PHONERELAY stream) — expect double uplink audio on the
-first live call; gate the injector after the native path proves out.
+**Not yet live-verified against the real phone** (needs an active mirror
+session during the call). Meanwhile the official TeleService distaudio
+uplink carries relayed-call mic audio on its own (live 2026-08-10:
+`uplink_stop sent=2658 failures=0` with the injector never engaged), so
+the Shizuku CallUplinkInjector (root :19307 "ELMA" endpoint) and its
+Mac-side inject client were removed outright.

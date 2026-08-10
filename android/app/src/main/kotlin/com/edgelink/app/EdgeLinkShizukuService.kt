@@ -11,7 +11,6 @@ import kotlin.math.min
 private const val COMMAND_TIMEOUT_SECONDS = 10L
 private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
 private const val MI_CONNECT_PERMISSION_SWITCH_PROPERTY = "lyra.permission.switch"
-private const val CALL_INJECT_PROPERTY = "debug.edgelink.call_inject"
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
 private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
     "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
@@ -31,32 +30,6 @@ private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
 class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
     override fun destroy() {
         System.exit(0)
-    }
-
-    // No-hook call-uplink inject: this root process owns the 19307 endpoint
-    // and writes the Mac mic PCM into a telephony-routed AudioTrack directly.
-    // The old LSPosed feed inside audiomonitor is gone; if the route is
-    // refused the injector retries for the whole call and logs a heartbeat.
-    private val callUplinkInjector = CallUplinkInjector()
-
-    // 2026-08-10: gated OFF by default while the native MirrorCallService
-    // PHONERELAY uplink (Mac answers event-23 KeyData, phone sinks our audio
-    // source with Business_IsPhoneRelay=1) is live-verified — both paths
-    // feeding the modem uplink would double the audio. Explicitly re-enable
-    // the injector with `setprop debug.edgelink.call_inject 1`.
-    override fun startCallUplinkInjector() {
-        if (readSystemProperty(CALL_INJECT_PROPERTY) != "1") {
-            android.util.Log.i(
-                "EdgeLinkShizuku",
-                "call inject (shizuku) gated off ($CALL_INJECT_PROPERTY != 1)"
-            )
-            return
-        }
-        callUplinkInjector.start()
-    }
-
-    override fun stopCallUplinkInjector() {
-        callUplinkInjector.stop()
     }
 
     // Permission gate for the mi_connect networking probe. mi_connect's

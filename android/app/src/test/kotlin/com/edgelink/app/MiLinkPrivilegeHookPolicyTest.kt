@@ -96,9 +96,9 @@ class MiLinkPrivilegeHookPolicyTest {
 
     @Test
     fun noLongerHooksAudioMonitor() {
-        // The call-uplink inject moved entirely into the root Shizuku
-        // service (CallUplinkInjector); the in-process LSPosed feed inside
-        // audiomonitor and its fallback were removed, so the module must
+        // The call uplink rides the native DistAudio/PHONERELAY paths; the
+        // in-process LSPosed feed inside audiomonitor, its fallback, and the
+        // root Shizuku injector were all removed, so the module must
         // not load into com.miui.audiomonitor anymore.
         assertFalse(
             MiLinkPrivilegeHookPolicy.shouldHook(
