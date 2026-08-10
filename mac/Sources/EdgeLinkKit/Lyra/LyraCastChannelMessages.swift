@@ -314,6 +314,58 @@ public struct LyraCastMouse: Equatable, Sendable {
     }
 }
 
+// duo.screen ProtoCommand (command.proto): global keys (home/back/menu)
+// from the PC, wire type 9 on the cast channel, decoded by MessageConvert
+// case 9 → KeyMessage.parseCommand → Android keyCode 3/4/82 injected like
+// any other key event. command_type is an enum (HOME=0, BACK=1, MENU=2);
+// HOME is the proto3 default so it is not serialized.
+public struct LyraCastCommand: Equatable, Sendable {
+    public enum CommandType: UInt32, Sendable {
+        case home = 0
+        case back = 1
+        case menu = 2
+    }
+
+    public var screenId: UInt32 = 0
+    public var down: Bool = false
+    public var commandType: CommandType = .home
+
+    public init() {}
+
+    public static func tap(screenId: UInt32 = 0, _ commandType: CommandType) -> [LyraCastCommand] {
+        var downMessage = LyraCastCommand()
+        downMessage.screenId = screenId
+        downMessage.down = true
+        downMessage.commandType = commandType
+        var upMessage = LyraCastCommand()
+        upMessage.screenId = screenId
+        upMessage.down = false
+        upMessage.commandType = commandType
+        return [downMessage, upMessage]
+    }
+
+    public func encode() -> Data {
+        var data = Data()
+        if screenId != 0 { LyraProtoWriter.appendVarintField(1, value: UInt64(screenId), to: &data) }
+        if down { LyraProtoWriter.appendBoolField(2, value: true, to: &data) }
+        if commandType != .home { LyraProtoWriter.appendVarintField(3, value: UInt64(commandType.rawValue), to: &data) }
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> LyraCastCommand {
+        var message = LyraCastCommand()
+        for field in try LyraProtoReader.readFields(from: data) {
+            switch field.number {
+            case 1: message.screenId = UInt32(field.varintValue ?? 0)
+            case 2: message.down = (field.varintValue ?? 0) != 0
+            case 3: message.commandType = CommandType(rawValue: UInt32(field.varintValue ?? 0)) ?? .home
+            default: break
+            }
+        }
+        return message
+    }
+}
+
 public struct LyraCastSimpleEvent: Equatable, Sendable {    public static let eventMirrorCallKey: UInt32 = 23
     public static let eventMirrorCallStop: UInt32 = 25
     public static let eventDeviceInfo: UInt32 = 38

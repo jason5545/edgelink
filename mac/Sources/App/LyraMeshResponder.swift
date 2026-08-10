@@ -305,8 +305,18 @@ final class LyraMeshResponder {
     }
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
-        lastEndpointDescription = endpoint.debugDescription
+        // Only let frames from the expected phone host move the announce
+        // target: with a pinned LAN IP, other HyperConnect devices on the
+        // network must not redirect our announce into the void.
         if let parsed = Self.parseEndpoint(endpoint.debugDescription), Self.isExpectedPhoneHost(parsed.host) {
+            lastEndpointDescription = endpoint.debugDescription
+            // Post-roam the phone redials from its NEW phys port (often
+            // auth-reuse, no fresh sync-auth): refresh the learned sync
+            // endpoint too, or currentPhoneEndpoint() keeps returning the
+            // stale pre-roam port and announces go into the void.
+            if syncAnnounceEndpoint != nil {
+                syncAnnounceEndpoint = endpoint.debugDescription
+            }
             Self.recordPhoneEndpoint(endpoint.debugDescription)
         }
         if let session = LyraCastTrustSession.activeTrustSession, session.handlesAdoptedMitrust(frame: frame, endpoint: endpoint) {

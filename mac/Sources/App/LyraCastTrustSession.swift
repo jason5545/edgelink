@@ -2143,6 +2143,10 @@ final class LyraCastTrustSession {
         sendCastMessage(type: LyraCastMessageType.mouse, payload: message.encode())
     }
 
+    func sendCommand(_ message: LyraCastCommand) {
+        sendCastMessage(type: LyraCastMessageType.command, payload: message.encode())
+    }
+
     private func handleChannelMessage(_ message: Data) {
         lastProgress = Date()
         var frame = message

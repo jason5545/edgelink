@@ -131,7 +131,6 @@ class AndroidMiLinkCommandBridge(
                     // the relay path had no recovery at all (the command used
                     // to fall through to "unsupported").
                     COMMAND_MIRROR_SOURCE_RECOVERY -> startMirrorMainDisplay(body)
-                    COMMAND_MIRROR_GLOBAL -> sendMirrorGlobal(body)
                     COMMAND_MIRROR_OPEN_REMOTE_DEVICE -> callMirrorDeviceProvider(body, "openRemoteDeviceMirror")
                     COMMAND_SYNERGY_STATUS -> querySynergyStatus()
                     COMMAND_SYNERGY_SHOW_RELAY_DATA -> callSynergyRelay(body, transactionShowRelayData, "showRelayData")
@@ -620,53 +619,6 @@ class AndroidMiLinkCommandBridge(
         }, "EdgeLinkMiMirror-btMacFallback").apply {
             isDaemon = true
             start()
-        }
-    }
-
-
-
-    private fun sendMirrorGlobal(body: MiLinkCommandBody): CommandResult {
-        val action = body.args["action"].orEmpty()
-        val result = callMirrorProviderWithDeadline(
-            method = "edgeLinkGlobal",
-            deadlineMs = mirrorKeyboardProviderDeadlineMs
-        ) {
-            val providerResult = appContext.contentResolver.callMirrorProvider(
-                "edgeLinkGlobal",
-                Bundle().apply {
-                    putString("action", action)
-                    putString("requestId", body.requestId)
-                    putString("deviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
-                    putString("remoteDeviceId", MiLinkPrivilegeHookPolicy.FAKE_MIRROR_REMOTE_ID)
-                    putInt("method_version", body.args["method_version"]?.toIntOrNull() ?: mirrorProviderMethodVersion)
-                }
-            )
-            val accepted = providerResult?.getBoolean("edgelinkGlobalAccepted", false) == true
-            CommandResult(
-                success = accepted,
-                route = "xiaomi.mirror.hid.global",
-                message = "global accepted=$accepted keys=${providerResult?.keySummary().orEmpty()}",
-                data = mapOf(
-                    "accepted" to accepted.toString(),
-                    "action" to action,
-                    "providerValue" to (providerResult?.valueInt()?.toString() ?: ""),
-                    "providerRoute" to providerResult?.getString("route").orEmpty(),
-                    "providerMessage" to providerResult?.getString("message").orEmpty()
-                )
-            )
-        }
-        return when (result) {
-            is MirrorProviderDeadlineResult.Completed -> result.result
-            is MirrorProviderDeadlineResult.Pending -> CommandResult(
-                success = false,
-                route = "xiaomi.mirror.hid.global.pending",
-                message = "global pending>${result.deadlineMs}ms",
-                data = mapOf(
-                    "pendingMethod" to "edgeLinkGlobal",
-                    "pendingDeadlineMs" to result.deadlineMs.toString(),
-                    "action" to action
-                )
-            )
         }
     }
 
@@ -1622,7 +1574,6 @@ class AndroidMiLinkCommandBridge(
         const val COMMAND_MIRROR_START_MAIN_DISPLAY = "xiaomi.mirror.startMainDisplay"
         const val COMMAND_MIRROR_SOURCE_RECOVERY = "xiaomi.mirror.requestSourceRecovery"
         const val COMMAND_MIRROR_LOCK_STATE = "xiaomi.mirror.lockState"
-        const val COMMAND_MIRROR_GLOBAL = "xiaomi.mirror.global"
         const val COMMAND_MIRROR_OPEN_REMOTE_DEVICE = "xiaomi.mirror.openRemoteDeviceMirror"
         const val COMMAND_SYNERGY_STATUS = "xiaomi.synergy.status"
         const val COMMAND_SYNERGY_SHOW_RELAY_DATA = "xiaomi.synergy.showRelayData"
@@ -1652,7 +1603,6 @@ class AndroidMiLinkCommandBridge(
         const val mirrorCastChannelReadyTimeoutMs = 10_000L
         const val mirrorCastChannelPollIntervalMs = 250L
         const val mirrorCastChannelFreshMs = 30_000L
-        const val mirrorKeyboardProviderDeadlineMs = 800L
         const val mirrorQueryProviderDeadlineMs = 3_000L
         const val mirrorProviderTerminalCapMs = 30_000L
         const val providerInflightPollMs = 25L

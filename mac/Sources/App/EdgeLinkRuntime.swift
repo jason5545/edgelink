@@ -16,7 +16,6 @@ final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
     private static let securePongTimeoutSeconds: TimeInterval = 15
     private static let disconnectStopFlushTimeoutNanoseconds: UInt64 = 1_500_000_000
-    private static let xiaomiMirrorGlobalCommand = "xiaomi.mirror.global"
     private static let androidMetaAltLeft = 0x10
     private static let androidMetaAltRight = 0x20
     private static let androidMetaShiftLeft = 0x40
@@ -3186,19 +3185,38 @@ final class EdgeLinkRuntime: ObservableObject {
 
     @discardableResult
     private func sendXiaomiMirrorGlobal(_ action: String) -> Bool {
-        let requestId = sendMiLinkCommand(
-            command: Self.xiaomiMirrorGlobalCommand,
-            args: ["action": action],
-            updatesStatus: false
-        )
-        if let requestId {
-            DiagnosticsLog.info(
-                "xiaomi.mac.global_sent requestId=\(requestId) action=\(action)"
-            )
-            return true
+        // Official route: ProtoCommand on the cast channel (wire type 9),
+        // exactly like the official Mac client — the phone maps it to
+        // Android keyCode 3/4/82 and injects it like any other key event.
+        // Recents has no ProtoCommand enum value, so it goes through the
+        // official keyboard path as Android KEYCODE_APP_SWITCH (the official
+        // client also sends non-home/back/menu keys as ProtoKeyboard).
+        guard let session = lyraCastTrustSession, session.isChannelReady,
+              let sessionId = xiaomiMirrorCastSessionId else {
+            DiagnosticsLog.warn("xiaomi.mac.global_ignored action=\(action) reason=no_cast_channel")
+            return false
         }
-        DiagnosticsLog.warn("xiaomi.mac.global_ignored action=\(action) not_sent")
-        return false
+        switch action {
+        case "home", "back":
+            let commandType: LyraCastCommand.CommandType = action == "home" ? .home : .back
+            for message in LyraCastCommand.tap(commandType) {
+                session.sendCommand(message)
+            }
+        case "recents":
+            for isDown in [true, false] {
+                session.sendKeyboard(.key(
+                    sessionId: sessionId,
+                    androidKeyCode: 187,
+                    metaInfo: 0,
+                    down: isDown
+                ))
+            }
+        default:
+            DiagnosticsLog.warn("xiaomi.mac.global_ignored action=\(action) reason=unsupported")
+            return false
+        }
+        DiagnosticsLog.info("xiaomi.mac.global_sent action=\(action)")
+        return true
     }
 
     private static func androidMetaState(

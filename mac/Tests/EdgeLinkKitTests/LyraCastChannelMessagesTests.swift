@@ -215,4 +215,40 @@ final class LyraCastChannelMessagesTests: XCTestCase {
         XCTAssertNil(decoded.keyEvent)
         XCTAssertFalse(decoded.isAndroidKey)
     }
+
+    // Wire layout checked against the phone-side descriptor
+    // (com.xiaomi.mirror.message.proto.Command, Mirror.apk): screen_id=1,
+    // down=2, command_type=3 (HOME=0, BACK=1, MENU=2). HOME is the proto3
+    // default and is not serialized.
+    func testCommandWireLayout() throws {
+        let tap = LyraCastCommand.tap(.back)
+        XCTAssertEqual(tap.count, 2)
+        XCTAssertTrue(tap[0].down)
+        XCTAssertFalse(tap[1].down)
+
+        let encoded = tap[0].encode()
+        // down=true: field 2 tag 0x10 value 0x01; command_type=BACK: field 3
+        // tag 0x18 value 0x01. screen_id=0 omitted.
+        XCTAssertEqual(Array(encoded), [0x10, 0x01, 0x18, 0x01])
+        let decoded = try LyraCastCommand.decode(encoded)
+        XCTAssertEqual(decoded, tap[0])
+
+        let frame = LyraCastMessageCodec.encodeFrame(
+            type: LyraCastMessageType.command,
+            payload: encoded
+        )
+        let (type, payload) = try LyraCastMessageCodec.decodeFrame(frame)
+        XCTAssertEqual(type, 9)
+        XCTAssertEqual(try LyraCastCommand.decode(payload), tap[0])
+    }
+
+    func testCommandHomeSerializesEmpty() throws {
+        // HOME=0 is the proto3 default: a home tap encodes only the down bit.
+        let tap = LyraCastCommand.tap(.home)
+        XCTAssertEqual(Array(tap[0].encode()), [0x10, 0x01])
+        XCTAssertTrue(tap[1].encode().isEmpty)
+        let decoded = try LyraCastCommand.decode(tap[0].encode())
+        XCTAssertEqual(decoded.commandType, .home)
+        XCTAssertTrue(decoded.down)
+    }
 }

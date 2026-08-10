@@ -381,6 +381,11 @@ devices through a local `RemoteDeviceInfo` parcelable shim, and registering/unre
 For controlled reverse-engineering, the LSPosed module supports a disabled-by-default runtime
 spoof:
 
+> **Stale (2026-08-10):** the entire `debug.edgelink.mirror_fake_*` / `debug.edgelink.relay_*`
+> prop family was removed from the code on 2026-08-05 (`b67642533` and follow-ups) once the
+> native relayCall / DistAudio paths landed. The section below is kept as historical research
+> notes; none of these props are read by the current tree.
+
 - `debug.edgelink.mirror_fake_remote=pad` injects one Xiaomi `AndroidPad` remote device with id
   `edgelink-mac-mi-pad` into `queryRemoteDevices`, answers `queryRemoteDevice`, and makes Mirror's
   internal terminal lookup/device-type checks resolve the same fake pad.

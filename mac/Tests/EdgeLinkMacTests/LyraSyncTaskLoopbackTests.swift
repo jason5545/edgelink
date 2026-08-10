@@ -17,6 +17,7 @@ final class LyraSyncTaskLoopbackTests: XCTestCase {
         "xiaomiTrustTicketHex",
         "xiaomiTrustUidHashB64",
         "xiaomiTrustDeviceKeyHex",
+        "lanLastPhoneIP",
     ]
 
     private var savedValues: [String: Any?] = [:]
@@ -38,6 +39,9 @@ final class LyraSyncTaskLoopbackTests: XCTestCase {
         defaults.removeObject(forKey: "xiaomiTrustPeerIdentityPubB64")
         defaults.removeObject(forKey: "xiaomiTrustSessionKeyHex")
         defaults.removeObject(forKey: "xiaomiTrustTicketHex")
+        // Endpoint learning must not be gated by a pinned LAN IP from the
+        // developer machine's real defaults (loopback host is 127.0.0.1).
+        defaults.removeObject(forKey: "lanLastPhoneIP")
         MiTrustTicketStore.lastAuthSessionKeyData = nil
     }
 
@@ -161,5 +165,60 @@ final class LyraSyncTaskLoopbackTests: XCTestCase {
         }
         XCTAssertEqual(second.state, .established)
         waitFor("reuse reply parsed") { second.peerDevice != nil }
+    }
+
+    // Roam simulation: the phone's lyra phys server rebinds to a new port
+    // (observed live 2026-07-29: 46541→38475) while the Mac keeps the same
+    // socket. The next phone-initiated dial must teach the responder the new
+    // endpoint — this is what makes the Shizuku /proc/net/udp mesh-port
+    // report a fallback rather than a hard requirement on LAN. (The mock
+    // phone dials from ephemeral ports rather than its listener port, so the
+    // test tracks the LEARNED port instead of phone.boundPort; the real
+    // phone's single-socket model makes its dial source equal its phys
+    // server port.)
+    func testPhoneEndpointRelearnedAfterPhoneRebindsPort() throws {
+        let responderPort = try startResponder()
+        phone = try makePhone()
+
+        phone.runSyncTask(host: "127.0.0.1", port: responderPort)
+        waitFor("first dial established") {
+            self.phone.syncTask.state == .established
+        }
+        waitFor("responder learned first endpoint") {
+            self.responder?.currentPhoneEndpoint() != nil
+        }
+        let firstLearnedPort = try XCTUnwrap(responder?.currentPhoneEndpoint()?.port)
+
+        // The phone records the session key; the Mac persists it the same
+        // way recordAuthSession does in production, so the post-roam dial
+        // can reuse auth without a full handshake.
+        let reuseKey = try XCTUnwrap(phone.syncTask.reuseKey)
+        let keyData = reuseKey.withUnsafeBytes { Data($0) }
+        UserDefaults.standard.set(
+            keyData.map { String(format: "%02x", $0) }.joined(),
+            forKey: "xiaomiTrustSessionKeyHex"
+        )
+        let identity = phone.identity
+        phone.stop()
+
+        let roamedPhone = LyraPhoneServer(identity: identity)
+        try roamedPhone.start(port: 0)
+        waitFor("roamed phone listener ready") { roamedPhone.boundPort != nil }
+
+        let redial = LyraSyncTaskRole(identity: identity, oracle: roamedPhone.oracle)
+        redial.reuseKey = reuseKey
+        var events: [String] = []
+        redial.onEvent = { events.append($0) }
+        redial.dial(server: roamedPhone.mesh, host: "127.0.0.1", port: responderPort)
+
+        waitFor("post-roam reuse dial pushes payload") {
+            events.contains("sync task payload pushed")
+        }
+        waitFor("responder learned roamed endpoint") {
+            guard let port = self.responder?.currentPhoneEndpoint()?.port else { return false }
+            return port != firstLearnedPort
+        }
+        waitFor("post-roam reply parsed") { redial.peerDevice != nil }
+        roamedPhone.stop()
     }
 }

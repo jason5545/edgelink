@@ -161,12 +161,13 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
-    fun keyboardAndPointerProviderStackIsGoneButGlobalStays() {
-        // Mirror keyboard and pointer moved to the official cast-channel
-        // route, so the hook-side provider must not answer them anymore.
-        // Global (back/home/recents/power) still injects via the hook.
+    fun keyboardPointerAndGlobalProviderStackIsGone() {
+        // Mirror keyboard, pointer, and global keys all moved to the
+        // official cast-channel route (ProtoKeyboard/ProtoMouse/
+        // ProtoCommand), so the hook-side provider must not answer them
+        // anymore.
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkKeyboard"))
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkPointer"))
-        assertTrue(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkGlobal"))
+        assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkGlobal"))
     }
 }

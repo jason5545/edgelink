@@ -1205,6 +1205,45 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Global keys (home/back) ride the same cast channel (wire type 9 =
+    // duo.screen ProtoCommand), exactly like the official Mac client — the
+    // phone maps command_type to Android keyCode 3/4/82 and injects it like
+    // any other key event, so no Android-app hook round trip is needed.
+    // Recents has no ProtoCommand enum value and goes through the official
+    // keyboard path as Android KEYCODE_APP_SWITCH (187).
+    func testGlobalCommandsFlowOnCastChannelAfterMirrorOpens() async throws {
+        try makeEnvironment(locked: false)
+        session.start()
+        controller.start()
+
+        try await waitFor("controller streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        for message in LyraCastCommand.tap(.home) { session.sendCommand(message) }
+        for message in LyraCastCommand.tap(.back) { session.sendCommand(message) }
+        for message in LyraCastCommand.tap(.menu) { session.sendCommand(message) }
+
+        try await waitFor("phone received command frames") { [self] in
+            self.phone.commandMessages.count >= 6
+        }
+        let messages = phone.commandMessages
+        XCTAssertEqual(messages[0].commandType, .home)
+        XCTAssertTrue(messages[0].down)
+        XCTAssertEqual(messages[1].commandType, .home)
+        XCTAssertFalse(messages[1].down)
+        XCTAssertEqual(messages[2].commandType, .back)
+        XCTAssertTrue(messages[2].down)
+        XCTAssertEqual(messages[3].commandType, .back)
+        XCTAssertFalse(messages[3].down)
+        XCTAssertEqual(messages[4].commandType, .menu)
+        XCTAssertEqual(messages[5].commandType, .menu)
+        XCTAssertFalse(messages[5].down)
+        for message in messages {
+            XCTAssertEqual(message.screenId, 0)
+        }
+    }
+
     // Pointer rides the same cast channel (wire type 3 = duo.screen
     // ProtoMouse). Hover MOVE events with no button state are what the
     // official client uses to keep the phone's synergy input state alive

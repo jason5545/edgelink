@@ -73,13 +73,7 @@
   adb shell am broadcast -a com.edgelink.app.DEBUG_PROBE_MILINK -p com.edgelink.app [--es command xiaomi.mi_connect.networkingProbe]
   ```
 
-- Call-relay debug properties 在值為空時不作用：
-
-  ```text
-  debug.edgelink.relay_filter_accept_all=1
-  debug.edgelink.relay_dial_test=<deviceId>
-  debug.edgelink.relay_inject_device=<deviceId>
-  ```
+- `[OBSERVED]` 2026-08-05 起 call-relay / mirror fake-remote inject 已全面拆除（commit `b67642533` 前後），`debug.edgelink.relay_*`、`debug.edgelink.mirror_fake_*` 等 prop 在程式碼中已不存在；TeleService relayCall 走自然註冊。目前 Android tree 唯一仍讀取的 debug prop 是 `debug.edgelink.mirror_wifi_gate`（手動除錯開關，production 不設定）。
 
 - lyra-debug CLI（pcap / parse / keys）：
 

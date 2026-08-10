@@ -28,6 +28,7 @@ final class FakeXiaomiPhone {
     private(set) var closeScreenCount = 0
     private(set) var keyboardMessages: [LyraCastKeyboard] = []
     private(set) var mouseMessages: [LyraCastMouse] = []
+    private(set) var commandMessages: [LyraCastCommand] = []
     private(set) var wfdSessionEstablished = false
     private(set) var wfdPlayCount = 0
     private(set) var videoDatagramsSent = 0
@@ -571,6 +572,11 @@ final class FakeXiaomiPhone {
                 log("fakephone.mouse sessionId=\(mouse.sessionId) action=\(mouse.action) x=\(mouse.x) y=\(mouse.y) " +
                     "state=\(mouse.state) scrollDelta=\(mouse.scrollDelta)")
                 mouseMessages.append(mouse)
+            }
+        case LyraCastMessageType.command:
+            if let command = try? LyraCastCommand.decode(framePayload) {
+                log("fakephone.command screenId=\(command.screenId) down=\(command.down) commandType=\(command.commandType)")
+                commandMessages.append(command)
             }
         case LyraCastMessageType.screenAction:
             if let action = try? LyraCastScreenAction.decode(framePayload) {
