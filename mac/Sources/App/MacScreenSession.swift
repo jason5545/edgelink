@@ -1470,7 +1470,10 @@ final class MacScreenSession: NSObject, ObservableObject {
     }
 
     private func sendPointerBody(_ body: CtrlPointerBody, kind: String, shouldLog: Bool) {
-        if isXiaomiMirrorRouteActive || isRenderingXiaomiMirror {
+        if MirrorPointerRouting.usesCastChannel(
+            action: body.action,
+            xiaomiMirrorActive: isXiaomiMirrorRouteActive || isRenderingXiaomiMirror
+        ) {
             let handled = onXiaomiMirrorPointer?(body) ?? false
             if handled {
                 markControlSent(kind: "xiaomi:\(kind)", shouldLog: shouldLog)

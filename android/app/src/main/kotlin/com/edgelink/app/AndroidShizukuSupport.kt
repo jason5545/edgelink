@@ -207,6 +207,18 @@ object AndroidShizukuSupport {
     // PermissionChecker refuses our uid — except while the Xiaomi debug gate
     // lyra.permission.switch=1 is set. Only root can write that property, so
     // the Shizuku service toggles it around the probe window.
+    suspend fun injectScroll(context: Context, x: Int, y: Int, wheelDy: Int): Boolean {
+        if (wheelDy == 0 || !currentState().canUse) {
+            return false
+        }
+        return runCatching {
+            withService(context) { service -> service.injectScroll(x, y, wheelDy) }
+        }.getOrElse { error ->
+            EdgeLinkLog.warn("shizuku.android.inject_scroll_failed", error)
+            false
+        }
+    }
+
     internal suspend fun probeMiConnectNetworking(
         context: Context,
         request: MiConnectNetworkingProbeRequest

@@ -11,6 +11,12 @@ import kotlin.math.min
 private const val COMMAND_TIMEOUT_SECONDS = 10L
 private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
 private const val MI_CONNECT_PERMISSION_SWITCH_PROPERTY = "lyra.permission.switch"
+private const val SCROLL_WHEEL_AXIS_DIVISOR = 16f
+private const val SCROLL_WHEEL_AXIS_MAX = 8f
+private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
+
+internal fun scrollAxisValue(wheelDy: Int): Float =
+    (wheelDy.toFloat() / SCROLL_WHEEL_AXIS_DIVISOR).coerceIn(-SCROLL_WHEEL_AXIS_MAX, SCROLL_WHEEL_AXIS_MAX)
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
 private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
     "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
@@ -85,6 +91,89 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
             "EdgeLinkShizuku",
             "mi_connect probe setprop $name=$value ok=$ok"
         )
+    }
+
+    override fun injectScroll(x: Int, y: Int, wheelDy: Int): Boolean {
+        if (wheelDy == 0) {
+            return false
+        }
+        val manager = inputManagerInstance ?: return false
+        val inject = injectInputEventMethod ?: return false
+        return runCatching {
+            val now = android.os.SystemClock.uptimeMillis()
+            val pointerProperties = android.view.MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = android.view.MotionEvent.TOOL_TYPE_MOUSE
+            }
+            val vscroll = scrollAxisValue(wheelDy)
+            val pointerCoords = android.view.MotionEvent.PointerCoords().apply {
+                this.x = x.toFloat()
+                this.y = y.toFloat()
+                setAxisValue(android.view.MotionEvent.AXIS_VSCROLL, vscroll)
+            }
+            @Suppress("DEPRECATION")
+            val event = android.view.MotionEvent.obtain(
+                now,
+                now,
+                android.view.MotionEvent.ACTION_SCROLL,
+                1,
+                arrayOf(pointerProperties),
+                arrayOf(pointerCoords),
+                0,
+                0,
+                1f,
+                1f,
+                0,
+                0,
+                android.view.InputDevice.SOURCE_MOUSE,
+                0
+            )
+            try {
+                inject.invoke(manager, event, INJECT_INPUT_EVENT_MODE_ASYNC)
+            } finally {
+                event.recycle()
+            }
+            true
+        }.getOrElse { error ->
+            val cause = error.cause ?: error
+            android.util.Log.w(
+                "EdgeLinkShizuku",
+                "injectScroll failed x=$x y=$y wheelDy=$wheelDy: " +
+                    "${cause.javaClass.simpleName}: ${cause.message}"
+            )
+            false
+        }
+    }
+
+    private val inputManagerInstance: Any? by lazy {
+        runCatching {
+            Class.forName("android.hardware.input.InputManager")
+                .getMethod("getInstance")
+                .invoke(null)
+        }.getOrElse { error ->
+            android.util.Log.w(
+                "EdgeLinkShizuku",
+                "InputManager.getInstance failed: ${error.javaClass.simpleName}: ${error.message}"
+            )
+            null
+        }
+    }
+
+    private val injectInputEventMethod: java.lang.reflect.Method? by lazy {
+        runCatching {
+            Class.forName("android.hardware.input.InputManager")
+                .getMethod(
+                    "injectInputEvent",
+                    android.view.InputEvent::class.java,
+                    Int::class.javaPrimitiveType
+                )
+        }.getOrElse { error ->
+            android.util.Log.w(
+                "EdgeLinkShizuku",
+                "injectInputEvent lookup failed: ${error.javaClass.simpleName}: ${error.message}"
+            )
+            null
+        }
     }
 
     override fun runCommand(command: Array<String>): String {

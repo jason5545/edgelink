@@ -258,6 +258,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         )
     )
     private val dispatcher = AndroidCommandDispatcher(
+        context = appContext,
         clipboardSync = clipboardSync,
         clipboardHistoryStore = clipboardHistoryStore,
         notificationPresenter = notificationPresenter,
@@ -2763,6 +2764,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 }
 
 private class AndroidCommandDispatcher(
+    private val context: Context,
     private val clipboardSync: AndroidClipboardSync,
     private val clipboardHistoryStore: ClipboardHistoryStore?,
     private val notificationPresenter: AndroidNotificationPresenter,
@@ -2996,7 +2998,19 @@ private class AndroidCommandDispatcher(
                 if (envelope.b.action != "move") {
                     EdgeLinkLog.info("control.android.pointer_in action=${envelope.b.action} bytes=${plaintext.size}")
                 }
-                RemoteInputService.dispatchPointer(envelope.b)
+                if (envelope.b.action == "wheel") {
+                    val injected = AndroidShizukuSupport.injectScroll(
+                        context,
+                        envelope.b.x,
+                        envelope.b.y,
+                        envelope.b.wheelDy ?: 0
+                    )
+                    if (!injected) {
+                        RemoteInputService.dispatchPointer(envelope.b)
+                    }
+                } else {
+                    RemoteInputService.dispatchPointer(envelope.b)
+                }
                 null
             }
             EnvelopeTypes.CTRL_GLOBAL -> {
