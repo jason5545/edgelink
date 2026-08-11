@@ -449,7 +449,14 @@ final class XiaomiMirrorFlowController {
             mask = .unlocking
         case .ready(let locked):
             if locked {
-                if stage != .unlocking {
+                if stage == .unlocking, !trustManager.awaitingAuthEvent {
+                    // The auth attempt ended without an unlock (phone-side
+                    // cancel, retry request, or the auth-event timeout):
+                    // return to the lock mask so 解除鎖定 can be retried
+                    // instead of sitting on 解鎖中 forever (live 2026-08-11).
+                    stage = .opening
+                    mask = .locked
+                } else if stage != .unlocking {
                     mask = .locked
                 }
             } else {

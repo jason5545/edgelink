@@ -261,6 +261,16 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     private var socketKey: SymmetricKey?
     private var nextSendSn: UInt32 = 0
     private var recvUna: UInt32 = 0
+    // Retransmitted segments are normal on the relay path: the phone's
+    // channel client KCP-dials the phone-side bridge on loopback (RTO tuned
+    // for ~0ms) while the real ack takes a relay RTT, and the stateless
+    // bridge forwards every retransmission. Without sn dedup a retransmitted
+    // negotiation was answered again with a fresh sn — the late plaintext
+    // reply lands after the phone entered encrypted mode, its channel layer
+    // hits GCM DecodeFailed and destroys the channel (live 2026-08-11:
+    // unlock 562 never arrived). Dedupe only exact retransmits: neither side
+    // retransmits outbound payloads on this path, so a gap never fills and
+    // out-of-order segments must still be processed on arrival.
     private var announced = false
     private var packetBuffer = Data()
     private var fragments: [Int: Data] = [:]
@@ -398,11 +408,18 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
             announced = true
             onPeerConnected?(endpoint)
         }
-        packetBuffer.append(segment.payload)
-        recvUna = segment.sn &+ 1
+        // Dedup retransmits by sn (acked but never reprocessed). Out-of-order
+        // segments are processed on arrival: nothing on this path retransmits
+        // outbound payloads, so a lost segment leaves a permanent gap and
+        // buffering behind it would stall the channel for good.
+        let isDuplicate = segment.sn < recvUna
+        if !isDuplicate {
+            packetBuffer.append(segment.payload)
+            recvUna = segment.sn &+ 1
+        }
         let ack = LyraMeshDatagram.encodeAck(tick: LyraMeshSocket.tick(), sn: segment.sn, una: recvUna)
         outbound?(ack)
-        guard socketKey != nil else { return }
+        guard !isDuplicate, socketKey != nil else { return }
         while packetBuffer.count >= 2 {
             let first = packetBuffer[packetBuffer.startIndex]
             let second = packetBuffer[packetBuffer.index(packetBuffer.startIndex, offsetBy: 1)]

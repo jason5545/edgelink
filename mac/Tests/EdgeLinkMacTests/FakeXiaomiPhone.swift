@@ -94,6 +94,12 @@ final class FakeXiaomiPhone {
     // bindStatus comes from the phone's real TA query.
     var notBoundViaPlaceholder = false
 
+    // Models the phone's mitrustservice never answering an authAction (live
+    // 2026-08-11: auth action sent over a relay-rebuilt channel, no
+    // authEvent ever came back — the Mac sat on 解鎖中 forever). The action
+    // is counted but no event goes out.
+    var dropAuthActions = false
+
     // The user entered the lock-screen password in the phone's
     // LockScreenUIActivity (the official verify flow): the TA re-provisions
     // its per-boot auth token, the password unlocks the phone itself (the
@@ -388,6 +394,15 @@ final class FakeXiaomiPhone {
                 log("fakephone.logi_request_ignored reason=wedged_phys")
                 return
             }
+            // Live 2026-08-11: the phone rejects a logi request that reuses
+            // an already-released conn id (lyra-conn-logi
+            // "invalided connection conflict local=1") — the redial goes
+            // unanswered and the Mac hits redial_timeout. Only a fresh conn
+            // id is accepted.
+            if releasedLogiConnIds.contains(logiConn.logiConnId) {
+                log("fakephone.logi_request_ignored reason=released_conn_id_conflict id=\(logiConn.logiConnId)")
+                return
+            }
             // logi conn request: extract the embedded peer-port request
             let privateData = lengthDelimited(3, in: requestData) ?? Data()
             if let peerPortRequest = lengthDelimited(10, in: privateData) {
@@ -431,6 +446,10 @@ final class FakeXiaomiPhone {
 
     // Simulates the phone releasing the cast logi conn mid-stream (observed
     // live on phone reboot: unencrypted inner disconnect payload {1: 52011}).
+    // Released conn ids stay dead: a later request reusing one is rejected
+    // (see the conflict note in the request handler).
+    private var releasedLogiConnIds = Set<UInt32>()
+
     func releaseCastChannel() {
         guard logiConnId != 0 else { return }
         let payload = Data([0x08, 0xAB, 0x96, 0x03])
@@ -438,6 +457,7 @@ final class FakeXiaomiPhone {
         let frame = LogiConnFrame(logiConnId: logiConnId, localNetId: phoneNetId, remoteNetId: 1, flag: false, inner: inner.serialized())
         let miFrame = MiConnectFrame(version: 0, logiConnFrames: [frame])
         sendMesh(packType: 2, payload: miFrame.serialized())
+        releasedLogiConnIds.insert(logiConnId)
         openMirrorScreenCount = 0
         if wedgePhysOnRelease {
             wedgedMeshConnection = meshConnection
@@ -722,7 +742,9 @@ final class FakeXiaomiPhone {
             guard action.feature == DuoScreenTrustFeature.unlockDevice else { return }
             authActionCount += 1
             log("fakephone.auth_action locked=\(self.locked) riskArmed=\(self.quickAuthRiskArmed)")
-            if quickAuthRiskArmed {
+            if dropAuthActions {
+                log("fakephone.auth_action_dropped")
+            } else if quickAuthRiskArmed {
                 let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.riskAuthRequired)
                 sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
                     DuoScreenTrust(sessionID: trust.sessionID, msg: .authEvent(event))

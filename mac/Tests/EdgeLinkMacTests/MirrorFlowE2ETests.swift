@@ -1182,6 +1182,52 @@ final class MirrorFlowE2ETests: XCTestCase {
         }
     }
 
+    // Regression (2026-08-11 live): Touch ID passed, the 562 auth action
+    // went out over the channel, and the phone's mitrustservice never
+    // answered — no authEvent at all. MacTrustManager waited on the event
+    // forever and the mirror window sat on 解鎖中 until the whole flow was
+    // torn down. The trust manager must bound the wait and return to the
+    // lock mask so 解除鎖定 can be retried.
+    func testUnlockTimeoutReturnsToLockMaskWhenPhoneDropsAuthEvent() async throws {
+        try makeEnvironment(locked: true)
+        phone.dropAuthActions = true
+        // Long enough for a real 562/563 mitrust run to complete on the
+        // retry (live 2026-08-11: 4s from auth action to unlock success),
+        // short enough to keep the dropped-event timeout quick.
+        trustManager.authEventTimeout = 8
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("phone received duo.screen authAction") { [self] in
+            self.phone.authActionCount >= 1
+        }
+        try await waitFor("unlocking mask while auth in flight") { [self] in
+            self.controller.mask == .unlocking
+        }
+        try await waitFor("auth wait times out back to the lock mask", timeout: 12) { [self] in
+            self.controller.mask == .locked
+        }
+        XCTAssertEqual(biometricCallCount, 1)
+
+        // The retry path must still work once the phone answers again.
+        phone.dropAuthActions = false
+        controller.unlockRequested()
+
+        try await waitFor("phone completed 562/563 after retry") { [self] in
+            self.phone.mitrustUnlockCompleted
+        }
+        try await waitFor("streaming after retry") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(biometricCallCount, 2)
+    }
+
     // Regression (2026-08-02 live, scenario 3): fresh app, phone's stale
     // encoder outlived the previous app instance, so our PLAY joined mid-GOP.
     // The low-latency HEVC encoder only emits VPS/SPS/PPS with an IDR, so
@@ -1361,6 +1407,62 @@ final class MirrorFlowE2ETests: XCTestCase {
         for message in messages {
             XCTAssertEqual(message.sessionId, sessionId)
             XCTAssertEqual(message.screenId, 0)
+        }
+    }
+
+    // Live 2026-08-11: unlock #1 succeeded, user stopped the mirror, the
+    // phone auto-released the cast logi conn (52011, keepchannellist keeps
+    // the adopted mitrustservice conn), and the mirror reopen redialed the
+    // cast channel with the SAME conn id — the phone rejected it
+    // ("invalided connection conflict local=1"), the redial timed out, the
+    // session was torn down, and the adopted mitrustservice socket died
+    // with it. The phone's trustservice kept its (now zombie) mitrust conn,
+    // so unlock #2's 562 went nowhere (kcp trans timeout) and the auth came
+    // back code=1. The redial must use a fresh conn id so the same session
+    // — and its live mitrust conn — survives, and unlock #2 works.
+    func testSecondUnlockAfterCastChannelReleaseAndRedial() async throws {
+        try makeEnvironment(locked: true)
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+        controller.unlockRequested()
+        try await waitFor("unlock #1 completed") { [self] in
+            self.phone.mitrustUnlockCompleted
+        }
+        try await waitFor("streaming") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        let unlockSession: LyraCastTrustSession? = session
+
+        phone.releaseCastChannel()
+
+        try await waitFor("channel marked down") { [self] in
+            self.session?.isChannelReady == false
+        }
+        try await waitFor("channel redialed on the same session") { [self] in
+            self.session?.isChannelReady == true
+        }
+        let recoveredSession: LyraCastTrustSession? = session
+        XCTAssertTrue(
+            recoveredSession != nil && recoveredSession === unlockSession,
+            "redial after release must succeed on the same session (fresh conn id), not rebuild"
+        )
+        try await waitFor("streaming again after release") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        // User re-locks the phone; unlock #2 rides the same session's
+        // (still alive) mitrust conn.
+        phone.setLocked(true)
+        controller.unlockRequested()
+        try await waitFor("unlock #2 completed") { [self] in
+            self.phone.mitrustUnlockCount >= 2
+        }
+        try await waitFor("streaming after unlock #2") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
         }
     }
 

@@ -47,6 +47,13 @@ final class MacTrustManager: ObservableObject {
     var statusNudgeDelay: TimeInterval = 4.0
     var maxStatusNudges = 3
     private var statusNudgeCount = 0
+    // Bounds the wait for the phone's authEvent after the 562 auth action.
+    // Live 2026-08-11: the action went out over a relay-rebuilt channel and
+    // mitrustservice never answered — awaitingAuthEvent stayed set and the
+    // mirror window sat on 解鎖中 forever. On timeout return to
+    // ready(locked: true) so the unlock entry can be retried.
+    var authEventTimeout: TimeInterval = 60
+    private var authEventEpoch: UInt64 = 0
 
     var sendFrame: ((Data) -> Void)?
     var autoUnlockOnReady = false
@@ -87,7 +94,7 @@ final class MacTrustManager: ObservableObject {
     var onStateChanged: ((State) -> Void)?
 
     private var sessionID: UInt64 = 0
-    private var awaitingAuthEvent = false
+    private(set) var awaitingAuthEvent = false
     private var awaitingBindEvent = false
     private var awaitingVerifyEvent = false
     private let biometric: BiometricAuthManager
@@ -214,6 +221,7 @@ final class MacTrustManager: ObservableObject {
         keyguardInfoConfirmed = false
         statusQueryEpoch &+= 1
         statusRetryCount = 0
+        authEventEpoch &+= 1
     }
 
     func requestBind() {
@@ -259,6 +267,23 @@ final class MacTrustManager: ObservableObject {
         send(.authAction(action))
         DiagnosticsLog.info("trust.mac.auth_action_sent")
         onAuthActionSent?()
+        scheduleAuthEventTimeout()
+    }
+
+    private func scheduleAuthEventTimeout() {
+        authEventEpoch &+= 1
+        let epoch = authEventEpoch
+        let timeout = authEventTimeout
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self,
+                  self.authEventEpoch == epoch,
+                  self.awaitingAuthEvent,
+                  self.state == .authenticating else { return }
+            self.awaitingAuthEvent = false
+            self.state = .ready(locked: true)
+            DiagnosticsLog.warn("trust.mac.unlock_timeout")
+        }
     }
 
     func handleFrame(_ frame: Data) {

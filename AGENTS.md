@@ -109,6 +109,7 @@
 - `[MUST NOT]` 不要預設去修改 dim、brightness、power 或 Hangup-related code，包括 `AndroidScreenPowerGuard`、MIUI Hangup / synergy power-key paths。
 - `[OBSERVED]` 截至 2026-07-28，在目前 Xiaomi mirror path 中，virtual display 即使亮度為 `2.44E-4`、處於 DIM，甚至 screen off，影片仍會持續流動；這符合官方 Hangup 行為。
 - `[OBSERVED]` 靜態畫面時 encoder 產生 zero frames 是目前已知的正常行為，不要直接當成 video stall。
+- `[OBSERVED]` 2026-08-11：HyperOS（myron）上 `KeyguardManager.isDeviceLocked` 在 SCREEN_ON 後約 300ms 會回報 `false`，即使 swipe-up lockscreen 還在畫面上；Mac 端信任這個 fresh「unlocked」push 會直接播鎖定畫面、不跳 Touch ID。lock reporter 已改用 `isKeyguardLocked`（lockscreen 顯示中即為 true）。另外 duo.screen authEvent 可能整個不送達（relay-rebuilt channel 上 mitrustservice 未回應），`MacTrustManager.authEventTimeout`（預設 60s）是解鎖等待的上限，不要移除。
 - `[DEFAULT]` 只有在新的可重現證據明確指向這些區域，或 Jason 明確要求重新調查時，才重新評估上述邊界。先補證據，再改 code。
 
 ## Xiaomi HyperConnect 研究資料

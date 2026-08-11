@@ -17,24 +17,49 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 internal class AndroidLockStateReporter(
-    context: Context,
+    context: Context?,
     private val onState: (PhoneLockStateBody) -> Unit
 ) {
-    private val appContext = context.applicationContext
+    private val appContext = context?.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var started = false
     private var lastLocked: Boolean? = null
     private var settleJob: Job? = null
     private var heartbeatJob: Job? = null
 
-    private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            // Keyguard state lags the broadcast slightly (especially
-            // SCREEN_OFF -> lock), so sample after a short settle delay.
-            settleJob?.cancel()
-            settleJob = scope.launch {
-                delay(SETTLE_MS)
-                emitCurrent(reason = "broadcast:${intent.action}", force = false)
+    // Test hooks (unit tests have no Context/KeyguardManager).
+    internal var log: (String) -> Unit = { EdgeLinkLog.info(it) }
+    internal var settleMs: Long = SETTLE_MS
+    internal var heartbeatMs: Long = HEARTBEAT_MS
+    // The lockscreen visibility sample. KeyguardManager.isDeviceLocked lies
+    // on HyperOS: right after SCREEN_ON it reports false while the swipe-up
+    // lockscreen is still on screen (live 2026-08-11, myron: sessionConnected
+    // reported locked=true, then every SCREEN_ON flipped the push to
+    // locked=false ~300ms later), and the Mac freshness-gate then trusted
+    // the fresh "unlocked" report and streamed the lock screen with no
+    // unlock prompt. isKeyguardLocked stays true whenever the lockscreen is
+    // showing — exactly what the mirror lock mask needs.
+    internal var lockStateSampler: () -> Boolean? = {
+        appContext?.let { ctx ->
+            runCatching {
+                ctx.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked
+            }.getOrNull()
+        }
+    }
+
+    // Lazy: plain-JUnit unit tests run against the stub android.jar, where
+    // any framework constructor throws — with a null context the receiver is
+    // never registered, so it must never be constructed either.
+    private val receiver by lazy(LazyThreadSafetyMode.NONE) {
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                // Keyguard state lags the broadcast slightly (especially
+                // SCREEN_OFF -> lock), so sample after a short settle delay.
+                settleJob?.cancel()
+                settleJob = scope.launch {
+                    delay(settleMs)
+                    emitCurrent(reason = "broadcast:${intent.action}", force = false)
+                }
             }
         }
     }
@@ -44,20 +69,22 @@ internal class AndroidLockStateReporter(
             return
         }
         started = true
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_USER_PRESENT)
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_SCREEN_OFF)
-        }
-        runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag")
-                appContext.registerReceiver(receiver, filter)
+        appContext?.let { ctx ->
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
             }
-        }.onFailure { error ->
-            EdgeLinkLog.warn("lockstate.android.receiver_register_failed", error)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                } else {
+                    @Suppress("UnspecifiedRegisterReceiverFlag")
+                    ctx.registerReceiver(receiver, filter)
+                }
+            }.onFailure { error ->
+                EdgeLinkLog.warn("lockstate.android.receiver_register_failed", error)
+            }
         }
         emitCurrent(reason = "start", force = true)
         // MIUI throttles background broadcasts (observed 2026-08-02:
@@ -68,11 +95,11 @@ internal class AndroidLockStateReporter(
         // would let a steady unlocked report age past the gate.
         heartbeatJob = scope.launch {
             while (isActive) {
-                delay(HEARTBEAT_MS)
+                delay(heartbeatMs)
                 emitCurrent(reason = "heartbeat", force = true)
             }
         }
-        EdgeLinkLog.info("lockstate.android.reporter_started")
+        log("lockstate.android.reporter_started")
     }
 
     fun stop() {
@@ -84,9 +111,11 @@ internal class AndroidLockStateReporter(
         settleJob = null
         heartbeatJob?.cancel()
         heartbeatJob = null
-        runCatching { appContext.unregisterReceiver(receiver) }
-            .onFailure { error -> EdgeLinkLog.warn("lockstate.android.receiver_unregister_failed", error) }
-        EdgeLinkLog.info("lockstate.android.reporter_stopped")
+        appContext?.let { ctx ->
+            runCatching { ctx.unregisterReceiver(receiver) }
+                .onFailure { error -> EdgeLinkLog.warn("lockstate.android.receiver_unregister_failed", error) }
+        }
+        log("lockstate.android.reporter_stopped")
     }
 
     fun sendCurrent(reason: String) {
@@ -94,15 +123,13 @@ internal class AndroidLockStateReporter(
     }
 
     private fun emitCurrent(reason: String, force: Boolean) {
-        val locked = runCatching {
-            appContext.getSystemService(KeyguardManager::class.java)?.isDeviceLocked
-        }.getOrNull() ?: return
+        val locked = lockStateSampler() ?: return
         if (!force && locked == lastLocked) {
             return
         }
         lastLocked = locked
         onState(PhoneLockStateBody(locked = locked, ts = Instant.now().epochSecond))
-        EdgeLinkLog.info("lockstate.android.state locked=$locked reason=$reason")
+        log("lockstate.android.state locked=$locked reason=$reason")
     }
 
     private companion object {

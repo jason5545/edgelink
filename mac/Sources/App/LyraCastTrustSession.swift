@@ -606,6 +606,13 @@ final class LyraCastTrustSession {
                 return
             }
             DiagnosticsLog.info("xiaomi.cast.trust_channel_redial")
+            // The phone rejects a logi request that reuses an already-
+            // released conn id (live 2026-08-11: lyra-conn-logi "invalided
+            // connection conflict local=1" — the redial went unanswered, the
+            // session failed, and the adopted mitrustservice socket died
+            // with it; the next unlock's 562 went into the phone's zombie
+            // conn and the auth came back code=1). Dial with a fresh id.
+            self.logiConnId = .random(in: 1...UInt32.max)
             self.sendLogiConnRequest()
             self.armRedialTimeout()
         }
