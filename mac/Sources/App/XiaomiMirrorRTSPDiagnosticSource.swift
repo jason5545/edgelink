@@ -208,12 +208,68 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
 
     func isControlChannelHealthy(id: UUID, maxAgeSeconds: TimeInterval) -> Bool {
         performOnQueue {
-            guard let last = states[id]?.lastControlResponseAtUptimeNs else {
+            controlChannelHealthyOnQueue(id: id, maxAgeSeconds: maxAgeSeconds)
+        }
+    }
+
+    // Static-screen source idle (2026-08-11): the official Xiaomi encoder
+    // stops emitting entirely — video AND audio, zero KCP pushes — while the
+    // phone content is static, which trips the 6s no-packets watchdog. As
+    // long as the RTSP control dialog is still being acked, the source is
+    // idle, not dead: hold the last frame, log throttled, and never request
+    // recovery. Only a dead control channel keeps the recovery path.
+    private static let mptSourceIdleControlHealthyMaxAgeSeconds: TimeInterval = 15
+    private var mptSourceIdleSuppressionLoggedUptimeNs: UInt64 = 0
+
+    private func controlChannelHealthyOnQueue(id: UUID, maxAgeSeconds: TimeInterval) -> Bool {
+        guard let last = states[id]?.lastControlResponseAtUptimeNs else {
+            return false
+        }
+        let ageNs = DispatchTime.now().uptimeNanoseconds &- last
+        return Double(ageNs) / 1_000_000_000 <= maxAgeSeconds
+    }
+
+    private func anyControlChannelHealthyOnQueue(maxAgeSeconds: TimeInterval) -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return states.values.contains { state in
+            guard let last = state.lastControlResponseAtUptimeNs else {
                 return false
             }
-            let ageNs = DispatchTime.now().uptimeNanoseconds &- last
-            return Double(ageNs) / 1_000_000_000 <= maxAgeSeconds
+            return Double(now &- last) / 1_000_000_000 <= maxAgeSeconds
         }
+    }
+
+    // True when a no-packets stall is just a static-screen idle source: the
+    // RTSP control plane (dialog/keepalive) is still alive. `id` is checked
+    // directly when the stall belongs to an RTSP-bound sink; pass nil for
+    // receivers whose session ID is not an RTSP connection id (cloudflare
+    // mirror receiver), which falls back to any live control dialog.
+    private func isStaticScreenSourceIdleOnQueue(stall: XiaomiMirrorMPTStallSnapshot, rtspSessionID: UUID?) -> Bool {
+        guard stall.reason == "no_packets_beyond_6s" else {
+            return false
+        }
+        if let rtspSessionID {
+            return controlChannelHealthyOnQueue(
+                id: rtspSessionID,
+                maxAgeSeconds: Self.mptSourceIdleControlHealthyMaxAgeSeconds
+            )
+        }
+        return anyControlChannelHealthyOnQueue(maxAgeSeconds: Self.mptSourceIdleControlHealthyMaxAgeSeconds)
+    }
+
+    private func logStaticScreenSourceIdleThrottled(context: String, stall: XiaomiMirrorMPTStallSnapshot) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let last = mptSourceIdleSuppressionLoggedUptimeNs
+        guard last == 0 || now &- last >= 60_000_000_000 else {
+            return
+        }
+        mptSourceIdleSuppressionLoggedUptimeNs = now
+        DiagnosticsLog.info(
+            "xiaomi.mirror.mpt.static_screen_source_idle context=\(context) " +
+                "session=\(stall.sessionID.uuidString) reason=\(stall.reason) " +
+                "elapsedMediaSeconds=\(String(format: "%.2f", stall.elapsedMediaSeconds)) " +
+                "decodedFrames=\(stall.decodedFrames) officialBehavior=hold_last_frame_no_recovery"
+        )
     }
 
     func connect(host: String, port: UInt16, advertisedHost: String?, lifetime: TimeInterval) throws {
@@ -494,6 +550,13 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     }
                 },
                 onMPTMediaStalled: { stall in
+                    // Static-screen no-packets stalls recur every watchdog
+                    // tick while the phone is idle; the underlying warn is
+                    // already throttled in the sender, so only surface
+                    // non-idle reasons here.
+                    guard stall.reason != "no_packets_beyond_6s" else {
+                        return
+                    }
                     DiagnosticsLog.warn(
                         "xiaomi.mirror.official.stalled session=\(stall.sessionID.uuidString) " +
                             "reason=\(stall.reason) datagrams=\(stall.datagramsReceived) " +
@@ -529,6 +592,10 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
 
     private func handleCloudflareMirrorStalled(_ stall: XiaomiMirrorMPTStallSnapshot) {
         guard cloudflareMirrorReceiverID == stall.sessionID else {
+            return
+        }
+        if isStaticScreenSourceIdleOnQueue(stall: stall, rtspSessionID: nil) {
+            logStaticScreenSourceIdleThrottled(context: "cloudflare", stall: stall)
             return
         }
         DiagnosticsLog.warn(
@@ -1994,6 +2061,10 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         guard var state = states[id] else {
             return
         }
+        if isStaticScreenSourceIdleOnQueue(stall: stall, rtspSessionID: id) {
+            logStaticScreenSourceIdleThrottled(context: "official_mpt_sink", stall: stall)
+            return
+        }
         let retryEndpoint = state.activeClientHost.map { host in
             state.activeClientPort.map { "\(host):\($0)" } ?? "\(host):none"
         } ?? "none"
@@ -3452,6 +3523,7 @@ private final class XiaomiMirrorRTPMediaSender {
     private var mptDecodeQueueProbeSent: UInt64 = 0
     private var mptDecodeQueueProbeCompleted: UInt64 = 0
     private var mptDecodeQueueJamRecoveryCount = 0
+    private var mptNoPacketsTimeoutLoggedUptimeNanoseconds: UInt64 = 0
 
     private func checkMPTDecodeQueueLiveness() {
         guard mptSinkHEVCDecoder != nil else {
@@ -3496,12 +3568,21 @@ private final class XiaomiMirrorRTPMediaSender {
                 elapsedMediaSeconds: elapsedMediaSeconds,
                 elapsedFrameSeconds: elapsedFrameSeconds
             )
-            DiagnosticsLog.warn(
-                "xiaomi.mirror.mpt.no_packets_timeout session=\(sessionID.uuidString) " +
-                    "elapsedSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) " +
-                    "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
-                    "decodedFrames=\(mptSinkDecodedFrames) officialAction=keep_sink_request_source_recovery"
-            )
+            // Static phone screens silence the encoder entirely (zero pushes,
+            // official behavior), so this condition can persist for minutes.
+            // The stall event still fires every tick — consumers decide
+            // source-idle vs dead-transport by control-channel health — but
+            // the warn log is throttled so an idle source doesn't spam.
+            let lastLog = mptNoPacketsTimeoutLoggedUptimeNanoseconds
+            if lastLog == 0 || now &- lastLog >= 30_000_000_000 {
+                mptNoPacketsTimeoutLoggedUptimeNanoseconds = now
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.no_packets_timeout session=\(sessionID.uuidString) " +
+                        "elapsedSeconds=\(String(format: "%.2f", elapsedMediaSeconds)) thresholdSeconds=\(Self.mptSinkNoPacketTimeoutSeconds) " +
+                        "datagrams=\(kcpDatagramsReceived) pushReceived=\(kcpTransport.pushReceived) inboundRTP=\(mptSinkRTPPacketsReceived) " +
+                        "decodedFrames=\(mptSinkDecodedFrames) officialAction=keep_sink_request_source_recovery"
+                )
+            }
             onMPTMediaStalled?(stall)
             return
         }
@@ -4932,7 +5013,7 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
 // hole by the same amount. Audio PES ride the same schedule so A/V stay
 // aligned — both streams share the TS 90kHz PTS clock and the same KCP
 // pipe, so one buffer paces both. All state lives on the decode queue.
-private final class XiaomiMirrorAccessUnitJitterBuffer {
+final class XiaomiMirrorAccessUnitJitterBuffer {
     enum Item {
         case videoAccessUnit([Data])
         case audioPES(Data)
@@ -4948,14 +5029,26 @@ private final class XiaomiMirrorAccessUnitJitterBuffer {
 
     private let sessionID: UUID
     private let depth90k: UInt64
+    // Self-correcting clock-skew regulation: when the sender's PTS clock runs
+    // faster than wall time, a fixed PTS→wall anchor lets the buffered span
+    // grow without bound (observed 2026-08-11: phone PTS +1.75% → latency
+    // climbed to the 3×depth overflow cap ≈1.5s, with an overflow-flush
+    // storm). Releasing the head early once the span exceeds ~1.2× the
+    // target depth pins effective latency near depth without estimating skew.
+    private let earlyReleaseSpan90k: UInt64
     private let maxSpan90k: UInt64
     private let onRelease: (Item, UInt64?) -> Void
     private var entries: [Entry] = []
     private var anchorPTS90k: UInt64?
     private var anchorUptimeNanoseconds: UInt64 = 0
     private var drainTimer: DispatchSourceTimer?
-    private var starvationEpisodes = 0
-    private var overflowFlushes = 0
+    private(set) var starvationEpisodes = 0
+    private(set) var overflowFlushes = 0
+    private(set) var earlyReleases = 0
+
+    var bufferedCount: Int {
+        entries.count
+    }
 
     init(
         sessionID: UUID,
@@ -4965,6 +5058,7 @@ private final class XiaomiMirrorAccessUnitJitterBuffer {
     ) {
         self.sessionID = sessionID
         self.depth90k = UInt64(max(0, depthMilliseconds) * 90)
+        self.earlyReleaseSpan90k = self.depth90k + self.depth90k / 5
         self.maxSpan90k = self.depth90k * 3
         self.onRelease = onRelease
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -5062,8 +5156,20 @@ private final class XiaomiMirrorAccessUnitJitterBuffer {
                 anchorUptimeNanoseconds = now
             }
             let elapsedNanoseconds = (head.pts90k - anchor) * 1_000_000 / 90
-            guard now >= anchorUptimeNanoseconds + elapsedNanoseconds else {
+            let due = now >= anchorUptimeNanoseconds + elapsedNanoseconds
+            // Span-based early release: keeps effective latency bounded when
+            // the sender's PTS clock drifts fast relative to wall time. The
+            // newest entry's PTS is arrival-paced, so this never outruns the
+            // sender; after a hole the catch-up burst also drains through
+            // here instead of being re-delayed by the full depth.
+            let spanOverrun = entries.last.map {
+                $0.pts90k >= head.pts90k && $0.pts90k - head.pts90k > earlyReleaseSpan90k
+            } ?? false
+            guard due || spanOverrun else {
                 return
+            }
+            if spanOverrun, !due {
+                earlyReleases += 1
             }
             entries.removeFirst()
             onRelease(head.item, head.pts90k)

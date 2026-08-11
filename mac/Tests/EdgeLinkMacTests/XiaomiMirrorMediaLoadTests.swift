@@ -173,6 +173,111 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
                        "decode must not stall >500ms (maxDecodeGapMs=\(probe.maxDecodeGapMilliseconds))")
     }
 
+    // MARK: - LAN: fast phone PTS clock (jitter buffer skew regulation)
+
+    // The real phone's PTS clock runs ~1.75% faster than Mac wall time
+    // (measured 2026-08-11, session 02892A1C: ~91580 ticks/s). A fixed
+    // PTS→wall anchor lets the buffered span grow to the 3×depth overflow
+    // cap (~1.5s glass-to-glass) with a continuous overflow-flush storm; the
+    // span-based early release must keep the stream healthy instead. The
+    // latency bound itself is asserted in XiaomiMirrorJitterBufferTests.
+    func testLANMPTSinkToleratesFastPhonePTSClock() async throws {
+        UserDefaults.standard.set("mpt", forKey: "xiaomiMirrorRTSPTransportMode")
+        UserDefaults.standard.set("official", forKey: "xiaomiMirrorRTSPProtocolProfile")
+
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onRecoveryRequired = { probe.noteRecovery($0) }
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+        try source.start(port: rtspPort, advertisedHost: "127.0.0.1", lifetime: 300)
+        defer { source.stop(reason: "test_teardown") }
+
+        let phone = FakePhoneOfficialRTSPClient(host: "127.0.0.1", port: rtspPort)
+        try phone.connect()
+        defer { phone.stop() }
+        try await waitFor("RTSP dialog reached PLAY", timeout: 10) { phone.playAcknowledged }
+
+        let media = FakePhoneMPTMediaSource(
+            width: 960, height: 2080, averageBitRate: 20_000_000,
+            loss: 0.02, duplicate: 0.2, retransmitsLost: true,
+            ptsClockFactor: 1.0175
+        )
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        phone.onIDRRequest = { [weak media] in media?.forceNextKeyframe() }
+        media.start()
+        defer { media.stop() }
+
+        try await Task.sleep(nanoseconds: 25_000_000_000)
+
+        XCTAssertTrue(probe.recoveryEvents.isEmpty,
+                      "fast phone PTS clock must not trigger recovery: \(probe.recoveryEvents)")
+        XCTAssertGreaterThan(probe.decodedFrames, 150,
+                             "decoder must keep up under skew (got \(probe.decodedFrames) frames)")
+        XCTAssertLessThan(probe.secondsSinceLastDecodedFrame, 2.0,
+                          "decoded frames must still flow at the end of the soak")
+        XCTAssertEqual(probe.decodeGapsOver500ms, 0,
+                       "decode must not stall >500ms under skew (maxDecodeGapMs=\(probe.maxDecodeGapMilliseconds))")
+        XCTAssertEqual(media.ackGapsOver500ms, 0,
+                       "receiver queue must not stall >500ms under skew (maxAckGapMs=\(media.maxAckGapMilliseconds))")
+    }
+
+    // MARK: - LAN: static screen (zero packets) is not a transport death
+
+    // Static phone content: the official encoder emits nothing at all — no
+    // video, no audio, zero KCP pushes — which trips the 6s no-packets
+    // watchdog. While the RTSP control dialog keeps answering keepalives the
+    // source is idle, not dead: hold the last frame, never recover. Once the
+    // control plane stops answering too, recovery must fire again.
+    func testLANMPTSinkStaticScreenSilenceDoesNotRecover() async throws {
+        UserDefaults.standard.set("mpt", forKey: "xiaomiMirrorRTSPTransportMode")
+        UserDefaults.standard.set("official", forKey: "xiaomiMirrorRTSPProtocolProfile")
+
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onRecoveryRequired = { probe.noteRecovery($0) }
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+        try source.start(port: rtspPort, advertisedHost: "127.0.0.1", lifetime: 300)
+        defer { source.stop(reason: "test_teardown") }
+
+        let phone = FakePhoneOfficialRTSPClient(host: "127.0.0.1", port: rtspPort)
+        try phone.connect()
+        defer { phone.stop() }
+        try await waitFor("RTSP dialog reached PLAY", timeout: 10) { phone.playAcknowledged }
+
+        // Stream briefly so the session reaches steady state, then go
+        // completely silent like a static phone screen.
+        let media = FakePhoneMPTMediaSource(
+            width: 640, height: 360, averageBitRate: 8_000_000
+        )
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        phone.onIDRRequest = { [weak media] in media?.forceNextKeyframe() }
+        media.start()
+        try await Task.sleep(nanoseconds: 4_000_000_000)
+        media.stop()
+        XCTAssertGreaterThan(probe.decodedFrames, 10,
+                             "the warm-up phase must decode frames (got \(probe.decodedFrames))")
+
+        // 30s of total media silence = 5× the no-packets threshold, with the
+        // RTSP keepalive dialog alive throughout.
+        try await Task.sleep(nanoseconds: 30_000_000_000)
+
+        XCTAssertTrue(probe.recoveryEvents.isEmpty,
+                      "static-screen silence with a healthy control plane must not recover: \(probe.recoveryEvents)")
+        XCTAssertGreaterThan(phone.getParameterRequestsAnswered, 0,
+                             "the control plane must have exercised keepalives during the silence")
+
+        // Negative control: the control plane goes dead too (keepalives no
+        // longer answered) — now the same silence must recover.
+        phone.respondsToGetParameter = false
+        try await waitFor("recovery after control plane death", timeout: 40) {
+            !probe.recoveryEvents.isEmpty
+        }
+    }
+
     private func waitFor(
         _ description: String,
         timeout: TimeInterval,
@@ -273,6 +378,11 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
     private let loss: Double
     private let duplicate: Double
     private let retransmitsLost: Bool
+    // Sender PTS clock skew (1.0 = perfect). The real phone's PTS clock was
+    // measured ~1.75% fast vs Mac wall time (2026-08-11); the sink jitter
+    // buffer must regulate the resulting span growth instead of letting
+    // latency climb to the overflow cap.
+    private let ptsClockFactor: Double
     // Per-segment ARQ state, mirroring the official phone KCP sender
     // (micontinuity_sdk MTP_NET_ConnectionKcpStackCreate: ikcp wnd 1024,
     // nodelay=1, interval 10-20ms, fastresend=2-3, nocwnd=1, min RTO 30ms):
@@ -310,7 +420,8 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         averageBitRate: Int = 15_000_000,
         loss: Double = 0,
         duplicate: Double = 0,
-        retransmitsLost: Bool = false
+        retransmitsLost: Bool = false,
+        ptsClockFactor: Double = 1.0
     ) {
         self.width = width
         self.height = height
@@ -319,6 +430,7 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         self.loss = loss
         self.duplicate = duplicate
         self.retransmitsLost = retransmitsLost
+        self.ptsClockFactor = ptsClockFactor
     }
     private var encoder: FakePhoneHEVCEncoder?
     private var udpSocketFD: Int32 = -1
@@ -363,7 +475,7 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
                 timer.resume()
             }
             self.openUDPSocket()
-            let encoder = FakePhoneHEVCEncoder(width: self.width, height: self.height, frameRate: self.frameRate, averageBitRate: self.averageBitRate)
+            let encoder = FakePhoneHEVCEncoder(width: self.width, height: self.height, frameRate: self.frameRate, averageBitRate: self.averageBitRate, ptsClockFactor: self.ptsClockFactor)
             encoder.onAccessUnit = { [weak self] nalUnits, pts90k in
                 self?.queue.async {
                     self?.sendAccessUnit(nalUnits, pts90k: pts90k)
@@ -632,6 +744,7 @@ private final class FakePhoneHEVCEncoder: @unchecked Sendable {
     private let height: Int
     private let frameRate: Int
     private let averageBitRate: Int
+    private let ptsClockFactor: Double
     private let queue = DispatchQueue(label: "FakePhoneHEVCEncoder")
     private var session: VTCompressionSession?
     private var frameIndex: Int64 = 0
@@ -640,11 +753,12 @@ private final class FakePhoneHEVCEncoder: @unchecked Sendable {
     private var parameterSets: [Data] = []
     private var framesSubmitted = 0
 
-    init(width: Int, height: Int, frameRate: Int, averageBitRate: Int = 15_000_000) {
+    init(width: Int, height: Int, frameRate: Int, averageBitRate: Int = 15_000_000, ptsClockFactor: Double = 1.0) {
         self.width = width
         self.height = height
         self.frameRate = frameRate
         self.averageBitRate = averageBitRate
+        self.ptsClockFactor = ptsClockFactor
     }
 
     func start() {
@@ -740,7 +854,7 @@ private final class FakePhoneHEVCEncoder: @unchecked Sendable {
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
 
         let ticksPerFrame: Int64 = 90_000 / Int64(frameRate)
-        let pts = CMTime(value: frameIndex * ticksPerFrame, timescale: 90_000)
+        let pts = CMTime(value: Int64(Double(frameIndex * ticksPerFrame) * ptsClockFactor), timescale: 90_000)
         frameIndex += 1
         var properties: [String: Any]? = nil
         if forceKeyframe {
@@ -954,6 +1068,10 @@ private final class FakePhoneTSMuxer {
 private final class FakePhoneOfficialRTSPClient: @unchecked Sendable {
     var onIDRRequest: (() -> Void)?
     private(set) var playAcknowledged = false
+    // Static-screen test hooks: count sink-initiated GET_PARAMETER keepalives
+    // and allow muting the replies to simulate a dead control plane.
+    private(set) var getParameterRequestsAnswered = 0
+    var respondsToGetParameter = true
 
     private let host: String
     private let port: UInt16
@@ -1068,6 +1186,8 @@ private final class FakePhoneOfficialRTSPClient: @unchecked Sendable {
             }
             sendRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
         case "GET_PARAMETER":
+            guard respondsToGetParameter else { return }
+            getParameterRequestsAnswered += 1
             sendRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
         default:
             sendRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
