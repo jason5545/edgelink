@@ -147,6 +147,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var currentChannelTransport: String?
     private var lanSessionListener: LANSessionListener?
     private var lanSessionTask: Task<Void, Never>?
+    private var lanSessionListenerRestartTask: Task<Void, Never>?
     private var hostSessionDidConnect = false
     private var lastSecurePongAt = Date.distantPast
     private var relaySecureRttMs: Int64?
@@ -4298,7 +4299,27 @@ final class EdgeLinkRuntime: ObservableObject {
             }
         }
         lanSessionListener = listener
+        listener.onFailure = { [weak self, weak listener] in
+            Task { @MainActor in
+                self?.scheduleLANSessionListenerRestart(listener: listener, identity: identity)
+            }
+        }
         listener.start(serviceName: identity.name)
+    }
+
+    private func scheduleLANSessionListenerRestart(listener: LANSessionListener?, identity: LocalIdentity) {
+        guard lanSessionListener === listener else {
+            return
+        }
+        lanSessionListenerRestartTask?.cancel()
+        lanSessionListenerRestartTask = Task { @MainActor [weak self, weak listener] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, let listener, !Task.isCancelled else {
+                return
+            }
+            DiagnosticsLog.info("lan.mac.session_listen_retry")
+            listener.start(serviceName: identity.name)
+        }
     }
 
     private func handleLANAcceptedChannel(_ channel: ByteChannel) {

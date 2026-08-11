@@ -10,6 +10,10 @@ final class LANSessionListener: @unchecked Sendable {
     private let stateLock = NSLock()
     private var listener: NWListener?
     private let onAccept: (ByteChannel) -> Void
+    // Invoked on the listener queue when the Bonjour listener dies; the owner
+    // re-arms start() with backoff so LAN control recovers without an app
+    // restart.
+    var onFailure: (() -> Void)?
 
     init(onAccept: @escaping (ByteChannel) -> Void) {
         self.onAccept = onAccept
@@ -47,6 +51,7 @@ final class LANSessionListener: @unchecked Sendable {
                     }
                     DiagnosticsLog.error("lan.mac.session_listen_failed port=\(Self.port)", error)
                     nextListener.cancel()
+                    self.onFailure?()
                 case .cancelled:
                     self.stateLock.withLock {
                         if self.listener === nextListener {
@@ -74,6 +79,7 @@ final class LANSessionListener: @unchecked Sendable {
             nextListener.start(queue: queue)
         } catch {
             DiagnosticsLog.error("lan.mac.session_listen_failed port=\(Self.port)", error)
+            onFailure?()
         }
     }
 
