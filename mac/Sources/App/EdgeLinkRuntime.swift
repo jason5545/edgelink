@@ -3176,10 +3176,25 @@ final class EdgeLinkRuntime: ObservableObject {
             messages.append(up)
         case "wheel":
             guard let wheelDy = body.wheelDy, wheelDy != 0 else { return true }
-            var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
-            message.action = wheelDy > 0 ? .wheelForward : .wheelBackward
-            message.scrollDelta = Int32(clamping: abs(wheelDy) * 10)
-            messages.append(message)
+            // The phone drops ProtoMouse wheel actions, so scroll rides the
+            // cast channel as a synthetic vertical drag instead.
+            for step in MirrorPointerRouting.wheelDragSteps(x: body.x, y: body.y, wheelDy: wheelDy) {
+                var message = xiaomiMirrorMouseMessage(
+                    sessionId: sessionId,
+                    body: CtrlPointerBody(x: step.x, y: step.y, action: step.action, wheelDy: nil)
+                )
+                switch step.action {
+                case "down":
+                    message.action = .leftDown
+                    message.state |= LyraCastMouse.stateLeftHold
+                case "up":
+                    message.action = .leftUp
+                default:
+                    message.action = .move
+                    message.state |= LyraCastMouse.stateLeftHold
+                }
+                messages.append(message)
+            }
         default:
             DiagnosticsLog.warn("xiaomi.mac.pointer_ignored reason=unknown_action action=\(body.action)")
             return false

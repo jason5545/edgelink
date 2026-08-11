@@ -2998,19 +2998,7 @@ private class AndroidCommandDispatcher(
                 if (envelope.b.action != "move") {
                     EdgeLinkLog.info("control.android.pointer_in action=${envelope.b.action} bytes=${plaintext.size}")
                 }
-                if (envelope.b.action == "wheel") {
-                    val injected = AndroidShizukuSupport.injectScroll(
-                        context,
-                        envelope.b.x,
-                        envelope.b.y,
-                        envelope.b.wheelDy ?: 0
-                    )
-                    if (!injected) {
-                        RemoteInputService.dispatchPointer(envelope.b)
-                    }
-                } else {
-                    RemoteInputService.dispatchPointer(envelope.b)
-                }
+                RemoteInputService.dispatchPointer(envelope.b)
                 null
             }
             EnvelopeTypes.CTRL_GLOBAL -> {
