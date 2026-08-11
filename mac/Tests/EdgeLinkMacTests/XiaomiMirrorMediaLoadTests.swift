@@ -163,21 +163,14 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
                       "LAN stream must not trigger recovery: \(probe.recoveryEvents)")
         XCTAssertGreaterThan(probe.decodedFrames, 150,
                              "decoder must keep up under load (got \(probe.decodedFrames) frames)")
-        // Documents the live HoL-blocking stall: any transport hole starves
-        // the in-order KCP delivery, decode pauses, and the heal drains as a
-        // burst (production: ~1s pause then catch-up). Expected to fail until
-        // the decode pipeline gains a PTS-paced jitter buffer.
-        let gapOptions = XCTExpectedFailure.Options()
-        gapOptions.isStrict = false
-        XCTExpectFailure(
-            "KCP in-order HoL blocking stalls decode under loss (2026-08-11 reproduction)",
-            options: gapOptions
-        ) {
-            XCTAssertEqual(media.ackGapsOver500ms, 0,
-                           "receiver queue must not stall >500ms (maxAckGapMs=\(media.maxAckGapMilliseconds))")
-            XCTAssertEqual(probe.decodeGapsOver500ms, 0,
-                           "decode must not stall >500ms (maxDecodeGapMs=\(probe.maxDecodeGapMilliseconds))")
-        }
+        // KCP HoL-blocking stalls are absorbed by the PTS-paced jitter
+        // buffer in the MPT sink decode path (2026-08-11 fix): holes up to
+        // the buffer depth no longer starve decode, and longer holes shrink
+        // by the same amount, so decode gaps stay well under 500ms.
+        XCTAssertEqual(media.ackGapsOver500ms, 0,
+                       "receiver queue must not stall >500ms (maxAckGapMs=\(media.maxAckGapMilliseconds))")
+        XCTAssertEqual(probe.decodeGapsOver500ms, 0,
+                       "decode must not stall >500ms (maxDecodeGapMs=\(probe.maxDecodeGapMilliseconds))")
     }
 
     private func waitFor(
@@ -280,15 +273,35 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
     private let loss: Double
     private let duplicate: Double
     private let retransmitsLost: Bool
-    private var unacked: [UInt32: (datagram: Data, sentAt: UInt64)] = [:]
+    // Per-segment ARQ state, mirroring the official phone KCP sender
+    // (micontinuity_sdk MTP_NET_ConnectionKcpStackCreate: ikcp wnd 1024,
+    // nodelay=1, interval 10-20ms, fastresend=2-3, nocwnd=1, min RTO 30ms):
+    // each skipped ACK increments the segment's fastack count and 2 strikes
+    // resend immediately; otherwise the segment is resent once its RTO
+    // elapses, with backoff on repeated timeouts.
+    private struct UnackedSegment {
+        let datagram: Data
+        var sentAtUptimeNanoseconds: UInt64
+        var resendAtUptimeNanoseconds: UInt64
+        var fastack: Int
+        var rtoNanoseconds: UInt64
+    }
+    private var unacked: [UInt32: UnackedSegment] = [:]
     private var pendingSend: [Data] = []
     private var retransmitTimer: DispatchSourceTimer?
-    private static let retransmitTimeoutNanoseconds: UInt64 = 250_000_000
+    private static let baseRTONanoseconds: UInt64 = 40_000_000
+    private static let maxRTONanoseconds: UInt64 = 500_000_000
+    private static let fastResendLimit = 2
+    private static let updateIntervalMilliseconds = 20
+    // ikcp_flush resends at most once per segment per update cycle; the cap
+    // additionally keeps a loss burst from turning into a retransmit flood
+    // (2% loss at ~1.4k seg/s creates <1 new hole per 20ms tick).
+    private static let maxResendPerUpdate = 64
     // KCP-style send window: new segments leave only while unacked fits the
     // window, so retransmits get priority and the backlog stays bounded
     // (without it, unacked grows to ~10k under loss and the retransmit
     // cycle dilates past the hole-heal deadline).
-    private static let sendWindowSegments = 2_048
+    private static let sendWindowSegments = 1_024
 
     init(
         width: Int = 640,
@@ -325,14 +338,24 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
                         return
                     }
                     if let segment = MiplayKcpSegment(data: packet) {
-                        self.unacked[segment.sn] = (packet, DispatchTime.now().uptimeNanoseconds)
+                        let now = DispatchTime.now().uptimeNanoseconds
+                        self.unacked[segment.sn] = UnackedSegment(
+                            datagram: packet,
+                            sentAtUptimeNanoseconds: now,
+                            resendAtUptimeNanoseconds: now + Self.baseRTONanoseconds,
+                            fastack: 0,
+                            rtoNanoseconds: Self.baseRTONanoseconds
+                        )
                     }
                 }
                 self.emitDatagram(packet)
             }
             if self.retransmitsLost {
                 let timer = DispatchSource.makeTimerSource(queue: self.queue)
-                timer.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
+                timer.schedule(
+                    deadline: .now() + .milliseconds(Self.updateIntervalMilliseconds),
+                    repeating: .milliseconds(Self.updateIntervalMilliseconds)
+                )
                 timer.setEventHandler { [weak self] in
                     self?.retransmitTimedOutSegments()
                 }
@@ -380,30 +403,50 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         }
     }
 
-    // ikcp-style fast retransmit: an ACK for sn removes it from the window;
-    // the head-of-line unacked segment gains a fast-ack strike for every
-    // ACK that skips it, and fastlimit (2) strikes resend immediately —
-    // holes heal in ~1 RTT instead of waiting for the retransmit timeout.
+    // ikcp-style fast retransmit bookkeeping: an ACK for sn removes it from
+    // the window, and every still-unacked segment it skips (sequence-wise
+    // older) gains a fastack strike. Resends are emitted only by the update
+    // tick (like ikcp_flush), never inline here — an inline resend-per-ACK
+    // floods loopback under sustained loss, the Mac's socket buffer
+    // overflows, and the resulting real loss death-spirals (observed
+    // 2026-08-11: 3.1M retransmits in 30s melted the soak).
     private func noteAcknowledgedSegment(sn: UInt32) {
         unacked.removeValue(forKey: sn)
-        guard let oldest = unacked.keys.min(),
-              Int32(bitPattern: oldest &- sn) < 0 else {
-            if unacked.isEmpty {
-                headHoleSN = nil
-                headHoleStrikes = 0
+        for (candidateSN, var entry) in unacked
+        where Int32(bitPattern: candidateSN &- sn) < 0 {
+            entry.fastack += 1
+            unacked[candidateSN] = entry
+        }
+    }
+
+    private func retransmitTimedOutSegments() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let due = unacked
+            .filter { $0.value.fastack >= Self.fastResendLimit || now >= $0.value.resendAtUptimeNanoseconds }
+            .sorted { Int32(bitPattern: $0.key &- $1.key) < 0 }
+            .prefix(Self.maxResendPerUpdate)
+        for (sn, _) in due {
+            guard var entry = unacked[sn] else { continue }
+            if entry.fastack >= Self.fastResendLimit, now < entry.resendAtUptimeNanoseconds {
+                // Fast retransmit: no RTO backoff (ikcp fastresend path).
+                entry.fastack = 0
+                entry.resendAtUptimeNanoseconds = now + entry.rtoNanoseconds
+            } else {
+                // RTO path: back off on repeated timeouts (ikcp nodelay
+                // mode grows the RTO per xmit).
+                entry.rtoNanoseconds = min(entry.rtoNanoseconds * 2, Self.maxRTONanoseconds)
+                entry.fastack = 0
+                entry.resendAtUptimeNanoseconds = now + entry.rtoNanoseconds
             }
-            return
-        }
-        if headHoleSN != oldest {
-            headHoleSN = oldest
-            headHoleStrikes = 0
-        }
-        headHoleStrikes += 1
-        if headHoleStrikes >= 2, let entry = unacked[oldest] {
-            unacked[oldest] = (entry.datagram, DispatchTime.now().uptimeNanoseconds)
-            headHoleStrikes = 0
+            entry.sentAtUptimeNanoseconds = now
+            unacked[sn] = entry
             retransmitsSent += 1
             emitDatagram(entry.datagram)
+        }
+        if retransmitsSent > 0, !due.isEmpty, retransmitsSent % 2000 < due.count || retransmitsSent == due.count {
+            DiagnosticsLog.info(
+                "fakephone.media.retransmit total=\(retransmitsSent) unacked=\(unacked.count) pending=\(pendingSend.count) latestUna=\(kcp.latestRemoteUNA.map(String.init) ?? "none")"
+            )
         }
     }
 
@@ -418,24 +461,6 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         }
     }
 
-    private var headHoleSN: UInt32?
-    private var headHoleStrikes = 0
-
-    private func retransmitTimedOutSegments() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        let timedOut = unacked.filter { now - $0.value.sentAt >= Self.retransmitTimeoutNanoseconds }
-        for (sn, entry) in timedOut {
-            unacked[sn] = (entry.datagram, now)
-            emitDatagram(entry.datagram)
-        }
-        retransmitsSent += timedOut.count
-        if retransmitsSent > 0, retransmitsSent % 2000 < timedOut.count || retransmitsSent == timedOut.count {
-            DiagnosticsLog.info(
-                "fakephone.media.retransmit total=\(retransmitsSent) unacked=\(unacked.count) pending=\(pendingSend.count) latestUna=\(kcp.latestRemoteUNA.map(String.init) ?? "none")"
-            )
-        }
-    }
-
     private(set) var retransmitsSent = 0
 
     private func pruneAcknowledgedSegments() {
@@ -443,14 +468,17 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         unacked = unacked.filter { sn, _ in
             Int32(bitPattern: sn &- una) >= 0
         }
-        if let headHoleSN, unacked[headHoleSN] == nil {
-            self.headHoleSN = nil
-            headHoleStrikes = 0
-        }
         while !pendingSend.isEmpty, unacked.count < Self.sendWindowSegments {
             let packet = pendingSend.removeFirst()
             if let segment = MiplayKcpSegment(data: packet) {
-                unacked[segment.sn] = (packet, DispatchTime.now().uptimeNanoseconds)
+                let now = DispatchTime.now().uptimeNanoseconds
+                unacked[segment.sn] = UnackedSegment(
+                    datagram: packet,
+                    sentAtUptimeNanoseconds: now,
+                    resendAtUptimeNanoseconds: now + Self.baseRTONanoseconds,
+                    fastack: 0,
+                    rtoNanoseconds: Self.baseRTONanoseconds
+                )
             }
             emitDatagram(packet)
         }

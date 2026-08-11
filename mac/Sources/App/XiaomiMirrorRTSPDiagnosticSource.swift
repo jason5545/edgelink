@@ -3055,6 +3055,7 @@ private final class XiaomiMirrorRTPMediaSender {
     // SPKI-prefix key and per-PES IVs from PES_private_data.
     var mptSinkPESDecryptionEnabled = false
     private var mptSinkHEVCDecoder: XiaomiMirrorHEVCDecoder?
+    private var mptSinkJitterBuffer: XiaomiMirrorAccessUnitJitterBuffer?
     private var mptSinkAudioPlayer: XiaomiMirrorMPTPrivateAudioPlayer?
     private var mptSinkDecodedFrames: UInt64 = 0
     private var mptSinkDecodeFailedFrames: UInt64 = 0
@@ -3147,18 +3148,34 @@ private final class XiaomiMirrorRTPMediaSender {
             audioPlayer.onFirstAudioRendered = { [weak self] in
                 self?.onFirstAudioRendered?()
             }
+            let jitterBufferMilliseconds = UserDefaults.standard
+                .object(forKey: "xiaomiMirrorMPTJitterBufferMilliseconds") as? Double ?? 500
+            let jitterBuffer = XiaomiMirrorAccessUnitJitterBuffer(
+                sessionID: sessionID,
+                depthMilliseconds: jitterBufferMilliseconds,
+                queue: mptDecodeQueue,
+                onRelease: { [weak decoder, weak audioPlayer] item, pts90k in
+                    switch item {
+                    case .videoAccessUnit(let accessUnit):
+                        decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+                    case .audioPES(let payload):
+                        audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
+                    }
+                }
+            )
             self.mptSinkHEVCDecoder = decoder
             self.mptSinkAudioPlayer = audioPlayer
+            self.mptSinkJitterBuffer = jitterBuffer
             self.mptSinkTSDemuxer = XiaomiMirrorMPEGTSHEVCDemuxer(
                 sessionID: sessionID,
-                onAccessUnit: { [weak self, weak decoder] accessUnit, pts90k in
+                onAccessUnit: { [weak self, weak jitterBuffer] accessUnit, pts90k in
                     self?.mptDecodeQueue.async {
-                        decoder?.decode(accessUnit: accessUnit, pts90k: pts90k)
+                        jitterBuffer?.push(.videoAccessUnit(accessUnit), pts90k: pts90k)
                     }
                 },
-                onPrivateAudioPES: { [weak self, weak audioPlayer] payload, pts90k in
+                onPrivateAudioPES: { [weak self, weak jitterBuffer] payload, pts90k in
                     self?.mptDecodeQueue.async {
-                        audioPlayer?.pushPESPayload(payload, pts90k: pts90k)
+                        jitterBuffer?.push(.audioPES(payload), pts90k: pts90k)
                     }
                 },
                 onVideoPES: { [weak self] in
@@ -4234,7 +4251,9 @@ private final class XiaomiMirrorRTPMediaSender {
         mptSinkTSDemuxer?.flush()
         let audioPlayer = mptSinkAudioPlayer
         let decoder = mptSinkHEVCDecoder
+        let jitterBuffer = mptSinkJitterBuffer
         mptDecodeQueue.async {
+            jitterBuffer?.invalidate()
             audioPlayer?.stop(reason: reason)
             decoder?.invalidate()
         }
@@ -4900,6 +4919,156 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
     private static let suspiciousPCMMaxAbsThreshold = 30_000
     private static let suspiciousPCMAverageAbsThreshold = 12_000
     private static let suspiciousPCMNonzeroRatioThreshold = 0.95
+}
+
+// PTS-paced access-unit jitter buffer between the TS demuxer and the HEVC
+// decoder. KCP delivery is strictly in-order, so a transport hole blocks the
+// whole stream until ARQ or the ~900ms stall resync heals it; without a
+// buffer the decoder starves for the whole hole and then burst-catches-up
+// (production: ~1s pause; reproduced 2026-08-11 by
+// XiaomiMirrorMediaLoadTests.testLANMPTSinkStreamsWithoutIngestionStalls).
+// Holding ~0.5s of access units and releasing them on a PTS schedule keeps
+// decode flowing through holes up to the buffer depth and shrinks any longer
+// hole by the same amount. Audio PES ride the same schedule so A/V stay
+// aligned — both streams share the TS 90kHz PTS clock and the same KCP
+// pipe, so one buffer paces both. All state lives on the decode queue.
+private final class XiaomiMirrorAccessUnitJitterBuffer {
+    enum Item {
+        case videoAccessUnit([Data])
+        case audioPES(Data)
+    }
+
+    private struct Entry {
+        let item: Item
+        let pts90k: UInt64
+    }
+
+    private static let drainTimerIntervalMilliseconds = 20
+    private static let maxBufferedCount = 240
+
+    private let sessionID: UUID
+    private let depth90k: UInt64
+    private let maxSpan90k: UInt64
+    private let onRelease: (Item, UInt64?) -> Void
+    private var entries: [Entry] = []
+    private var anchorPTS90k: UInt64?
+    private var anchorUptimeNanoseconds: UInt64 = 0
+    private var drainTimer: DispatchSourceTimer?
+    private var starvationEpisodes = 0
+    private var overflowFlushes = 0
+
+    init(
+        sessionID: UUID,
+        depthMilliseconds: Double,
+        queue: DispatchQueue,
+        onRelease: @escaping (Item, UInt64?) -> Void
+    ) {
+        self.sessionID = sessionID
+        self.depth90k = UInt64(max(0, depthMilliseconds) * 90)
+        self.maxSpan90k = self.depth90k * 3
+        self.onRelease = onRelease
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(
+            deadline: .now() + .milliseconds(Self.drainTimerIntervalMilliseconds),
+            repeating: .milliseconds(Self.drainTimerIntervalMilliseconds)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.drainDue()
+        }
+        drainTimer = timer
+        timer.resume()
+    }
+
+    func invalidate() {
+        drainTimer?.cancel()
+        drainTimer = nil
+        entries.removeAll(keepingCapacity: false)
+        anchorPTS90k = nil
+    }
+
+    func push(_ item: Item, pts90k: UInt64?) {
+        guard drainTimer != nil else {
+            return
+        }
+        // A PES without PTS cannot be scheduled; inherit the previous AU's
+        // PTS so ordering and pacing survive, or bypass an empty buffer.
+        guard let effectivePTS = pts90k ?? entries.last?.pts90k else {
+            onRelease(item, nil)
+            return
+        }
+        let wasEmpty = entries.isEmpty
+        entries.append(Entry(item: item, pts90k: effectivePTS))
+        if wasEmpty, anchorPTS90k != nil {
+            // The hole outlasted the buffer; this AU (and the burst behind
+            // it) is overdue and drains immediately.
+            starvationEpisodes += 1
+            if starvationEpisodes <= 5 || starvationEpisodes % 20 == 0 {
+                DiagnosticsLog.warn(
+                    "xiaomi.mirror.mpt.jitter_buffer_starved session=\(sessionID.uuidString) episodes=\(starvationEpisodes)"
+                )
+            }
+        }
+        if anchorPTS90k == nil {
+            // Preroll: anchor once the buffered span covers the target depth
+            // so the head AU becomes due immediately.
+            guard let firstPTS = entries.first?.pts90k,
+                  effectivePTS >= firstPTS,
+                  effectivePTS - firstPTS >= depth90k || entries.count >= Self.maxBufferedCount else {
+                return
+            }
+            anchorPTS90k = firstPTS
+            anchorUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            DiagnosticsLog.info(
+                "xiaomi.mirror.mpt.jitter_buffer_anchored session=\(sessionID.uuidString) " +
+                    "depthMs=\(depth90k / 90) buffered=\(entries.count)"
+            )
+        }
+        if let firstPTS = entries.first?.pts90k,
+           effectivePTS >= firstPTS,
+           effectivePTS - firstPTS > maxSpan90k {
+            // A sender burst after a long hole piled up far more than the
+            // target depth: release the oldest excess as a catch-up burst
+            // and keep pacing the remainder.
+            overflowFlushes += 1
+            var released = 0
+            while let head = entries.first,
+                  effectivePTS >= head.pts90k,
+                  effectivePTS - head.pts90k > maxSpan90k {
+                entries.removeFirst()
+                onRelease(head.item, head.pts90k)
+                released += 1
+            }
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.mpt.jitter_buffer_overflow_flush session=\(sessionID.uuidString) " +
+                    "flushed=\(released) flushes=\(overflowFlushes)"
+            )
+        }
+        drainDue()
+    }
+
+    private func drainDue() {
+        guard !entries.isEmpty else {
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        while let head = entries.first {
+            guard var anchor = anchorPTS90k else {
+                return
+            }
+            if head.pts90k < anchor {
+                // PTS moved backwards (stream restart): re-anchor at the head.
+                anchor = head.pts90k
+                anchorPTS90k = anchor
+                anchorUptimeNanoseconds = now
+            }
+            let elapsedNanoseconds = (head.pts90k - anchor) * 1_000_000 / 90
+            guard now >= anchorUptimeNanoseconds + elapsedNanoseconds else {
+                return
+            }
+            entries.removeFirst()
+            onRelease(head.item, head.pts90k)
+        }
+    }
 }
 
 private final class XiaomiMirrorMPEGTSHEVCDemuxer {
