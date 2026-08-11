@@ -15,29 +15,45 @@ enum MirrorPointerRouting {
     // does inject drags as real touch MotionEvents — so a wheel tick becomes
     // a synthetic vertical drag (down → moves → up), which scrolls exactly
     // like the official client's drag. Distance and direction mirror the
-    // Android accessibility fallback (RemoteInputService): |dy| * 2.6 px
-    // clamped to 96...720, positive wheelDy swipes downward.
-    static let wheelDragMoveCount = 4
+    // like the official client's drag. TrackPal/edge scrolling emits
+    // pixel-unit deltas of only a few px per 50 ms coalesced tick (see
+    // ~/Library/Logs/TrackPal.log), so the min clamp dominates slow scrolls:
+    // 2.0 px/unit with a 48 px floor keeps slow scrolls gentle while fast
+    // flicks scale up. The floor must clear Android's touch slop (~8 dp ≈
+    // 24 px at 3x density) comfortably or the drag classifies as a tap.
+    // Positive wheelDy swipes downward.
+    static let wheelDragMoveCount = 6
     static let wheelDragMaxDistance = 720.0
-    static let wheelDragMinDistance = 96.0
-    static let wheelDragDistancePerUnit = 2.6
+    static let wheelDragMinDistance = 48.0
+    static let wheelDragDistancePerUnit = 2.0
 
-    static func wheelDragSteps(x: Int, y: Int, wheelDy: Int) -> [MirrorWheelDragStep] {
-        guard wheelDy != 0 else { return [] }
-        let distance = min(
+    static func wheelDragSignedDistance(wheelDy: Int) -> Int {
+        guard wheelDy != 0 else { return 0 }
+        let magnitude = min(
             wheelDragMaxDistance,
             max(wheelDragMinDistance, abs(Double(wheelDy)) * wheelDragDistancePerUnit)
         )
-        let direction = wheelDy > 0 ? 1.0 : -1.0
-        let endY = max(0, Int((Double(y) + distance * direction).rounded()))
-        guard endY != y else { return [] }
-        var steps = [MirrorWheelDragStep(action: "down", x: x, y: y)]
+        return Int(magnitude.rounded()) * (wheelDy > 0 ? 1 : -1)
+    }
+
+    static func wheelDragMoveSteps(x: Int, fromY: Int, toY: Int) -> [MirrorWheelDragStep] {
+        guard toY != fromY else { return [] }
+        var steps: [MirrorWheelDragStep] = []
         for index in 1...wheelDragMoveCount {
             let fraction = Double(index) / Double(wheelDragMoveCount)
-            let stepY = y + Int((Double(endY - y) * fraction).rounded())
+            let stepY = fromY + Int((Double(toY - fromY) * fraction).rounded())
             steps.append(MirrorWheelDragStep(action: "move", x: x, y: stepY))
         }
-        steps.append(MirrorWheelDragStep(action: "up", x: x, y: endY))
         return steps
+    }
+
+    static func wheelDragSteps(x: Int, y: Int, wheelDy: Int) -> [MirrorWheelDragStep] {
+        let signedDistance = wheelDragSignedDistance(wheelDy: wheelDy)
+        guard signedDistance != 0 else { return [] }
+        let endY = max(0, y + signedDistance)
+        guard endY != y else { return [] }
+        return [MirrorWheelDragStep(action: "down", x: x, y: y)]
+            + wheelDragMoveSteps(x: x, fromY: y, toY: endY)
+            + [MirrorWheelDragStep(action: "up", x: x, y: endY)]
     }
 }

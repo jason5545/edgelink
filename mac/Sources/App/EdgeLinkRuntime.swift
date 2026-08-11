@@ -14,6 +14,8 @@ enum XiaomiTrustPairing {
 @MainActor
 final class EdgeLinkRuntime: ObservableObject {
     private static let secureKeepaliveIntervalNanoseconds: UInt64 = 5_000_000_000
+    private static let wheelDragStepIntervalSeconds: TimeInterval = 0.025
+    private static let wheelDragEndDelaySeconds: TimeInterval = 0.12
     private static let securePongTimeoutSeconds: TimeInterval = 15
     private static let disconnectStopFlushTimeoutNanoseconds: UInt64 = 1_500_000_000
     private static let androidMetaAltLeft = 0x10
@@ -3152,6 +3154,22 @@ final class EdgeLinkRuntime: ObservableObject {
         var messages: [LyraCastMouse] = []
         switch body.action {
         case "down":
+            // A real press must first close any held wheel drag, otherwise
+            // its pending moves/up would corrupt this gesture.
+            if let wheelPosition = xiaomiMirrorWheelDragPosition {
+                xiaomiMirrorWheelDragEndWorkItem?.cancel()
+                xiaomiMirrorWheelDragEndWorkItem = nil
+                for step in xiaomiMirrorWheelDragPendingSteps { step.cancel() }
+                xiaomiMirrorWheelDragPendingSteps.removeAll()
+                var wheelUp = xiaomiMirrorMouseMessage(
+                    sessionId: sessionId,
+                    body: CtrlPointerBody(x: wheelPosition.x, y: wheelPosition.y, action: "up", wheelDy: nil)
+                )
+                wheelUp.action = .leftUp
+                messages.append(wheelUp)
+                xiaomiMirrorWheelDragPosition = nil
+                xiaomiMirrorWheelDragBusyUntil = nil
+            }
             xiaomiMirrorPointerLeftHeld = true
             var message = xiaomiMirrorMouseMessage(sessionId: sessionId, body: body)
             message.action = .leftDown
@@ -3177,24 +3195,73 @@ final class EdgeLinkRuntime: ObservableObject {
         case "wheel":
             guard let wheelDy = body.wheelDy, wheelDy != 0 else { return true }
             // The phone drops ProtoMouse wheel actions, so scroll rides the
-            // cast channel as a synthetic vertical drag instead.
-            for step in MirrorPointerRouting.wheelDragSteps(x: body.x, y: body.y, wheelDy: wheelDy) {
+            // cast channel as a synthetic drag. While wheel flushes keep
+            // arriving (~50 ms coalescing) the touch stays held and moves
+            // stream in — discrete down/up per flush made scrolling
+            // stair-step. The touch lifts shortly after flushes stop. Steps
+            // stay paced and serialized: back-to-back or overlapping
+            // gestures read as taps on the phone.
+            let signedDistance = MirrorPointerRouting.wheelDragSignedDistance(wheelDy: wheelDy)
+            guard signedDistance != 0 else { return true }
+            let now = DispatchTime.now()
+            var cursor = max(now, xiaomiMirrorWheelDragBusyUntil ?? now)
+
+            func stageWheelStep(action: LyraCastMouse.Action, x: Int, y: Int) {
                 var message = xiaomiMirrorMouseMessage(
                     sessionId: sessionId,
-                    body: CtrlPointerBody(x: step.x, y: step.y, action: step.action, wheelDy: nil)
+                    body: CtrlPointerBody(x: x, y: y, action: "wheelStep", wheelDy: nil)
                 )
-                switch step.action {
-                case "down":
-                    message.action = .leftDown
-                    message.state |= LyraCastMouse.stateLeftHold
-                case "up":
-                    message.action = .leftUp
-                default:
-                    message.action = .move
+                message.action = action
+                if action != .leftUp {
                     message.state |= LyraCastMouse.stateLeftHold
                 }
-                messages.append(message)
+                if cursor <= now {
+                    session.sendMouse(message)
+                } else {
+                    let deadline = cursor
+                    let workItem = DispatchWorkItem {
+                        session.sendMouse(message)
+                    }
+                    xiaomiMirrorWheelDragPendingSteps.append(workItem)
+                    DispatchQueue.main.asyncAfter(deadline: deadline, execute: workItem)
+                }
+                cursor = cursor + Self.wheelDragStepIntervalSeconds
             }
+
+            let dragX = xiaomiMirrorWheelDragPosition?.x ?? body.x
+            let fromY = xiaomiMirrorWheelDragPosition?.y ?? body.y
+            if xiaomiMirrorWheelDragPosition == nil {
+                stageWheelStep(action: .leftDown, x: dragX, y: fromY)
+            }
+            let toY = max(0, fromY + signedDistance)
+            for step in MirrorPointerRouting.wheelDragMoveSteps(x: dragX, fromY: fromY, toY: toY) {
+                stageWheelStep(action: .move, x: step.x, y: step.y)
+            }
+            xiaomiMirrorWheelDragPosition = (x: dragX, y: toY)
+            xiaomiMirrorWheelDragBusyUntil = cursor
+
+            // Lift the touch shortly after the last flush; the next flush
+            // replaces this work item and the drag continues instead.
+            xiaomiMirrorWheelDragEndWorkItem?.cancel()
+            let endPosition = xiaomiMirrorWheelDragPosition
+            let endWorkItem = DispatchWorkItem { [weak self] in
+                guard let self, let endPosition else { return }
+                var up = self.xiaomiMirrorMouseMessage(
+                    sessionId: sessionId,
+                    body: CtrlPointerBody(x: endPosition.x, y: endPosition.y, action: "up", wheelDy: nil)
+                )
+                up.action = .leftUp
+                session.sendMouse(up)
+                self.xiaomiMirrorWheelDragPosition = nil
+                self.xiaomiMirrorWheelDragBusyUntil = nil
+                self.xiaomiMirrorWheelDragPendingSteps.removeAll()
+                self.xiaomiMirrorWheelDragEndWorkItem = nil
+            }
+            xiaomiMirrorWheelDragEndWorkItem = endWorkItem
+            DispatchQueue.main.asyncAfter(
+                deadline: cursor + Self.wheelDragEndDelaySeconds,
+                execute: endWorkItem
+            )
         default:
             DiagnosticsLog.warn("xiaomi.mac.pointer_ignored reason=unknown_action action=\(body.action)")
             return false
@@ -3209,6 +3276,10 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private var xiaomiMirrorPointerLeftHeld = false
+    private var xiaomiMirrorWheelDragPosition: (x: Int, y: Int)?
+    private var xiaomiMirrorWheelDragBusyUntil: DispatchTime?
+    private var xiaomiMirrorWheelDragPendingSteps: [DispatchWorkItem] = []
+    private var xiaomiMirrorWheelDragEndWorkItem: DispatchWorkItem?
     private var xiaomiMirrorPointerRightHeld = false
 
     private func xiaomiMirrorMouseMessage(sessionId: UInt64, body: CtrlPointerBody) -> LyraCastMouse {

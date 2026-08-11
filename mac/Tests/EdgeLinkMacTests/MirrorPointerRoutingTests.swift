@@ -25,7 +25,7 @@ final class MirrorPointerRoutingTests: XCTestCase {
         XCTAssertEqual(steps.first?.x, 500)
         XCTAssertEqual(steps.first?.y, 300)
         XCTAssertEqual(steps.last?.action, "up")
-        XCTAssertEqual(steps.last?.y, 300 + 312, "120 * 2.6 = 312 px downward swipe")
+        XCTAssertEqual(steps.last?.y, 300 + 240, "120 * 2.0 = 240 px downward swipe")
         let moves = steps.dropFirst().dropLast()
         XCTAssertEqual(moves.count, MirrorPointerRouting.wheelDragMoveCount)
         XCTAssertTrue(moves.allSatisfy { $0.action == "move" && $0.x == 500 })
@@ -39,7 +39,7 @@ final class MirrorPointerRoutingTests: XCTestCase {
         let steps = MirrorPointerRouting.wheelDragSteps(x: 500, y: 600, wheelDy: -120)
         XCTAssertEqual(steps.first?.action, "down")
         XCTAssertEqual(steps.last?.action, "up")
-        XCTAssertEqual(steps.last?.y, 600 - 312)
+        XCTAssertEqual(steps.last?.y, 600 - 240)
         for step in steps.dropFirst() {
             XCTAssertLessThan(step.y, 600)
         }
@@ -47,7 +47,7 @@ final class MirrorPointerRoutingTests: XCTestCase {
 
     func testWheelDragStepsClampDistance() {
         let tiny = MirrorPointerRouting.wheelDragSteps(x: 100, y: 1000, wheelDy: 1)
-        XCTAssertEqual(tiny.last?.y, 1000 + 96, "distance clamps to the 96 px minimum")
+        XCTAssertEqual(tiny.last?.y, 1000 + 48, "distance clamps to the 48 px minimum")
         let huge = MirrorPointerRouting.wheelDragSteps(x: 100, y: 1000, wheelDy: 100_000)
         XCTAssertEqual(huge.last?.y, 1000 + 720, "distance clamps to the 720 px maximum")
     }
