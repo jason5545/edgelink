@@ -33,6 +33,14 @@ final class XiaomiMirrorWFDClient {
     // decodes a frame without this.
     var idrRequestDelay: TimeInterval = 20
 
+    // Official sink behavior: the client also initiates GET_PARAMETER
+    // keepalives (the phone's SETUP reply advertises Session;timeout=60 and
+    // tears the whole WFD source down — media stops, RTSP listener dies —
+    // when the sink stays silent past it; live 2026-08-11: session froze
+    // ~100s after PLAY+20s IDR, the last sink-initiated message). 25s keeps
+    // two full intervals of margin under the 60s timeout.
+    var keepaliveInterval: TimeInterval = 25
+
     private let queue = DispatchQueue(label: "EdgeLink.XiaomiMirrorWFDClient")
     private var connection: NWConnection?
     private var stage: Stage = .idle
@@ -45,6 +53,7 @@ final class XiaomiMirrorWFDClient {
     private var ourAuthMsg = ""
     private var firstRenderSent = false
     private var idrRequestWork: DispatchWorkItem?
+    private var keepaliveTimer: DispatchSourceTimer?
     private var watchdog: DispatchSourceTimer?
     private var lastProgress = Date()
     private var startArgs: (host: String, rtspPort: UInt16, clientRTPPort: UInt16)?
@@ -90,6 +99,8 @@ final class XiaomiMirrorWFDClient {
         self.firstRenderSent = false
         self.idrRequestWork?.cancel()
         self.idrRequestWork = nil
+        self.keepaliveTimer?.cancel()
+        self.keepaliveTimer = nil
         self.buffer.removeAll()
         guard let port = NWEndpoint.Port(rawValue: rtspPort) else {
             self.fail("invalid_rtsp_port")
@@ -306,6 +317,7 @@ final class XiaomiMirrorWFDClient {
                 "xiaomi.wfd.established session=\(session ?? "none") serverRTPPort=\(port)"
             )
             scheduleIDRRequest()
+            startKeepaliveTimer()
             onSessionEstablished?(port)
         default:
             break
@@ -368,6 +380,32 @@ final class XiaomiMirrorWFDClient {
         }
         idrRequestWork = work
         queue.asyncAfter(deadline: .now() + idrRequestDelay, execute: work)
+    }
+
+    // Sink-initiated GET_PARAMETER keepalive. Empty body is what the
+    // cloudflare bridge already sends to MirrorControl on its local RTSP
+    // (sessions there stay alive indefinitely); here it resets the phone's
+    // RTSP session timeout on the direct WFD route.
+    private func startKeepaliveTimer() {
+        keepaliveTimer?.cancel()
+        guard keepaliveInterval > 0 else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(
+            deadline: .now() + keepaliveInterval,
+            repeating: keepaliveInterval,
+            leeway: .milliseconds(500)
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self, self.stage == .established else { return }
+            self.ourCSeq += 1
+            self.sendRequest(
+                method: "GET_PARAMETER",
+                target: Self.presentationURL,
+                extraHeaders: self.sessionHeaders()
+            )
+        }
+        keepaliveTimer = timer
+        timer.resume()
     }
 
     private func sendRequest(method: String, target: String, extraHeaders: [String], body: String = "") {
@@ -502,6 +540,8 @@ final class XiaomiMirrorWFDClient {
         watchdog = nil
         idrRequestWork?.cancel()
         idrRequestWork = nil
+        keepaliveTimer?.cancel()
+        keepaliveTimer = nil
         connection?.cancel()
         connection = nil
         DiagnosticsLog.info("xiaomi.wfd.closed reason=\(reason)")

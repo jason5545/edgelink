@@ -1001,6 +1001,8 @@ final class FakeXiaomiPhone {
         wfdSessionEstablished = false
         wfdSentGetParameter = false
         wfdSentTrigger = false
+        wfdSessionTimeoutTimer?.cancel()
+        wfdSessionTimeoutTimer = nil
         videoTimer?.cancel()
         videoTimer = nil
         videoConnection?.cancel()
@@ -1009,6 +1011,8 @@ final class FakeXiaomiPhone {
 
     private func startWFDServer() {
         guard wfdListener == nil, let port = NWEndpoint.Port(rawValue: wfdPort) else { return }
+        wfdSessionTimeoutFired = false
+        wfdClientKeepaliveCount = 0
         let listener = try? NWListener(using: .tcp, on: port)
         listener?.stateUpdateHandler = { [weak self] state in
             self?.log("fakephone.wfd_listener_state \(state)")
@@ -1093,6 +1097,16 @@ final class FakeXiaomiPhone {
     private(set) var idrRequestCount = 0
     private(set) var lastIDRRequestLine: String?
 
+    // Real-phone behavior (live 2026-08-11): the SETUP reply carries
+    // Session;timeout=60 and the phone tears the whole WFD source down —
+    // media stops and the RTSP listener dies — when the sink sends nothing
+    // within the timeout. 0 disables the enforcement.
+    var wfdSessionTimeoutSeconds: TimeInterval = 0
+    private var wfdLastClientRequestAt = Date.distantPast
+    private var wfdSessionTimeoutTimer: DispatchSourceTimer?
+    private(set) var wfdClientKeepaliveCount = 0
+    private(set) var wfdSessionTimeoutFired = false
+
     private func handleWFDMessage(firstLine: String, headers: [String: String], body: Data) {
         let bodyText = String(data: body, encoding: .utf8) ?? ""
         if firstLine.hasPrefix("RTSP/") {
@@ -1109,6 +1123,10 @@ final class FakeXiaomiPhone {
         let method = firstLine.split(separator: " ").first.map(String.init) ?? ""
         let cseq = headers["cseq"].flatMap(Int.init) ?? 0
         log("fakephone.wfd_rx method=\(method) cseq=\(cseq)")
+        wfdLastClientRequestAt = Date()
+        if method == "GET_PARAMETER", wfdSessionEstablished {
+            wfdClientKeepaliveCount += 1
+        }
         switch method {
         case "OPTIONS":
             let authMsg = headers["authmsg"] ?? ""
@@ -1123,6 +1141,7 @@ final class FakeXiaomiPhone {
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nSession: 87654321\r\n\r\n")
             wfdSessionEstablished = true
             wfdPlayCount += 1
+            startWFDSessionTimeoutIfNeeded()
             if withholdVideoUntilIDRRequest {
                 videoWithheld = true
             }
@@ -1138,6 +1157,24 @@ final class FakeXiaomiPhone {
         default:
             sendWFDRaw("RTSP/1.0 200 OK\r\nCSeq: \(cseq)\r\nContent-Length: 0\r\n\r\n")
         }
+    }
+
+    private func startWFDSessionTimeoutIfNeeded() {
+        wfdSessionTimeoutTimer?.cancel()
+        guard wfdSessionTimeoutSeconds > 0 else { return }
+        wfdLastClientRequestAt = Date()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.25, repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.wfdSessionEstablished else { return }
+            let silentFor = Date().timeIntervalSince(self.wfdLastClientRequestAt)
+            guard silentFor >= self.wfdSessionTimeoutSeconds else { return }
+            self.wfdSessionTimeoutFired = true
+            self.log("fakephone.wfd_session_timeout silentSeconds=\(Int(silentFor))")
+            self.tearDownWFDServer()
+        }
+        wfdSessionTimeoutTimer = timer
+        timer.resume()
     }
 
     private func startVideoSender() {

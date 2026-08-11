@@ -25,6 +25,7 @@ final class MirrorFlowE2ETests: XCTestCase {
     // happy-path tests but is disabled when video starvation is the point.
     private var wfdIDRRequestDelay: TimeInterval = 20
     private var establishedNotifiesVideoFrame = true
+    private var wfdKeepaliveInterval: TimeInterval = 25
 
     // Each test gets its own port block: UDP/TCP listener sockets from the
     // previous test release asynchronously after cancel(), and a next test
@@ -145,6 +146,7 @@ final class MirrorFlowE2ETests: XCTestCase {
         wfdClient?.stop(reason: "replace")
         let client = XiaomiMirrorWFDClient()
         client.idrRequestDelay = wfdIDRRequestDelay
+        client.keepaliveInterval = wfdKeepaliveInterval
         client.onSessionEstablished = { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.establishedNotifiesVideoFrame else { return }
@@ -244,6 +246,50 @@ final class MirrorFlowE2ETests: XCTestCase {
             elapsed, 3.5,
             "OPEN→established took \(elapsed)s; the old 6s watchdog + 1s backoff budget is ~7s"
         )
+    }
+
+    // Real-phone behavior (live 2026-08-11): the SETUP reply advertises
+    // Session;timeout=60 and the phone tears the whole WFD source down when
+    // the sink initiates nothing within the timeout — media stops and the
+    // RTSP listener dies (the "spontaneous MirrorControl restart" freeze).
+    // The official sink sends GET_PARAMETER keepalives; our client must too.
+    func testWFDKeepaliveKeepsSessionAlivePastPhoneSessionTimeout() async throws {
+        try makeEnvironment(locked: false)
+        wfdKeepaliveInterval = 1.0
+        phone.wfdSessionTimeoutSeconds = 3.0
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD session established") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+
+        try await Task.sleep(nanoseconds: 8_000_000_000)
+
+        XCTAssertFalse(phone.wfdSessionTimeoutFired,
+                       "keepalives must hold the phone's session timeout")
+        XCTAssertTrue(phone.wfdSessionEstablished, "session must still be alive")
+        XCTAssertGreaterThanOrEqual(phone.wfdClientKeepaliveCount, 5,
+                                    "client must keep sending GET_PARAMETER keepalives")
+    }
+
+    // Negative control for the keepalive: with keepalives disabled the fake
+    // phone's session timeout must fire and tear the source down — this is
+    // the exact failure seen live before the keepalive existed.
+    func testWFDWithoutKeepalivePhoneTearsDownAtSessionTimeout() async throws {
+        try makeEnvironment(locked: false)
+        wfdKeepaliveInterval = 0
+        phone.wfdSessionTimeoutSeconds = 2.0
+        session.start()
+        controller.start()
+
+        try await waitFor("WFD session established") { [self] in
+            self.phone.wfdSessionEstablished
+        }
+        try await waitFor("phone session timeout fires") { [self] in
+            self.phone.wfdSessionTimeoutFired
+        }
+        XCTAssertFalse(self.phone.wfdSessionEstablished)
     }
 
     // Phone locked: OPEN still goes out immediately (official behavior keeps

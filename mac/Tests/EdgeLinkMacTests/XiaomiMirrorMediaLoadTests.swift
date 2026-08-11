@@ -115,6 +115,71 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
                              "the soak must actually push high traffic (sent \(media.datagramsSent))")
     }
 
+    // MARK: - LAN: ingestion stall reproduction (gap distribution)
+
+    // Same 40Mbps flood as the recovery soak, but measured for stall-burst
+    // cycles instead of watchdog events: the production symptom is a ~1s pause
+    // every ~2 minutes with no loss/recovery. KCP ACKs are emitted inside the
+    // Mac receiver's receiveDatagram on the receiver queue, so ACK gaps on the
+    // fake phone directly measure Mac ingestion pipeline stalls.
+    func testLANMPTSinkStreamsWithoutIngestionStalls() async throws {
+        UserDefaults.standard.set("mpt", forKey: "xiaomiMirrorRTSPTransportMode")
+        UserDefaults.standard.set("official", forKey: "xiaomiMirrorRTSPProtocolProfile")
+
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onRecoveryRequired = { probe.noteRecovery($0) }
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+        try source.start(port: rtspPort, advertisedHost: "127.0.0.1", lifetime: 300)
+        defer { source.stop(reason: "test_teardown") }
+
+        let phone = FakePhoneOfficialRTSPClient(host: "127.0.0.1", port: rtspPort)
+        try phone.connect()
+        try await waitFor("RTSP dialog reached PLAY", timeout: 10) { phone.playAcknowledged }
+
+        let media = FakePhoneMPTMediaSource(
+            width: 960, height: 2080, averageBitRate: 20_000_000,
+            loss: 0.02, duplicate: 0.2, retransmitsLost: true
+        )
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        phone.onIDRRequest = { [weak media] in media?.forceNextKeyframe() }
+        media.start()
+        defer { media.stop() }
+
+        try await Task.sleep(nanoseconds: 30_000_000_000)
+
+        DiagnosticsLog.info(
+            "loadtest.lan_gap_stats decoded=\(probe.decodedFrames) " +
+                "maxDecodeGapMs=\(String(format: "%.0f", probe.maxDecodeGapMilliseconds)) " +
+                "decodeGaps200=\(probe.decodeGapsOver200ms) decodeGaps500=\(probe.decodeGapsOver500ms) " +
+                "maxAckGapMs=\(String(format: "%.0f", media.maxAckGapMilliseconds)) " +
+                "ackGaps200=\(media.ackGapsOver200ms) ackGaps500=\(media.ackGapsOver500ms) " +
+                "datagrams=\(media.datagramsSent) acks=\(media.acksReceived) retransmits=\(media.retransmitsSent)"
+        )
+
+        XCTAssertTrue(probe.recoveryEvents.isEmpty,
+                      "LAN stream must not trigger recovery: \(probe.recoveryEvents)")
+        XCTAssertGreaterThan(probe.decodedFrames, 150,
+                             "decoder must keep up under load (got \(probe.decodedFrames) frames)")
+        // Documents the live HoL-blocking stall: any transport hole starves
+        // the in-order KCP delivery, decode pauses, and the heal drains as a
+        // burst (production: ~1s pause then catch-up). Expected to fail until
+        // the decode pipeline gains a PTS-paced jitter buffer.
+        let gapOptions = XCTExpectedFailure.Options()
+        gapOptions.isStrict = false
+        XCTExpectFailure(
+            "KCP in-order HoL blocking stalls decode under loss (2026-08-11 reproduction)",
+            options: gapOptions
+        ) {
+            XCTAssertEqual(media.ackGapsOver500ms, 0,
+                           "receiver queue must not stall >500ms (maxAckGapMs=\(media.maxAckGapMilliseconds))")
+            XCTAssertEqual(probe.decodeGapsOver500ms, 0,
+                           "decode must not stall >500ms (maxDecodeGapMs=\(probe.maxDecodeGapMilliseconds))")
+        }
+    }
+
     private func waitFor(
         _ description: String,
         timeout: TimeInterval,
@@ -136,6 +201,9 @@ private final class MediaLoadProbe: @unchecked Sendable {
     private(set) var recoveryEvents: [XiaomiMirrorRTSPRecoveryEvent] = []
     private(set) var decodedFrames: UInt64 = 0
     private var lastDecodedFrameUptime: UInt64 = 0
+    private(set) var maxDecodeGapMilliseconds: Double = 0
+    private(set) var decodeGapsOver200ms = 0
+    private(set) var decodeGapsOver500ms = 0
 
     var secondsSinceLastDecodedFrame: Double {
         lock.lock()
@@ -153,7 +221,14 @@ private final class MediaLoadProbe: @unchecked Sendable {
     func noteDecodedFrame() {
         lock.lock()
         decodedFrames += 1
-        lastDecodedFrameUptime = DispatchTime.now().uptimeNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        if lastDecodedFrameUptime > 0 {
+            let gapMs = Double(now - lastDecodedFrameUptime) / 1_000_000
+            maxDecodeGapMilliseconds = max(maxDecodeGapMilliseconds, gapMs)
+            if gapMs > 200 { decodeGapsOver200ms += 1 }
+            if gapMs > 500 { decodeGapsOver500ms += 1 }
+        }
+        lastDecodedFrameUptime = now
         lock.unlock()
     }
 }
@@ -168,6 +243,24 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
 
     private(set) var datagramsSent: UInt64 = 0
     private(set) var acksReceived: UInt64 = 0
+    // ACK inter-arrival gaps measured on the fake phone. KCP ACKs are emitted
+    // synchronously inside the Mac receiver's receiveDatagram on the receiver
+    // queue, so a >200ms ACK gap means the Mac's ingestion pipeline stalled.
+    private(set) var maxAckGapMilliseconds: Double = 0
+    private(set) var ackGapsOver200ms = 0
+    private(set) var ackGapsOver500ms = 0
+    private var lastAckUptimeNanoseconds: UInt64 = 0
+
+    private func noteAckArrival() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if lastAckUptimeNanoseconds > 0 {
+            let gapMs = Double(now - lastAckUptimeNanoseconds) / 1_000_000
+            maxAckGapMilliseconds = max(maxAckGapMilliseconds, gapMs)
+            if gapMs > 200 { ackGapsOver200ms += 1 }
+            if gapMs > 500 { ackGapsOver500ms += 1 }
+        }
+        lastAckUptimeNanoseconds = now
+    }
 
     private let queue = DispatchQueue(label: "FakePhoneMPTMediaSource")
     private let kcp = MiplayKcpTransport(
@@ -373,6 +466,7 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
     func receiveACKs(_ packets: [Data]) {
         queue.async {
             for packet in packets {
+                self.noteAckArrival()
                 if self.retransmitsLost {
                     self.processACKDatagram(packet)
                 }
@@ -411,6 +505,7 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
             let count = Darwin.recv(udpSocketFD, &buffer, buffer.count, 0)
             guard count > 0 else { break }
             let packet = Data(buffer.prefix(count))
+            noteAckArrival()
             if retransmitsLost {
                 processACKDatagram(packet)
             }
