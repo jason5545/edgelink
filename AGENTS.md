@@ -18,8 +18,10 @@
 - `[MUST]` macOS code、`mac/project.yml` 或 Mac 測試變更完成前，必須通過完整 Mac 測試套件：
 
   ```sh
-  cd mac && xcodebuild -project EdgeLink.xcodeproj -scheme EdgeLinkMacTests -configuration Debug -derivedDataPath /private/tmp/edgelink-test-dd test
+  cd mac && xcodebuild -project EdgeLink.xcodeproj -scheme EdgeLinkMacTests -configuration Debug -derivedDataPath /private/tmp/edgelink-test-dd test -parallel-testing-enabled YES -maximum-parallel-testing-workers 4
   ```
+
+- `[MUST]` 跑測試前先 quit 使用中的 `/Applications/EdgeLinkMac.app`：它持有 UDP `*:15550`，`XiaomiMirrorMediaLoadTests` 的 MPT sink 也要綁同一個 port，搶不到會整組 0  inbound 失敗。
 
 - `[MUST]` 新增測試檔後，先在 `mac/` 執行 `xcodegen generate`，再跑完整測試；否則新檔可能不會被 Xcode project 收進去。
 - `[MUST]` Android code、Gradle 設定或 Android 測試變更完成前，至少在 `android/` 執行：

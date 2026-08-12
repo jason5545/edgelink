@@ -293,7 +293,12 @@ final class MirrorFlowE2ETests: XCTestCase {
         try await waitFor("phone session timeout fires") { [self] in
             self.phone.wfdSessionTimeoutFired
         }
-        XCTAssertFalse(self.phone.wfdSessionEstablished)
+        // The teardown lands in the same phone-queue block that sets the
+        // fired flag, but the cross-queue read can observe the flag first
+        // (wider window under parallel test workers) — wait it out.
+        try await waitFor("phone tore the session down") { [self] in
+            !self.phone.wfdSessionEstablished
+        }
     }
 
     // Phone locked: OPEN still goes out immediately (official behavior keeps
