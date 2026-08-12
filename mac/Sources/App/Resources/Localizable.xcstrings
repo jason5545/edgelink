@@ -947,24 +947,24 @@
         }
       }
     },
-    "iPhone 來電，%@": {
+    "%@ 來電，%@": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone call, %@"
+            "value": "%@ call, %@"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone 着信、%@"
+            "value": "%@ 着信、%@"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone 来电，%@"
+            "value": "%@ 来电，%@"
           }
         }
       }
@@ -991,24 +991,68 @@
         }
       }
     },
-    "iPhone 行動電話": {
+    "行動電話": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone Mobile"
+            "value": "Mobile"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone 携帯電話"
+            "value": "携帯電話"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "iPhone 移动电话"
+            "value": "移动电话"
+          }
+        }
+      }
+    },
+    "手機": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Phone"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "携帯"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "手机"
+          }
+        }
+      }
+    },
+    "%@ 行動電話": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Mobile"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 携帯電話"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 移动电话"
           }
         }
       }

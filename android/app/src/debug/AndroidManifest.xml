@@ -3,6 +3,12 @@
   <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
   <application>
     <service
+      android:name=".EdgeLinkInCallService">
+      <meta-data
+        android:name="android.telecom.INCLUDE_SELF_MANAGED_CALLS"
+        android:value="true" />
+    </service>
+    <service
       android:name=".DebugFakeCallConnectionService"
       android:exported="true"
       android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">

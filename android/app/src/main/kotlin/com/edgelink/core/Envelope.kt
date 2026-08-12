@@ -230,7 +230,8 @@ data class StatusCapsBody(
     val clipboardThumbnail: Boolean = true,
     val clipboardBlob: Boolean = false,
     val photoSync: Boolean = false,
-    val mirrorTurnDataChannel: Boolean = false
+    val mirrorTurnDataChannel: Boolean = false,
+    val deviceName: String? = null
 )
 
 @Serializable

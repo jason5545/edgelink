@@ -1278,6 +1278,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
         DiagnosticsLog.info("relay.mac.reconnect_requested hostId=\(identity.deviceId) clientId=\(peer.deviceId)")
         peerName = peer.name
+        incomingCallPresenter.phoneDisplayName = peer.name
         peerDeviceId = DeviceID.display(peer.deviceId)
         startConnection(identity: identity, peer: peer, reason: "manual")
     }
@@ -3852,6 +3853,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
             DiagnosticsLog.info("runtime.mac.loaded_peer clientId=\(peer.deviceId) pkfp=\(DiagnosticsLog.fingerprint(peer.publicKey))")
             peerName = peer.name
+            incomingCallPresenter.phoneDisplayName = peer.name
             peerDeviceId = DeviceID.display(peer.deviceId)
             currentPeer = peer
             startConnection(identity: identity, peer: peer, reason: "startup")
@@ -3966,6 +3968,7 @@ final class EdgeLinkRuntime: ObservableObject {
             }
             pendingPairing = nil
             peerName = peer.name
+            incomingCallPresenter.phoneDisplayName = peer.name
             peerDeviceId = DeviceID.display(peer.deviceId)
             pairingSAS = ""
             pairingPeerName = ""
@@ -4678,6 +4681,17 @@ final class EdgeLinkRuntime: ObservableObject {
         peerCapabilityBlob = caps.clipboardBlob
         peerClipboardBlobSupported = caps.clipboardBlob
         peerCapabilityMirrorTurn = caps.mirrorTurnDataChannel
+        if let deviceName = caps.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !deviceName.isEmpty,
+           let peer = currentPeer,
+           peer.name != deviceName {
+            let renamed = PinnedPeer(deviceId: peer.deviceId, name: deviceName, publicKey: peer.publicKey, pairedAt: peer.pairedAt)
+            try? pairingStore?.savePeer(renamed)
+            currentPeer = renamed
+            peerName = deviceName
+            incomingCallPresenter.phoneDisplayName = deviceName
+            DiagnosticsLog.info("pair.mac.peer_renamed from=\(peer.name) to=\(deviceName)")
+        }
         DiagnosticsLog.info("clipboard.mac.caps_received history=\(caps.clipboardHistory) thumbnail=\(caps.clipboardThumbnail) blob=\(caps.clipboardBlob) mirrorTurn=\(caps.mirrorTurnDataChannel)")
         // Answer with our own caps. The phone sends its caps every time its
         // process reconnects; if our session lived through that restart we

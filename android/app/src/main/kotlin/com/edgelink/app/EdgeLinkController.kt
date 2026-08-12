@@ -126,6 +126,7 @@ private const val PONG_TIMEOUT_MS = 15_000L
 // held, later LAN mirror attaches refused). The control plane detects a dead
 // Mac within ~15s (pong_timeout); 5 minutes gives reconnects a wide margin.
 private const val MIRROR_BRIDGE_ZOMBIE_TIMEOUT_MS = 300_000L
+private const val NO_SESSION_DROP_LOG_INTERVAL_MS = 60_000L
 private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
 private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
@@ -402,6 +403,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     @Volatile
     private var pendingPhotoItems: Map<String, AndroidPhotoSync.MediaItem> = emptyMap()
     private var shizukuAutoRepairJob: Job? = null
+    private var phoneCallCompanionJob: Job? = null
+    private var phoneCallCompanionRegistered = false
+    @Volatile
+    private var lastNoSessionDropLogMs = 0L
     private var turnCredentialJob: Job? = null
     private var pendingCallRelayBridgeJob: Job? = null
     private var pendingPairing: PendingPairing? = null
@@ -506,6 +511,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
         runShizukuAutoRepairIfReady("init")
         runMiLinkRootProbeIfReady("init")
+        runPhoneCallCompanionRegistrationIfReady("init")
     }
 
     fun close() {
@@ -1148,6 +1154,34 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             runPendingShizukuAction()
             runShizukuAutoRepairIfReady(reason)
             runMiLinkRootProbeIfReady(reason)
+            runPhoneCallCompanionRegistrationIfReady(reason)
+        }
+    }
+
+    private fun runPhoneCallCompanionRegistrationIfReady(reason: String) {
+        val shizukuState = AndroidShizukuSupport.currentState()
+        if (phoneCallCompanionRegistered || !shizukuState.canUse || shizukuState.uid != 0) {
+            return
+        }
+        if (phoneCallCompanionJob?.isActive == true) {
+            return
+        }
+        phoneCallCompanionJob = scope.launch {
+            // Incoming-call relay depends on Telecom binding EdgeLinkInCallService
+            // as a companion in-call service; without this registration the first
+            // incoming call after a reinstall never reaches the Mac.
+            val result = runCatching {
+                AndroidShizukuSupport.ensurePhoneCallCompanionApp(appContext)
+            }.getOrElse { error ->
+                EdgeLinkLog.warn("phone.android.companion_register_failed", error)
+                ShizukuOperationResult(success = false, message = error.message.orEmpty())
+            }
+            phoneCallCompanionRegistered = result.success
+            if (result.success) {
+                EdgeLinkLog.info("phone.android.companion_registered reason=$reason message=${result.message}")
+            } else {
+                EdgeLinkLog.warn("phone.android.companion_register_failed reason=$reason message=${result.message}")
+            }
         }
     }
 
@@ -1562,17 +1596,30 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     private suspend fun loadOrRegisterIdentity(): LocalIdentity =
         withContext(Dispatchers.IO) {
-            identityStore.loadIdentity()?.let {
-                EdgeLinkLog.info("runtime.android.identity_loaded deviceId=${it.deviceId}")
-                return@withContext it
+            identityStore.loadIdentity()?.let { stored ->
+                EdgeLinkLog.info("runtime.android.identity_loaded deviceId=${stored.deviceId}")
+                val resolvedName = AndroidDeviceName.resolve()
+                if (resolvedName != stored.name) {
+                    val renamed = stored.copy(name = resolvedName)
+                    identityStore.saveIdentity(renamed)
+                    runCatching {
+                        registrar.register(
+                            publicKey = renamed.publicKey,
+                            name = renamed.name,
+                            platform = "android"
+                        )
+                    }.onFailure { error ->
+                        EdgeLinkLog.warn("runtime.android.identity_rename_register_failed", error)
+                    }
+                    EdgeLinkLog.info("runtime.android.identity_renamed deviceId=${stored.deviceId} from=${stored.name} to=$resolvedName")
+                    return@withContext renamed
+                }
+                return@withContext stored
             }
 
             val seed = crypto.randomSeed()
             val keyPair = crypto.ed25519KeyPairFromSeed(seed)
-            val name = listOf(Build.MANUFACTURER, Build.MODEL)
-                .filter { it.isNotBlank() }
-                .joinToString(" ")
-                .ifBlank { "Android" }
+            val name = AndroidDeviceName.resolve()
             val deviceId = registrar.register(
                 publicKey = keyPair.publicKey,
                 name = name,
@@ -2306,7 +2353,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             StatusCapsBody(
                 clipboardBlob = true,
                 photoSync = stateFlow.value.photoSyncEnabled,
-                mirrorTurnDataChannel = true
+                mirrorTurnDataChannel = true,
+                deviceName = identity.name
             )
         )
         sendEnvelope(EnvelopeTypes.CLIPBOARD_HISTORY_REQUEST, ClipboardHistoryRequestBody(limit = 50))
@@ -2776,7 +2824,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     }
 
     private fun sendPlaintext(plaintext: ByteArray) {
-        val activeSession = session ?: return
+        val activeSession = session
+        if (activeSession == null) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastNoSessionDropLogMs >= NO_SESSION_DROP_LOG_INTERVAL_MS) {
+                lastNoSessionDropLogMs = nowMs
+                EdgeLinkLog.warn("relay.android.envelope_dropped_no_session bytes=${plaintext.size}")
+            }
+            return
+        }
         scope.launch(Dispatchers.IO) {
             runCatching {
                 activeSession.sendPlaintext(plaintext)

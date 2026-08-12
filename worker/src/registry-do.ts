@@ -46,6 +46,10 @@ export class RegistryDO implements DurableObject {
 
     const existingDeviceId = await this.state.storage.get<string>(`pubkey:${body.pubkey}`);
     if (existingDeviceId) {
+      const record = await this.state.storage.get<DeviceRecord>(`device:${existingDeviceId}`);
+      if (record && record.name !== body.name) {
+        await this.state.storage.put(`device:${existingDeviceId}`, { ...record, name: body.name });
+      }
       return json({ deviceId: existingDeviceId });
     }
 

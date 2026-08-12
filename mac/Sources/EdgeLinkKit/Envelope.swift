@@ -302,13 +302,15 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
     public let clipboardBlob: Bool
     public let photoSync: Bool
     public let mirrorTurnDataChannel: Bool
+    public let deviceName: String?
 
-    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true, photoSync: Bool = false, mirrorTurnDataChannel: Bool = false) {
+    public init(clipboardHistory: Bool = true, clipboardThumbnail: Bool = true, clipboardBlob: Bool = true, photoSync: Bool = false, mirrorTurnDataChannel: Bool = false, deviceName: String? = nil) {
         self.clipboardHistory = clipboardHistory
         self.clipboardThumbnail = clipboardThumbnail
         self.clipboardBlob = clipboardBlob
         self.photoSync = photoSync
         self.mirrorTurnDataChannel = mirrorTurnDataChannel
+        self.deviceName = deviceName
     }
 
     public init(from decoder: Decoder) throws {
@@ -318,6 +320,7 @@ public struct StatusCapsBody: Codable, Equatable, Sendable {
         clipboardBlob = try container.decodeIfPresent(Bool.self, forKey: .clipboardBlob) ?? false
         photoSync = try container.decodeIfPresent(Bool.self, forKey: .photoSync) ?? false
         mirrorTurnDataChannel = try container.decodeIfPresent(Bool.self, forKey: .mirrorTurnDataChannel) ?? false
+        deviceName = try container.decodeIfPresent(String.self, forKey: .deviceName)
     }
 }
 

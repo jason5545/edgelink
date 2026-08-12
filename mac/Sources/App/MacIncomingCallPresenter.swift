@@ -7,6 +7,7 @@ import SwiftUI
 final class MacIncomingCallPresenter {
     var onAnswerPhoneCall: (@MainActor @Sendable (String) -> Void)?
     var onHangUpPhoneCall: (@MainActor @Sendable (String) -> Void)?
+    var phoneDisplayName: String?
 
     private let model = IncomingCallViewModel()
     private var panel: IncomingCallPanel?
@@ -23,7 +24,8 @@ final class MacIncomingCallPresenter {
         let isNewCall = activeCallId != status.callId
         activeCallId = status.callId
         model.callerName = Self.callerName(for: status)
-        model.callerDetail = Self.callerDetail(for: status)
+        model.phoneName = phoneDisplayName
+        model.callerDetail = Self.callerDetail(for: status, phoneName: phoneDisplayName)
         model.canAnswer = status.canAnswer
         model.canDecline = status.canHangUp
         model.onAnswer = { [weak self] in
@@ -189,13 +191,16 @@ final class MacIncomingCallPresenter {
         return handle.isEmpty ? String(localized: "未知來電") : handle
     }
 
-    private static func callerDetail(for status: PhoneCallStatusBody) -> String {
+    private static func callerDetail(for status: PhoneCallStatusBody, phoneName: String?) -> String {
         let handle = status.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let name = status.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !handle.isEmpty, handle != name {
-            return "iPhone • \(handle)"
+            return "\(phoneName ?? String(localized: "手機")) • \(handle)"
         }
-        return String(localized: "iPhone 行動電話")
+        guard let phoneName, !phoneName.isEmpty else {
+            return String(localized: "行動電話")
+        }
+        return String(format: String(localized: "%@ 行動電話"), phoneName)
     }
 
     private static func logSafe(_ value: String) -> String {
@@ -222,7 +227,8 @@ final class MacIncomingCallPresenter {
 @MainActor
 private final class IncomingCallViewModel: ObservableObject {
     @Published var callerName = String(localized: "未知來電")
-    @Published var callerDetail = String(localized: "iPhone 行動電話")
+    @Published var callerDetail = String(localized: "行動電話")
+    @Published var phoneName: String?
     @Published var canAnswer = true
     @Published var canDecline = true
     var onAnswer: (() -> Void)?
@@ -302,7 +308,13 @@ private struct IncomingCallBanner: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("iPhone 來電，\(model.callerName)")
+        .accessibilityLabel(
+            String(
+                format: String(localized: "%@ 來電，%@"),
+                model.phoneName ?? String(localized: "手機"),
+                model.callerName
+            )
+        )
     }
 }
 

@@ -440,7 +440,7 @@ object AndroidShizukuSupport {
             }
         }
 
-    private suspend fun ensurePhoneCallCompanionApp(context: Context): ShizukuOperationResult =
+    internal suspend fun ensurePhoneCallCompanionApp(context: Context): ShizukuOperationResult =
         withService(context) { service ->
             val appOpsResult = service.runCommandResult(
                 arrayOf("cmd", "appops", "set", context.packageName, "MANAGE_ONGOING_CALLS", "allow")
