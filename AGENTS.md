@@ -51,6 +51,7 @@
 ## Android 與裝置診斷
 
 - `[DEFAULT]` 開始 adb 診斷前，先用 `adb devices` 確認 USB 裝置與連線狀態。手機目前通常已連線，且 adb root 可用，但不要把這件事當成無條件保證。
+- `[OBSERVED]` 2026-08-12：手機上 Shizuku 以 uid 0（root）運行，因此 `EdgeLinkShizukuService` 內可直接執行需 root 的操作（例如 `su 1000 -c ...` 進 uid 1000 keystore namespace 存取 `lyra_store_manager` alias），不需要另外假設只有 shell（uid 2000）權限。
 - Android diagnostics log：
 
   ```sh
@@ -97,6 +98,22 @@
   ```
 
   既有 decompile 在 `captures/`，例如 `captures/xiaomi-mirror-device/jadx/` 與 `captures/mi-connect-service/jadx/`。
+
+- lyra store seed 工具的原始 source（root 種 identity-cred/ticket 進 `storage.lyra`，搭配 `su 1000` + app_process + keystore alias `lyra_store_manager`）：
+
+  ```text
+  captures/lyra-live/lyraseed/Seed.java（+ 已編譯 classes.dex）
+  captures/mi-connect-service/jadx/sources/com/xiaomi/continuity/netbus/utils/AesUtils.java（AES/GCM/NoPadding、pack=BE32 ctLen|ct|BE32 ivLen|iv）
+  ```
+
+  可用 invocation（2026-08-03 驗證）：
+
+  ```sh
+  adb shell "su 1000 -c 'CLASSPATH=/data/local/tmp/seed.dex:/product/app/MiConnectService/MiConnectService.apk app_process / Seed dump > /data/local/tmp/seed.out 2>&1; echo exit=\$?'"
+  adb shell "su -c 'head -60 /data/local/tmp/seed.out'"
+  ```
+
+  `[OBSERVED]` 2026-08-03：shell 只顯示 `Killed`（exit=137）時，根因通常是 dex 拋 uncaught exception（例如只放 seed.dex 沒帶 MiConnectService.apk → `ClassNotFoundException: AesUtils`）後被 RuntimeInit 的 KillApplicationHandler SIGKILL，不是 OOM/SELinux；看 logcat 的 AndroidRuntime 才是真相。CLASSPATH 必須含 APK、必須 `su 1000`（root 跑會 `DECRYPT_FAILED`）、輸出導檔再讀。
 
 - 擷取 pcap 時：
 
