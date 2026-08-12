@@ -42,6 +42,10 @@ final class XiaomiMirrorFlowController {
 
     var sessionProvider: () -> LyraCastTrustSession? = { nil }
     var sessionFactory: (_ reason: String) -> Void = { _ in }
+    // Drops the current session synchronously (wedged-dial recovery): the
+    // next beginStart then builds a fresh session — fresh phys handshake,
+    // and on the relay path a fresh mesh flow index.
+    var sessionInvalidator: () -> Void = {}
     var biometricEvaluate: () async throws -> Void = {}
     var openMirrorScreen: (_ session: LyraCastTrustSession) -> Void = { _ in }
     var stopMirrorMedia: () -> Void = {}
@@ -89,6 +93,17 @@ final class XiaomiMirrorFlowController {
     var openTimeout: TimeInterval = 20
     private var openResendAttempted = false
 
+    // Fresh-dial stall (live 2026-08-11): a dial that lands in phone-side
+    // transport churn (screen-off keepalive suppression tearing the
+    // relay-fed phys conns, relay reconnect) wedges — the phone answers the
+    // phys sync but the logi-layer exchange never advances. The channel wait
+    // then failed straight to 連接失敗 and only a manual 重試 (fresh
+    // session, fresh flow index) recovered. Retry automatically before
+    // surfacing the failure.
+    var channelReadyTimeout: TimeInterval = 15
+    var channelTimeoutMaxAutoRetries = 1
+    private var channelTimeoutRetries = 0
+
     init(trustManager: MacTrustManager) {
         self.trustManager = trustManager
         trustManager.onStateChanged = { [weak self] state in
@@ -109,6 +124,7 @@ final class XiaomiMirrorFlowController {
     func start() {
         flowGeneration &+= 1
         openSent = false
+        channelTimeoutRetries = 0
         if stage != .unlocking {
             stage = .connecting
             mask = .loading
@@ -147,7 +163,7 @@ final class XiaomiMirrorFlowController {
         let generation = flowGeneration
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let deadline = Date().addingTimeInterval(15)
+            let deadline = Date().addingTimeInterval(self.channelReadyTimeout)
             while Date() < deadline {
                 // A stopped/superseded flow must not keep rebuilding
                 // sessions in the background (post-reboot recovery, test
@@ -166,6 +182,14 @@ final class XiaomiMirrorFlowController {
             }
             if self.sessionProvider()?.isChannelReady == true {
                 self.openMirrorScreenNow()
+            } else if self.channelTimeoutRetries < self.channelTimeoutMaxAutoRetries {
+                self.channelTimeoutRetries += 1
+                self.log(
+                    "xiaomi.mac.mirror_flow_channel_retry attempt=\(self.channelTimeoutRetries) " +
+                        "generation=\(generation)"
+                )
+                self.sessionInvalidator()
+                self.beginStart()
             } else {
                 self.stage = .failed
                 self.mask = .connectFailed
@@ -288,12 +312,14 @@ final class XiaomiMirrorFlowController {
 
     // Connect-failed mask button (重試): the phone tears down its RTSP server
     // ~80s after OPEN, so retry means re-sending OPEN, not just re-dialing
-    // RTSP.
+    // RTSP. The reopen is forced: stale media from the pre-retry session can
+    // leave stage == .streaming, but the phone's server is gone (teardown on
+    // risk refusal / OPEN expiry), so the pipeline must be re-OPENed anyway.
     func retryRequested() {
         stopMirrorMedia()
         openSent = false
         if sessionProvider()?.isChannelReady == true {
-            openMirrorScreenNow()
+            openMirrorScreenNow(force: true)
         } else {
             start()
         }
@@ -326,10 +352,10 @@ final class XiaomiMirrorFlowController {
     // server mid-stream (official never re-sends it either).
     private var openSent = false
 
-    private func openMirrorScreenNow() {
+    private func openMirrorScreenNow(force: Bool = false) {
         guard !openSent,
               let session = sessionProvider(), session.isChannelReady,
-              stage != .streaming else { return }
+              force || stage != .streaming else { return }
         if stage != .opening {
             stage = .opening
             // Re-opening from a failed state must re-arm the open timeout,

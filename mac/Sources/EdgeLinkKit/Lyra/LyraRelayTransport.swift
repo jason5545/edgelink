@@ -231,7 +231,9 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
 // MARK: - Virtual channel pipe
 // LyraChannelSocket stand-in for relay-carried channels (relayCall, cast):
 // plaintext negotiation TLVs plus trans-key encrypted packets
-// (LyraSocketPacket + LyraChannelFragment), wrapped in the same KCP
+// (LyraSocketPacket 81 04 + LyraChannelFragment, or the official 82 58
+// packet format the phone's relay-path HeteroChannel client speaks),
+// wrapped in the same KCP
 // segment framing (sn/una + acks) the real UDP channel socket uses, and
 // exchanged through the relay session instead of UDP.
 
@@ -241,6 +243,9 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     public var onPeerConnected: ((NWEndpoint) -> Void)?
     public var onNegotiated: ((UInt32, UInt32) -> Void)?
     public var onMessage: ((Data, NWEndpoint) -> Void)?
+    // Log-only diagnostic surface (segment arrivals, buffer wipes, frame
+    // decode failures). Wired to DiagnosticsLog by the session layer.
+    public var onDiagnostic: ((String) -> Void)?
     // Endpoint the peer's datagrams appear to arrive from (log surface only).
     public var peerHost = "127.0.0.1"
     public var peerPort: UInt16 = 40201
@@ -253,6 +258,12 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     // flip this to commandAck to reproduce the real phone's ack-framed
     // responses (0x52 + payload).
     public var dataCommand: UInt8 = LyraMeshDatagram.commandPush
+
+    // Test hook modeling the real phone's relay-path channel client
+    // (HeteroChannel quick-conn), which speaks ONLY the official 82 58
+    // packet format (live 2026-08-11 mitrust channel): sends are encoded
+    // official and inbound 81 04 frames are dropped.
+    public var forceOfficialFormat = false
 
     public private(set) var boundPort: UInt16?
 
@@ -272,6 +283,10 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     // retransmits outbound payloads on this path, so a gap never fills and
     // out-of-order segments must still be processed on arrival.
     private var announced = false
+    // Set once an official (82 58) frame decodes: the phone's relay-path
+    // channel client speaks the official format, so answer in kind. Default
+    // stays 81 04 (the format relayCall peers already accept).
+    private var sendOfficial = false
     private var packetBuffer = Data()
     private var fragments: [Int: Data] = [:]
     private var fragmentExpectedTotal = 0
@@ -329,6 +344,7 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
         nextSendSn = 0
         recvUna = 0
         announced = false
+        sendOfficial = false
         packetBuffer.removeAll()
         fragments.removeAll()
         fragmentExpectedTotal = 0
@@ -350,14 +366,26 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     public func sendVariant(channelFrame: Data, key: Data, singleLayer: Bool) throws {
         let symmetricKey = SymmetricKey(data: key)
         if singleLayer {
-            let packet = try LyraSocketPacket.encode(plaintext: channelFrame, key: symmetricKey)
-            sendDatagram(packet)
+            sendEncryptedOnQueue(plaintext: channelFrame, key: symmetricKey)
             return
         }
         let encodedFragments = try LyraChannelFragment.encode(message: channelFrame, key: symmetricKey)
         for fragment in encodedFragments {
-            let packet = try LyraSocketPacket.encode(plaintext: fragment, key: symmetricKey)
-            sendDatagram(packet)
+            sendEncryptedOnQueue(plaintext: fragment, key: symmetricKey)
+        }
+    }
+
+    // Packet encode happens on the pipe queue: the official/81-04 choice
+    // reads sendOfficial, which message handlers (on this queue) may have
+    // just flipped — a queue.sync read from such a handler would deadlock.
+    private func sendEncryptedOnQueue(plaintext: Data, key: SymmetricKey) {
+        queue.async { [weak self] in
+            guard let self,
+                  let packet = try? (self.sendOfficial || self.forceOfficialFormat
+                      ? LyraSocketPacket.encodeOfficial(plaintext: plaintext, key: key)
+                      : LyraSocketPacket.encode(plaintext: plaintext, key: key))
+            else { return }
+            self.sendPayloadOnQueue(packet)
         }
     }
 
@@ -371,6 +399,7 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
             nextSendSn = 0
             recvUna = 0
             announced = false
+            sendOfficial = false
             packetBuffer.removeAll()
             fragments.removeAll()
             fragmentExpectedTotal = 0
@@ -413,6 +442,7 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
         // outbound payloads, so a lost segment leaves a permanent gap and
         // buffering behind it would stall the channel for good.
         let isDuplicate = segment.sn < recvUna
+        onDiagnostic?("rx_segment sn=\(segment.sn) bytes=\(segment.payload.count) dup=\(isDuplicate) recvUna=\(recvUna) head=\(Self.hexPrefix(segment.payload))")
         if !isDuplicate {
             packetBuffer.append(segment.payload)
             recvUna = segment.sn &+ 1
@@ -434,6 +464,38 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
                 guard let frameLength = LyraSocketPacket.frameLength(prefix: packetBuffer),
                       frameLength > 0
                 else {
+                    onDiagnostic?("buffer_wipe reason=bad_8104_length buffered=\(packetBuffer.count) head=\(Self.hexPrefix(packetBuffer))")
+                    packetBuffer = Data()
+                    return
+                }
+                guard packetBuffer.count >= frameLength else { return }
+                let frame = Data(packetBuffer.prefix(frameLength))
+                packetBuffer.removeFirst(frameLength)
+                guard !forceOfficialFormat else {
+                    onDiagnostic?("frame_dropped format=8104 reason=official_only bytes=\(frame.count)")
+                    continue
+                }
+                guard let key = socketKey,
+                      let (fragment, _) = try? LyraSocketPacket.decode(frame, key: key)
+                else {
+                    onDiagnostic?("frame_decode_failed format=8104 bytes=\(frame.count)")
+                    continue
+                }
+                if let (chunk, offset, total, _) = try? LyraChannelFragment.decode(fragment: fragment, key: key) {
+                    deliverChunk(chunk: chunk, offset: offset, total: total, endpoint: endpoint)
+                } else if (try? LyraExpressTLVParser.parseOneOf(fragment)) != nil {
+                    deliverChunk(chunk: fragment, offset: 0, total: 1, endpoint: endpoint)
+                }
+            } else if first == 0x82, second == 0x58 {
+                // The phone's relay-path channel client (HeteroChannel
+                // quick-conn) speaks the official packet format, not
+                // 81 04 — live 2026-08-11: negotiation answered, then every
+                // encrypted frame arrived as 82 58 and was wiped here, so
+                // the unlock 562 never reached the session.
+                guard let frameLength = LyraSocketPacket.officialFrameLength(prefix: packetBuffer),
+                      frameLength > 0
+                else {
+                    onDiagnostic?("buffer_wipe reason=bad_8258_length buffered=\(packetBuffer.count) head=\(Self.hexPrefix(packetBuffer))")
                     packetBuffer = Data()
                     return
                 }
@@ -441,14 +503,18 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
                 let frame = Data(packetBuffer.prefix(frameLength))
                 packetBuffer.removeFirst(frameLength)
                 guard let key = socketKey,
-                      let (fragment, _) = try? LyraSocketPacket.decode(frame, key: key)
-                else { continue }
-                if let (chunk, offset, total, _) = try? LyraChannelFragment.decode(fragment: fragment, key: key) {
-                    deliverChunk(chunk: chunk, offset: offset, total: total, endpoint: endpoint)
-                } else if (try? LyraExpressTLVParser.parseOneOf(fragment)) != nil {
-                    deliverChunk(chunk: fragment, offset: 0, total: 1, endpoint: endpoint)
+                      let plaintext = try? LyraSocketPacket.decodeOfficial(frame, key: key)
+                else {
+                    onDiagnostic?("frame_decode_failed format=8258 bytes=\(frame.count)")
+                    continue
                 }
+                if !sendOfficial {
+                    sendOfficial = true
+                    onDiagnostic?("official_format_detected bytes=\(frame.count)")
+                }
+                deliverChunk(chunk: plaintext, offset: 0, total: 1, endpoint: endpoint)
             } else {
+                onDiagnostic?("buffer_wipe reason=unknown_prefix buffered=\(packetBuffer.count) head=\(Self.hexPrefix(packetBuffer))")
                 packetBuffer = Data()
                 return
             }
@@ -501,5 +567,9 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
             host: NWEndpoint.Host(peerHost),
             port: NWEndpoint.Port(rawValue: peerPort) ?? NWEndpoint.Port(rawValue: defaultPort)!
         )
+    }
+
+    private static func hexPrefix(_ data: Data, max: Int = 12) -> String {
+        data.prefix(max).map { String(format: "%02x", $0) }.joined(separator: " ")
     }
 }

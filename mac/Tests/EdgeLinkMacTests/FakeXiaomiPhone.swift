@@ -140,10 +140,13 @@ final class FakeXiaomiPhone {
             self?.queue.async {
                 self?.meshConnection?.cancel()
                 self?.meshConnection = connection
-                // A fresh phys conn clears the wedge: the real phone answers
-                // logi requests on a newly dialed session even while it
-                // ignores them on the torn-down one.
-                if self?.wedgedMeshConnection != nil, connection !== self?.wedgedMeshConnection {
+                if self?.deafToNextDial == true {
+                    self?.deafToNextDial = false
+                    self?.wedgedMeshConnection = connection
+                } else if self?.wedgedMeshConnection != nil, connection !== self?.wedgedMeshConnection {
+                    // A fresh phys conn clears the wedge: the real phone
+                    // answers logi requests on a newly dialed session even
+                    // while it ignores them on the torn-down one.
                     self?.wedgedMeshConnection = nil
                 }
                 // Fresh KCP state per connection — the real phone does the
@@ -225,6 +228,10 @@ final class FakeXiaomiPhone {
     }
 
     private func handleMeshFrame(_ frame: LyraMeshPack.Frame) {
+        // A wedged (churn-deaf) conn ignores every frame, phys sync included.
+        if let wedged = wedgedMeshConnection, wedged === meshConnection {
+            return
+        }
         switch frame.packType {
         case 1:
             guard let miFrame = MiConnectFrame(parsing: frame.payload),
@@ -443,6 +450,12 @@ final class FakeXiaomiPhone {
     // wedging the current mesh connection on releaseCastChannel().
     var wedgePhysOnRelease = false
     private var wedgedMeshConnection: NWConnection?
+
+    // Live 2026-08-11: a fresh dial that lands in phone-side transport churn
+    // wedges silently — the phone never answers the phys sync on the new
+    // conn, and only the next dial (fresh session) gets through. The next
+    // incoming mesh connection is wedged on arrival.
+    var deafToNextDial = false
 
     // Simulates the phone releasing the cast logi conn mid-stream (observed
     // live on phone reboot: unencrypted inner disconnect payload {1: 52011}).

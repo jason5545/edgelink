@@ -1393,6 +1393,11 @@ final class LyraCastTrustSession {
                 DiagnosticsLog.warn("xiaomi.cast.mitrust_socket_decrypt_failed \(reason)")
             }
         }
+        if let pipe = socket as? LyraVirtualChannelPipe {
+            pipe.onDiagnostic = { detail in
+                DiagnosticsLog.info("xiaomi.cast.mitrust_pipe \(detail)")
+            }
+        }
         do {
             try socket.start(socketKey: transKey, serverChannelId: 6)
             srvChannelSocket = socket

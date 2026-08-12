@@ -551,6 +551,15 @@ public final class LyraCastRole: LyraServiceHandler {
     // real phone takes when the session is relay-carried (the phone bridge's
     // reverse listener stamps the dialed port onto each envelope).
     public var mitrustChannelFactory: ((UInt16) -> LyraChannelDatagramPipe?)?
+    // Models the real phone's score-based phys-conn reuse dialing the
+    // mitrustservice adoption on the ANNOUNCE conn instead of the cast conn
+    // (live 2026-08-12: the Mac announcer dropped those sync_infos as
+    // announcer_stray_conn and the unlock never reached the mitrust server).
+    public var mitrustMeshServerOverride: LyraPhoneMeshServer?
+    // Models the real phone's relay-path channel client (HeteroChannel
+    // quick-conn) speaking ONLY the official 82 58 packet format on the
+    // mitrust channel (live 2026-08-11). Applies to the pipe dial path.
+    public var mitrustSpeaksOfficial = false
     private var mitrustPipe: LyraChannelDatagramPipe?
     private var mitrustSendSn: UInt32 = 0
     private var mitrustRecvUna: UInt32 = 0
@@ -564,7 +573,7 @@ public final class LyraCastRole: LyraServiceHandler {
     }
 
     private func startMitrustAdoption() {
-        guard let server else { return }
+        guard let server = mitrustMeshServerOverride ?? server else { return }
         mitrustConnId = UInt32.random(in: 1...UInt32.max)
         // Each unlock run adopts a fresh mitrustservice conn and dials a fresh
         // channel on it — drop the previous run's (now stale) connection and
@@ -748,6 +757,9 @@ public final class LyraCastRole: LyraServiceHandler {
     // packets cross the relay session as p-stamped channel envelopes.
     private func connectMitrustChannelViaPipe(_ pipe: LyraChannelDatagramPipe) {
         guard mitrustServerPort != 0, mitrustPipe == nil else { return }
+        if mitrustSpeaksOfficial, let virtualPipe = pipe as? LyraVirtualChannelPipe {
+            virtualPipe.forceOfficialFormat = true
+        }
         mitrustPipe = pipe
         pipe.onNegotiated = { [weak self] _, _ in
             self?.queue.async {

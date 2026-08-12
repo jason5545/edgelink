@@ -120,6 +120,12 @@ private const val LAN_DISCOVERY_WAIT_MS = 2_000L
 private const val MAX_AUTO_RECONNECT_DELAY_MS = 5_000L
 private const val PING_INTERVAL_MS = 5_000L
 private const val PONG_TIMEOUT_MS = 15_000L
+// The cloud mirror bridge is deliberately kept alive across relay reconnects
+// (connectLoop catch), but unbounded keeps turned a dead Mac into a 10-hour
+// zombie (live 2026-08-12: TURN streaming into the void, phone RTSP source
+// held, later LAN mirror attaches refused). The control plane detects a dead
+// Mac within ~15s (pong_timeout); 5 minutes gives reconnects a wide margin.
+private const val MIRROR_BRIDGE_ZOMBIE_TIMEOUT_MS = 300_000L
 private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
 private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
@@ -414,6 +420,28 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var manuallyDisconnected = false
     @Volatile
     private var macSleepSuppressed = false
+    private var mirrorBridgeZombieJob: Job? = null
+
+    private fun armMirrorBridgeZombieWatchdog() {
+        mirrorBridgeZombieJob?.cancel()
+        val zombieSessionId = AndroidMiLinkMirrorMediaBridge.currentSessionId() ?: return
+        mirrorBridgeZombieJob = scope.launch {
+            delay(MIRROR_BRIDGE_ZOMBIE_TIMEOUT_MS)
+            val stillActive = AndroidMiLinkMirrorMediaBridge.currentSessionId()
+            if (stillActive == null || stillActive != zombieSessionId) return@launch
+            EdgeLinkLog.warn(
+                "xiaomi.mirror.android.cloudflare_bridge_zombie_timeout sessionId=$stillActive " +
+                    "idleMs=$MIRROR_BRIDGE_ZOMBIE_TIMEOUT_MS"
+            )
+            AndroidMiLinkMirrorMediaBridge.stop("mac_liveness_timeout")
+            closeMirrorTurnSession("mac_liveness_timeout")
+        }
+    }
+
+    private fun disarmMirrorBridgeZombieWatchdog() {
+        mirrorBridgeZombieJob?.cancel()
+        mirrorBridgeZombieJob = null
+    }
     private val connectionGeneration = AtomicInteger(0)
     private val autoReconnectWakeups = Channel<Unit>(Channel.CONFLATED)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -1704,6 +1732,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 EdgeLinkLog.info("relay.android.handshake_ok hostId=${peer.deviceId} clientId=${identity.deviceId}")
                 lastPongElapsedMs = SystemClock.elapsedRealtime()
                 macSleepSuppressed = false
+                disarmMirrorBridgeZombieWatchdog()
                 session = nextSession
                 refreshTurnCredentials("relay_connected")
                 sendLatestMiLinkStatus(nextSession, identity)
@@ -1772,6 +1801,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     macSleepSuppressed = true
                 }
                 val sleepSuppressed = macSleepSuppressed && autoReconnect
+                if (!sleepSuppressed) {
+                    armMirrorBridgeZombieWatchdog()
+                }
                 stateFlow.update {
                     it.copy(
                         connectionStatus = when {

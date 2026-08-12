@@ -278,6 +278,10 @@ final class EdgeLinkRuntime: ObservableObject {
             guard let self else { return }
             _ = self.ensureCastTrustChannel(reason: reason)
         }
+        xiaomiMirrorFlow.sessionInvalidator = { [weak self] in
+            self?.lyraCastTrustSession?.cancel()
+            self?.lyraCastTrustSession = nil
+        }
         xiaomiMirrorFlow.biometricEvaluate = {
             try await BiometricAuthManager.shared.evaluate(reason: "解鎖手機鎖定螢幕")
         }

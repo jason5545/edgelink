@@ -71,8 +71,14 @@ object AndroidMiLinkMirrorMediaBridge {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lifecycleMutex = Mutex()
     private var activeJob: Job? = null
+    @Volatile
     private var activeSessionId: String? = null
     private var activeSession: MirrorMediaBridgeSession? = null
+
+    // The live cloud bridge session id, null when no bridge is running.
+    // Read by the controller's zombie watchdog (a bridge with no Mac left
+    // must not stream into the void forever).
+    fun currentSessionId(): String? = activeSessionId
 
     fun start(
         request: AndroidMiLinkMirrorCloudBridgeRequest,

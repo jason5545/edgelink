@@ -44,6 +44,8 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     private var hostLoop: Task<Void, Error>?
     private var clientLoop: Task<Void, Error>?
     private var savedIsExpectedPhoneHost: ((String) -> Bool)?
+    private var relayAnnouncer: LyraMeshAnnouncer?
+    private var phoneAnnounceMesh: LyraPhoneMeshServer?
 
     // When set, the relay session pair crosses an impaired link (cloud-relay
     // conditions) instead of the perfect loopback. Configure before calling
@@ -91,6 +93,10 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         videoListener?.cancel()
         videoConnection?.cancel()
         session?.cancel()
+        relayAnnouncer?.stop()
+        relayAnnouncer = nil
+        phoneAnnounceMesh?.stop()
+        phoneAnnounceMesh = nil
         phone?.stop()
         pair?.hostSide.close()
         pair?.clientSide.close()
@@ -209,7 +215,9 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     // reproduces the real phone's mesh service behavior seen on the cloud
     // relay: responses leave as ack-command datagrams carrying the payload
     // (0x52 + data) instead of pushes.
-    private func startMirrorEnds(locked: Bool, ackFramedResponses: Bool = false) async throws {
+    private func startMirrorEnds(
+        locked: Bool, ackFramedResponses: Bool = false, mitrustViaAnnounceFlow: Bool = false
+    ) async throws {
         let clientBridge = try XCTUnwrap(clientBridge)
         let hostBridge = try XCTUnwrap(hostBridge)
 
@@ -249,6 +257,30 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         self.phone = phone
         try phone.start(port: 0)
         phoneMeshPort = try XCTUnwrap(phone.boundPort)
+
+        if mitrustViaAnnounceFlow {
+            // Live 2026-08-12: the real phone's trustservice dials
+            // mitrustservice on whichever phys conn its score-based reuse
+            // judge picks — sometimes the ANNOUNCE flow's, not the cast
+            // flow's. Run the production relay announcer on mesh flow 0 and
+            // route the phone's mitrust adoption over it.
+            let announceMesh = LyraPhoneMeshServer(
+                identity: phone.identity, oracle: phone.oracle,
+                meshTransport: clientBridge.meshFlow(index: 0)
+            )
+            try announceMesh.start(port: 0)
+            phoneAnnounceMesh = announceMesh
+            phone.cast.mitrustMeshServerOverride = announceMesh
+            let announcer = LyraMeshAnnouncer(
+                deviceIdHexProvider: { "721572C3" },
+                displayNameProvider: { "EdgeLinkMacTests" },
+                meshTransport: hostBridge.meshFlow(index: 0)
+            )
+            let announcePort = try XCTUnwrap(announceMesh.boundPort)
+            hostBridge.meshFlow(index: 0).peerPort = announcePort
+            announcer.start(host: "127.0.0.1", port: announcePort)
+            relayAnnouncer = announcer
+        }
 
         // The mesh pipe presents the peer endpoint to the trust session;
         // point it at the phone's mesh port before dialing.
@@ -551,6 +583,30 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         impairmentClientToHost = .hiNetCloudflareWAN
         try await establishRelaySession()
         try await startMirrorEnds(locked: true)
+        try await driveUnlockToStreaming()
+    }
+
+    // Same unlock, but the phone speaks the official 82 58 packet format on
+    // the relay-carried mitrust channel (live 2026-08-11: the phone's
+    // HeteroChannel client sent every post-negotiation frame as 82 58; the
+    // pipe wiped them as unknown prefixes and the 562 never arrived). The
+    // pipe must decode official frames and answer in the same format.
+    func testTrustUnlockOverCloudRelayWithOfficialPacketFormat() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        let phone = try XCTUnwrap(self.phone)
+        phone.cast.mitrustSpeaksOfficial = true
+        try await driveUnlockToStreaming()
+    }
+
+    // Live 2026-08-12: the phone's trustservice dialed mitrustservice
+    // reusing the ANNOUNCE flow's phys conn (score-based reuse), not the cast
+    // flow's. The announcer must adopt the mitrust conn into the live trust
+    // session — pre-fix those sync_infos fell into announcer_stray_conn and
+    // the unlock timed out (phone: "remote device is not responding").
+    func testTrustUnlockOverCloudRelayWhenMitrustDialsAnnounceFlow() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true, mitrustViaAnnounceFlow: true)
         try await driveUnlockToStreaming()
     }
 

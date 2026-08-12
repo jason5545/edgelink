@@ -180,7 +180,17 @@ final class XiaomiMirrorWFDClient {
                 }
                 if isComplete {
                     if self.stage != .closed {
-                        self.close(reason: "peer_closed")
+                        // Pre-establishment the close is the phone's
+                        // duplicate-OPEN teardown killing an in-flight
+                        // dialog — ride through the rebuild window like a
+                        // refused dial instead of dying silently (the flow
+                        // then stalls in .opening until the open-timeout
+                        // resend, which re-tears the server down).
+                        if self.stage == .established {
+                            self.close(reason: "peer_closed")
+                        } else {
+                            self.fail("peer_closed", retryDelay: 0.25)
+                        }
                     }
                     return
                 }

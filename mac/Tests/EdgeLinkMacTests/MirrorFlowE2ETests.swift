@@ -99,6 +99,10 @@ final class MirrorFlowE2ETests: XCTestCase {
             self?.attachSession()
             self?.session.start()
         }
+        controller.sessionInvalidator = { [weak self] in
+            self?.session?.cancel()
+            self?.session = nil
+        }
         controller.biometricEvaluate = { [weak self] in
             self?.biometricCallCount += 1
         }
@@ -654,6 +658,33 @@ final class MirrorFlowE2ETests: XCTestCase {
         XCTAssertEqual(
             phone.openMirrorScreenTotal, 2,
             "exactly one re-OPEN on the rebuilt channel"
+        )
+    }
+
+    // Live 2026-08-11: a fresh dial that lands in phone-side transport churn
+    // (screen-off keepalive suppression tearing the relay-fed phys conns)
+    // wedges silently — the phone never answers on the new conn, the channel
+    // wait failed straight to 連接失敗, and only a manual 重試 (fresh
+    // session) recovered. The flow must drop the wedged session and redial
+    // once on its own before surfacing the failure.
+    func testFreshDialStallAutoRetriesWithFreshSession() async throws {
+        try makeEnvironment(locked: false)
+        controller.channelReadyTimeout = 2
+        phone.deafToNextDial = true
+        let oldSession = session!
+        session.start()
+        controller.start()
+
+        try await waitFor("flow recovered on a fresh session without user action", timeout: 25) { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertFalse(
+            session === oldSession,
+            "wedged dial must be dropped so the flow rebuilds a fresh session"
+        )
+        XCTAssertEqual(
+            phone.openMirrorScreenTotal, 1,
+            "exactly one OPEN on the recovered channel"
         )
     }
 

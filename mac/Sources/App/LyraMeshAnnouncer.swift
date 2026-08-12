@@ -858,6 +858,16 @@ final class LyraMeshAnnouncer {
             )
             return
         }
+        // The phone's trustservice picks ANY live phys conn (score-based
+        // reuse) when it dials mitrustservice — including the announcer's.
+        // Frames for a mitrust conn adopted by the live trust session are
+        // theirs, not ours. (After the packType-5 block: adopted forwarding
+        // accepts packType 5, but on this socket those are our announce sync
+        // payloads and must stay here.)
+        if let session = LyraCastTrustSession.activeTrustSession,
+           session.handlesAdoptedMitrust(frame: frame, endpoint: endpoint) {
+            return
+        }
         guard let miFrame = MiConnectFrame(parsing: frame.payload) else {
             DiagnosticsLog.warn(
                 "xiaomi.mishare.announcer_frame_parse_failed packType=\(frame.packType) " +
@@ -954,6 +964,38 @@ final class LyraMeshAnnouncer {
                     }
                 } else if let session = LyraDistHardwareSession.activeSession, session.handles(logiConn: logiConn) {
                     session.handleFrame(logiConn)
+                } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+                   case let .syncInfo(syncInfoData) = inner.payload,
+                   lengthDelimitedField(4, in: syncInfoData)
+                       .flatMap({ String(data: $0, encoding: .utf8) }) == "com.xiaomi.trustservice:mitrustservice"
+                {
+                    // Live 2026-08-12: the phone's trustservice dialed
+                    // mitrustservice reusing the ANNOUNCER's phys conn; these
+                    // sync_infos fell into announcer_stray_conn and the unlock
+                    // 562 never reached the mitrust server (phone: "remote
+                    // device is not responding"). Adopt into the live trust
+                    // session, same as LyraMeshResponder does on the
+                    // published port; replies must ride this socket since the
+                    // phone's conn is bound to it. Must precede the
+                    // activeRelaySession fallback, which would swallow the
+                    // sync_info.
+                    if let session = LyraCastTrustSession.activeTrustSession {
+                        DiagnosticsLog.info(
+                            "xiaomi.mishare.announcer_mitrust_adopt connId=\(logiConn.logiConnId) " +
+                                "peerNetId=\(logiConn.localNetId)"
+                        )
+                        session.adoptMitrustSyncInfo(
+                            syncInfoData: syncInfoData,
+                            logiConn: logiConn,
+                            endpoint: endpoint
+                        ) { [weak self] frame in
+                            self?.send(frame: frame, label: "mitrust_adopted")
+                        }
+                    } else {
+                        DiagnosticsLog.info(
+                            "xiaomi.mishare.announcer_mitrust_ignored connId=\(logiConn.logiConnId)"
+                        )
+                    }
                 } else if let inner = LogiConnInnerFrame(parsing: logiConn.inner),
                    case let .syncInfo(syncInfoData) = inner.payload,
                    lengthDelimitedField(4, in: syncInfoData)
