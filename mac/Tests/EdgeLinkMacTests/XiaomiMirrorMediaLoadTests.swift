@@ -20,15 +20,21 @@ import XCTest
 final class XiaomiMirrorMediaLoadTests: XCTestCase {
     private static var portBlockIndex: UInt16 = 0
     private var rtspPort: UInt16!
+    private var sinkPort: UInt16!
 
     override func setUp() {
         super.setUp()
         Self.portBlockIndex += 1
         rtspPort = 29_501 + Self.portBlockIndex * 10
+        sinkPort = rtspPort + 1
+        // Keep the soak off the prod app's MPT sink port (UDP 15550) so the
+        // suite passes while /Applications/EdgeLinkMac.app is running.
+        XiaomiMirrorRTSPDiagnosticSource.officialMPTClientPortOverride = sinkPort
         continueAfterFailure = false
     }
 
     override func tearDown() {
+        XiaomiMirrorRTSPDiagnosticSource.officialMPTClientPortOverride = nil
         UserDefaults.standard.removeObject(forKey: "xiaomiMirrorRTSPTransportMode")
         UserDefaults.standard.removeObject(forKey: "xiaomiMirrorRTSPProtocolProfile")
         super.tearDown()
@@ -55,6 +61,7 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
             width: 1200, height: 2608, averageBitRate: 40_000_000,
             loss: 0.02, duplicate: 0.2, retransmitsLost: true
         )
+        media.sinkPort = sinkPort
         media.onDatagram = { [weak media] datagram in
             media?.sendUDP(datagram)
         }
@@ -141,6 +148,7 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
             width: 960, height: 2080, averageBitRate: 20_000_000,
             loss: 0.02, duplicate: 0.2, retransmitsLost: true
         )
+        media.sinkPort = sinkPort
         media.onDatagram = { [weak media] datagram in
             media?.sendUDP(datagram)
         }
@@ -202,6 +210,7 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
             loss: 0.02, duplicate: 0.2, retransmitsLost: true,
             ptsClockFactor: 1.0175
         )
+        media.sinkPort = sinkPort
         media.onDatagram = { [weak media] datagram in
             media?.sendUDP(datagram)
         }
@@ -251,6 +260,7 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
         let media = FakePhoneMPTMediaSource(
             width: 640, height: 360, averageBitRate: 8_000_000
         )
+        media.sinkPort = sinkPort
         media.onDatagram = { [weak media] datagram in
             media?.sendUDP(datagram)
         }
@@ -623,7 +633,11 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         }
     }
 
-    // MARK: UDP socket (LAN path: datagrams to the Mac's MPT sink port 15550)
+    // MARK: UDP socket (LAN path: datagrams to the Mac's MPT sink port)
+
+    // The Mac sink's UDP port (prod: 15550; these tests override it to stay
+    // clear of a running prod app).
+    var sinkPort: UInt16 = 15_550
 
     private func openUDPSocket() {
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -659,7 +673,7 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         guard udpSocketFD >= 0 else { return }
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = UInt16(15_550).bigEndian
+        address.sin_port = sinkPort.bigEndian
         address.sin_addr.s_addr = inet_addr("127.0.0.1")
         datagram.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else { return }

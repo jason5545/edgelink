@@ -170,7 +170,11 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     }
 
     private let sourceRTPPort: UInt16 = 19_002
-    private let officialMPTClientPort: UInt16 = 15_550
+    // Test-only override: the LAN soak tests bind the MPT sink while a
+    // running prod app already holds UDP 15550 (EADDRINUSE wiped the whole
+    // class with 0 inbound). Production code never sets this.
+    static var officialMPTClientPortOverride: UInt16?
+    private var officialMPTClientPort: UInt16 { Self.officialMPTClientPortOverride ?? 15_550 }
     private let officialMPTMaxRTSPRetries = 3
     private let officialMPTRTSPRetryDelay: TimeInterval = 1
     private let rtspSessionKeepaliveInterval: TimeInterval = 10
