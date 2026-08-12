@@ -1973,8 +1973,9 @@ struct PhoneScreenView: View {
     private var topBar: some View {
         HStack(spacing: 6) {
             Spacer()
-            chromeButton(
+            GlassCircleButton(
                 systemName: session.isPinned ? "pin.fill" : "pin",
+                isActive: session.isPinned,
                 help: session.isPinned ? String(localized: "取消置頂") : String(localized: "視窗置頂")
             ) {
                 session.togglePinned()
@@ -1984,42 +1985,38 @@ struct PhoneScreenView: View {
         .padding(.bottom, 8)
     }
 
-    private func chromeButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 28, height: 28)
-                .background(.black.opacity(0.55), in: Circle())
-                .contentShape(Circle())
-        }
-        .buttonStyle(.borderless)
-        .help(help)
-    }
-
     private var bottomBar: some View {
-        HStack(spacing: 28) {
-            globalButton(systemName: "rectangle.stack", action: "recents", help: String(localized: "進入最近任務"))
-            globalButton(systemName: "circle", action: "home", help: String(localized: "Home"))
-            globalButton(systemName: "chevron.backward", action: "back", help: String(localized: "Back"))
+        HStack(spacing: 2) {
+            NavPillButton(systemName: "rectangle.stack", help: String(localized: "進入最近任務")) {
+                session.sendGlobal("recents")
+            }
+            NavPillButton(systemName: "circle", help: String(localized: "Home")) {
+                session.sendGlobal("home")
+            }
+            NavPillButton(systemName: "chevron.backward", help: String(localized: "Back")) {
+                session.sendGlobal("back")
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 8)
-    }
-
-    private func globalButton(systemName: String, action: String, help: String) -> some View {
-        Button {
-            session.sendGlobal(action)
-        } label: {
-            Image(systemName: systemName)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.white)
-                .frame(width: 32, height: 32)
-                .background(.black.opacity(0.55), in: Circle())
-                .contentShape(Circle())
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .background {
+            Capsule(style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.38), Color.white.opacity(0.2)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 0.5
+                        )
+                }
+                .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
         }
-        .buttonStyle(.borderless)
-        .help(help)
+        .compositingGroup()
+        .padding(.top, 6)
     }
 
     @ViewBuilder
@@ -2074,14 +2071,24 @@ struct PhoneScreenView: View {
 
     private func maskIcon(_ systemName: String) -> some View {
         Image(systemName: systemName)
-            .font(.system(size: 30, weight: .regular))
-            .foregroundStyle(.secondary)
-            .padding(.bottom, 4)
+            .font(.system(size: 26, weight: .medium))
+            .foregroundStyle(.white.opacity(0.92))
+            .frame(width: 64, height: 64)
+            .background {
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                    }
+                    .shadow(color: .black.opacity(0.3), radius: 8, y: 3)
+            }
+            .padding(.bottom, 6)
     }
 
     private func maskTitle(_ text: String) -> some View {
         Text(text)
-            .font(.headline)
+            .font(.title3.weight(.semibold))
             .multilineTextAlignment(.center)
     }
 
@@ -2094,9 +2101,124 @@ struct PhoneScreenView: View {
 
     private func maskButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(title, action: action)
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .padding(.top, 6)
+            .buttonStyle(MaskCTAButtonStyle())
+            .padding(.top, 10)
+    }
+}
+
+private struct GlassCircleButton: View {
+    let systemName: String
+    var isActive: Bool = false
+    let help: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isActive ? Color.white : Color.white.opacity(isHovered ? 1 : 0.85))
+                .frame(width: 28, height: 28)
+                .background {
+                    ZStack {
+                        Circle()
+                            .fill(.ultraThinMaterial)
+                        if isActive {
+                            Circle()
+                                .fill(Color.accentColor)
+                        } else {
+                            Circle()
+                                .fill(Color.white.opacity(isHovered ? 0.16 : 0.08))
+                        }
+                    }
+                }
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(isActive ? 0.5 : 0.38),
+                                    Color.white.opacity(isActive ? 0.2 : 0.12)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 0.5
+                        )
+                }
+                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+                .scaleEffect(isHovered ? 1.08 : 1)
+                .contentShape(Circle())
+        }
+        .buttonStyle(ChromePressStyle())
+        .onHover { isHovered = $0 }
+        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isHovered)
+        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isActive)
+        .help(help)
+    }
+}
+
+private struct NavPillButton: View {
+    let systemName: String
+    let help: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.white.opacity(isHovered ? 1 : 0.85))
+                .frame(width: 38, height: 34)
+                .background {
+                    Circle()
+                        .fill(Color.white.opacity(isHovered ? 0.16 : 0))
+                }
+                .scaleEffect(isHovered ? 1.05 : 1)
+                .contentShape(Circle())
+        }
+        .buttonStyle(ChromePressStyle())
+        .onHover { isHovered = $0 }
+        .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isHovered)
+        .help(help)
+    }
+}
+
+private struct ChromePressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(.spring(response: 0.18, dampingFraction: 0.6), value: configuration.isPressed)
+    }
+}
+
+private struct MaskCTAButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 26)
+            .padding(.vertical, 10)
+            .background {
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.accentColor, Color.accentColor.opacity(0.75)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .shadow(
+                        color: Color.accentColor.opacity(configuration.isPressed ? 0.25 : 0.45),
+                        radius: configuration.isPressed ? 4 : 10,
+                        y: 4
+                    )
+            }
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: configuration.isPressed)
     }
 }
 
@@ -2112,43 +2234,57 @@ struct PhoneVideoView: NSViewRepresentable {
 
 private struct ConnectingSpinnerView: View {
     @State private var rotation: Double = 0
-    @State private var pulse = false
+    @State private var glow = false
+
+    private static let size: CGFloat = 44
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.primary.opacity(0.12), lineWidth: 3.5)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    Circle()
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5)
+                }
 
             Circle()
-                .trim(from: 0, to: 0.72)
+                .stroke(Color.white.opacity(0.10), lineWidth: 3)
+                .padding(6)
+
+            Circle()
+                .trim(from: 0, to: 0.62)
                 .stroke(
                     AngularGradient(
                         colors: [
                             Color.accentColor.opacity(0),
-                            Color.accentColor.opacity(0.45),
+                            Color.accentColor.opacity(0.4),
                             Color.accentColor
                         ],
                         center: .center,
                         startAngle: .degrees(0),
-                        endAngle: .degrees(360 * 0.72)
+                        endAngle: .degrees(360 * 0.62)
                     ),
-                    style: StrokeStyle(lineWidth: 3.5, lineCap: .round)
+                    style: StrokeStyle(lineWidth: 3, lineCap: .round)
                 )
+                .padding(6)
                 .rotationEffect(.degrees(rotation))
-                .shadow(color: Color.accentColor.opacity(0.45), radius: 6)
+                .shadow(color: Color.accentColor.opacity(glow ? 0.6 : 0.3), radius: glow ? 8 : 4)
 
             Circle()
-                .fill(Color.accentColor.opacity(pulse ? 0.28 : 0.10))
-                .frame(width: 10, height: 10)
-                .scaleEffect(pulse ? 1.25 : 0.85)
+                .fill(Color.white)
+                .frame(width: 5, height: 5)
+                .shadow(color: Color.accentColor, radius: 4)
+                .offset(y: -(Self.size / 2 - 6))
+                .rotationEffect(.degrees(rotation + 360 * 0.62))
         }
-        .frame(width: 40, height: 40)
+        .frame(width: Self.size, height: Self.size)
+        .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
         .onAppear {
-            withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+            withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
                 rotation = 360
             }
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                pulse = true
+            withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                glow = true
             }
         }
     }
