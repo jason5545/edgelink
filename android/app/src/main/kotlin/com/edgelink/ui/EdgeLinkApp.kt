@@ -245,7 +245,6 @@ interface EdgeLinkActions {
     fun onNotificationSyncChange(enabled: Boolean)
     fun onScreenSharePrivacyChange(enabled: Boolean)
     fun onPhotoSyncChange(enabled: Boolean)
-    fun onPhotoSyncNow()
     fun onRequestPhotoAccess()
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
@@ -271,7 +270,6 @@ interface EdgeLinkActions {
         override fun onNotificationSyncChange(enabled: Boolean) = Unit
         override fun onScreenSharePrivacyChange(enabled: Boolean) = Unit
         override fun onPhotoSyncChange(enabled: Boolean) = Unit
-        override fun onPhotoSyncNow() = Unit
         override fun onRequestPhotoAccess() = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
@@ -844,28 +842,18 @@ private fun SettingsScreen(
                             }
                         }
                     }
-                    if (state.photoSyncEnabled && state.photoMediaAccessGranted) {
+                    if (state.photoSyncEnabled && state.photoMediaAccessGranted &&
+                        state.photoSyncStatus.isNotEmpty()
+                    ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (state.photoSyncStatus.isNotEmpty()) {
-                                Text(
-                                    text = state.photoSyncStatus,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.weight(1f)
-                                )
-                            } else {
-                                Spacer(modifier = Modifier.weight(1f))
-                            }
-                            FilledTonalButton(
-                                onClick = actions::onPhotoSyncNow,
-                                enabled = state.isConnected
-                            ) {
-                                Text(stringResource(R.string.action_photo_sync_now))
-                            }
+                            Text(
+                                text = state.photoSyncStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }

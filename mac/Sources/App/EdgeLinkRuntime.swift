@@ -549,9 +549,12 @@ final class EdgeLinkRuntime: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.photoSyncEnabledDefaultsKey)
         photoSyncEnabled = enabled
         DiagnosticsLog.info("photo.mac.sync_enabled enabled=\(enabled)")
+        if enabled {
+            requestPhotoSyncNow()
+        }
     }
 
-    func requestPhotoSyncNow() {
+    private func requestPhotoSyncNow() {
         guard let session = currentSession, isConnected else {
             photoSyncStatus = String(localized: "尚未連線")
             return

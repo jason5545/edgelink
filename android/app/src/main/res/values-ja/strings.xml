@@ -57,7 +57,6 @@
   <string name="toggle_auto_reconnect">自動再接続</string>
 
   <string name="toggle_photo_sync">写真を Mac に同期</string>
-  <string name="action_photo_sync_now">写真を今すぐ同期</string>
   <string name="permission_photos_missing">写真と動画の権限が必要です</string>
   <string name="photo_sync_scanning">新しい写真をスキャン中…</string>
   <string name="photo_sync_waiting">%1$d 件の新規項目を報告、Mac の応答待ち…</string>

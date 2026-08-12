@@ -3,11 +3,15 @@ package com.edgelink.app
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.provider.Settings
 import com.edgelink.core.AndroidMicStatusBody
 import com.edgelink.core.BatteryStatusBody
@@ -127,6 +131,7 @@ private const val PONG_TIMEOUT_MS = 15_000L
 // Mac within ~15s (pong_timeout); 5 minutes gives reconnects a wide margin.
 private const val MIRROR_BRIDGE_ZOMBIE_TIMEOUT_MS = 300_000L
 private const val NO_SESSION_DROP_LOG_INTERVAL_MS = 60_000L
+private const val PHOTO_MEDIA_CHANGE_DEBOUNCE_MS = 3_000L
 private const val MAC_SLEEP_PRESENCE_POLL_INTERVAL_MS = 2 * 60_000L
 private const val MAC_SLEEP_UNKNOWN_POLLS_BEFORE_PROBE = 5
 private const val MAC_PRESENCE_FRESH_SECONDS = 1_800L
@@ -211,6 +216,12 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val photoSync = AndroidPhotoSync(appContext, settingsStore)
+    private val photoMediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            schedulePhotoSyncForMediaChange()
+        }
+    }
+    private var photoMediaChangeJob: Job? = null
     private val phoneCallController = AndroidPhoneCallController(appContext)
     private val miLinkCommandBridge = AndroidMiLinkCommandBridge(
         appContext,
@@ -356,7 +367,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             handlePhotoAck(body)
         },
         onPhotoSyncRequest = {
-            launchPhotoSync("manual_remote")
+            launchPhotoSync("remote_request")
         },
         onXiaomiTrustStatus = { body ->
             stateFlow.update { it.copy(xiaomiTrustPaired = body.paired) }
@@ -502,6 +513,13 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         lockStateReporter.start()
         xiaomiMirrorScreenConfigReporter.start()
         runCatching {
+            val resolver = appContext.contentResolver
+            resolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, photoMediaObserver)
+            resolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, photoMediaObserver)
+        }.onFailure { error ->
+            EdgeLinkLog.error("photo.android.media_observer_failed", error)
+        }
+        runCatching {
             connectivityManager.registerDefaultNetworkCallback(networkCallback)
         }.onFailure { error ->
             EdgeLinkLog.error("relay.android.network_callback_failed", error)
@@ -516,6 +534,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     fun close() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        runCatching { appContext.contentResolver.unregisterContentObserver(photoMediaObserver) }
+        photoMediaChangeJob?.cancel()
         Shizuku.removeBinderReceivedListener(shizukuBinderReceivedListener)
         Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
@@ -890,9 +910,15 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
-    override fun onPhotoSyncNow() {
-        refreshPhotoAccess()
-        launchPhotoSync("manual_button")
+    private fun schedulePhotoSyncForMediaChange() {
+        if (!stateFlow.value.photoSyncEnabled || !stateFlow.value.isConnected) {
+            return
+        }
+        photoMediaChangeJob?.cancel()
+        photoMediaChangeJob = scope.launch(Dispatchers.IO) {
+            delay(PHOTO_MEDIA_CHANGE_DEBOUNCE_MS)
+            launchPhotoSync("media_added")
+        }
     }
 
     override fun onRequestPhotoAccess() {

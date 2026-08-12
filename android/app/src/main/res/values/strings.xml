@@ -57,7 +57,6 @@
   <string name="toggle_auto_reconnect">自動重新連線</string>
 
   <string name="toggle_photo_sync">照片同步到 Mac</string>
-  <string name="action_photo_sync_now">立即同步照片</string>
   <string name="permission_photos_missing">需要相片與影片權限</string>
   <string name="photo_sync_scanning">掃描新照片…</string>
   <string name="photo_sync_waiting">已回報 %1$d 個新項目，等待 Mac 回覆…</string>
