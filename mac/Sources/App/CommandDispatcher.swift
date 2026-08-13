@@ -25,6 +25,7 @@ final class CommandDispatcher {
     private let onBatteryStatus: @Sendable (BatteryStatusBody) -> Void
     private let onPhoneLockState: @Sendable (PhoneLockStateBody) -> Void
     private let onXiaomiTrustBind: @Sendable () -> Void
+    private let onXiaomiLyraSeedResult: @Sendable (XiaomiLyraSeedResultBody) -> Void
     private let onTunnelEnvelope: @Sendable (String, Data) -> Void
     private let onLyraRelayDatagram: @Sendable (String, Data) -> Void
     private let onStatusCaps: @Sendable (StatusCapsBody) -> Void
@@ -61,6 +62,7 @@ final class CommandDispatcher {
         onBatteryStatus: @escaping @Sendable (BatteryStatusBody) -> Void = { _ in },
         onPhoneLockState: @escaping @Sendable (PhoneLockStateBody) -> Void = { _ in },
         onXiaomiTrustBind: @escaping @Sendable () -> Void = {},
+        onXiaomiLyraSeedResult: @escaping @Sendable (XiaomiLyraSeedResultBody) -> Void = { _ in },
         onTunnelEnvelope: @escaping @Sendable (String, Data) -> Void = { _, _ in },
         onLyraRelayDatagram: @escaping @Sendable (String, Data) -> Void = { _, _ in },
         onStatusCaps: @escaping @Sendable (StatusCapsBody) -> Void = { _ in },
@@ -94,6 +96,7 @@ final class CommandDispatcher {
         self.onBatteryStatus = onBatteryStatus
         self.onPhoneLockState = onPhoneLockState
         self.onXiaomiTrustBind = onXiaomiTrustBind
+        self.onXiaomiLyraSeedResult = onXiaomiLyraSeedResult
         self.onTunnelEnvelope = onTunnelEnvelope
         self.onLyraRelayDatagram = onLyraRelayDatagram
         self.onStatusCaps = onStatusCaps
@@ -275,6 +278,10 @@ final class CommandDispatcher {
             return nil
         case EnvelopeType.xiaomiTrustBind:
             onXiaomiTrustBind()
+            return nil
+        case EnvelopeType.xiaomiLyraSeedResult:
+            let envelope = try decoder.decode(Envelope<XiaomiLyraSeedResultBody>.self, from: plaintext)
+            onXiaomiLyraSeedResult(envelope.b)
             return nil
         case EnvelopeType.screenMeta:
             let envelope = try decoder.decode(Envelope<ScreenMetaBody>.self, from: plaintext)

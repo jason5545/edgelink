@@ -35,6 +35,26 @@ struct MiTrustTicketStore {
 
     var isEnabled: Bool { ticketKey != nil && identityPrivateKey != nil && uidHashRaw.count == 32 }
 
+    // Route-C seed material for the phone's lyra identity store
+    // (identity-cred/identity-ticket:<deviceId>). The phone-side executor
+    // (Shizuku, uid 1000 keystore) writes these verbatim into storage.lyra.
+    func lyraSeedPayload(deviceIdHex: String, now: Date = Date()) -> (cred: String, ticket: String)? {
+        guard let ticketKey, identityPubKey.count == 65, uidHashRaw.count == 32 else {
+            return nil
+        }
+        let ticketData = ticketKey.withUnsafeBytes { Data($0) }
+        guard ticketData.count == 32 else { return nil }
+        let notBefore = Int64(now.timeIntervalSince1970) - 86_400
+        let notAfter = Int64(now.timeIntervalSince1970) + 550 * 86_400
+        let cred = """
+            {"account":{"ability":0,"iot_pub_key":"","not_after":\(notAfter),"not_before":\(notBefore),"pub_key":"\(identityPubKey.base64EncodedString())","uid":"\(uidHashRaw.base64EncodedString())"},"device_id":"\(deviceIdHex)","trusted_type":1}
+            """
+        let ticket = """
+            {"algorithm":0,"alias":"","key":"\(ticketData.base64EncodedString())"}
+            """
+        return (cred, ticket)
+    }
+
     private static let defaultTicketHex = "ff86e4d9c93e1dbf02dee28117aa8cc0ba176f64eb9a5db3724caa98a6488035"
     private static let defaultIdentityPrivHex = "3c223f0237c0cdc80a273821f388bf4d9f12c05d30246baece2dbe35ec8d66ac"
     private static let defaultIdentityPubB64 = "BL/434ltP50le6fDe3X0Q3iXPo4fcf0+7H9c3P87N06fseKWnSjnsq12p22w5oZV/nLrtQyeRenyVOOdVUQqxh4="

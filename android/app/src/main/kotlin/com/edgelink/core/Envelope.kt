@@ -87,6 +87,8 @@ object EnvelopeTypes {
     const val PHOTO_STATUS = "photo.status"
     const val XIAOMI_TRUST_STATUS = "xiaomi.trustStatus"
     const val XIAOMI_TRUST_BIND = "xiaomi.trustBind"
+    const val XIAOMI_LYRA_SEED = "xiaomi.lyraSeed"
+    const val XIAOMI_LYRA_SEED_RESULT = "xiaomi.lyraSeedResult"
     const val RELAY_MESH_DATAGRAM = "relay.mesh.datagram"
     const val RELAY_CHANNEL_DATAGRAM = "relay.channel.datagram"
 }
@@ -510,6 +512,25 @@ data class PhoneLockStateBody(
 data class XiaomiTrustStatusBody(
     val paired: Boolean,
     val ts: Long
+)
+
+@Serializable
+data class XiaomiLyraSeedBody(
+    val action: String,
+    val deviceId: String,
+    val cred: String? = null,
+    val ticket: String? = null
+)
+
+@Serializable
+data class XiaomiLyraSeedResultBody(
+    val action: String,
+    val deviceId: String,
+    val ok: Boolean,
+    val hasCred: Boolean = false,
+    val hasTicket: Boolean = false,
+    val credNotAfter: Long? = null,
+    val output: String = ""
 )
 
 @Serializable

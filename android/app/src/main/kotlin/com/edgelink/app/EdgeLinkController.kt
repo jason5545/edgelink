@@ -35,6 +35,8 @@ import com.edgelink.core.CtrlPointerBody
 import com.edgelink.core.CtrlTextBody
 import com.edgelink.core.DeviceId
 import com.edgelink.core.EmptyBody
+import com.edgelink.core.XiaomiLyraSeedBody
+import com.edgelink.core.XiaomiLyraSeedResultBody
 import com.edgelink.core.XiaomiTrustStatusBody
 import com.edgelink.core.EnvelopeCodec
 import com.edgelink.core.EnvelopeTypes
@@ -371,6 +373,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onXiaomiTrustStatus = { body ->
             stateFlow.update { it.copy(xiaomiTrustPaired = body.paired) }
+        },
+        onXiaomiLyraSeed = { body ->
+            handleXiaomiLyraSeed(body)
         }
     )
 
@@ -992,6 +997,47 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
 
     override fun onXiaomiTrustPair() {
         sendEnvelope(EnvelopeTypes.XIAOMI_TRUST_BIND, EmptyBody)
+    }
+
+    private suspend fun handleXiaomiLyraSeed(body: XiaomiLyraSeedBody): XiaomiLyraSeedResultBody {
+        val request = LyraSeedServiceRequest(
+            action = body.action,
+            deviceId = body.deviceId,
+            cred = body.cred,
+            ticket = body.ticket
+        )
+        LyraSeedProtocol.validate(request)?.let { reason ->
+            return XiaomiLyraSeedResultBody(
+                action = body.action,
+                deviceId = body.deviceId,
+                ok = false,
+                output = reason
+            )
+        }
+        val result = runCatching {
+            AndroidShizukuSupport.runLyraSeed(appContext, request)
+        }.getOrElse { error ->
+            LyraSeedServiceResult(
+                ok = false,
+                action = body.action,
+                deviceId = body.deviceId,
+                output = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
+            )
+        }
+        EdgeLinkLog.info(
+            "xiaomi.lyra.seed action=${result.action} ok=${result.ok} " +
+                "hasCred=${result.hasCred} hasTicket=${result.hasTicket} " +
+                "credNotAfter=${result.credNotAfter} output=${result.output.replace(Regex("\\s+"), " ").take(300)}"
+        )
+        return XiaomiLyraSeedResultBody(
+            action = result.action,
+            deviceId = result.deviceId,
+            ok = result.ok,
+            hasCred = result.hasCred,
+            hasTicket = result.hasTicket,
+            credNotAfter = result.credNotAfter,
+            output = result.output
+        )
     }
 
     fun tryHandleNotificationAccessWithShizuku(): Boolean =
@@ -2909,7 +2955,15 @@ private class AndroidCommandDispatcher(
     private val onPhotoRequest: (PhotoRequestBody) -> Unit = {},
     private val onPhotoAck: (PhotoAckBody) -> Unit = {},
     private val onPhotoSyncRequest: () -> Unit = {},
-    private val onXiaomiTrustStatus: (XiaomiTrustStatusBody) -> Unit = {}
+    private val onXiaomiTrustStatus: (XiaomiTrustStatusBody) -> Unit = {},
+    private val onXiaomiLyraSeed: suspend (XiaomiLyraSeedBody) -> XiaomiLyraSeedResultBody = { body ->
+        XiaomiLyraSeedResultBody(
+            action = body.action,
+            deviceId = body.deviceId,
+            ok = false,
+            output = "unhandled"
+        )
+    }
 ) {
     suspend fun handle(plaintext: ByteArray): ByteArray? {
         return when (EnvelopeCodec.type(plaintext)) {
@@ -2945,6 +2999,11 @@ private class AndroidCommandDispatcher(
                     .getOrNull()
                     ?.let(onXiaomiTrustStatus)
                 null
+            }
+            EnvelopeTypes.XIAOMI_LYRA_SEED -> {
+                val envelope = EnvelopeCodec.decode<XiaomiLyraSeedBody>(plaintext)
+                val result = onXiaomiLyraSeed(envelope.b)
+                EnvelopeCodec.encode(EnvelopeTypes.XIAOMI_LYRA_SEED_RESULT, result)
             }
             EnvelopeTypes.MAC_AWAKE -> {
                 onMacAwake()

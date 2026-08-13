@@ -1,6 +1,7 @@
 package com.edgelink.app
 
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -9,9 +10,14 @@ import kotlin.concurrent.thread
 import kotlin.math.min
 
 private const val COMMAND_TIMEOUT_SECONDS = 10L
+private const val LYRA_SEED_TIMEOUT_SECONDS = 30L
 private const val COMMAND_OUTPUT_LIMIT = 16 * 1024
 private const val MI_CONNECT_PERMISSION_SWITCH_PROPERTY = "lyra.permission.switch"
+private const val MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service"
 private const val EDGE_LINK_PACKAGE_NAME = "com.edgelink.app"
+private const val LYRA_SEED_WORK_DIR = "/data/local/tmp/edgelink-lyra-seed"
+private const val LYRA_STORE_PATH =
+    "/data/data/com.xiaomi.mi_connect_service/cache/storage.lyra"
 private const val EDGE_LINK_NOTIFICATION_LISTENER_COMPONENT =
     "com.edgelink.app/com.edgelink.app.AndroidNotificationListenerService"
 private val MIRROR_BT_LOGCAT_COMMAND = arrayOf(
@@ -86,6 +92,173 @@ class EdgeLinkShizukuService : IEdgeLinkShizukuService.Stub() {
             "mi_connect probe setprop $name=$value ok=$ok"
         )
     }
+
+    override fun lyraSeed(requestJson: String, dexBytes: ByteArray): String {
+        val request = runCatching { LyraSeedProtocol.decodeRequest(requestJson) }.getOrElse { error ->
+            return lyraSeedError("", "", "bad request: ${error.message}")
+        }
+        LyraSeedProtocol.validate(request)?.let { return lyraSeedError(request.action, request.deviceId, it) }
+        return runCatching { lyraSeedInternal(request, dexBytes) }.getOrElse { error ->
+            android.util.Log.w("EdgeLinkShizuku", "lyraSeed ${request.action} failed", error)
+            lyraSeedError(request.action, request.deviceId, "${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun lyraSeedInternal(request: LyraSeedServiceRequest, dexBytes: ByteArray): String {
+        val workDir = File(LYRA_SEED_WORK_DIR)
+        workDir.mkdirs()
+        workDir.setReadable(true, false)
+        workDir.setExecutable(true, false)
+        val dex = File(workDir, "seed.dex")
+        if (!dex.isFile || dex.length() != dexBytes.size.toLong()) {
+            dex.writeBytes(dexBytes)
+        }
+        dex.setReadable(true, false)
+        return when (request.action) {
+            LyraSeedProtocol.ACTION_STATUS -> lyraSeedStatus(request)
+            else -> lyraSeedSeed(request)
+        }
+    }
+
+    private fun lyraSeedStatus(request: LyraSeedServiceRequest): String {
+        val run = runLyraSeedTool(listOf("check", request.deviceId))
+        val parsed = parseLyraSeedCheck(run.second)
+        return LyraSeedProtocol.encodeResult(
+            LyraSeedServiceResult(
+                ok = run.first == 0 && parsed != null && parsed.hasCred && parsed.hasTicket,
+                action = request.action,
+                deviceId = request.deviceId,
+                hasCred = parsed?.hasCred ?: false,
+                hasTicket = parsed?.hasTicket ?: false,
+                credNotAfter = parsed?.credNotAfter,
+                output = run.second.take(2_000)
+            )
+        )
+    }
+
+    private fun lyraSeedSeed(request: LyraSeedServiceRequest): String {
+        val workDir = File(LYRA_SEED_WORK_DIR)
+        val payload = File(workDir, "payload.json")
+        payload.writeText(
+            LyraSeedProtocol.encodeRequest(
+                request.copy(action = LyraSeedProtocol.ACTION_SEED)
+            )
+        )
+        chownSystem(payload)
+        // The dex payload format is {deviceId, cred, ticket} — reuse the
+        // request JSON directly (extra fields are ignored by the tool).
+        val seedRun = runLyraSeedTool(listOf("seed", payload.absolutePath))
+        val seedOk = seedRun.first == 0 && !seedRun.second.contains("ERROR ")
+        var installNote = ""
+        if (seedOk) {
+            val store = File(LYRA_STORE_PATH)
+            val seeded = File("$LYRA_STORE_PATH.seeded")
+            if (seeded.isFile) {
+                val backup = File("$LYRA_STORE_PATH.edgelink-bak-${System.currentTimeMillis()}")
+                store.copyTo(backup, overwrite = false)
+                if (seeded.renameTo(store)) {
+                    installNote = "installed"
+                } else {
+                    installNote = "install failed: rename"
+                }
+            } else {
+                installNote = "install failed: no .seeded output"
+            }
+            runProcess(listOf("am", "force-stop", MI_CONNECT_PACKAGE), COMMAND_TIMEOUT_SECONDS)
+        }
+        val verify = runLyraSeedTool(listOf("check", request.deviceId))
+        val parsed = parseLyraSeedCheck(verify.second)
+        val verified = verify.first == 0 && parsed != null && parsed.hasCred && parsed.hasTicket
+        return LyraSeedProtocol.encodeResult(
+            LyraSeedServiceResult(
+                ok = seedOk && installNote == "installed" && verified,
+                action = request.action,
+                deviceId = request.deviceId,
+                hasCred = parsed?.hasCred ?: false,
+                hasTicket = parsed?.hasTicket ?: false,
+                credNotAfter = parsed?.credNotAfter,
+                output = (seedRun.second + "\n" + installNote + "\nverify: " + verify.second).take(2_000)
+            )
+        )
+    }
+
+    private data class LyraSeedCheck(
+        val hasCred: Boolean,
+        val hasTicket: Boolean,
+        val credNotAfter: Long?
+    )
+
+    private fun parseLyraSeedCheck(output: String): LyraSeedCheck? {
+        val line = output.lineSequence().lastOrNull { it.trimStart().startsWith("{\"deviceId\"") }
+            ?: return null
+        return runCatching {
+            val json = org.json.JSONObject(line.trim())
+            LyraSeedCheck(
+                hasCred = json.optBoolean("hasCred"),
+                hasTicket = json.optBoolean("hasTicket"),
+                credNotAfter = if (json.has("credNotAfter")) json.optLong("credNotAfter") else null
+            )
+        }.getOrNull()
+    }
+
+    private fun runLyraSeedTool(toolArgs: List<String>): Pair<Int, String> {
+        val out = File(LYRA_SEED_WORK_DIR, "tool.out")
+        out.writeText("")
+        chownSystem(out)
+        val command = buildList {
+            add("CLASSPATH=${File(LYRA_SEED_WORK_DIR, "seed.dex").absolutePath}")
+            add("app_process")
+            add("/")
+            add("LyraSeed")
+            addAll(toolArgs)
+            add(">")
+            add(out.absolutePath)
+            add("2>&1")
+        }.joinToString(" ")
+        val result = runProcess(listOf("/system/bin/su", "1000", "-c", command), LYRA_SEED_TIMEOUT_SECONDS)
+        val toolOutput = runCatching { out.readText() }.getOrDefault("")
+        return result.exitCode to (toolOutput.ifBlank { result.stderr })
+    }
+
+    private fun chownSystem(file: File) {
+        runProcess(listOf("chown", "1000:1000", file.absolutePath), COMMAND_TIMEOUT_SECONDS)
+    }
+
+    private fun lyraSeedError(action: String, deviceId: String, message: String): String =
+        LyraSeedProtocol.encodeResult(
+            LyraSeedServiceResult(
+                ok = false,
+                action = action,
+                deviceId = deviceId,
+                output = message
+            )
+        )
+
+    private fun runProcess(command: List<String>, timeoutSeconds: Long): ShizukuCommandResult =
+        runCatching {
+            val process = ProcessBuilder(command).start()
+            val stdout = AtomicReference("")
+            val stderr = AtomicReference("")
+            val stdoutThread = thread(name = "edgelink-shizuku-stdout") {
+                stdout.set(readLimited(process.inputStream))
+            }
+            val stderrThread = thread(name = "edgelink-shizuku-stderr") {
+                stderr.set(readLimited(process.errorStream))
+            }
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+            }
+            stdoutThread.join(1_000)
+            stderrThread.join(1_000)
+            ShizukuCommandResult(
+                exitCode = if (finished) process.exitValue() else 124,
+                stdout = stdout.get(),
+                stderr = stderr.get()
+            )
+        }.getOrElse { error ->
+            ShizukuCommandResult(exitCode = 1, stdout = "", stderr = error.message.orEmpty())
+        }
 
     override fun runCommand(command: Array<String>): String {
         if (!EdgeLinkShizukuCommandPolicy.isAllowed(command)) {

@@ -162,4 +162,61 @@ final class MiTrustTicketStoreTests: XCTestCase {
             Data(base64Encoded: Self.phoneAccountPubB64)!
         ))
     }
+
+    func testLyraSeedPayloadBuildsOfficialShapes() throws {
+        let now = Date(timeIntervalSince1970: 1_786_000_000)
+        let store = MiTrustTicketStore.current()
+        let payload = try XCTUnwrap(store.lyraSeedPayload(deviceIdHex: "721572C3", now: now))
+
+        let cred = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(payload.cred.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(cred["device_id"] as? String, "721572C3")
+        XCTAssertEqual(cred["trusted_type"] as? Int, 1)
+        let account = try XCTUnwrap(cred["account"] as? [String: Any])
+        XCTAssertEqual(account["ability"] as? Int, 0)
+        XCTAssertEqual(account["iot_pub_key"] as? String, "")
+        XCTAssertEqual(account["pub_key"] as? String, store.identityPubKey.base64EncodedString())
+        XCTAssertEqual(account["uid"] as? String, store.uidHashRaw.base64EncodedString())
+        XCTAssertEqual(account["not_before"] as? Int64, Int64(now.timeIntervalSince1970) - 86_400)
+        XCTAssertEqual(account["not_after"] as? Int64, Int64(now.timeIntervalSince1970) + 550 * 86_400)
+        XCTAssertEqual(Data(base64Encoded: account["pub_key"] as? String ?? "")?.count, 65)
+
+        let ticket = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(payload.ticket.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(ticket["algorithm"] as? Int, 0)
+        XCTAssertEqual(ticket["alias"] as? String, "")
+        let ticketKeyData = try XCTUnwrap(Data(base64Encoded: ticket["key"] as? String ?? ""))
+        XCTAssertEqual(ticketKeyData.count, 32)
+        let expectedTicket = try XCTUnwrap(store.ticketKey).withUnsafeBytes { Data($0) }
+        XCTAssertEqual(ticketKeyData, expectedTicket)
+    }
+
+    func testLyraSeedPayloadDefaultsMatchLiveSeededMaterial() throws {
+        // The 2026-07-30 route-C seed used these exact values; the builder
+        // must keep producing them for the default (live) store.
+        let keys = [
+            "xiaomiTrustTicketHex",
+            "xiaomiTrustIdentityPrivHex",
+            "xiaomiTrustIdentityPubB64",
+            "xiaomiTrustUidHashB64"
+        ]
+        let saved = keys.map { ($0, UserDefaults.standard.string(forKey: $0)) }
+        defer { for (key, value) in saved { restore(value, forKey: key) } }
+        for key in keys { UserDefaults.standard.removeObject(forKey: key) }
+
+        let store = MiTrustTicketStore.current()
+        let payload = try XCTUnwrap(store.lyraSeedPayload(deviceIdHex: "721572C3"))
+        XCTAssertTrue(payload.cred.contains(
+            "\"pub_key\":\"BL/434ltP50le6fDe3X0Q3iXPo4fcf0+7H9c3P87N06fseKWnSjnsq12p22w5oZV/nLrtQyeRenyVOOdVUQqxh4=\""
+        ))
+        XCTAssertTrue(payload.cred.contains(
+            "\"uid\":\"YfJQtjvnAuNXhZmXZ8IhFjr3I4mVdX9ZgDS3U+OvBzM=\""
+        ))
+        XCTAssertEqual(
+            payload.ticket,
+            "{\"algorithm\":0,\"alias\":\"\",\"key\":\"/4bk2ck+Hb8C3uKBF6qMwLoXb2Trml2zckyqmKZIgDU=\"}"
+        )
+    }
 }

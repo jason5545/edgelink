@@ -6,4 +6,6 @@ interface IEdgeLinkShizukuService {
     String runCommand(in String[] command) = 1;
 
     void setMiConnectPermissionSwitch(boolean enabled) = 6;
+
+    String lyraSeed(String requestJson, in byte[] dexBytes) = 7;
 }

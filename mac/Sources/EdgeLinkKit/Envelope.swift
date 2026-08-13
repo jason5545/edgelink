@@ -98,6 +98,8 @@ public enum EnvelopeType {
     public static let photoStatus = "photo.status"
     public static let xiaomiTrustStatus = "xiaomi.trustStatus"
     public static let xiaomiTrustBind = "xiaomi.trustBind"
+    public static let xiaomiLyraSeed = "xiaomi.lyraSeed"
+    public static let xiaomiLyraSeedResult = "xiaomi.lyraSeedResult"
 }
 
 public struct InputPointerBody: Codable, Equatable, Sendable {
@@ -1041,6 +1043,52 @@ public struct XiaomiTrustStatusBody: Codable, Equatable, Sendable {
     public init(paired: Bool, ts: Int64) {
         self.paired = paired
         self.ts = ts
+    }
+}
+
+// Lyra identity-store seeding (route C): the Mac owns the identity material
+// (P-256 pubkey + 32B ticket in MiTrustTicketStore) and asks the phone to
+// write identity-cred/identity-ticket into mi_connect's storage.lyra via its
+// Shizuku executor. action: "status" (read-only check) or "seed".
+public struct XiaomiLyraSeedBody: Codable, Equatable, Sendable {
+    public let action: String
+    public let deviceId: String
+    public let cred: String?
+    public let ticket: String?
+
+    public init(action: String, deviceId: String, cred: String? = nil, ticket: String? = nil) {
+        self.action = action
+        self.deviceId = deviceId
+        self.cred = cred
+        self.ticket = ticket
+    }
+}
+
+public struct XiaomiLyraSeedResultBody: Codable, Equatable, Sendable {
+    public let action: String
+    public let deviceId: String
+    public let ok: Bool
+    public let hasCred: Bool
+    public let hasTicket: Bool
+    public let credNotAfter: Int64?
+    public let output: String
+
+    public init(
+        action: String,
+        deviceId: String,
+        ok: Bool,
+        hasCred: Bool = false,
+        hasTicket: Bool = false,
+        credNotAfter: Int64? = nil,
+        output: String = ""
+    ) {
+        self.action = action
+        self.deviceId = deviceId
+        self.ok = ok
+        self.hasCred = hasCred
+        self.hasTicket = hasTicket
+        self.credNotAfter = credNotAfter
+        self.output = output
     }
 }
 

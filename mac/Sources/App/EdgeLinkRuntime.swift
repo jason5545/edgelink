@@ -317,6 +317,12 @@ final class EdgeLinkRuntime: ObservableObject {
                     break
                 }
                 self?.sendXiaomiTrustStatusToPhone()
+                if state == .needsBind {
+                    // Distinguish "TA slot unbound" (official bind fixes it)
+                    // from "phone lyra store lost our cred" (needs reseed):
+                    // ask the phone's seed executor for a store-level check.
+                    self?.requestXiaomiLyraSeedStatus()
+                }
             }
         }
         xiaomiMirrorFlow.log = { message in
@@ -1787,6 +1793,61 @@ final class EdgeLinkRuntime: ObservableObject {
                 DiagnosticsLog.warn("xiaomi.trust.status_tx_failed error=\(error.localizedDescription)")
             }
         }
+    }
+
+    // Route-C lyra identity-store seeding, executed on the phone by its
+    // Shizuku service (root → su 1000 → app_process dex). The Mac owns the
+    // material (MiTrustTicketStore); the phone only performs the local write.
+    @Published private(set) var xiaomiLyraSeedLastResult: XiaomiLyraSeedResultBody?
+
+    func requestXiaomiLyraSeedStatus() {
+        sendXiaomiLyraSeedRequest(action: "status")
+    }
+
+    func requestXiaomiLyraSeedReseed() {
+        sendXiaomiLyraSeedRequest(action: "seed")
+    }
+
+    private func sendXiaomiLyraSeedRequest(action: String) {
+        guard let session = currentSession, isConnected else {
+            DiagnosticsLog.warn("xiaomi.lyra.seed_tx_skipped action=\(action) reason=not_connected")
+            return
+        }
+        guard let deviceId = xiaomiMiShareDiscovery.localDeviceIdHex, !deviceId.isEmpty else {
+            DiagnosticsLog.warn("xiaomi.lyra.seed_tx_skipped action=\(action) reason=no_device_id")
+            return
+        }
+        var body = XiaomiLyraSeedBody(action: action, deviceId: deviceId)
+        if action == "seed" {
+            guard let payload = MiTrustTicketStore.current().lyraSeedPayload(deviceIdHex: deviceId) else {
+                DiagnosticsLog.warn("xiaomi.lyra.seed_tx_skipped reason=no_material")
+                return
+            }
+            body = XiaomiLyraSeedBody(
+                action: action,
+                deviceId: deviceId,
+                cred: payload.cred,
+                ticket: payload.ticket
+            )
+        }
+        DiagnosticsLog.info("xiaomi.lyra.seed_tx action=\(action) deviceId=\(deviceId)")
+        Task {
+            do {
+                let data = try encoder.encode(Envelope(t: EnvelopeType.xiaomiLyraSeed, b: body))
+                try await session.sendPlaintext(data)
+            } catch {
+                DiagnosticsLog.warn("xiaomi.lyra.seed_tx_failed action=\(action) error=\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func handleXiaomiLyraSeedResult(_ body: XiaomiLyraSeedResultBody) {
+        xiaomiLyraSeedLastResult = body
+        DiagnosticsLog.info(
+            "xiaomi.lyra.seed_result action=\(body.action) ok=\(body.ok) " +
+                "hasCred=\(body.hasCred) hasTicket=\(body.hasTicket) " +
+                "credNotAfter=\(body.credNotAfter ?? 0)"
+        )
     }
 
     func requestPhoneUnlock() async {
@@ -4227,6 +4288,11 @@ final class EdgeLinkRuntime: ObservableObject {
                     onXiaomiTrustBind: { [weak self] in
                         Task { @MainActor in
                             self?.handleXiaomiTrustBindRequest()
+                        }
+                    },
+                    onXiaomiLyraSeedResult: { [weak self] body in
+                        Task { @MainActor in
+                            self?.handleXiaomiLyraSeedResult(body)
                         }
                     },
                     onTunnelEnvelope: { [weak self] type, plaintext in

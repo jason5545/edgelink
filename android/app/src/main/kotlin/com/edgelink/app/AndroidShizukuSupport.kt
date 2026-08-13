@@ -25,7 +25,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val SHIZUKU_REQUEST_CODE = 61_240
-private const val SHIZUKU_USER_SERVICE_VERSION = 8
+private const val SHIZUKU_USER_SERVICE_VERSION = 9
 private const val SHIZUKU_USER_SERVICE_MAX_ATTEMPTS = 2
 private const val SHIZUKU_USER_SERVICE_RETRY_DELAY_MS = 200L
 private const val SHIZUKU_USER_SERVICE_BIND_TIMEOUT_MS = 5_000L
@@ -289,6 +289,14 @@ object AndroidShizukuSupport {
             ShizukuOperationResult(
                 success = successCount > 0,
                 message = "MiLink attribution probe $successCount/${results.size}"
+            )
+        }
+
+    suspend fun runLyraSeed(context: Context, request: LyraSeedServiceRequest): LyraSeedServiceResult =
+        withService(context) { service ->
+            val dexBytes = context.assets.open(LyraSeedProtocol.DEX_ASSET_NAME).use { it.readBytes() }
+            LyraSeedProtocol.decodeResult(
+                service.lyraSeed(LyraSeedProtocol.encodeRequest(request), dexBytes)
             )
         }
 
