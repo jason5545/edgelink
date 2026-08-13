@@ -1014,7 +1014,12 @@ final class LyraMeshAnnouncer {
                         session.adoptMitrustSyncInfo(
                             syncInfoData: syncInfoData,
                             logiConn: logiConn,
-                            endpoint: endpoint
+                            endpoint: endpoint,
+                            // The phone's channel client dials back over the
+                            // transport this phys conn rides — a relay-fed
+                            // announcer conn means the mitrust server channel
+                            // must listen on the relay bridge.
+                            viaRelay: !(socket is LyraMeshSocket)
                         ) { [weak self] frame in
                             self?.send(frame: frame, label: "mitrust_adopted")
                         }

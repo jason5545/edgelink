@@ -44,8 +44,14 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     private var hostLoop: Task<Void, Error>?
     private var clientLoop: Task<Void, Error>?
     private var savedIsExpectedPhoneHost: ((String) -> Bool)?
+    private var savedActiveRelayBridge: (() -> LyraRelayTransportBridge?)?
     private var relayAnnouncer: LyraMeshAnnouncer?
     private var phoneAnnounceMesh: LyraPhoneMeshServer?
+    // LAN-hybrid scenario (castOverLAN): the cast session dials the phone's
+    // real UDP mesh like a LAN desk while the announcer stays relay-fed.
+    private var castIsLAN = false
+    private var lanPhoneMeshPort: UInt16 = 0
+    private var lanCastChannelPort: UInt16 = 0
 
     // When set, the relay session pair crosses an impaired link (cloud-relay
     // conditions) instead of the perfect loopback. Configure before calling
@@ -88,6 +94,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         // relay flow must complete despite a pin that rejects 127.0.0.1.
         savedIsExpectedPhoneHost = LyraCastTrustSession.isExpectedPhoneHost
         LyraCastTrustSession.isExpectedPhoneHost = { $0 == "10.9.9.9" }
+        savedActiveRelayBridge = LyraCastTrustSession.activeRelayBridge
     }
 
     override func tearDown() {
@@ -128,6 +135,9 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         savedValues = [:]
         if let savedIsExpectedPhoneHost {
             LyraCastTrustSession.isExpectedPhoneHost = savedIsExpectedPhoneHost
+        }
+        if let savedActiveRelayBridge {
+            LyraCastTrustSession.activeRelayBridge = savedActiveRelayBridge
         }
         super.tearDown()
     }
@@ -223,10 +233,12 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     // relay: responses leave as ack-command datagrams carrying the payload
     // (0x52 + data) instead of pushes.
     private func startMirrorEnds(
-        locked: Bool, ackFramedResponses: Bool = false, mitrustViaAnnounceFlow: Bool = false
+        locked: Bool, ackFramedResponses: Bool = false, mitrustViaAnnounceFlow: Bool = false,
+        castOverLAN: Bool = false
     ) async throws {
         let clientBridge = try XCTUnwrap(clientBridge)
         let hostBridge = try XCTUnwrap(hostBridge)
+        castIsLAN = castOverLAN
 
         // Production wiring: the cast trust dial rides mesh flow 1 (the
         // announce/relayCall dial owns flow 0) so the phone sees a fresh peer
@@ -235,14 +247,31 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             clientBridge.meshFlow(index: 1).dataCommand = LyraMeshDatagram.commandAck
             clientBridge.channel.dataCommand = LyraMeshDatagram.commandAck
         }
-        let phone = LyraPhoneServer(
-            identity: LyraPhoneIdentity.generate(),
-            castChannelPort: 0,
-            wfdPort: wfdPort,
-            meshTransport: clientBridge.meshFlow(index: 1),
-            castChannelTransport: clientBridge.channel,
-            clientVideoPort: clientVideoPort
-        )
+        let phone: LyraPhoneServer
+        if castOverLAN {
+            // LAN-hybrid (live 2026-08-13): the phone is dual-homed — the
+            // secure session and its relay-fed announcer ride the cloud
+            // relay, but the mirror's cast session dials the phone's real
+            // LAN mesh (LAN-first policy). The phone's mesh/cast channel
+            // are real UDP sockets here.
+            lanPhoneMeshPort = 30_101 + Self.portBlockIndex * 10 + 2
+            lanCastChannelPort = 30_101 + Self.portBlockIndex * 10 + 3
+            phone = LyraPhoneServer(
+                identity: LyraPhoneIdentity.generate(),
+                castChannelPort: lanCastChannelPort,
+                wfdPort: wfdPort,
+                clientVideoPort: clientVideoPort
+            )
+        } else {
+            phone = LyraPhoneServer(
+                identity: LyraPhoneIdentity.generate(),
+                castChannelPort: 0,
+                wfdPort: wfdPort,
+                meshTransport: clientBridge.meshFlow(index: 1),
+                castChannelTransport: clientBridge.channel,
+                clientVideoPort: clientVideoPort
+            )
+        }
         // The real phone's mitrust channel dial crosses the relay too: the
         // phone bridge's reverse listener stamps the advertised Mac port onto
         // every envelope, and the Mac bridge routes by that stamp. Mimic it
@@ -262,8 +291,10 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         // (connection-refused) or the relay mirror deadlocks here.
         phone.cast.wfdServerStartupDelay = 1.5
         self.phone = phone
-        try phone.start(port: 0)
-        phoneMeshPort = try XCTUnwrap(phone.boundPort)
+        try phone.start(port: castOverLAN ? lanPhoneMeshPort : 0)
+        // LAN sockets bind asynchronously (NWListener ready callback); the
+        // LAN variant dialed a fixed port so there is nothing to wait for.
+        phoneMeshPort = castOverLAN ? lanPhoneMeshPort : try XCTUnwrap(phone.boundPort)
 
         if mitrustViaAnnounceFlow {
             // Live 2026-08-12: the real phone's trustservice dials
@@ -291,13 +322,27 @@ final class LyraMirrorOverRelayTests: XCTestCase {
 
         // The mesh pipe presents the peer endpoint to the trust session;
         // point it at the phone's mesh port before dialing.
-        hostBridge.meshFlow(index: 1).peerPort = phoneMeshPort
+        if !castOverLAN {
+            hostBridge.meshFlow(index: 1).peerPort = phoneMeshPort
+        }
 
         let trustManager = MacTrustManager()
         trustManager.statusRetryDelay = 0.1
         trustManager.maxStatusRetries = 3
         self.trustManager = trustManager
-        attachSession()
+        if castOverLAN {
+            // The LAN cast session's phys-sync reply comes from the phone's
+            // loopback UDP socket in this harness — accept it as the pinned
+            // phone host.
+            LyraCastTrustSession.isExpectedPhoneHost = { $0 == "10.9.9.9" || $0 == "127.0.0.1" }
+            // Production wiring (EdgeLinkRuntime): the runtime's current
+            // relay bridge, consulted when a relay-fed phys conn adopts
+            // mitrustservice into a LAN-routed session.
+            LyraCastTrustSession.activeRelayBridge = { [weak self] in self?.hostBridge }
+            attachLANSession()
+        } else {
+            attachSession()
+        }
 
         let controller = XiaomiMirrorFlowController(trustManager: trustManager)
         controller.sessionProvider = { [weak self] in self?.session }
@@ -309,7 +354,11 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             guard let self else { return }
             let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
             session.sendScreenAction(.openMirrorScreen(sessionId: sessionId))
-            self.startWFDClientViaTunnel()
+            if self.castIsLAN {
+                self.startWFDClientDirect()
+            } else {
+                self.startWFDClientViaTunnel()
+            }
         }
         controller.hasRemoteVideo = { [weak self] in
             (self?.videoDatagramsReceived ?? 0) > 0
@@ -355,6 +404,43 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         self.session = session
     }
 
+    // LAN variant: the session dials the phone's real UDP mesh socket — no
+    // relay pipes, relayBridge == nil, exactly the production LAN-first
+    // mirror session.
+    private func attachLANSession() {
+        let trustManager = trustManager ?? MacTrustManager()
+        let session = LyraCastTrustSession(
+            endpoints: [("127.0.0.1", lanPhoneMeshPort)],
+            deviceIdHex: "721572C3",
+            displayName: "EdgeLinkMacTests",
+            trustManager: trustManager
+        )
+        session.retainPhysAfterAuth = true
+        session.duoScreenStatusEnabled = true
+        session.onChannelReady = { [weak self] in
+            Task { @MainActor in
+                self?.controller?.notifyChannelReady()
+            }
+        }
+        session.onChannelReleased = { [weak self] in
+            Task { @MainActor in
+                self?.controller?.notifyChannelReleased()
+            }
+        }
+        session.onFinish = { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session, self.session === session else { return }
+                self.session = nil
+                if self.castRebuildPending {
+                    self.castRebuildPending = false
+                    self.attachLANSession()
+                    self.session?.start()
+                }
+            }
+        }
+        self.session = session
+    }
+
     private var castRebuildPending = false
 
     // Production dials each cast session from a fresh peer (on the relay
@@ -378,6 +464,11 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     }
 
     private func redialCastSessionOnFreshPipes() {
+        if castIsLAN {
+            attachLANSession()
+            session?.start()
+            return
+        }
         clientBridge?.meshFlow(index: 1).stop()
         try? clientBridge?.meshFlow(index: 1).start(preferredPort: phoneMeshPort)
         hostBridge?.meshFlow(index: 1).stop()
@@ -416,6 +507,20 @@ final class LyraMirrorOverRelayTests: XCTestCase {
                 XCTFail("wfd tunnel forward failed: \(error)")
             }
         }
+    }
+
+    // LAN variant: the WFD dialog dials the phone's RTSP listener directly
+    // (no tunnel), exactly the production LAN mirror.
+    private func startWFDClientDirect() {
+        wfdClient?.stop(reason: "replace")
+        let client = XiaomiMirrorWFDClient()
+        client.onSessionEstablished = { [weak self] _ in
+            Task { @MainActor in
+                self?.controller?.notifyVideoFrame()
+            }
+        }
+        wfdClient = client
+        client.start(host: "127.0.0.1", rtspPort: wfdPort, clientRTPPort: clientVideoPort)
     }
 
     private func startVideoListener() {
@@ -640,6 +745,66 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         try await establishRelaySession()
         try await startMirrorEnds(locked: true, mitrustViaAnnounceFlow: true)
         try await driveUnlockToStreaming()
+    }
+
+    // Live 2026-08-13 04:13–04:18: dual-homed phone (secure session over the
+    // cloud relay, mirror on LAN per the LAN-first policy). The phone's
+    // trustservice score-based reuse dialed mitrustservice on the RELAY-fed
+    // announce phys conn while the cast session was LAN-routed. The session
+    // keyed the mitrust server channel off its OWN transport (relayBridge ==
+    // nil → plain LAN UDP socket) and advertised that port on the adopted
+    // relay conn; the phone's channel client, bound to the relay phys conn's
+    // addressing, dialed through its relay bridge — the Mac bridge had no
+    // pipe for the port and dropped every datagram. No channel, 562 went
+    // nowhere, ~10s kcp trans timeout → authEvent code=1 → hard 解鎖失敗
+    // mask. Which phys conn the phone picked was effectively random, hence
+    // the alternating success/code=1. The mitrust channel transport must
+    // follow the ADOPTION conn: relay-fed adoption → bridge pipe on the
+    // runtime's current relay bridge.
+    func testTrustUnlockWhenRelayFedAdoptionMeetsLANCastSession() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true, mitrustViaAnnounceFlow: true, castOverLAN: true)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        // The stuck-ceremony watchdog mirrors the real phone's ~10s kcp
+        // trans timeout; 8s leaves the loopback-relay ceremony ample room
+        // under parallel test load while still failing fast on a regression.
+        phone.cast.mitrustUnlockTimeout = 8
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready over LAN") { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("lock mask from truthful locked status") {
+            controller.mask == .locked
+        }
+        try await waitFor("OPEN sent even while locked (official)") {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("phone received duo.screen authAction (562)") {
+            phone.cast.authActionCount >= 1
+        }
+        // The phone adopted mitrustservice on the relay-fed announce conn;
+        // its channel dial crosses the relay. The session must register the
+        // server channel on the current relay bridge so the dial lands.
+        try await waitFor("phone verified auth_token_A (562/563) via relay-fed mitrust channel") {
+            phone.cast.mitrustUnlockCompleted && phone.cast.lastAuthTokenA != nil
+        }
+        XCTAssertEqual(
+            phone.cast.mitrustUnlockTimedOutCount, 0,
+            "the relay-fed channel dial must connect — no kcp-timeout code=1"
+        )
+        try await waitFor("mask cleared via confirmed unlock") {
+            controller.mask == nil
+        }
+        try await waitFor("controller streaming") {
+            controller.stage == .streaming && controller.mask == nil
+        }
     }
 
     private func driveUnlockToStreaming() async throws {

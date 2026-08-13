@@ -338,6 +338,9 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         LyraCastTrustSession.isExpectedPhoneHost = LyraMeshResponder.isExpectedPhoneHost
         LyraCastTrustSession.recordPhoneEndpoint = LyraMeshResponder.recordPhoneEndpoint
+        // Read live at adoption time: the bridge object is replaced on every
+        // secure-session rebuild, so a captured reference would go stale.
+        LyraCastTrustSession.activeRelayBridge = { [weak self] in self?.lyraRelayBridge }
         LyraCastTrustSession.onPasskeyCompare = { code in
             LyraPairingPresenter.showPasskey(code)
         }
@@ -1558,30 +1561,34 @@ final class EdgeLinkRuntime: ObservableObject {
             break
         }
         if let session = lyraCastTrustSession {
-            let stuckBuilding = !session.isChannelReady &&
-                Date().timeIntervalSince(session.createdAt) > 30
-            if stuckBuilding {
-                DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild stuckBuilding=true")
-                stopPhoneTrustUnlock()
-            } else {
-                let quietMs = Date().timeIntervalSince(session.lastInboundAt) * 1000
-                if session.isChannelReady, quietMs > probeAfterMs {
-                    if quietMs > rebuildAfterMs, castChannelProbeSentAt != .distantPast,
-                       Date().timeIntervalSince(castChannelProbeSentAt) > 15 {
-                        // Probe sent and still no inbound — the conn is dead.
-                        DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild silent=\(Int(quietMs))ms")
-                        castChannelProbeSentAt = .distantPast
-                        stopPhoneTrustUnlock()
-                    } else if castChannelProbeSentAt == .distantPast {
-                        // Quiet channel may be normal (the phone stops
-                        // keepalives after setup); probe before rebuilding.
-                        castChannelProbeSentAt = Date()
-                        session.probeLiveness()
-                        DiagnosticsLog.info("xiaomi.cast.channel_supervisor_probe quietMs=\(Int(quietMs))")
-                    }
+            // No stuckBuilding rebuild here: a session that lost its channel
+            // is owned by the mirror flow's own recovery (redial with a 6s
+            // response timeout → fast fail → flow rebuild; wedged fresh
+            // dials hit the flow's channelReadyTimeout auto-retry and the
+            // session's 30s watchdog). Killing a mid-redial session from
+            // here also kills the mitrust server channel the phone still
+            // considers alive — the next 562 goes into the phone's zombie
+            // channel and comes back code=1 (live 2026-08-13: supervisor
+            // cancelled a session 2s into its redial, the phone's phys
+            // heartbeat timed out at 17s, and the in-flight unlock failed).
+            guard session.isChannelReady else { return }
+            let quietMs = Date().timeIntervalSince(session.lastInboundAt) * 1000
+            if quietMs > probeAfterMs {
+                if quietMs > rebuildAfterMs, castChannelProbeSentAt != .distantPast,
+                   Date().timeIntervalSince(castChannelProbeSentAt) > 15 {
+                    // Probe sent and still no inbound — the conn is dead.
+                    DiagnosticsLog.info("xiaomi.cast.channel_supervisor_rebuild silent=\(Int(quietMs))ms")
+                    castChannelProbeSentAt = .distantPast
+                    stopPhoneTrustUnlock()
+                } else if castChannelProbeSentAt == .distantPast {
+                    // Quiet channel may be normal (the phone stops
+                    // keepalives after setup); probe before rebuilding.
+                    castChannelProbeSentAt = Date()
+                    session.probeLiveness()
+                    DiagnosticsLog.info("xiaomi.cast.channel_supervisor_probe quietMs=\(Int(quietMs))")
                 }
-                return
             }
+            return
         }
         _ = ensureCastTrustChannel(reason: "supervisor")
     }

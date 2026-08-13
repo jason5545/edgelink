@@ -18,6 +18,13 @@ final class LyraCastTrustSession {
     }
     static var isExpectedPhoneHost: (String) -> Bool = { _ in true }
     static var recordPhoneEndpoint: (String) -> Void = { _ in }
+    // Runtime wiring (EdgeLinkRuntime): the current cloud-relay transport
+    // bridge, nil on pure LAN. Consulted when a phone-dialed mitrustservice
+    // conn was adopted from a relay-fed phys conn (the announcer's) while
+    // THIS session is LAN-routed — the phone's channel client dials through
+    // its relay bridge in that case, so the mitrust server channel must
+    // listen on the Mac bridge, not on an unreachable LAN UDP port.
+    static var activeRelayBridge: () -> LyraRelayTransportBridge? = { nil }
     static var onPasskeyCompare: ((String) -> Void)?
     static let officialMacSyncInfoSignature = Data([
         0x33, 0x85, 0xFB, 0xAA, 0x02, 0xFD, 0x4E, 0x2C, 0xE1, 0x95, 0x74, 0x3A,
@@ -71,7 +78,6 @@ final class LyraCastTrustSession {
     private var stage: Stage = .physSync
     private var lastProgress = Date()
     var lastInboundAt: Date { lastProgress }
-    private(set) var createdAt = Date()
     private var watchdog: DispatchSourceTimer?
     private var cancelled = false
 
@@ -144,6 +150,12 @@ final class LyraCastTrustSession {
     // the mitrust server pipe, so teardown can unregister it.
     private let relayBridge: LyraRelayTransportBridge?
     private var srvChannelBridgePort: UInt16?
+    // The bridge that actually owns the mitrust server pipe: this session's
+    // own relayBridge when relay-routed, or the runtime's current bridge
+    // when the adoption arrived on a relay-fed phys conn while the session
+    // itself is LAN-routed (mitrustAdoptedViaRelay). Teardown must
+    // unregister from the owning bridge, not the session's.
+    private var srvChannelBridge: LyraRelayTransportBridge?
     private var srvReuseKey: SymmetricKey?
     private var srvChannelId: UInt32 = 0
     private var srvTransKey = Data()
@@ -173,6 +185,15 @@ final class LyraCastTrustSession {
     // Outbound frames then ride the responder's socket so the source port
     // matches the phys conn the phone established.
     private var adoptedSend: ((LyraMeshPack.Frame) -> Void)?
+    // Whether the adopted mitrustservice conn rides a relay-fed phys conn
+    // (the relay announcer's virtual pipe). The phone's channel client dials
+    // through the same transport the adoption arrived on, so the mitrust
+    // server channel must listen on the relay bridge when this is true —
+    // even when the session itself is LAN-routed (live 2026-08-13: a LAN
+    // session advertised a LAN UDP port on a relay-fed adoption, the phone's
+    // dial crossed the relay and hit no pipe, and the 562 kcp-timed-out into
+    // authEvent code=1).
+    private var mitrustAdoptedViaRelay = false
     var onPairingPasskey: ((String) -> Void)?
     var onPairingCompareCode: ((String) -> Void)?
     var onPairingCompleted: (() -> Void)?
@@ -273,8 +294,9 @@ final class LyraCastTrustSession {
         srvChannelSocket?.stop()
         srvChannelSocket = nil
         if let port = srvChannelBridgePort {
-            relayBridge?.removeChannelPipe(port: port)
+            srvChannelBridge?.removeChannelPipe(port: port)
             srvChannelBridgePort = nil
+            srvChannelBridge = nil
         }
     }
 
@@ -352,11 +374,16 @@ final class LyraCastTrustSession {
     }
 
     // Called by LyraMeshResponder when the phone opens a mitrustservice logi
-    // conn on the published mesh port (phone-initiated bind/pair flow).
+    // conn on the published mesh port (phone-initiated bind/pair flow), or by
+    // LyraMeshAnnouncer when it reuses the announcer's phys conn. viaRelay
+    // tells us the adopting socket's transport: the phone's channel client
+    // dials back over the same transport, which decides where the mitrust
+    // server channel must listen.
     func adoptMitrustSyncInfo(
         syncInfoData: Data,
         logiConn: LogiConnFrame,
         endpoint: NWEndpoint,
+        viaRelay: Bool = false,
         send: @escaping (LyraMeshPack.Frame) -> Void
     ) {
         queue.async { [weak self] in
@@ -367,6 +394,7 @@ final class LyraCastTrustSession {
                 self.endpoints = [parsed]
             }
             self.adoptedSend = send
+            self.mitrustAdoptedViaRelay = viaRelay
             if self.stage == .physSync {
                 self.progress(.syncAuth, String(localized: "手機信任服務連線…"))
             }
@@ -1369,20 +1397,34 @@ final class LyraCastTrustSession {
             self?.sendMitrustChannelMessage(jsonData)
         }
         mitrustAuth = authService
+        // The phone's channel client dials back over the transport the
+        // mitrustservice conn rides — not necessarily this session's own.
         // Relay-routed session: the phone cannot reach a Mac UDP socket (its
         // channel client dials the relay bridge's loopback forward), so the
         // mitrust server listens on a virtual channel pipe attached to the
         // bridge. The advertised port is the bridge demux key: the phone
-        // bridge snoops it from the responseOfPeerPort and stamps it onto the
-        // phone-dialed datagrams. LAN sessions keep the real UDP socket.
+        // bridge snoops it from the responseOfPeerPort and stamps it onto
+        // the phone-dialed datagrams. LAN sessions keep the real UDP socket
+        // — EXCEPT when the adoption itself arrived on a relay-fed phys
+        // conn (score-based reuse picking the relay announcer's conn on a
+        // dual-homed phone): then the phone's dial crosses the relay even
+        // though this session is LAN-routed, and only a pipe on the
+        // runtime's current bridge is reachable (live 2026-08-13: a LAN
+        // socket port advertised on the relay-fed adoption made the phone's
+        // dial vanish at the Mac bridge → 562 kcp-timeout → authEvent
+        // code=1, alternating with successes whenever the phone happened to
+        // pick the LAN conn).
+        let mitrustChannelBridge = relayBridge ?? (mitrustAdoptedViaRelay ? Self.activeRelayBridge() : nil)
         let socket: LyraChannelDatagramPipe
-        if let relayBridge {
-            let bridgePort = relayBridge.allocateChannelPort()
-            socket = relayBridge.channelPipe(port: bridgePort)
+        if let bridge = mitrustChannelBridge {
+            let bridgePort = bridge.allocateChannelPort()
+            socket = bridge.channelPipe(port: bridgePort)
             srvChannelBridgePort = bridgePort
+            srvChannelBridge = bridge
         } else {
             socket = LyraChannelSocket()
             srvChannelBridgePort = nil
+            srvChannelBridge = nil
         }
         socket.onMessage = { [weak self] message, _ in
             self?.handleMitrustChannelMessage(message)
@@ -1413,8 +1455,9 @@ final class LyraCastTrustSession {
         } catch {
             DiagnosticsLog.error("xiaomi.cast.mitrust_channel_start_failed", error)
             if let port = srvChannelBridgePort {
-                relayBridge?.removeChannelPipe(port: port)
+                srvChannelBridge?.removeChannelPipe(port: port)
                 srvChannelBridgePort = nil
+                srvChannelBridge = nil
             }
             return
         }
@@ -1434,8 +1477,9 @@ final class LyraCastTrustSession {
             DiagnosticsLog.warn("xiaomi.cast.mitrust_channel_no_port")
             srvChannelSocket = nil
             if let bridgePort = srvChannelBridgePort {
-                relayBridge?.removeChannelPipe(port: bridgePort)
+                srvChannelBridge?.removeChannelPipe(port: bridgePort)
                 srvChannelBridgePort = nil
+                srvChannelBridge = nil
             }
             return
         }
@@ -1711,6 +1755,9 @@ final class LyraCastTrustSession {
         switch inner.payload {
         case let .syncInfo(syncInfoData):
             if isMitrustSyncInfo(syncInfoData) {
+                // The phone dialed mitrustservice on THIS session's own phys
+                // conn — the channel dial follows this socket's transport.
+                mitrustAdoptedViaRelay = isRelayRouted
                 handleMitrustSyncInfo(syncInfoData, logiConn: logiConn)
             } else if Self.syncServiceName(of: syncInfoData) == LyraSyncTaskServer.syncServiceName {
                 let responseLogiConn = syncTaskServer.handleClassicSyncInfo(

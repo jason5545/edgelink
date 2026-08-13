@@ -566,9 +566,37 @@ public final class LyraCastRole: LyraServiceHandler {
     private var mitrustSessionKeyHex: String?
     private var saidB = Data()
 
+    // Live 2026-08-13: when the 562's mitrust channel never completes (the
+    // Mac advertised an endpoint this phys conn's transport can't reach),
+    // the phone's channel client kcp-times-out ~10s after the authAction and
+    // the authEvent comes back code=1 (terminalAlt) — the alternating
+    // success/code=1 pattern depended on which phys conn carried the
+    // adoption. 0 disables the watchdog (ceremony always completes in tests
+    // that never exercise the stuck path within the default window).
+    public var mitrustUnlockTimeout: TimeInterval = 10
+    private var mitrustUnlockEpoch: UInt64 = 0
+    private var mitrustRunCompleted = false
+    public private(set) var mitrustUnlockTimedOutCount = 0
+
     private func runMitrustUnlock() {
+        mitrustUnlockEpoch &+= 1
+        let epoch = mitrustUnlockEpoch
+        mitrustRunCompleted = false
         queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.startMitrustAdoption()
+        }
+        queue.asyncAfter(deadline: .now() + mitrustUnlockTimeout) { [weak self] in
+            guard let self, !self.stopped,
+                  self.mitrustUnlockEpoch == epoch, !self.mitrustRunCompleted
+            else { return }
+            self.mitrustUnlockTimedOutCount += 1
+            self.onEvent("mitrust unlock stuck → authEvent code=1 (kcp trans timeout)")
+            let event = TrustAuthEvent(
+                feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.terminalAlt
+            )
+            self.sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
+                DuoScreenTrust(sessionID: 0, msg: .authEvent(event))
+            ))
         }
     }
 
@@ -888,6 +916,7 @@ public final class LyraCastRole: LyraServiceHandler {
                   let tokenA = Self.data(fromHex: tokenAHex) else { return }
             lastAuthTokenA = tokenA
             mitrustUnlockCompleted = true
+            mitrustRunCompleted = true
             mitrustUnlockCount += 1
             locked = false
             onEvent("mitrust unlocked")
