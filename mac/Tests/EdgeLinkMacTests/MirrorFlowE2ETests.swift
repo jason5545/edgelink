@@ -1535,4 +1535,255 @@ final class MirrorFlowE2ETests: XCTestCase {
             self.controller.stage == .streaming && self.controller.mask == nil
         }
     }
+
+    // Live 2026-08-13 07:45: the user ran the Touch ID unlock while the
+    // mirror was NOT streaming — 562 auth action → auth success
+    // (auth_level=2), the Android lock reporter pushed locked=false — then
+    // the phone's screen timeout re-armed the keyguard 15s later
+    // (locked=true push) and the mirror only opened ~40s after the unlock.
+    // The fresh status resolution landed on locked and the flow parked on
+    // the lock mask with no further 562 ("Touch ID 過了但畫面還是鎖的").
+    // A locked resolution within the grace window of a reporter-confirmed
+    // unlock_success is a stale re-lock: the flow must re-run the unlock
+    // auth (one extra Touch ID prompt) instead of parking on the mask.
+    func testPreMirrorUnlockThenScreenTimeoutRelockAutoReauthsOnMirrorStart() async throws {
+        try makeEnvironment(locked: true)
+        session.start()
+        // No controller.start() — the mirror window is closed. The channel
+        // comes up and the pairing status query resolves locked.
+        try await waitFor("trust resolved locked with mirror closed") { [self] in
+            if case .ready(let locked) = self.trustManager.state { return locked }
+            return false
+        }
+
+        // User unlocks up front (menu-bar unlock): 562 → mitrust run →
+        // authEvent success, phone unlocked.
+        trustManager.touchIdPreauthorized = true
+        await trustManager.requestUnlock()
+        try await waitFor("pre-mirror unlock completed") { [self] in
+            self.phone.mitrustUnlockCount == 1
+        }
+        // The lock reporter confirms the unlock took effect…
+        trustManager.notifyExternalLockState(locked: false)
+        // …then the screen timeout re-arms the keyguard before the mirror
+        // opens.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        phone.setLocked(true)
+        trustManager.notifyExternalLockState(locked: true)
+
+        // The mirror window opens only now.
+        controller.start()
+
+        // Stale re-lock: the flow must re-run the unlock auth on its own.
+        try await waitFor("stale re-lock auto re-authed (562 re-sent)", timeout: 10) { [self] in
+            self.phone.authActionCount >= 2
+        }
+        try await waitFor("second unlock completed") { [self] in
+            self.phone.mitrustUnlockCount == 2
+        }
+        try await waitFor("streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(biometricCallCount, 1, "exactly one automatic Touch ID prompt")
+        XCTAssertEqual(phone.openMirrorScreenCount, 1, "the stale re-lock retry must not duplicate OPEN")
+    }
+
+    // Companion boundary: without the lock reporter confirming the unlock
+    // took effect (no locked=false push), a locked resolution after a
+    // pre-mirror unlock is NOT treated as a stale re-lock — the unlock may
+    // never have taken effect on the phone, so the flow shows the lock
+    // mask and the manual 解除鎖定 still works.
+    func testPreMirrorUnlockRelockWithoutReporterConfirmationShowsLockMask() async throws {
+        try makeEnvironment(locked: true)
+        session.start()
+        try await waitFor("trust resolved locked with mirror closed") { [self] in
+            if case .ready(let locked) = self.trustManager.state { return locked }
+            return false
+        }
+
+        trustManager.touchIdPreauthorized = true
+        await trustManager.requestUnlock()
+        try await waitFor("pre-mirror unlock completed") { [self] in
+            self.phone.mitrustUnlockCount == 1
+        }
+        // Screen timeout re-lock — but no reporter pushes this time.
+        phone.setLocked(true)
+
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(
+            phone.authActionCount, 1,
+            "no reporter-confirmed unlock → no automatic re-auth"
+        )
+
+        controller.unlockRequested()
+        try await waitFor("manual unlock completed") { [self] in
+            self.phone.mitrustUnlockCount == 2
+        }
+        try await waitFor("streaming after manual unlock") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
+
+    // Companion boundary: once the unlock_success is older than the grace
+    // window, a locked resolution is an ordinary re-lock — the flow shows
+    // the lock mask instead of re-prompting Touch ID for a stale unlock.
+    func testPreMirrorUnlockRelockBeyondGraceShowsLockMask() async throws {
+        try makeEnvironment(locked: true)
+        controller.staleRelockGrace = 0.3
+        session.start()
+        try await waitFor("trust resolved locked with mirror closed") { [self] in
+            if case .ready(let locked) = self.trustManager.state { return locked }
+            return false
+        }
+
+        trustManager.touchIdPreauthorized = true
+        await trustManager.requestUnlock()
+        try await waitFor("pre-mirror unlock completed") { [self] in
+            self.phone.mitrustUnlockCount == 1
+        }
+        trustManager.notifyExternalLockState(locked: false)
+        // Let the grace window expire before the re-lock + mirror open.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        phone.setLocked(true)
+        trustManager.notifyExternalLockState(locked: true)
+
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(
+            phone.authActionCount, 1,
+            "unlock_success beyond the grace window must not auto re-auth"
+        )
+    }
+
+    // Live 2026-08-13: the 562 auth was in flight when a relay flap killed
+    // the cast session. The old session's finish reset the shared trust
+    // manager — clearing the pending auth wait and neutering its timeout —
+    // so when the phone re-drove the mitrust ceremony on the rebuilt
+    // channel and completed it, the late authEvent was silently dropped
+    // and the mirror sat on 解鎖中/正在連接 with no recovery ("stuck at
+    // unlocking"). The auth wait must survive the rebuild: the re-driven
+    // ceremony completes the unlock with no second Touch ID.
+    func testUnlockSurvivesSessionRebuildMidAuth() async throws {
+        try makeEnvironment(locked: true)
+        // The authEvent is the only unlock signal on this device (its
+        // status queries never answer), so the test asserts the authEvent
+        // path itself survives the rebuild.
+        phone.silentStatusQueries = true
+        trustManager.statusNudgeDelay = 0.1
+        trustManager.maxStatusNudges = 2
+        // Hold the initial ceremony so the release lands while the auth is
+        // still pending; the phone re-drives it on the rebuilt session.
+        phone.withholdMitrustCeremony = true
+        phone.wedgePhysOnRelease = true
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask after nudge fallback") { [self] in
+            self.controller.mask == .locked
+        }
+
+        controller.unlockRequested()
+        try await waitFor("phone received duo.screen authAction (562)") { [self] in
+            self.phone.authActionCount == 1
+        }
+
+        // Relay flap: the session dies mid-auth; the flow rebuilds a fresh
+        // one (the redial on the wedged phys conn stalls and fails).
+        let oldSession: LyraCastTrustSession? = session
+        phone.releaseCastChannel()
+
+        try await waitFor("unlock completed on the rebuilt session", timeout: 25) { [self] in
+            self.phone.mitrustUnlockCount == 1
+        }
+        try await waitFor("streaming, mask cleared") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+        XCTAssertEqual(biometricCallCount, 1, "the rebuilt ceremony must not re-prompt Touch ID")
+        XCTAssertFalse(session === oldSession, "flow must rebuild a fresh session")
+    }
+
+    // Companion: if the session dies mid-auth and the rebuilt dial wedges
+    // (phone-side transport churn), the auth-event timeout must still fire
+    // — the wait survives the session's stop() — and return the flow to
+    // the retryable lock mask instead of stranding 解鎖中 forever.
+    func testUnlockAbortReturnsToLockMaskWhenSessionDiesMidAuth() async throws {
+        try makeEnvironment(locked: true)
+        phone.dropAuthActions = true
+        trustManager.authEventTimeout = 1
+        // The rebuild's first dial wedges, so nothing re-resolves the trust
+        // state within the assertion window — only the auth-event timeout
+        // can bring the mask back.
+        phone.deafToNextDial = true
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+        controller.unlockRequested()
+        try await waitFor("phone received duo.screen authAction (562)") { [self] in
+            self.phone.authActionCount == 1
+        }
+        try await waitFor("unlocking mask while auth in flight") { [self] in
+            self.controller.mask == .unlocking
+        }
+
+        // The session dies mid-auth.
+        controller.sessionInvalidator()
+
+        try await waitFor("auth timeout returns to the lock mask", timeout: 6) { [self] in
+            self.controller.mask == .locked
+        }
+    }
+
+    // Live 2026-08-13 03:29: the unlock succeeded and the mirror was
+    // streaming; 45s later the phone's screen timeout re-armed the
+    // keyguard and the lock reporter pushed locked=true — but the trust
+    // state stayed ready(locked: false), so the Mac kept streaming what
+    // was now the phone's LOCK SCREEN with no mask. A truthful locked
+    // push while unlocked must re-arm the lock state (and the mask);
+    // 解除鎖定 from there still works.
+    func testRelockPushWhileStreamingRestoresLockMask() async throws {
+        try makeEnvironment(locked: true)
+        session.start()
+        controller.start()
+
+        try await waitFor("lock mask") { [self] in
+            self.controller.mask == .locked
+        }
+        controller.unlockRequested()
+        try await waitFor("streaming after unlock") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+
+        // Phone screen timeout re-locks mid-stream; the reporter push is
+        // truthful (KeyguardManager isKeyguardLocked).
+        phone.setLocked(true)
+        trustManager.notifyExternalLockState(locked: true)
+
+        try await waitFor("lock mask re-applied") { [self] in
+            self.controller.mask == .locked
+        }
+        XCTAssertFalse(
+            trustManager.unlockConfirmed,
+            "re-lock must consume the confirmed unlock"
+        )
+
+        controller.unlockRequested()
+        try await waitFor("unlock #2 completed") { [self] in
+            self.phone.mitrustUnlockCount == 2
+        }
+        try await waitFor("streaming again") { [self] in
+            self.controller.stage == .streaming && self.controller.mask == nil
+        }
+    }
 }

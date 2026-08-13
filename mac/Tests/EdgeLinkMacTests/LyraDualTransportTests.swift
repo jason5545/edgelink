@@ -145,7 +145,7 @@ final class LyraDualTransportTests: XCTestCase {
             guard let self else { return }
             let sessionId = UInt64(Date().timeIntervalSince1970 * 1000)
             session.sendScreenAction(.openMirrorScreen(sessionId: sessionId))
-            self.startWFDForCurrentTransport()
+            self.startMirrorMediaForOpen()
         }
         controller.hasRemoteVideo = { [weak self] in
             (self?.videoDatagramsReceived ?? 0) > 0
@@ -200,21 +200,30 @@ final class LyraDualTransportTests: XCTestCase {
         self.session = session
     }
 
-    private func startWFDForCurrentTransport() {
-        switch currentTransport {
-        case .lan:
-            wfdClient?.stop(reason: "replace")
-            let client = XiaomiMirrorWFDClient()
-            client.onSessionEstablished = { [weak self] _ in
-                Task { @MainActor in
-                    self?.controller?.notifyVideoFrame()
-                }
-            }
-            wfdClient = client
-            client.start(host: "127.0.0.1", rtspPort: lanWfdPort, clientRTPPort: clientVideoPort)
-        case .relay:
+    // Models EdgeLinkRuntime.sendXiaomiMirrorOpenScreenViaCastChannel: the
+    // media route after OPEN_MIRROR_SCREEN follows the shared policy — the
+    // relay cloud bridge only when the phone is NOT reachable on the LAN.
+    private func startMirrorMediaForOpen() {
+        if LyraRelayTransportGlue.preferRelayMirrorTransport(
+            relayBridgeAvailable: hostBridge != nil,
+            lanPhoneReachable: lanPhone != nil
+        ) {
             startWFDClientViaTunnel()
+        } else {
+            startWFDViaLAN()
         }
+    }
+
+    private func startWFDViaLAN() {
+        wfdClient?.stop(reason: "replace")
+        let client = XiaomiMirrorWFDClient()
+        client.onSessionEstablished = { [weak self] _ in
+            Task { @MainActor in
+                self?.controller?.notifyVideoFrame()
+            }
+        }
+        wfdClient = client
+        client.start(host: "127.0.0.1", rtspPort: lanWfdPort, clientRTPPort: clientVideoPort)
     }
 
     private func startWFDClientViaTunnel() {
@@ -570,6 +579,26 @@ final class LyraDualTransportTests: XCTestCase {
 
         controller.stop()
         try await driveMirrorFlowToStreaming { self.lanPhone?.openMirrorScreenCount ?? 0 }
+    }
+
+    // Live 2026-08-13: the phone was on the LAN (mesh announces from its
+    // LAN IP arriving the whole time) while the secure session rode the
+    // cloud relay. The mirror OPEN keyed its media route off "relay bridge
+    // exists" and went TURN (RTT ~100ms) instead of the direct LAN WFD
+    // dial, stalling into the cloudflare recovery loop every ~30s. With
+    // the phone reachable on the LAN the media path must prefer the direct
+    // LAN dial even while the relay bridge is up.
+    func testMirrorMediaPrefersLANWhenRelayBridgeAlsoUp() async throws {
+        makeMirrorController()
+        try startLANPhoneAndSession()
+        try await establishRelaySession()
+
+        try await driveMirrorFlowToStreaming { self.lanPhone?.openMirrorScreenCount ?? 0 }
+
+        XCTAssertTrue(
+            lanPhone?.wfdSessionEstablished ?? false,
+            "media must ride the direct LAN WFD dial, not the relay tunnel"
+        )
     }
 }
 

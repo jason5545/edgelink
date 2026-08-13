@@ -29,6 +29,18 @@ enum LyraRelayTransportGlue {
         var log: (String) -> Void = { _ in }
     }
 
+    // Mirror transport policy, shared by the cast-channel dial and the
+    // media route: the cloud-relay bridge is the NO-LAN fallback. Whenever
+    // the phone's mesh is reachable on the LAN (miShare discovery
+    // endpoints), the mirror prefers the direct LAN path even if the
+    // secure session rides the relay — keying the route off "relay bridge
+    // exists" sent every mirror OPEN over TURN on a LAN desk (live
+    // 2026-08-13: RTT ~100ms and a cloudflare stall loop every ~30s) while
+    // LAN mesh announces from the phone were arriving the whole time.
+    static func preferRelayMirrorTransport(relayBridgeAvailable: Bool, lanPhoneReachable: Bool) -> Bool {
+        relayBridgeAvailable && !lanPhoneReachable
+    }
+
     // Binds the relay-datagram bridge to the secure session's send path when
     // the phone is only reachable through the cloud relay. The LAN UDP
     // announcer / cast session stay intact as the fallback; the bridge is

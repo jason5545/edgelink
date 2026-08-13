@@ -100,6 +100,15 @@ final class FakeXiaomiPhone {
     // is counted but no event goes out.
     var dropAuthActions = false
 
+    // The pending unlock is phone-side state: if the session carrying the
+    // 562 dies mid-ceremony, the phone's trustservice re-drives the mitrust
+    // adoption on the next fresh phys conn (live 2026-08-13 relay flap).
+    // withholdMitrustCeremony defers the INITIAL ceremony after authAction
+    // so a test can kill the session before it runs; the re-drive on a new
+    // conn is not gated.
+    var withholdMitrustCeremony = false
+    private var mitrustUnlockPending = false
+
     // The user entered the lock-screen password in the phone's
     // LockScreenUIActivity (the official verify flow): the TA re-provisions
     // its per-boot auth token, the password unlocks the phone itself (the
@@ -148,6 +157,14 @@ final class FakeXiaomiPhone {
                     // answers logi requests on a newly dialed session even
                     // while it ignores them on the torn-down one.
                     self?.wedgedMeshConnection = nil
+                }
+                if self?.mitrustUnlockPending == true {
+                    // The session carrying the pending unlock died
+                    // mid-ceremony: re-drive the adoption on this fresh
+                    // phys conn, like the real trustservice does.
+                    self?.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.startMitrustAdoption()
+                    }
                 }
                 // Fresh KCP state per connection — the real phone does the
                 // same (a redialed/rebooted session restarts sn at 0).
@@ -763,7 +780,10 @@ final class FakeXiaomiPhone {
                     DuoScreenTrust(sessionID: trust.sessionID, msg: .authEvent(event))
                 ))
             } else if locked {
-                runMitrustUnlock()
+                mitrustUnlockPending = true
+                if !withholdMitrustCeremony {
+                    runMitrustUnlock()
+                }
             } else {
                 let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)
                 sendChannelMessage(type: LyraCastMessageType.trust, payload: DuoScreenTrustProto.encode(
@@ -1008,6 +1028,7 @@ final class FakeXiaomiPhone {
             lastAuthTokenA = tokenA
             mitrustUnlockCompleted = true
             mitrustUnlockCount += 1
+            mitrustUnlockPending = false
             locked = false
             log("fakephone.mitrust_unlocked")
             let event = TrustAuthEvent(feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.success)

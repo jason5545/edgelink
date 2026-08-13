@@ -153,4 +153,32 @@ final class LyraRelayTransportGlueTests: XCTestCase {
         XCTAssertTrue(bridge === configuredBridge)
         XCTAssertNotNil(announcer)
     }
+
+    // Mirror transport policy (live 2026-08-13): the relay cloud bridge is
+    // the no-LAN fallback — with the phone reachable on the LAN the mirror
+    // must prefer the direct LAN path even while the relay bridge is up.
+    func testMirrorTransportPrefersLANWhenPhoneReachable() {
+        XCTAssertFalse(
+            LyraRelayTransportGlue.preferRelayMirrorTransport(
+                relayBridgeAvailable: true, lanPhoneReachable: true
+            ),
+            "bridge up + phone on LAN → LAN direct"
+        )
+        XCTAssertTrue(
+            LyraRelayTransportGlue.preferRelayMirrorTransport(
+                relayBridgeAvailable: true, lanPhoneReachable: false
+            ),
+            "bridge up + no LAN → relay cloud bridge"
+        )
+        XCTAssertFalse(
+            LyraRelayTransportGlue.preferRelayMirrorTransport(
+                relayBridgeAvailable: false, lanPhoneReachable: true
+            )
+        )
+        XCTAssertFalse(
+            LyraRelayTransportGlue.preferRelayMirrorTransport(
+                relayBridgeAvailable: false, lanPhoneReachable: false
+            )
+        )
+    }
 }

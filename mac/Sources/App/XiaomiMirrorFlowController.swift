@@ -104,6 +104,19 @@ final class XiaomiMirrorFlowController {
     var channelTimeoutMaxAutoRetries = 1
     private var channelTimeoutRetries = 0
 
+    // Stale re-lock (live 2026-08-13 07:45): the user ran the Touch ID
+    // unlock BEFORE the mirror was streaming; the phone unlocked, then its
+    // screen timeout re-armed the keyguard in the unlock→streaming gap, so
+    // the mirror opened onto a locked status resolution and parked on the
+    // lock mask ("Touch ID 過了但畫面還是鎖的"). When the lock reporter
+    // confirmed that unlock took effect and the locked resolution arrives
+    // within staleRelockGrace of it, treat the lock as a stale re-lock and
+    // re-run the unlock auth (one extra Touch ID prompt) instead of
+    // parking. Each unlock_success buys at most one automatic re-auth, so
+    // a phone that keeps timing out cannot loop prompts.
+    var staleRelockGrace: TimeInterval = 60
+    private var staleRelockRetriedAfter: Date?
+
     init(trustManager: MacTrustManager) {
         self.trustManager = trustManager
         trustManager.onStateChanged = { [weak self] state in
@@ -219,7 +232,12 @@ final class XiaomiMirrorFlowController {
     // and eventually give up to the retryable connect-failed mask.
     func notifyChannelReleased() {
         switch stage {
-        case .opening, .streaming:
+        case .opening, .streaming, .unlocking:
+            // .unlocking included: the 562/mitrust ceremony rides the cast
+            // channel, so losing it mid-auth must rebuild the channel too —
+            // the phone re-drives the pending ceremony on the rebuilt one
+            // (the trust manager keeps the auth wait alive across the
+            // rebuild; live 2026-08-13 relay flap).
             stopMirrorMedia()
             openSent = false
             let now = Date()
@@ -481,6 +499,33 @@ final class XiaomiMirrorFlowController {
                     // return to the lock mask so 解除鎖定 can be retried
                     // instead of sitting on 解鎖中 forever (live 2026-08-11).
                     stage = .opening
+                    mask = .locked
+                } else if stage == .connecting || stage == .opening {
+                    // Mirror start landing on locked: if a reporter-
+                    // confirmed unlock_success is still inside the grace
+                    // window this is a stale re-lock (screen timeout
+                    // re-armed the keyguard before the mirror opened) —
+                    // re-run the unlock auth instead of parking.
+                    if let unlockedAt = trustManager.lastUnlockSuccessAt,
+                       Date().timeIntervalSince(unlockedAt) < staleRelockGrace,
+                       let externalUnlockAt = trustManager.lastExternalUnlockAt,
+                       externalUnlockAt >= unlockedAt,
+                       staleRelockRetriedAfter != unlockedAt,
+                       // State events arrive via a Task hop: by the time
+                       // this runs the manager may already be mid-requery
+                       // (a fresh start() put it back in .queryingStatus).
+                       // Acting on the stale queued event would fire Touch
+                       // ID off a superseded state — and unlockRequested's
+                       // fallback path would redial the healthy channel,
+                       // killing the in-flight query (E2E 2026-08-13).
+                       case .ready(locked: true) = trustManager.state {
+                        staleRelockRetriedAfter = unlockedAt
+                        log(
+                            "xiaomi.mac.mirror_stale_relock_reauth ageMs=\(Int(Date().timeIntervalSince(unlockedAt) * 1000))"
+                        )
+                        unlockRequested()
+                        break
+                    }
                     mask = .locked
                 } else if stage != .unlocking {
                     mask = .locked

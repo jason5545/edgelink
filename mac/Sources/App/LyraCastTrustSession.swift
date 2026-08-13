@@ -292,7 +292,15 @@ final class LyraCastTrustSession {
         teardownServerChannelLocked()
         socket.stop()
         DispatchQueue.main.async { [weak self] in
-            self?.trustManager.stop()
+            guard let self else { return }
+            // A newer session may already have taken over the shared trust
+            // manager by the time this deferred stop runs — resetting it
+            // then clobbers the fresh session's in-flight status query
+            // (live 2026-08-13: a relay flap killed the session mid-auth;
+            // this stop landed after the rebuilt session's start() and
+            // silenced it for ~70s).
+            guard LyraCastTrustSession.activeTrustSession == nil else { return }
+            self.trustManager.stop()
         }
         onFinish?()
     }

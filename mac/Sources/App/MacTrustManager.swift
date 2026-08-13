@@ -23,6 +23,17 @@ final class MacTrustManager: ObservableObject {
     // locked, after its shared-auth query times out), so the lock mask may
     // only be cleared by this confirmed signal.
     private(set) var unlockConfirmed = false
+    // Wall-clock time of the last confirmed duo.screen unlock (authEvent
+    // success). Unlike unlockConfirmed this survives start() — the mirror
+    // flow uses it, together with lastExternalUnlockAt, to recognize a
+    // stale re-lock: the phone's screen timeout re-armed the keyguard in
+    // the gap between a pre-mirror unlock and the mirror actually opening
+    // (live 2026-08-13).
+    private(set) var lastUnlockSuccessAt: Date?
+    // Last time the Android lock reporter pushed "unlocked" (recorded in
+    // notifyExternalLockState). A push at/after lastUnlockSuccessAt proves
+    // the Mac-driven unlock actually took effect on the phone.
+    private(set) var lastExternalUnlockAt: Date?
     // Set when a status event arrives that actually carries keyguard
     // information (success + authEnableStatus=enabled). The official client
     // gets these reliably; our earlier authSettingFirst query made the phone
@@ -137,7 +148,15 @@ final class MacTrustManager: ObservableObject {
         // flow says nothing about the phone's current keyguard (the user may
         // have re-locked while the mirror was stopped).
         unlockConfirmed = false
-        state = .queryingStatus
+        // An in-flight unlock is phone-global (see stop()): the phone
+        // re-drives the mitrust ceremony on the rebuilt channel. Keep the
+        // authenticating state — and with it the auth-event timeout — and
+        // just re-issue the status query on the new channel; resetting to
+        // queryingStatus here would neuter the timeout (its guard requires
+        // .authenticating) and unbound the wait (live 2026-08-13).
+        if state != .authenticating {
+            state = .queryingStatus
+        }
         sendStatusQuery()
         scheduleStatusQueryNudge()
     }
@@ -212,15 +231,22 @@ final class MacTrustManager: ObservableObject {
     }
 
     func stop() {
-        state = .idle
         statusEvent = nil
-        awaitingAuthEvent = false
         awaitingBindEvent = false
         awaitingVerifyEvent = false
         unlockConfirmed = false
         keyguardInfoConfirmed = false
         statusQueryEpoch &+= 1
         statusRetryCount = 0
+        // A pending unlock is phone-global state, not scoped to the session
+        // that carried the 562: the phone re-drives the mitrust ceremony on
+        // whatever channel is current (live 2026-08-13: a relay flap killed
+        // the cast session mid-auth and the phone re-adopted mitrustservice
+        // on the rebuilt channel). Keep the wait — and its timeout — across
+        // the rebuild; clearing it here silently dropped the late authEvent
+        // and wedged the mirror on 解鎖中 with no recovery.
+        if awaitingAuthEvent { return }
+        state = .idle
         authEventEpoch &+= 1
     }
 
@@ -439,6 +465,7 @@ final class MacTrustManager: ObservableObject {
         switch event.code {
         case DuoScreenTrustCode.success:
             unlockConfirmed = true
+            lastUnlockSuccessAt = Date()
             state = .ready(locked: false)
             DiagnosticsLog.info("trust.mac.unlock_success")
             onUnlockSucceeded?()
@@ -506,7 +533,25 @@ final class MacTrustManager: ObservableObject {
     // further Mac-side auth; the verifyEvent may never arrive if the phone
     // tore the channel down on unlock.
     func notifyExternalLockState(locked: Bool) {
-        guard !locked, case .riskBlocked = state else { return }
+        if locked {
+            // The reporter is truthful (KeyguardManager.isKeyguardLocked):
+            // a locked push while we consider the phone unlocked means the
+            // keyguard re-armed (screen timeout, power key) — re-arm the
+            // lock state so the flow shows the mask instead of streaming
+            // the phone's lock screen (live 2026-08-13: mid-stream re-lock
+            // 45s after a successful unlock kept playing behind no mask).
+            // Mid-auth (.authenticating) the ceremony outcome resolves the
+            // state; don't stomp it — the auth-event timeout is guarded on
+            // that state.
+            if case .ready(locked: false) = state {
+                unlockConfirmed = false
+                state = .ready(locked: true)
+                DiagnosticsLog.info("trust.mac.relock_phone_push")
+            }
+            return
+        }
+        lastExternalUnlockAt = Date()
+        guard case .riskBlocked = state else { return }
         awaitingVerifyEvent = false
         unlockConfirmed = true
         state = .ready(locked: false)
