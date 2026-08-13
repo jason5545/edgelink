@@ -472,6 +472,15 @@ final class MacTrustManager: ObservableObject {
         case DuoScreenTrustCode.userCancel, DuoScreenTrustCode.timeoutCancel:
             state = .ready(locked: true)
             DiagnosticsLog.info("trust.mac.unlock_cancelled code=\(event.code)")
+        case DuoScreenTrustCode.terminalAlt:
+            // Transport-level timeout, NOT an unlock refusal: the phone's
+            // quickAuth shared-auth wait expired — typically its 562 went
+            // into a zombie mitrust channel after a cast-session rebuild
+            // (live 2026-08-13 05:53). The cast channel itself is healthy
+            // (usually still streaming), so return to the retryable lock
+            // mask instead of the hard failed → connectFailed path.
+            state = .ready(locked: true)
+            DiagnosticsLog.warn("trust.mac.unlock_transport_timeout code=\(event.code)")
         case DuoScreenTrustCode.retryWithFingerprint:
             state = .ready(locked: true)
             DiagnosticsLog.info("trust.mac.unlock_retry_requested")

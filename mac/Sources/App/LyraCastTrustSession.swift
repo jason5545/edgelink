@@ -300,6 +300,38 @@ final class LyraCastTrustSession {
         }
     }
 
+    // Actively releases the phone-dialed mitrustservice conn before our
+    // socket dies. Without this the phone's mitrust channel client only
+    // learns the conn is dead from the phys heartbeat (~17-20s); a 562
+    // landing in that zombie window goes nowhere and the phone's quickAuth
+    // shared-auth wait expires ~10s later → authEvent code=1, a
+    // user-perceived stall (live 2026-08-13 05:53: cast-channel idle
+    // auto-release → redial_timeout → session fail left the phone's mitrust
+    // channel a zombie; the manual retry after the window succeeded). The
+    // official server→phone disconnect precedent is the 52011 release
+    // phones send us. With the conn released the phone tears its channel
+    // client down NOW and the next 562 drives a fresh adoption.
+    //
+    // Returns true when a disconnect was sent: NWConnection.send is
+    // asynchronous, so cancel()ing the socket in the same queue turn would
+    // drop the queued datagram — the caller must then give the socket a
+    // short flush beat before stopping it.
+    @discardableResult
+    private func sendMitrustDisconnectLocked() -> Bool {
+        guard srvConnId != 0 else { return false }
+        var payload = Data()
+        LyraProtoWriter.appendVarintField(1, value: 52011, to: &payload)
+        let inner = LogiConnInnerFrame(frameType: 4, payload: .disconnect(payload))
+        let logiConn = LogiConnFrame(
+            logiConnId: srvConnId, localNetId: 1, remoteNetId: srvPeerNetId,
+            inner: inner.serialized()
+        )
+        let miFrame = MiConnectFrame(version: 0, logiConnFrames: [logiConn])
+        send(frame: LyraMeshPack.Frame(packType: 2, payload: miFrame.serialized()), label: "mitrust_disconnect")
+        srvConnId = 0
+        return true
+    }
+
     private func finishLocked() {
         cancelled = true
         if LyraCastTrustSession.activeTrustSession === self {
@@ -312,7 +344,20 @@ final class LyraCastTrustSession {
         mirrorCallRelay?.teardown()
         mirrorCallRelay = nil
         teardownServerChannelLocked()
-        socket.stop()
+        if sendMitrustDisconnectLocked() {
+            // Flush beat before the socket dies (see above). onFinish rides
+            // the delayed stop: rebuilds keyed on onFinish replace this
+            // session's (possibly shared relay) pipes, and a stop landing
+            // after them would kill the fresh dial.
+            queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self else { return }
+                self.socket.stop()
+                self.onFinish?()
+            }
+        } else {
+            socket.stop()
+            onFinish?()
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // A newer session may already have taken over the shared trust
@@ -324,7 +369,6 @@ final class LyraCastTrustSession {
             guard LyraCastTrustSession.activeTrustSession == nil else { return }
             self.trustManager.stop()
         }
-        onFinish?()
     }
 
     private func teardownPhysAfterAuth() {
@@ -344,7 +388,14 @@ final class LyraCastTrustSession {
         mirrorCallRelay?.teardown()
         mirrorCallRelay = nil
         teardownServerChannelLocked()
-        socket.stop()
+        if sendMitrustDisconnectLocked() {
+            // Flush beat before the socket dies (see sendMitrustDisconnectLocked).
+            queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.socket.stop()
+            }
+        } else {
+            socket.stop()
+        }
     }
 
     private func send(frame: LyraMeshPack.Frame, label: String) {

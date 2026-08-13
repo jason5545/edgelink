@@ -560,6 +560,16 @@ public final class LyraCastRole: LyraServiceHandler {
     // quick-conn) speaking ONLY the official 82 58 packet format on the
     // mitrust channel (live 2026-08-11). Applies to the pipe dial path.
     public var mitrustSpeaksOfficial = false
+    // The phone's mitrust channel client as the PHONE sees it: once connected
+    // it stays live across a Mac cast-session teardown until an explicit logi
+    // disconnect arrives — phys-heartbeat discovery takes ~17-20s, and a 562
+    // landing in that zombie window reuses the dead-end channel and
+    // kcp-times-out into authEvent code=1 (live 2026-08-13 05:53: idle
+    // auto-release → redial_timeout → session fail → zombie unlock). Cleared
+    // by handleMitrustLogiConn when the Mac's teardown sends the server→phone
+    // disconnect for the adopted conn.
+    public private(set) var mitrustChannelClientLive = false
+    public private(set) var mitrustDisconnectCount = 0
     private var mitrustPipe: LyraChannelDatagramPipe?
     private var mitrustSendSn: UInt32 = 0
     private var mitrustRecvUna: UInt32 = 0
@@ -583,7 +593,18 @@ public final class LyraCastRole: LyraServiceHandler {
         let epoch = mitrustUnlockEpoch
         mitrustRunCompleted = false
         queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.startMitrustAdoption()
+            guard let self else { return }
+            if self.mitrustChannelClientLive {
+                // Score-based reuse: the real phone's trustservice runs a new
+                // 562 on its LIVE mitrust channel client instead of dialing a
+                // fresh adoption. If the Mac end died with the old session
+                // (and never sent the release), every frame goes nowhere and
+                // the watchdog above fires code=1 — the zombie window.
+                self.onEvent("mitrust reusing live channel client")
+                self.sendMitrustJSON(["event_name": 595, "client_hello": "client_hello"])
+                return
+            }
+            self.startMitrustAdoption()
         }
         queue.asyncAfter(deadline: .now() + mitrustUnlockTimeout) { [weak self] in
             guard let self, !self.stopped,
@@ -661,6 +682,22 @@ public final class LyraCastRole: LyraServiceHandler {
             sendMitrustKeyAgree(server: server)
         case .upgrade(let data):
             handleMitrustKeyAgreeReply(data, server: server)
+        case .disconnect:
+            // Server→phone release (the official 52011 disconnect precedent):
+            // the Mac session teardown actively released the adopted
+            // mitrustservice conn — drop the channel client NOW instead of
+            // discovering the dead conn via phys heartbeat (~17-20s zombie
+            // window where a 562 would kcp-timeout into code=1).
+            mitrustDisconnectCount += 1
+            mitrustChannelClientLive = false
+            mitrustConnId = 0
+            mitrustSessionKey = nil
+            mitrustServerPort = 0
+            mitrustConnection?.cancel()
+            mitrustConnection = nil
+            mitrustPipe?.stop()
+            mitrustPipe = nil
+            onEvent("mitrust conn released by peer disconnect")
         default:
             break
         }
@@ -791,6 +828,7 @@ public final class LyraCastRole: LyraServiceHandler {
         mitrustPipe = pipe
         pipe.onNegotiated = { [weak self] _, _ in
             self?.queue.async {
+                self?.mitrustChannelClientLive = true
                 self?.sendMitrustJSON(["event_name": 595, "client_hello": "client_hello"])
             }
         }
@@ -808,6 +846,7 @@ public final class LyraCastRole: LyraServiceHandler {
     }
 
     private func sendMitrustNegotiation() {
+        mitrustChannelClientLive = true
         let tlv = LyraExpressTLV.oneOfNode(
             tag: 0xFFFF,
             selectedTag: 0,

@@ -807,6 +807,127 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         }
     }
 
+    // Live 2026-08-13 05:53 (LAN 直連): the phone's Mirror app idle-auto-
+    // released the cast channel (~5s), the redial went unanswered,
+    // redial_timeout failed the session, and the session teardown killed the
+    // mitrust server channel — but the phone's mitrust channel CLIENT only
+    // learns a dead conn from the phys heartbeat (~17-20s). A 562 landing in
+    // that zombie window went nowhere and the phone's quickAuth shared-auth
+    // wait expired ~10s later: authEvent code=1, a user-perceived stall
+    // (a manual retry after the window succeeded). The session teardown
+    // must actively release the adopted mitrustservice conn (logi
+    // disconnect, the official server→phone 52011 precedent) so the phone
+    // drops the zombie immediately and the next unlock drives a fresh
+    // adoption.
+    func testTrustUnlockAfterSessionRebuildClearsZombieMitrustChannel() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true, castOverLAN: true)
+        let phone = try XCTUnwrap(self.phone)
+        let firstSession = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        // Pure-LAN adoption: the real phone's channel client dials the
+        // advertised Mac UDP port directly, not a relay bridge pipe.
+        phone.cast.mitrustChannelFactory = nil
+        phone.cast.mitrustUnlockTimeout = 5
+        firstSession.start()
+        controller.start()
+
+        try await waitFor("cast channel ready") { [weak firstSession] in
+            firstSession?.isChannelReady == true
+        }
+        try await waitFor("lock mask from truthful locked status") { [weak controller] in
+            controller?.mask == .locked
+        }
+        controller.unlockRequested()
+        try await waitFor("first unlock completed") {
+            phone.cast.mitrustUnlockCompleted
+        }
+        try await waitFor("phone mitrust channel client live") {
+            phone.cast.mitrustChannelClientLive
+        }
+
+        // Session fail (idle auto-release → redial unanswered →
+        // redial_timeout): the flow drops the dead session and builds a
+        // fresh one. The dead session's teardown must actively release the
+        // phone's mitrust channel client, or it stays a zombie.
+        controller.sessionFactory("session_fail_rebuild")
+        try await waitFor("fresh session rebuilt") { [weak self] in
+            guard let session = self?.session else { return false }
+            return session !== firstSession
+        }
+        try await waitFor("phone dropped the zombie mitrust channel client") {
+            phone.cast.mitrustDisconnectCount == 1 && !phone.cast.mitrustChannelClientLive
+        }
+        try await waitFor("rebuilt cast channel ready") { [weak self] in
+            self?.session?.isChannelReady == true
+        }
+
+        // The phone's screen timeout re-armed the keyguard in the gap; the
+        // user re-opens the mirror window (fresh flow on the rebuilt
+        // session) and unlocks again.
+        phone.cast.setLocked(true)
+        controller.stop()
+        controller.start()
+        try await waitFor("lock mask on rebuilt session") { [weak controller] in
+            controller?.mask == .locked
+        }
+        controller.unlockRequested()
+        try await waitFor("second unlock completed via fresh adoption") {
+            phone.cast.mitrustUnlockCount == 2
+        }
+        XCTAssertEqual(
+            phone.cast.mitrustUnlockTimedOutCount, 0,
+            "no zombie-window kcp-timeout code=1 — teardown must release the phone's channel client"
+        )
+        try await waitFor("mask cleared after second unlock") { [weak controller] in
+            controller?.mask == nil
+        }
+    }
+
+    // authEvent code=1 (terminalAlt) is the phone's quickAuth shared-auth
+    // TRANSPORT timeout (its 562 went into a dead-end mitrust channel), not
+    // an unlock refusal — the cast channel itself is healthy, usually still
+    // streaming. It must return to the retryable locked state, not the hard
+    // .failed → connectFailed path.
+    func testAuthEventTerminalAltReturnsToRetryableLocked() async throws {
+        let trustManager = MacTrustManager()
+        trustManager.sendFrame = { _ in }
+        trustManager.start()
+        var auth = TrustAuthStatus()
+        auth.features = [DuoScreenTrustFeature.unlockDevice]
+        auth.enableStatus = DuoScreenTrustEnableStatus.enabled.rawValue
+        auth.bindStatus = DuoScreenTrustBindStatus.bound.rawValue
+        var status = TrustStatusEvent()
+        status.code = DuoScreenTrustCode.success
+        status.localKeyguardStatus = DuoScreenKeyguardStatus.valid
+        status.remoteKeyguardStatus = 1
+        status.auth = auth
+        trustManager.handleFrame(DuoScreenProtocolV1.encodeFrame(
+            type: DuoScreenProtocolV1.typeTrust,
+            payload: DuoScreenTrustProto.encode(DuoScreenTrust(sessionID: 0, msg: .statusEvent(status)))
+        ))
+        guard case .ready(locked: true) = trustManager.state else {
+            XCTFail("expected ready(locked: true), got \(trustManager.state)")
+            return
+        }
+        trustManager.touchIdPreauthorized = true
+        await trustManager.requestUnlock()
+        XCTAssertEqual(trustManager.state, .authenticating)
+
+        let event = TrustAuthEvent(
+            feature: DuoScreenTrustFeature.unlockDevice, code: DuoScreenTrustCode.terminalAlt
+        )
+        trustManager.handleFrame(DuoScreenProtocolV1.encodeFrame(
+            type: DuoScreenProtocolV1.typeTrust,
+            payload: DuoScreenTrustProto.encode(DuoScreenTrust(sessionID: 0, msg: .authEvent(event)))
+        ))
+        XCTAssertEqual(
+            trustManager.state, .ready(locked: true),
+            "code=1 is a transport timeout — the lock mask must stay retryable, not connectFailed"
+        )
+        XCTAssertFalse(trustManager.awaitingAuthEvent)
+    }
+
     private func driveUnlockToStreaming() async throws {
         let phone = try XCTUnwrap(self.phone)
         let session = try XCTUnwrap(self.session)
