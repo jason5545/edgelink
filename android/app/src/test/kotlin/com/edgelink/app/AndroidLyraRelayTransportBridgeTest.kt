@@ -632,6 +632,57 @@ class AndroidLyraRelayTransportBridgeTest {
     }
 
     @Test
+    fun announcedChannelListenBindsReverseListenerWithoutSnoop() = runBlocking {
+        // Live 2026-08-13: the responseOfPeerPort snoop is loss-fragile
+        // (mid-ceremony relay rebuild / reassembly gap reset) — a missed
+        // snoop left no reverse listener and the phone's channel-client dial
+        // went into a loopback void (562 kcp-timeout → authEvent code=1).
+        // The Mac now announces the port out-of-band via relay.channel.listen
+        // right before the responseOfPeerPort; the bridge must bind the
+        // reverse listener from the envelope alone, no snoop involved.
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        val dialedPort = 54_323
+        try {
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_CHANNEL_LISTEN,
+                JsonObject(mapOf("p" to kotlinx.serialization.json.JsonPrimitive(dialedPort)))
+            )
+            assertTrue(
+                "reverse listener should be bound for the announced port",
+                waitFor { bridge.reverseChannelPorts().contains(dialedPort) }
+            )
+            // The phone's channel client dials the advertised port; the
+            // datagrams must leave stamped with p=<port> so the Mac bridge
+            // routes them to its mitrust pipe.
+            val client = DatagramSocket(0, InetAddress.getLoopbackAddress())
+            try {
+                val negotiation = byteArrayOf(0x01, 0x01, 0xCC.toByte(), 0xDD.toByte())
+                client.send(DatagramPacket(negotiation, negotiation.size, InetAddress.getLoopbackAddress(), dialedPort))
+                assertTrue(
+                    "phone-dialed datagram should be emitted with p=$dialedPort",
+                    waitFor {
+                        emitted.any { body ->
+                            body.p == dialedPort &&
+                                (RelayDatagram.decode(body)?.contentEquals(negotiation) == true)
+                        }
+                    }
+                )
+            } finally {
+                client.close()
+            }
+        } finally {
+            bridge.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun snoopedPeerPortBindsReverseListenerAndStampsDialedPort() = runBlocking {
         // The Mac's mitrust responseOfPeerPort crosses a mesh flow as a
         // plaintext packType-5 command; the bridge must snoop it, bind a

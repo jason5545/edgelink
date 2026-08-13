@@ -12,6 +12,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonPrimitive
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
@@ -80,10 +82,27 @@ class AndroidLyraRelayTransportBridge(
 
     companion object {
         fun handles(type: String): Boolean =
-            type == EnvelopeTypes.RELAY_MESH_DATAGRAM || type == EnvelopeTypes.RELAY_CHANNEL_DATAGRAM
+            type == EnvelopeTypes.RELAY_MESH_DATAGRAM || type == EnvelopeTypes.RELAY_CHANNEL_DATAGRAM ||
+                type == EnvelopeTypes.RELAY_CHANNEL_LISTEN
     }
 
     suspend fun handleEnvelope(type: String, body: JsonObject) {
+        if (type == EnvelopeTypes.RELAY_CHANNEL_LISTEN) {
+            // The Mac announces a server channel port it hosts (the
+            // mitrustservice pipe) out-of-band, right before its
+            // responseOfPeerPort. Bind the reverse listener directly instead
+            // of relying on the snooper: the snoop taps the response off the
+            // mesh KCP stream and is loss-fragile (mid-ceremony relay
+            // rebuild / reassembly gap reset — live 2026-08-13: snoop
+            // missed, no listener, the phone's channel-client dial went into
+            // a loopback void, ~10s kcp trans timeout → authEvent code=1).
+            val port = body["p"]?.let { runCatching { it.jsonPrimitive.int }.getOrNull() }
+            if (port == null || port !in 1..65_535) return
+            bindReverseChannel(port) {
+                log("xiaomi.relaybridge.android.channel_listen_rx port=$port")
+            }
+            return
+        }
         val relayBody = runCatching {
             EnvelopeCodec.json.decodeFromJsonElement<RelayDatagramBody>(body)
         }.getOrNull() ?: return
@@ -222,6 +241,18 @@ class AndroidLyraRelayTransportBridge(
     // to a Mac-side port. Bind the reverse listener the phone's channel
     // client is about to dial.
     private fun onPeerPortSnooped(clientChannelId: Long, port: Int) {
+        bindReverseChannel(port) {
+            log(
+                "xiaomi.relaybridge.android.peer_port_snooped " +
+                    "clientChannelId=$clientChannelId port=$port"
+            )
+        }
+    }
+
+    // Binds the reverse listener for a Mac server channel port, whether the
+    // port was learned from the snooped responseOfPeerPort or announced
+    // out-of-band via relay.channel.listen. onBound runs only on a fresh bind.
+    private fun bindReverseChannel(port: Int, onBound: () -> Unit) {
         synchronized(lock) {
             if (reverseChannelFlows.containsKey(port)) return
             if (reverseChannelFlows.size >= 8) {
@@ -231,10 +262,7 @@ class AndroidLyraRelayTransportBridge(
             val flow = ReverseChannelFlow(port, scope, ::emitReverseDatagram, log)
             if (flow.start()) {
                 reverseChannelFlows[port] = flow
-                log(
-                    "xiaomi.relaybridge.android.peer_port_snooped " +
-                        "clientChannelId=$clientChannelId port=$port"
-                )
+                onBound()
             }
         }
     }

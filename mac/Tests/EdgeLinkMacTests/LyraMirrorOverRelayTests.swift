@@ -52,6 +52,11 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     private var castIsLAN = false
     private var lanPhoneMeshPort: UInt16 = 0
     private var lanCastChannelPort: UInt16 = 0
+    // Models a phone bridge new enough to handle the relay.channel.listen
+    // envelope (binding the reverse listener out-of-band). False = legacy
+    // phone bridge that ignores the unknown envelope and relies on the
+    // loss-fragile responseOfPeerPort snoop only.
+    private var phoneHandlesChannelListen = true
 
     // When set, the relay session pair crosses an impaired link (cloud-relay
     // conditions) instead of the perfect loopback. Configure before calling
@@ -176,7 +181,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         let hostSessionBox = SessionBox()
         let hostBridge = LyraRelayTransportBridge(sendHandler: { data in
             try await hostSessionBox.session?.sendPlaintext(data)
-        })
+        }, log: { DiagnosticsLog.info("harness.hostbridge.\($0)") })
         let hostSession = LyraRelaySession(
             channel: hostChannel,
             identity: hostIdentity,
@@ -196,7 +201,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         let clientSessionBox = SessionBox()
         let clientBridge = LyraRelayTransportBridge(sendHandler: { data in
             try await clientSessionBox.session?.sendPlaintext(data)
-        })
+        }, log: { DiagnosticsLog.info("harness.clientbridge.\($0)") })
         let phoneTunnel = LyraTunnelBridge(sendHandler: { data in
             try await clientSessionBox.session?.sendPlaintext(data)
         })
@@ -274,10 +279,20 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         }
         // The real phone's mitrust channel dial crosses the relay too: the
         // phone bridge's reverse listener stamps the advertised Mac port onto
-        // every envelope, and the Mac bridge routes by that stamp. Mimic it
-        // with a bridge channel pipe keyed by the dialed port.
-        phone.cast.mitrustChannelFactory = { [weak clientBridge] port in
-            clientBridge?.channelPipe(port: port)
+        // every envelope, and the Mac bridge routes by that stamp. The
+        // listener exists iff the bridge learned the port — snooped from the
+        // responseOfPeerPort, or bound from the Mac's out-of-band
+        // relay.channel.listen envelope (listen-capable phone bridges).
+        // mitrustChannelDialUnreachable models the snoop miss: then only the
+        // announced listener can still reach the Mac's pipe.
+        phone.cast.mitrustChannelFactory = { [weak self, weak clientBridge] port in
+            guard let bridge = clientBridge else { return nil }
+            if self?.phone?.cast.mitrustChannelDialUnreachable == true {
+                let announced = bridge.announcedChannelListeners.contains(Int(port))
+                let listenCapable = self?.phoneHandlesChannelListen ?? true
+                guard announced, listenCapable else { return nil }
+            }
+            return bridge.channelPipe(port: port)
         }
         phone.cast.setLocked(locked)
         phone.onEvent = { event in
@@ -734,6 +749,80 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         let phone = try XCTUnwrap(self.phone)
         phone.cast.mitrustSpeaksOfficial = true
         try await driveUnlockToStreaming()
+    }
+
+    // Live 2026-08-13 07:01 (pure relay): the mitrust ceremony itself
+    // completed over the relay-carried conn — sync_info, the type=5 "bad
+    // server notify message" alert (the benign AccountPair cred-wall
+    // rejection, present in every successful LAN ceremony too), KeyAgree
+    // fallback, logi, responseOfPeerPort — then silence: the phone bridge's
+    // reverse listener never learned the advertised channel port (the relay
+    // session was rebuilt mid-ceremony / the snooper's reassembly gap
+    // reset), so the phone's channel client dialed into the void and ~10s
+    // later quickAuth kcp-timed-out into authEvent code=1. The alert is a
+    // red herring — the killer is the unreachable channel dial. This test
+    // models a LEGACY phone bridge that ignores the relay.channel.listen
+    // envelope, so the snoop miss is fatal; the Mac must surface code=1 as
+    // the retryable lock mask, not a hard failure.
+    func testTrustUnlockOverCloudRelayWhenChannelDialUnreachable() async throws {
+        try await establishRelaySession()
+        phoneHandlesChannelListen = false
+        try await startMirrorEnds(locked: true)
+        let phone = try XCTUnwrap(self.phone)
+        let session = try XCTUnwrap(self.session)
+        let controller = try XCTUnwrap(self.controller)
+        phone.cast.mitrustChannelDialUnreachable = true
+        phone.cast.mitrustUnlockTimeout = 5
+        session.start()
+        controller.start()
+
+        try await waitFor("cast channel ready over relay") { [weak session] in
+            session?.isChannelReady == true
+        }
+        try await waitFor("lock mask from truthful locked status") {
+            controller.mask == .locked
+        }
+        try await waitFor("OPEN sent even while locked (official)") {
+            phone.cast.openMirrorScreenCount >= 1
+        }
+
+        controller.unlockRequested()
+
+        try await waitFor("phone received duo.screen authAction (562)") {
+            phone.cast.authActionCount >= 1
+        }
+        // The ceremony runs (the Mac answers sync_info / keyagree / logi /
+        // peer-port over the relay-carried mesh conn) but the channel dial
+        // blackholes, so the 595/546/562 exchange never starts and the
+        // phone's quickAuth wait kcp-times-out into code=1.
+        try await waitFor("phone kcp-timed-out into authEvent code=1") {
+            phone.cast.mitrustUnlockTimedOutCount == 1
+        }
+        XCTAssertFalse(phone.cast.mitrustUnlockCompleted)
+        // code=1 is a transport timeout, not an unlock refusal: the mask
+        // must return to the retryable locked state, never connectFailed.
+        // (The locked-screen video keeps streaming underneath, so the stage
+        // may already be .streaming — the mask is the user-visible surface.)
+        try await waitFor("mask back to retryable locked") {
+            controller.mask == .locked
+        }
+    }
+
+    // The fix for the snoop-miss failure above: the Mac announces the
+    // mitrust channel port out-of-band (relay.channel.listen) right before
+    // the responseOfPeerPort, so a listen-capable phone bridge binds its
+    // reverse listener without depending on the lossy snoop. The snoop miss
+    // is then irrelevant — the dial lands and the unlock completes.
+    func testTrustUnlockOverCloudRelayWhenChannelDialUnreachableButAnnounced() async throws {
+        try await establishRelaySession()
+        try await startMirrorEnds(locked: true)
+        let phone = try XCTUnwrap(self.phone)
+        phone.cast.mitrustChannelDialUnreachable = true
+        try await driveUnlockToStreaming()
+        XCTAssertEqual(
+            phone.cast.mitrustUnlockTimedOutCount, 0,
+            "the announced reverse listener must carry the dial — no kcp-timeout code=1"
+        )
     }
 
     // Live 2026-08-12: the phone's trustservice dialed mitrustservice

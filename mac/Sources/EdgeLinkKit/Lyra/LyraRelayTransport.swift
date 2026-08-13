@@ -28,6 +28,21 @@ public struct RelayDatagramBody: Codable, Equatable, Sendable {
     }
 }
 
+// relay.channel.listen body: asks the peer's relay bridge to bind a reverse
+// channel listener for the Xiaomi server port `p` out-of-band. Sent by the
+// side hosting a phone-dialed server channel (the Mac's mitrustservice)
+// right before the responseOfPeerPort, so the phone bridge no longer depends
+// on snooping that response off the mesh stream — the snoop is loss-fragile
+// (mid-ceremony relay rebuild / reassembly gap reset, live 2026-08-13) and a
+// missed snoop sends the phone's channel-client dial into a loopback void.
+public struct RelayChannelListenBody: Codable, Equatable, Sendable {
+    public let p: Int
+
+    public init(p: Int) {
+        self.p = p
+    }
+}
+
 // MARK: - Mesh datagram pipe
 // The transport surface the mesh endpoints (Mac announcer / relayCall server
 // side, phone mesh endpoint) need from LyraMeshSocket. A UDP socket and a

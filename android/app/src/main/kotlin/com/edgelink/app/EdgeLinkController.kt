@@ -3210,7 +3210,8 @@ private class AndroidCommandDispatcher(
                 onTunnelEnvelope(type, body)
                 null
             }
-            EnvelopeTypes.RELAY_MESH_DATAGRAM, EnvelopeTypes.RELAY_CHANNEL_DATAGRAM -> {
+            EnvelopeTypes.RELAY_MESH_DATAGRAM, EnvelopeTypes.RELAY_CHANNEL_DATAGRAM,
+            EnvelopeTypes.RELAY_CHANNEL_LISTEN -> {
                 val type = EnvelopeCodec.type(plaintext)
                 val envelope = EnvelopeCodec.json.decodeFromString<kotlinx.serialization.json.JsonObject>(plaintext.decodeToString())
                 val body = envelope["b"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())

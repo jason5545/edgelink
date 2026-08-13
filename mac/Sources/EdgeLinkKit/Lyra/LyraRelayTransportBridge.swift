@@ -27,6 +27,12 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
     // with "p" route here; unstamped envelopes keep landing on `channel` (the
     // Mac-dialed cast/relayCall pipe) for backward compatibility.
     private var channelPipes: [Int: LyraVirtualChannelPipe] = [:]
+    // Server channel ports the PEER announced out-of-band via
+    // relay.channel.listen (the peer hosts a phone-dialed server channel and
+    // wants our reverse listener up before its responseOfPeerPort arrives).
+    // Production Mac never dials such channels; the test harness's phone-side
+    // bridge gates its reverse-listener model on this set.
+    public private(set) var announcedChannelListeners: Set<Int> = []
 
     public init(
         mesh: LyraVirtualMeshPipe = LyraVirtualMeshPipe(),
@@ -72,6 +78,7 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
 
     public static func handles(_ type: String) -> Bool {
         type == EnvelopeType.relayMeshDatagram || type == EnvelopeType.relayChannelDatagram
+            || type == EnvelopeType.relayChannelListen
     }
 
     // The channel pipe for a phone-dialed server channel (mitrustservice on a
@@ -110,6 +117,18 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
     }
 
     public func handleEnvelope(type: String, plaintext: Data) {
+        if type == EnvelopeType.relayChannelListen {
+            guard let envelope = try? JSONDecoder().decode(Envelope<RelayChannelListenBody>.self, from: plaintext)
+            else {
+                log("relay.transport_bad_envelope type=\(type)")
+                return
+            }
+            lock.lock()
+            announcedChannelListeners.insert(envelope.b.p)
+            lock.unlock()
+            log("relay.channel_listen_rx port=\(envelope.b.p)")
+            return
+        }
         guard let envelope = try? JSONDecoder().decode(Envelope<RelayDatagramBody>.self, from: plaintext),
               let datagram = Data(base64Encoded: envelope.b.payload), !datagram.isEmpty
         else {
@@ -138,6 +157,29 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
         default:
             break
         }
+    }
+
+    // Announces a server channel port we host (the mitrustservice pipe) so
+    // the peer's bridge binds its reverse listener directly instead of
+    // snooping the responseOfPeerPort off the lossy mesh stream.
+    public func announceChannelListener(port: UInt16) {
+        let sendHandler = sendHandler
+        let log = log
+        lock.lock()
+        let previous = lastSend
+        let next = Task {
+            await previous?.value
+            do {
+                let body = RelayChannelListenBody(p: Int(port))
+                let encoded = try JSONEncoder().encode(Envelope(t: EnvelopeType.relayChannelListen, b: body))
+                try await sendHandler(encoded)
+            } catch {
+                log("relay.transport_send_failed type=\(EnvelopeType.relayChannelListen) error=\(error)")
+            }
+        }
+        lastSend = next
+        lock.unlock()
+        log("relay.channel_listen_tx port=\(port)")
     }
 
     private func enqueue(_ type: String, _ datagram: Data, flow: Int, dialPort: UInt16? = nil) {

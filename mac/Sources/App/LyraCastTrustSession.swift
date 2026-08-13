@@ -1536,6 +1536,17 @@ final class LyraCastTrustSession {
         }
         mitrustPeerPortChannelId = channelId
         mitrustPeerPort = port
+        // Bind the phone bridge's reverse listener out-of-band BEFORE the
+        // responseOfPeerPort teaches the phone's trustservice the port. The
+        // phone bridge's snooper taps that response off the mesh stream, but
+        // the tap is loss-fragile (mid-ceremony relay rebuild / reassembly
+        // gap reset — live 2026-08-13 07:01: snoop missed, no reverse
+        // listener, the phone's channel-client dial went into a loopback
+        // void, ~10s kcp trans timeout → authEvent code=1). The ordered
+        // send chain puts this envelope ahead of the response, so a
+        // listen-capable phone bridge is guaranteed to be bound before the
+        // channel client can dial.
+        srvChannelBridge?.announceChannelListener(port: port)
         sendMitrustPeerPortResponseIfReady()
     }
 

@@ -91,6 +91,7 @@ object EnvelopeTypes {
     const val XIAOMI_LYRA_SEED_RESULT = "xiaomi.lyraSeedResult"
     const val RELAY_MESH_DATAGRAM = "relay.mesh.datagram"
     const val RELAY_CHANNEL_DATAGRAM = "relay.channel.datagram"
+    const val RELAY_CHANNEL_LISTEN = "relay.channel.listen"
 }
 
 object EnvelopeCodec {

@@ -560,6 +560,16 @@ public final class LyraCastRole: LyraServiceHandler {
     // quick-conn) speaking ONLY the official 82 58 packet format on the
     // mitrust channel (live 2026-08-11). Applies to the pipe dial path.
     public var mitrustSpeaksOfficial = false
+    // Live 2026-08-13 07:01 (pure relay): the phone's channel client dials
+    // the advertised port on loopback, which only reaches the Mac when the
+    // phone bridge's reverse listener caught the responseOfPeerPort. When
+    // that snoop misses (relay session rebuilt mid-ceremony / reassembly
+    // gap reset), the dial goes nowhere — nothing reaches the Mac's mitrust
+    // pipe, the channel never negotiates, and the unlock watchdog below
+    // fires authEvent code=1. The Mac log shows the full ceremony (incl.
+    // the benign type=5 "bad server notify" AccountPair rejection) then
+    // silence after peer_port_tx. Set to model that dead-end dial.
+    public var mitrustChannelDialUnreachable = false
     // The phone's mitrust channel client as the PHONE sees it: once connected
     // it stays live across a Mac cast-session teardown until an explicit logi
     // disconnect arrives — phys-heartbeat discovery takes ~17-20s, and a 562
@@ -576,13 +586,13 @@ public final class LyraCastRole: LyraServiceHandler {
     private var mitrustSessionKeyHex: String?
     private var saidB = Data()
 
-    // Live 2026-08-13: when the 562's mitrust channel never completes (the
-    // Mac advertised an endpoint this phys conn's transport can't reach),
-    // the phone's channel client kcp-times-out ~10s after the authAction and
-    // the authEvent comes back code=1 (terminalAlt) — the alternating
-    // success/code=1 pattern depended on which phys conn carried the
-    // adoption. 0 disables the watchdog (ceremony always completes in tests
-    // that never exercise the stuck path within the default window).
+    // Live 2026-08-13 (pure relay): when the 562's mitrust channel never
+    // completes (the Mac advertised an endpoint this phys conn's transport
+    // can't reach), the phone's channel client kcp-times-out ~10s after the
+    // authAction and the authEvent comes back code=1 (terminalAlt) — the
+    // alternating success/code=1 pattern depended on which phys conn carried
+    // the adoption. 0 disables the watchdog (ceremony always completes in
+    // tests that never exercise the stuck path within the default window).
     public var mitrustUnlockTimeout: TimeInterval = 10
     private var mitrustUnlockEpoch: UInt64 = 0
     private var mitrustRunCompleted = false
@@ -798,8 +808,19 @@ public final class LyraCastRole: LyraServiceHandler {
     // MARK: - mitrust channel client (595/546/562)
 
     private func connectMitrustChannel() {
+        // The factory models the phone bridge's reverse listener: it hands
+        // out a pipe only when the listener exists for the dialed port —
+        // snooped from the responseOfPeerPort, or bound from the Mac's
+        // out-of-band relay.channel.listen envelope.
         if let pipe = mitrustChannelFactory.flatMap({ $0(mitrustServerPort) }) {
             connectMitrustChannelViaPipe(pipe)
+            return
+        }
+        if mitrustChannelDialUnreachable {
+            // Snoop missed and no out-of-band listener either: the channel
+            // client's datagrams die on loopback. The Mac sees silence; the
+            // stuck watchdog fires the code=1 authEvent.
+            onEvent("mitrust channel dial unreachable port=\(mitrustServerPort) (no reverse listener)")
             return
         }
         guard mitrustServerPort != 0, mitrustConnection == nil else { return }
