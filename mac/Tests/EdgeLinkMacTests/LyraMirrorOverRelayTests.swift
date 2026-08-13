@@ -55,6 +55,13 @@ final class LyraMirrorOverRelayTests: XCTestCase {
 
     // Unique port block per test (the WFD TCP listener and the video UDP
     // listener bind real sockets; the previous test's release is async).
+    // Class-wide range 30_101...30_999 — must not overlap the other
+    // harnesses' ranges (29_101+ MirrorFlowE2ETests, 31_101+ call relay,
+    // 32_101+ dial-end, 33_101+ dual-transport, 34_101+ media load):
+    // parallel workers are separate processes, so colliding ports double-
+    // bind across processes (2026-08-12 flake: this class's video UDP
+    // 29_342 collided with MirrorFlowE2ETests' cast-channel UDP 29_342 and
+    // wedged both tests).
     private static var portBlockIndex: UInt16 = 0
     private var wfdPort: UInt16!
     private var clientVideoPort: UInt16!
@@ -63,7 +70,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
     override func setUp() {
         super.setUp()
         Self.portBlockIndex += 1
-        let base = 29_301 + Self.portBlockIndex * 10
+        let base = 30_101 + Self.portBlockIndex * 10
         wfdPort = base
         clientVideoPort = base + 1
         continueAfterFailure = false
@@ -295,17 +302,7 @@ final class LyraMirrorOverRelayTests: XCTestCase {
         let controller = XiaomiMirrorFlowController(trustManager: trustManager)
         controller.sessionProvider = { [weak self] in self?.session }
         controller.sessionFactory = { [weak self] _ in
-            guard let self else { return }
-            self.session?.cancel()
-            self.session = nil
-            // Production presents a fresh UDP peer per cast dial (641c8da39),
-            // which restarts the phone's KCP sn at 0. Reset both flow pipes
-            // or the phone-side dedupe drops the rebuilt dial's sn=0 frames
-            // behind the old recvUna.
-            self.clientBridge?.meshFlow(index: 1).stop()
-            try? self.clientBridge?.meshFlow(index: 1).start(preferredPort: self.phoneMeshPort)
-            self.attachSession()
-            self.session?.start()
+            self?.rebuildCastSession()
         }
         controller.biometricEvaluate = {}
         controller.openMirrorScreen = { [weak self] session in
@@ -349,9 +346,44 @@ final class LyraMirrorOverRelayTests: XCTestCase {
             Task { @MainActor in
                 guard let self, let session, self.session === session else { return }
                 self.session = nil
+                if self.castRebuildPending {
+                    self.castRebuildPending = false
+                    self.redialCastSessionOnFreshPipes()
+                }
             }
         }
         self.session = session
+    }
+
+    private var castRebuildPending = false
+
+    // Production dials each cast session from a fresh peer (on the relay
+    // transport a fresh random flow index), so the phone restarts its KCP
+    // sn at 0 and neither side's dedupe carries stale state across dials.
+    // The harness reuses flow 1, so the rebuild must reset both flow pipes
+    // — and it must wait for the old session's teardown first: cancel()
+    // asynchronously stops the SHARED bridge pipes from the old session's
+    // queue, and a rebuild that doesn't wait races that stop into the fresh
+    // dial (the late stop resets nextSendSn mid-dial; the phone drops the
+    // regressed sn behind its recvUna and the dial wedges — the 2026-08-12
+    // "OPEN_MIRROR_SCREEN after rebuild" flake).
+    private func rebuildCastSession() {
+        if let old = session {
+            guard !castRebuildPending else { return }
+            castRebuildPending = true
+            old.cancel()
+            return
+        }
+        redialCastSessionOnFreshPipes()
+    }
+
+    private func redialCastSessionOnFreshPipes() {
+        clientBridge?.meshFlow(index: 1).stop()
+        try? clientBridge?.meshFlow(index: 1).start(preferredPort: phoneMeshPort)
+        hostBridge?.meshFlow(index: 1).stop()
+        try? hostBridge?.meshFlow(index: 1).start(preferredPort: nil)
+        attachSession()
+        session?.start()
     }
 
     // The WFD RTSP dialog rides the EdgeLink TCP tunnel (route b), exactly the

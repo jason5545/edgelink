@@ -37,6 +37,13 @@ final class LyraMeshAnnouncer {
     private var announceTimer: DispatchSourceTimer?
     private var lastActivity = Date.distantPast
     private static let staleTimeout: TimeInterval = 20
+    // A handshake stalled this long (no inbound frame) means a datagram was
+    // dropped mid-flow — the mesh transport ACKs but never retransmits, so
+    // without a restart the announce flow wedges forever (2026-08-13:
+    // LyraPhoneServerIntegrationTests.testAnnounceFlowRegistersMacOnline
+    // timed out under parallel test workers after a loopback UDP drop; the
+    // same drop on real WiFi wedges production until discovery re-dials).
+    private static let handshakeStallTimeout: TimeInterval = 10
     private let queue = DispatchQueue(label: "edgelink.lyra.announcer")
     private let deviceIdHexProvider: () -> String?
     private let displayNameProvider: () -> String
@@ -146,21 +153,27 @@ final class LyraMeshAnnouncer {
                         "idleSeconds=\(Int(Date().timeIntervalSince(self.lastActivity)))"
                 )
             }
-            self.stopLocked()
-            self.host = host
-            self.candidatePorts = ports
-            self.state = .idle
-            self.socket.onFrame = { [weak self] frame, endpoint, reply in
-                self?.handle(frame: frame, endpoint: endpoint, reply: reply)
-            }
-            self.socket.onRawDatagram = { datagram, endpoint in
-                DiagnosticsLog.info(
-                    "xiaomi.mishare.announcer_rx from=\(endpoint.debugDescription) bytes=\(datagram.count)"
-                )
-            }
-            self.sendPhysSyncRequest()
-            self.startAnnounceTimerLocked()
+            self.beginLocked(host: host, ports: ports)
         }
+    }
+
+    private func beginLocked(host: String, ports: [UInt16]) {
+        self.stopLocked()
+        self.host = host
+        self.candidatePorts = ports
+        self.state = .idle
+        self.socket.onFrame = { [weak self] frame, endpoint, reply in
+            self?.handle(frame: frame, endpoint: endpoint, reply: reply)
+        }
+        self.socket.onRawDatagram = { datagram, endpoint in
+            DiagnosticsLog.info(
+                "xiaomi.mishare.announcer_rx from=\(endpoint.debugDescription) bytes=\(datagram.count)"
+            )
+        }
+        // Anchor the stall watchdog at the (re)start of the handshake.
+        self.lastActivity = Date()
+        self.sendPhysSyncRequest()
+        self.startAnnounceTimerLocked()
     }
 
     func stop() {
@@ -812,8 +825,22 @@ final class LyraMeshAnnouncer {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 7, repeating: 7)
         timer.setEventHandler { [weak self] in
-            guard let self, self.state == .logiSynced else { return }
-            self.sendAnnounce()
+            guard let self else { return }
+            if self.state == .logiSynced {
+                self.sendAnnounce()
+                return
+            }
+            // Handshake stalled mid-flow (dropped datagram): restart from
+            // phys sync, the same recovery the discovery-driven
+            // start(host:ports:) resync provides.
+            guard let host = self.host,
+                  Date().timeIntervalSince(self.lastActivity) > Self.handshakeStallTimeout
+            else { return }
+            DiagnosticsLog.warn(
+                "xiaomi.mishare.announcer_handshake_stalled state=\(self.state) " +
+                    "idleSeconds=\(Int(Date().timeIntervalSince(self.lastActivity)))"
+            )
+            self.beginLocked(host: host, ports: self.candidatePorts)
         }
         announceTimer = timer
         timer.resume()

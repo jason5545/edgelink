@@ -31,7 +31,11 @@ final class MirrorFlowE2ETests: XCTestCase {
     // previous test release asynchronously after cancel(), and a next test
     // binding the same ports immediately would hit EADDRINUSE (observed as
     // the fake phone's WFD server failing to start right after the
-    // mid-stream recovery test).
+    // mid-stream recovery test). Blocks are class-wide: parallel test
+    // workers are separate processes with per-process counters, so classes
+    // must not be able to overrun each other's range. This class's range is
+    // 29_101...29_999 (100 blocks of 10, 4 ports used per block); other
+    // classes start at 30_101 / 31_101 / 32_101 / 33_101 / 34_101.
     private static var portBlockIndex: UInt16 = 0
     private var meshPort: UInt16!
     private var castChannelPort: UInt16!

@@ -74,8 +74,14 @@ actor TunnelManager {
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        let randomPort = NWEndpoint.Port(rawValue: UInt16.random(in: 40000...60000))!
-        let listener = try NWListener(using: parameters, on: randomPort)
+        // Bind an ephemeral port (.any): the system never assigns an in-use
+        // port, while a random pick in 40000...60000 lands inside the
+        // ephemeral range (49152+) and can collide with any outbound
+        // connection or listener on the machine — the forward then fails to
+        // bind and the WFD tunnel dies (2026-08-12 test flake:
+        // listenerFailed under parallel workers; same failure reachable in
+        // production). The caller learns the port from the read-back below.
+        let listener = try NWListener(using: parameters, on: .any)
         listeners[tunnelId] = listener
 
         listener.newConnectionHandler = { [weak self] connection in

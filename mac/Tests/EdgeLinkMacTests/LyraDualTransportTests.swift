@@ -40,7 +40,9 @@ final class LyraDualTransportTests: XCTestCase {
     private let credKey = P256.Signing.PrivateKey()
     private let certBytes = Data("edgelink-dual-transport-cert".utf8)
 
-    // Ports (own block; other harnesses use 29_101 / 29_301).
+    // Ports (own class-wide range 33_101...33_999; other harnesses use
+    // 29_101+ / 30_101+ / 31_101+ / 32_101+ / 34_101+ — ranges must not
+    // overlap across the parallel worker processes).
     private static var portBlockIndex: UInt16 = 0
     private var lanMeshPort: UInt16!
     private var lanCastChannelPort: UInt16!
@@ -82,7 +84,7 @@ final class LyraDualTransportTests: XCTestCase {
     override func setUp() {
         super.setUp()
         Self.portBlockIndex += 1
-        let base = 29_401 + Self.portBlockIndex * 10
+        let base = 33_101 + Self.portBlockIndex * 10
         lanMeshPort = base
         lanCastChannelPort = base + 1
         lanWfdPort = base + 2
