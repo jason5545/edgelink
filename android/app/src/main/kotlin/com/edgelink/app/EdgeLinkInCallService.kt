@@ -3,6 +3,7 @@ package com.edgelink.app
 import android.os.Build
 import android.telecom.Call
 import android.telecom.InCallService
+import android.telecom.TelecomManager
 import com.edgelink.core.PhoneCallStatusBody
 import java.time.Instant
 import java.util.IdentityHashMap
@@ -18,6 +19,8 @@ class EdgeLinkInCallService : InCallService() {
         super.onCallAdded(call)
         EdgeLinkLog.configure(applicationContext)
         DistAudioConnector.appContext = applicationContext
+        EdgeLinkInCallCallStore.telecomManager =
+            applicationContext.getSystemService(TelecomManager::class.java)
         // After a reboot MIUI keeps com.milink.service dead and TeleService
         // never sees the Mac as a relay device; re-register the route with
         // root on every call so the first dial after a reboot can relay too.
@@ -75,53 +78,89 @@ class EdgeLinkInCallService : InCallService() {
 
 private object EdgeLinkInCallCallStore {
     private val lock = Any()
-    private val calls = IdentityHashMap<Call, Call.Callback>()
+
+    @Volatile
+    var telecomManager: TelecomManager? = null
+
+    private class TrackedCall(
+        val callback: Call.Callback,
+        var reportable: Boolean
+    )
+
+    private val calls = IdentityHashMap<Call, TrackedCall>()
 
     fun add(call: Call) {
-        val callback = object : Call.Callback() {
-            override fun onStateChanged(call: Call, state: Int) {
-                EdgeLinkLog.info("phone.android.incall_service state=$state calls=${callStatesSummary()}")
-                EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "state_changed"))
-                if (state == Call.STATE_ACTIVE) {
-                    val extras = call.details?.extras
-                    if (extras?.getBoolean(EXTRA_CALL_RELAYED) == true) {
-                        val deviceId = extras.getString(EXTRA_RELAY_DEVICE_ID).orEmpty()
-                        if (deviceId.isNotEmpty()) {
-                            DistAudioConnector.appContext?.let { context ->
-                                DistAudioConnector.onRelayedCallActive(context, deviceId)
+        val tracked = TrackedCall(
+            callback = object : Call.Callback() {
+                override fun onStateChanged(call: Call, state: Int) {
+                    EdgeLinkLog.info("phone.android.incall_service state=$state calls=${callStatesSummary()}")
+                    val reportable = refreshReportable(call)
+                    if (reportable) {
+                        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "state_changed"))
+                    }
+                    if (state == Call.STATE_ACTIVE && reportable) {
+                        val extras = call.details?.extras
+                        if (extras?.getBoolean(EXTRA_CALL_RELAYED) == true) {
+                            val deviceId = extras.getString(EXTRA_RELAY_DEVICE_ID).orEmpty()
+                            if (deviceId.isNotEmpty()) {
+                                DistAudioConnector.appContext?.let { context ->
+                                    DistAudioConnector.onRelayedCallActive(context, deviceId)
+                                }
                             }
                         }
                     }
+                    if (state == Call.STATE_DISCONNECTED) {
+                        val deviceId = call.details?.extras?.getString(EXTRA_RELAY_DEVICE_ID)
+                        DistAudioConnector.onCallEnded(deviceId)
+                        remove(call, "disconnected")
+                    }
                 }
-                if (state == Call.STATE_DISCONNECTED) {
-                    val deviceId = call.details?.extras?.getString(EXTRA_RELAY_DEVICE_ID)
-                    DistAudioConnector.onCallEnded(deviceId)
-                    remove(call, "disconnected")
-                }
-            }
 
-            override fun onDetailsChanged(call: Call, details: Call.Details) {
-                EdgeLinkLog.info("phone.android.incall_service details state=${call.state} calls=${callStatesSummary()}")
-                EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "details_changed"))
-            }
-        }
+                override fun onDetailsChanged(call: Call, details: Call.Details) {
+                    EdgeLinkLog.info("phone.android.incall_service details state=${call.state} calls=${callStatesSummary()}")
+                    if (refreshReportable(call)) {
+                        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "details_changed"))
+                    }
+                }
+            },
+            reportable = false
+        )
         synchronized(lock) {
-            calls[call] = callback
+            calls[call] = tracked
         }
-        call.registerCallback(callback)
+        call.registerCallback(tracked.callback)
         EdgeLinkLog.info("phone.android.incall_service call_added state=${call.state} calls=${callStatesSummary()}")
-        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "added"))
+        if (refreshReportable(call)) {
+            EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, "added"))
+        }
+    }
+
+    // A call becomes reportable once Telecom exposes SIM/account details that
+    // classify it as telephony; never downgrade (details can transiently be
+    // incomplete on later callbacks).
+    private fun refreshReportable(call: Call): Boolean {
+        val tracked = synchronized(lock) { calls[call] } ?: return false
+        if (!tracked.reportable && PhoneCallReportPolicy.shouldReport(call.details, telecomManager)) {
+            tracked.reportable = true
+        }
+        if (!tracked.reportable) {
+            val accountPackage = call.details?.accountHandle?.componentName?.packageName ?: "unknown"
+            EdgeLinkLog.info("phone.android.incall_service_suppressed state=${call.state} account=$accountPackage")
+        }
+        return tracked.reportable
     }
 
     fun remove(call: Call, reason: String) {
-        val (callback, emptyAfterRemove) = synchronized(lock) {
-            calls.remove(call) to calls.isEmpty()
+        val (tracked, reportableRemaining) = synchronized(lock) {
+            calls.remove(call) to calls.values.any { it.reportable }
         }
-        callback?.let { runCatching { call.unregisterCallback(it) } }
+        tracked?.let { runCatching { call.unregisterCallback(it.callback) } }
         EdgeLinkLog.info("phone.android.incall_service call_removed reason=$reason calls=${callStatesSummary()}")
-        EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, reason, removed = true))
-        if (callback != null && emptyAfterRemove) {
-            EdgeLinkInCallService.notifyCallsIdle(reason)
+        if (tracked?.reportable == true) {
+            EdgeLinkInCallService.notifyCallStatus(callStatusBody(call, reason, removed = true))
+            if (!reportableRemaining) {
+                EdgeLinkInCallService.notifyCallsIdle(reason)
+            }
         }
     }
 
@@ -131,18 +170,20 @@ private object EdgeLinkInCallCallStore {
             calls.clear()
             entries
         }
-        snapshot.forEach { (call, callback) ->
-            runCatching { call.unregisterCallback(callback) }
+        snapshot.forEach { (call, tracked) ->
+            runCatching { call.unregisterCallback(tracked.callback) }
         }
         EdgeLinkLog.info("phone.android.incall_service cleared")
-        EdgeLinkInCallService.notifyCallStatus(
-            PhoneCallStatusBody(
-                callId = "all",
-                state = "ended",
-                reason = "cleared",
-                ts = Instant.now().epochSecond
+        if (snapshot.any { it.second.reportable }) {
+            EdgeLinkInCallService.notifyCallStatus(
+                PhoneCallStatusBody(
+                    callId = "all",
+                    state = "ended",
+                    reason = "cleared",
+                    ts = Instant.now().epochSecond
+                )
             )
-        )
+        }
     }
 
     fun sendDtmfSequence(sequence: String): ShizukuOperationResult {
@@ -189,7 +230,9 @@ private object EdgeLinkInCallCallStore {
     fun diagnosticState(): String = "states=${callStatesSummary()}"
 
     fun hasOngoingCall(): Boolean {
-        val snapshot = synchronized(lock) { calls.keys.toList() }
+        val snapshot = synchronized(lock) {
+            calls.entries.filter { it.value.reportable }.map { it.key }
+        }
         return snapshot.any { call ->
             when (call.state) {
                 Call.STATE_ACTIVE,
@@ -203,7 +246,9 @@ private object EdgeLinkInCallCallStore {
     }
 
     private fun activeCall(): Call? {
-        val snapshot = synchronized(lock) { calls.keys.toList() }
+        val snapshot = synchronized(lock) {
+            calls.entries.filter { it.value.reportable }.map { it.key }
+        }
         return snapshot.firstOrNull { it.state == Call.STATE_ACTIVE }
             ?: snapshot.firstOrNull { it.state == Call.STATE_DIALING || it.state == Call.STATE_CONNECTING }
     }

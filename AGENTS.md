@@ -78,6 +78,8 @@
 
 - `[OBSERVED]` 2026-08-05 起 call-relay / mirror fake-remote inject 已全面拆除（commit `b67642533` 前後），`debug.edgelink.relay_*`、`debug.edgelink.mirror_fake_*` 等 prop 在程式碼中已不存在；TeleService relayCall 走自然註冊。目前 Android tree 唯一仍讀取的 debug prop 是 `debug.edgelink.mirror_wifi_gate`（手動除錯開關，production 不設定）。
 
+- `[OBSERVED]` 2026-08-13：Android Telecom 像 CallKit 一樣統一第三方 VoIP 通話——LINE 等 app 註冊 self-managed ConnectionService 後，其通話會送達所有 bound InCallService（含 `EdgeLinkInCallService`），曾導致 LINE 來電觸發 Mac incoming-call UI。`PhoneCallReportPolicy` 只放行 SIM telephony（`PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION`，或 account package 為 `com.android.phone`/`com.android.server.telecom`）；非 telephony call 不送 `phone.call_status`、不參與 idle/DTMF/activeCall 判定。分類是 per-call sticky upgrade（details 後補齊時轉 reportable，不 downgrade）。
+
 - lyra-debug CLI（pcap / parse / keys）：
 
   ```sh
