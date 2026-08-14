@@ -35,9 +35,11 @@ object PhoneCallReportPolicy {
     fun shouldReport(details: Call.Details?, telecomManager: TelecomManager?): Boolean {
         val handle = details?.accountHandle ?: return false
         val accountPackage = handle.componentName?.packageName
-        val hasSimSubscription = telecomManager
-            ?.getPhoneAccount(handle)
-            ?.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) == true
+        val hasSimSubscription = runCatching {
+            telecomManager
+                ?.getPhoneAccount(handle)
+                ?.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) == true
+        }.getOrDefault(false)
         return shouldReport(accountPackage, hasSimSubscription)
     }
 }
