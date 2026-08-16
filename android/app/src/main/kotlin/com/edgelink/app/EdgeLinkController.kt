@@ -153,7 +153,6 @@ private fun elapsedMs(startedAtNanos: Long, endedAtNanos: Long = SystemClock.ela
 private enum class PendingShizukuAction {
     Notification,
     RemoteInput,
-    Screen,
     Sms,
     MiLinkProbe
 }
@@ -167,7 +166,6 @@ private enum class MacPresenceState {
 internal enum class ShizukuAutoRepairTarget {
     Notification,
     RemoteInput,
-    Screen,
     Sms
 }
 
@@ -178,9 +176,6 @@ internal fun shizukuAutoRepairTargets(state: EdgeLinkUiState): List<ShizukuAutoR
         }
         if (!state.remoteInputAccessGranted) {
             add(ShizukuAutoRepairTarget.RemoteInput)
-        }
-        if (!state.screenDimmingAccessGranted) {
-            add(ShizukuAutoRepairTarget.Screen)
         }
         if (!state.smsAccessGranted) {
             add(ShizukuAutoRepairTarget.Sms)
@@ -235,7 +230,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         peerMirrorTurnDataChannelSupported = { peerCapabilityMirrorTurn }
     )
-    private val miLinkScreenPowerGuard = AndroidScreenPowerGuard(appContext)
     private val micActivityMonitor = AndroidMicActivityMonitor(appContext) { status: AndroidMicStatusBody ->
         sendEnvelope(EnvelopeTypes.ANDROID_MIC_STATUS, status)
     }
@@ -267,7 +261,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
             notificationAccessGranted = isNotificationListenerEnabled(),
             notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
-            screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
             smsAccessGranted = smsSync.smsAccessGranted(),
             shizukuAvailable = initialShizukuState.available,
             shizukuSupported = initialShizukuState.supported,
@@ -301,15 +294,10 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         onScreenStartReceived = {
             ensureTurnCredentials("screen_start")
         },
-        onScreenStopReceived = {
-            stopMiLinkScreenPowerGuard()
-        },
         onMirrorTurnSessionStop = {
             closeMirrorTurnSession("screen_stop")
         },
-        onMiLinkCommandResult = { body, result ->
-            handleMiLinkCommandResult(body, result)
-        },
+        onMiLinkCommandResult = { _, _ -> },
         onPhoneActionReceived = { body ->
             if (body.action == "dial" || body.action == "answer") {
                 refreshTurnCredentials("phone_action_${body.action}")
@@ -723,20 +711,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             body.command == MILINK_COMMAND_MIRROR_SOURCE_RECOVERY) &&
             result.route == "xiaomi.mirror.pending"
         if (!result.success && !startPending) {
-            return
-        }
-        // The mirror now runs the native path end to end (cast channel
-        // OPEN_MIRROR_SCREEN + the phone's real WFD source); HyperOS owns the
-        // screen/dim/hangup behavior. Do NOT engage the EdgeLink screen power
-        // guard here: its 5s dim throttles the MirrorControl encoder into slow
-        // motion (observed 0.5x media clock + video starvation on the relay
-        // path), and its rapid start/stop raced ScreenPowerForegroundService
-        // into FGS-timeout crashes.
-    }
-
-    private fun stopMiLinkScreenPowerGuard() {
-        scope.launch {
-            miLinkScreenPowerGuard.onSharingStopped()
+            EdgeLinkLog.info(
+                "milink.command_result_ignored command=${body.command} success=${result.success} route=${result.route}"
+            )
         }
     }
 
@@ -854,7 +831,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         lyraRelayBridge.stop()
         AndroidMiLinkMirrorMediaBridge.stop("disconnect")
         closeMirrorTurnSession("disconnect")
-        stopMiLinkScreenPowerGuard()
         screenSession.stop()
         stateFlow.update {
             it.copy(
@@ -962,26 +938,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         RemoteInputService.openSettings(appContext)
     }
 
-    override fun onOpenScreenDimmingSettings() {
-        if (tryRunOrRequestShizuku(PendingShizukuAction.Screen)) {
-            return
-        }
-        openScreenDimmingSettingsDirect()
-    }
-
-    private fun openScreenDimmingSettingsDirect() {
-        EdgeLinkLog.info("screen.android.dimming_open_settings")
-        val action = if (!AndroidScreenPowerGuard.canWriteSettings(appContext)) {
-            Settings.ACTION_MANAGE_WRITE_SETTINGS
-        } else {
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION
-        }
-        val intent = Intent(action)
-            .setData(Uri.parse("package:${appContext.packageName}"))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        appContext.startActivity(intent)
-    }
-
     override fun onOpenSmsSettings() {
         EdgeLinkLog.info("sms.android.permission_request")
         tryHandleSmsAccessWithShizuku()
@@ -1080,7 +1036,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 when (action) {
                     PendingShizukuAction.Notification -> AndroidShizukuSupport.enableNotificationAccess(appContext)
                     PendingShizukuAction.RemoteInput -> AndroidShizukuSupport.enableRemoteInput(appContext)
-                    PendingShizukuAction.Screen -> AndroidShizukuSupport.prepareScreenAccess(appContext)
                     PendingShizukuAction.Sms -> AndroidShizukuSupport.grantSmsPermissions(appContext)
                     PendingShizukuAction.MiLinkProbe -> {
                         val status = probeMiLinkStatus()
@@ -1209,11 +1164,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                     openRemoteInputSettingsDirect()
                 }
             }
-            PendingShizukuAction.Screen -> {
-                if (!state.screenDimmingAccessGranted) {
-                    openScreenDimmingSettingsDirect()
-                }
-            }
             PendingShizukuAction.Sms,
             PendingShizukuAction.MiLinkProbe -> Unit
         }
@@ -1288,8 +1238,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                             AndroidShizukuSupport.enableNotificationAccess(appContext)
                         ShizukuAutoRepairTarget.RemoteInput ->
                             AndroidShizukuSupport.enableRemoteInput(appContext)
-                        ShizukuAutoRepairTarget.Screen ->
-                            AndroidShizukuSupport.prepareScreenAccess(appContext)
                         ShizukuAutoRepairTarget.Sms ->
                             AndroidShizukuSupport.grantSmsPermissions(appContext)
                     }
@@ -1338,7 +1286,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 remoteInputAccessGranted = RemoteInputService.isEnabled(appContext),
                 notificationAccessGranted = isNotificationListenerEnabled(),
                 notificationPostGranted = AndroidNotificationPresenter.canPostNotifications(appContext),
-                screenDimmingAccessGranted = AndroidScreenPowerGuard.hasRequiredScreenPowerAccess(appContext),
                 screenSharePrivacyControlAvailable = AndroidScreenShareProtectionGuard.canControl(appContext),
             smsAccessGranted = smsSync.smsAccessGranted(),
             photoSyncEnabled = settingsStore.photoSyncEnabled(),
@@ -1717,7 +1664,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         connectionJob?.cancel()
         AndroidMiLinkMirrorMediaBridge.stop("connection_restart")
         closeMirrorTurnSession("connection_restart")
-        stopMiLinkScreenPowerGuard()
         screenSession.stop()
         session?.close()
         session = null
@@ -1910,7 +1856,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 // (stock startShare cannot revive the fake remote). The bridge
                 // send closure no-ops while session is null and re-binds on
                 // the next startMainDisplay.
-                stopMiLinkScreenPowerGuard()
                 screenSession.stop()
                 val autoReconnect = stateFlow.value.autoReconnectEnabled && !manuallyDisconnected
                 if (autoReconnect && !macSleepSuppressed &&
@@ -2133,7 +2078,6 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private fun handleMacSleep() {
         EdgeLinkLog.info("relay.android.mac_sleep_received")
         macSleepSuppressed = true
-        stopMiLinkScreenPowerGuard()
         session?.close()
         stateFlow.update {
             it.copy(
@@ -2935,7 +2879,7 @@ private class AndroidCommandDispatcher(
     private val onPong: () -> Unit,
     private val onSmsSendResult: (SmsSendResultBody) -> Unit,
     private val onScreenStartReceived: suspend () -> Unit,
-    private val onScreenStopReceived: () -> Unit,
+    private val onScreenStopReceived: () -> Unit = {},
     private val onMirrorTurnSessionStop: () -> Unit = {},
     private val onMiLinkCommandResult: (MiLinkCommandBody, MiLinkCommandResultBody) -> Unit,
     private val onPhoneActionReceived: (PhoneActionBody) -> Unit,

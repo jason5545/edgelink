@@ -51,7 +51,6 @@ class MainActivity : ComponentActivity() {
             ::handleNotificationSyncChange,
             ::handleOpenNotificationSettings,
             ::handleOpenRemoteInputSettings,
-            ::handleOpenScreenDimmingSettings,
             ::handleOpenSmsSettings,
             ::handleQuit,
             ::handlePhotoSyncChange,
@@ -90,10 +89,6 @@ class MainActivity : ComponentActivity() {
 
     private fun handleOpenRemoteInputSettings() {
         controller.onOpenRemoteInputSettings()
-    }
-
-    private fun handleOpenScreenDimmingSettings() {
-        controller.onOpenScreenDimmingSettings()
     }
 
     private fun handleOpenSmsSettings() {
@@ -155,7 +150,6 @@ private class EdgeLinkActivityActions(
     private val notificationSyncChangeHandler: (Boolean) -> Unit,
     private val openNotificationSettingsHandler: () -> Unit,
     private val openRemoteInputSettingsHandler: () -> Unit,
-    private val openScreenDimmingSettingsHandler: () -> Unit,
     private val openSmsSettingsHandler: () -> Unit,
     private val quitHandler: () -> Unit,
     private val photoSyncChangeHandler: (Boolean) -> Unit,
@@ -178,7 +172,6 @@ private class EdgeLinkActivityActions(
     override fun onRequestPhotoAccess() = requestPhotoAccessHandler.invoke()
     override fun onOpenNotificationSettings() = openNotificationSettingsHandler.invoke()
     override fun onOpenRemoteInputSettings() = openRemoteInputSettingsHandler.invoke()
-    override fun onOpenScreenDimmingSettings() = openScreenDimmingSettingsHandler.invoke()
     override fun onOpenSmsSettings() = openSmsSettingsHandler.invoke()
     override fun onRequestShizukuPermission() = delegate.onRequestShizukuPermission()
     override fun onXiaomiTrustPair() = delegate.onXiaomiTrustPair()

@@ -74,8 +74,6 @@
   <string name="permission_ready">就绪</string>
   <string name="permission_remote_input">远程输入</string>
   <string name="permission_remote_input_missing">需要启用无障碍服务</string>
-  <string name="permission_keep_screen_on">屏幕保持唤醒</string>
-  <string name="permission_keep_screen_on_missing">需要修改系统设置或显示在其他应用上层</string>
   <string name="permission_sms_missing">需要短信权限</string>
   <string name="permission_notification_sync_title">通知同步</string>
   <string name="notification_access_missing">需要通知读取权限</string>

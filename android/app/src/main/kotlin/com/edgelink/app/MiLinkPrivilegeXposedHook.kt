@@ -8,7 +8,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
-import android.os.PowerManager
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
@@ -94,8 +93,6 @@ internal object MiLinkPrivilegeHookPolicy {
 }
 
 class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
-    private val mirrorKeepAwakeLockGuard = Any()
-    private var mirrorKeepAwakeLock: PowerManager.WakeLock? = null
     private val installedTargets = Collections.synchronizedList(mutableListOf<InstalledTarget>())
 
     data class InstalledTarget(
@@ -121,12 +118,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
 
     fun shutdown() {
         runCatching { MiShareTrustInjection.shutdown() }
-        synchronized(mirrorKeepAwakeLockGuard) {
-            mirrorKeepAwakeLock?.let { lock ->
-                runCatching { if (lock.isHeld) lock.release() }
-            }
-            mirrorKeepAwakeLock = null
-        }
         log("generation shutdown complete")
     }
 
@@ -636,17 +627,12 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             ) { chain ->
                 val method = chain.args.getOrNull(2) as? String
                 val extras = chain.args.getOrNull(4) as? Bundle
-                if (extras != null) {
-                    if (method == "edgeLinkCastChannel") {
-                        return@installHook Bundle().apply {
-                            putLong("castChannelConfirmAtMs", lastCastChannelConfirmAtMs)
-                            putString("castChannelDevice", lastCastChannelConfirmDevice)
-                            putBoolean("enable", true)
-                            putInt("value", 0)
-                        }
-                    }
-                    if (method == "edgeLinkKeepAwake") {
-                        return@installHook handleMirrorKeepAwakeProvider(extras)
+                if (extras != null && method == "edgeLinkCastChannel") {
+                    return@installHook Bundle().apply {
+                        putLong("castChannelConfirmAtMs", lastCastChannelConfirmAtMs)
+                        putString("castChannelDevice", lastCastChannelConfirmDevice)
+                        putBoolean("enable", true)
+                        putInt("value", 0)
                     }
                 }
                 chain.proceed()
@@ -654,54 +640,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             log("mirror edgelink provider hook installed")
         }.onFailure { error ->
             log("failed to hook mirror edgelink provider: ${error.javaClass.simpleName}: ${error.message}")
-        }
-    }
-
-    private fun handleMirrorKeepAwakeProvider(extras: Bundle): Bundle {
-        val active = extras.booleanCompat("active")
-        val context = currentApplicationContext()
-        if (context == null) {
-            log("mirror keep-awake failed active=$active error=no_context")
-            return Bundle().apply {
-                putBoolean("keepAwakeApplied", false)
-                putString("keepAwakeError", "no_context")
-            }
-        }
-        val powerManager = context.getSystemService(PowerManager::class.java)
-        if (powerManager == null) {
-            log("mirror keep-awake failed active=$active error=no_power_manager")
-            return Bundle().apply {
-                putBoolean("keepAwakeApplied", false)
-                putString("keepAwakeError", "no_power_manager")
-            }
-        }
-        synchronized(mirrorKeepAwakeLockGuard) {
-            if (active) {
-                if (mirrorKeepAwakeLock?.isHeld != true) {
-                    @Suppress("DEPRECATION")
-                    mirrorKeepAwakeLock = powerManager.newWakeLock(
-                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
-                        MIRROR_KEEP_AWAKE_TAG
-                    ).apply {
-                        setReferenceCounted(false)
-                        acquire(MIRROR_KEEP_AWAKE_TIMEOUT_MS)
-                    }
-                }
-                log("mirror keep-awake acquired uid=${Process.myUid()}")
-            } else {
-                mirrorKeepAwakeLock?.let { lock ->
-                    runCatching { if (lock.isHeld) lock.release() }
-                        .onFailure { error ->
-                            log("mirror keep-awake release failed: ${error.javaClass.simpleName}: ${error.message}")
-                        }
-                }
-                mirrorKeepAwakeLock = null
-                log("mirror keep-awake released")
-            }
-        }
-        return Bundle().apply {
-            putBoolean("keepAwakeApplied", true)
-            putBoolean("keepAwakeActive", synchronized(mirrorKeepAwakeLockGuard) { mirrorKeepAwakeLock?.isHeld == true })
         }
     }
 
@@ -722,18 +660,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
 
     private fun callTargetMethod(target: Any, methodName: String): Any? =
         target.javaClass.getMethod(methodName).invoke(target)
-
-    private fun Bundle.booleanCompat(key: String): Boolean =
-        when (val value = get(key)) {
-            is Boolean -> value
-            is String -> value.equals("true", ignoreCase = true) ||
-                value == "1" ||
-                value.equals("yes", ignoreCase = true) ||
-                value.equals("on", ignoreCase = true)
-            is Int -> value != 0
-            is Long -> value != 0L
-            else -> false
-        }
 
     private fun currentApplicationContext(): Context? =
         runCatching {
@@ -826,8 +752,6 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         private const val MILINK_BASE_CLIENT_SERVICE = "com.milink.client.BaseClientService"
         private const val MILINK_PRIVILEGED_PACKAGE_MANAGER = "com.milink.base.utils.p"
         private const val XIAOMI_MIRROR_CALL_PROVIDER = "com.xiaomi.mirror.provider.CallProvider"
-        private const val MIRROR_KEEP_AWAKE_TAG = "EdgeLink:MirrorKeepAwake"
-        private const val MIRROR_KEEP_AWAKE_TIMEOUT_MS = 8 * 60 * 60 * 1000L
         private const val XIAOMI_MIRROR_APPLICATION = "com.xiaomi.mirror.Mirror"
         private const val XIAOMI_MIRROR_MESSAGE_MANAGER = "com.xiaomi.mirror.message.MessageManagerImpl"
         private const val XIAOMI_MIRROR_SCREEN_CONFIGURATION_MESSAGE =

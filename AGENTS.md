@@ -129,6 +129,7 @@
 
 - `[MUST NOT]` 不要預設去修改 dim、brightness、power 或 Hangup-related code，包括 `AndroidScreenPowerGuard`、MIUI Hangup / synergy power-key paths。
 - `[OBSERVED]` 截至 2026-07-28，在目前 Xiaomi mirror path 中，virtual display 即使亮度為 `2.44E-4`、處於 DIM，甚至 screen off，影片仍會持續流動；這符合官方 Hangup 行為。
+- `[OBSERVED]` 2026-08-16：已拆除所有 dim/keep-awake workaround（`AndroidScreenPowerGuard` 的亮度 dim 與 mirror keep-awake provider、Xposed hook 的 `edgeLinkKeepAwake` 分支、controller 的 `miLinkScreenPowerGuard` 與 `screenDimmingAccessGranted` plumbing）。官方鏡像走 Hangup 虛擬螢幕，實體螢幕狀態不影響 encoder，這些 workaround 已無用途。`AndroidScreenPowerGuard` 現在只做 WebRTC 螢幕分享路徑的 screensaver 停用 + FGS。不要把它們加回來。
 - `[OBSERVED]` 靜態畫面時 encoder 產生 zero frames 是目前已知的正常行為，不要直接當成 video stall。
 - `[OBSERVED]` 2026-08-11：HyperOS（myron）上 `KeyguardManager.isDeviceLocked` 在 SCREEN_ON 後約 300ms 會回報 `false`，即使 swipe-up lockscreen 還在畫面上；Mac 端信任這個 fresh「unlocked」push 會直接播鎖定畫面、不跳 Touch ID。lock reporter 已改用 `isKeyguardLocked`（lockscreen 顯示中即為 true）。另外 duo.screen authEvent 可能整個不送達（relay-rebuilt channel 上 mitrustservice 未回應），`MacTrustManager.authEventTimeout`（預設 60s）是解鎖等待的上限，不要移除。
 - `[OBSERVED]` 2026-08-11：手機的 relay-path channel client（HeteroChannel quick-conn）在 mitrust channel 上講 official `82 58` packet format，不是 `81 04`；`LyraVirtualChannelPipe` 已支援兩種格式，收到 82 58 後 send 端也切 official（`sendOfficial` auto-detect）。測試用 `forceOfficialFormat`（pipe）與 `LyraCastRole.mitrustSpeaksOfficial` 建模。

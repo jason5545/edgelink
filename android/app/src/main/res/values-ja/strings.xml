@@ -74,8 +74,6 @@
   <string name="permission_ready">準備完了</string>
   <string name="permission_remote_input">リモート入力</string>
   <string name="permission_remote_input_missing">ユーザー補助サービスを有効にする必要があります</string>
-  <string name="permission_keep_screen_on">画面をスリープしない</string>
-  <string name="permission_keep_screen_on_missing">システム設定の変更または他のアプリの上に表示する権限が必要です</string>
   <string name="permission_sms_missing">SMS の権限が必要です</string>
   <string name="permission_notification_sync_title">通知の同期</string>
   <string name="notification_access_missing">通知へのアクセス権が必要です</string>

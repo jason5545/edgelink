@@ -12,14 +12,12 @@ class EdgeLinkShizukuAutoRepairTest {
             notificationAccessGranted = false,
             notificationPostGranted = true,
             remoteInputAccessGranted = true,
-            screenDimmingAccessGranted = false,
             smsAccessGranted = true
         )
 
         assertEquals(
             listOf(
-                ShizukuAutoRepairTarget.Notification,
-                ShizukuAutoRepairTarget.Screen
+                ShizukuAutoRepairTarget.Notification
             ),
             shizukuAutoRepairTargets(state)
         )
@@ -32,7 +30,6 @@ class EdgeLinkShizukuAutoRepairTest {
             notificationAccessGranted = false,
             notificationPostGranted = false,
             remoteInputAccessGranted = true,
-            screenDimmingAccessGranted = true,
             smsAccessGranted = true
         )
 
@@ -46,10 +43,28 @@ class EdgeLinkShizukuAutoRepairTest {
             notificationAccessGranted = true,
             notificationPostGranted = true,
             remoteInputAccessGranted = true,
-            screenDimmingAccessGranted = true,
             smsAccessGranted = true
         )
 
         assertEquals(emptyList<ShizukuAutoRepairTarget>(), shizukuAutoRepairTargets(state))
+    }
+
+    @Test
+    fun repairsMissingRemoteInputAndSms() {
+        val state = EdgeLinkUiState(
+            notificationSyncEnabled = true,
+            notificationAccessGranted = true,
+            notificationPostGranted = true,
+            remoteInputAccessGranted = false,
+            smsAccessGranted = false
+        )
+
+        assertEquals(
+            listOf(
+                ShizukuAutoRepairTarget.RemoteInput,
+                ShizukuAutoRepairTarget.Sms
+            ),
+            shizukuAutoRepairTargets(state)
+        )
     }
 }

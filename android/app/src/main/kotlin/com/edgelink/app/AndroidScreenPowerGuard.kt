@@ -1,11 +1,7 @@
-@file:Suppress("DEPRECATION")
-
 package com.edgelink.app
 
 import android.content.Context
-import android.net.Uri
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -14,20 +10,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
-// HyperOS pauses the MirrorControl encoder at very low brightness: 0 and 1
-// both stall the video stream; 10 verified smooth, now trying 5.
-private const val SCREEN_DIM_DELAY_MS = 5_000L
-private const val DIMMED_SCREEN_BRIGHTNESS = 5
+// The guard only disables the screensaver while the WebRTC screen share is
+// active. Brightness dimming and the Xiaomi mirror keep-awake provider were
+// removed: the mirror runs the official Hangup virtual-display path where the
+// physical screen state does not affect the encoder, so fighting brightness
+// and wake locks is no longer needed.
 private const val SCREEN_POWER_PREFS = "edgelink_screen_power"
-private const val MIRROR_CALL_PROVIDER_AUTHORITY = "com.xiaomi.mirror.callprovider"
-private const val MIRROR_KEEP_AWAKE_METHOD = "edgeLinkKeepAwake"
+private const val KEY_HAS_SCREENSAVER_SNAPSHOT = "hasScreensaverSnapshot"
+private const val KEY_SCREENSAVER_ENABLED = "screensaverEnabled"
+private const val SECURE_SCREENSAVER_ENABLED = "screensaver_enabled"
+
+// Legacy keys written by the retired brightness-dim logic; restored once on
+// stop so user settings survive the upgrade, then cleared.
 private const val KEY_LEGACY_HAS_SNAPSHOT = "hasSnapshot"
 private const val KEY_HAS_BRIGHTNESS_SNAPSHOT = "hasBrightnessSnapshot"
 private const val KEY_BRIGHTNESS_MODE = "brightnessMode"
 private const val KEY_BRIGHTNESS = "brightness"
-private const val KEY_HAS_SCREENSAVER_SNAPSHOT = "hasScreensaverSnapshot"
-private const val KEY_SCREENSAVER_ENABLED = "screensaverEnabled"
-private const val SECURE_SCREENSAVER_ENABLED = "screensaver_enabled"
 
 class AndroidScreenPowerGuard(context: Context) {
     private val appContext = context.applicationContext
@@ -35,110 +33,50 @@ class AndroidScreenPowerGuard(context: Context) {
     private val prefs = appContext.getSharedPreferences(SCREEN_POWER_PREFS, Context.MODE_PRIVATE)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val secureSettingsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var originalBrightnessSettings: BrightnessSnapshot? = null
     private var originalScreensaverSettings: ScreensaverSnapshot? = null
-    private var sharingActive = false
-    private val dimRunnable = Runnable { dimIfSharingActive() }
 
     init {
-        restoreBrightnessIfNeeded(reason = "startup")
         restoreScreensaverIfNeeded(reason = "startup")
     }
 
     fun onSharingStarted() {
-        sharingActive = true
-        setMirrorKeepAwake(active = true)
         ScreenPowerForegroundService.start(appContext)
         disableScreensaver()
-        mainHandler.removeCallbacks(dimRunnable)
-        mainHandler.postDelayed(dimRunnable, SCREEN_DIM_DELAY_MS)
-        EdgeLinkLog.info("screen.android.power_guard_started canWrite=${canWriteSettings(appContext)}")
+        EdgeLinkLog.info("screen.android.power_guard_started")
     }
 
     fun onSharingStopped() {
-        sharingActive = false
-        mainHandler.removeCallbacks(dimRunnable)
-        restoreBrightnessIfNeeded(reason = "sharing_stopped")
+        mainHandler.removeCallbacksAndMessages(null)
+        restoreLegacyBrightnessIfNeeded(reason = "sharing_stopped")
         restoreScreensaverIfNeeded(reason = "sharing_stopped")
-        setMirrorKeepAwake(active = false)
         ScreenPowerForegroundService.stop(appContext)
     }
 
-    private fun setMirrorKeepAwake(active: Boolean) {
-        secureSettingsScope.launch {
-            val result = runCatching {
-                val extras = Bundle().apply { putBoolean("active", active) }
-                if (Build.VERSION.SDK_INT >= 29) {
-                    resolver.call(MIRROR_CALL_PROVIDER_AUTHORITY, MIRROR_KEEP_AWAKE_METHOD, null, extras)
-                } else {
-                    resolver.call(
-                        Uri.parse("content://$MIRROR_CALL_PROVIDER_AUTHORITY"),
-                        MIRROR_KEEP_AWAKE_METHOD,
-                        null,
-                        extras
-                    )
-                }
-            }
-            result.onSuccess { bundle ->
-                val applied = bundle?.getBoolean("keepAwakeApplied", false) == true
-                if (applied) {
-                    EdgeLinkLog.info("screen.android.mirror_keep_awake_set active=$active")
-                } else {
-                    EdgeLinkLog.warn(
-                        "screen.android.mirror_keep_awake_not_applied active=$active " +
-                            "error=${bundle?.getString("keepAwakeError").orEmpty()}"
-                    )
-                }
-            }.onFailure { error ->
-                EdgeLinkLog.warn("screen.android.mirror_keep_awake_failed active=$active", error)
-            }
-        }
-    }
-
-    private fun dimIfSharingActive() {
-        if (!sharingActive) {
+    private fun restoreLegacyBrightnessIfNeeded(reason: String) {
+        val hasSnapshot = prefs.getBoolean(KEY_HAS_BRIGHTNESS_SNAPSHOT, false) ||
+            prefs.getBoolean(KEY_LEGACY_HAS_SNAPSHOT, false)
+        if (!hasSnapshot) {
             return
         }
-        if (!canWriteSettings(appContext)) {
-            EdgeLinkLog.warn("screen.android.brightness_dim_skipped missing_write_settings")
-            return
-        }
-
-        val snapshot = originalBrightnessSettings ?: loadBrightnessSnapshot() ?: readCurrentBrightnessSnapshot().also {
-            saveBrightnessSnapshot(it)
-        }
-        originalBrightnessSettings = snapshot
-
-        runCatching {
-            Settings.System.putInt(
-                resolver,
-                Settings.System.SCREEN_BRIGHTNESS_MODE,
-                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
-            )
-            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, DIMMED_SCREEN_BRIGHTNESS)
-        }.onSuccess {
-            EdgeLinkLog.info("screen.android.brightness_dimmed delayMs=$SCREEN_DIM_DELAY_MS value=$DIMMED_SCREEN_BRIGHTNESS")
-        }.onFailure { error ->
-            EdgeLinkLog.warn("screen.android.brightness_dim_failed", error)
-        }
-    }
-
-    private fun restoreBrightnessIfNeeded(reason: String) {
-        val snapshot = originalBrightnessSettings ?: loadBrightnessSnapshot() ?: return
         if (!canWriteSettings(appContext)) {
             EdgeLinkLog.warn("screen.android.brightness_restore_skipped reason=$reason missing_write_settings")
             return
         }
-
+        val mode = prefs.getInt(KEY_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+        val brightness = prefs.getInt(KEY_BRIGHTNESS, 125)
         runCatching {
-            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, snapshot.brightness)
-            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS_MODE, snapshot.mode)
+            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, brightness)
+            Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS_MODE, mode)
         }.onSuccess {
-            originalBrightnessSettings = null
-            clearBrightnessSnapshot()
+            prefs.edit()
+                .remove(KEY_HAS_BRIGHTNESS_SNAPSHOT)
+                .remove(KEY_LEGACY_HAS_SNAPSHOT)
+                .remove(KEY_BRIGHTNESS_MODE)
+                .remove(KEY_BRIGHTNESS)
+                .apply()
             EdgeLinkLog.info("screen.android.brightness_restored reason=$reason")
         }.onFailure { error ->
-            EdgeLinkLog.warn("screen.android.brightness_restore_failed reason=$reason", error)
+            EdgeLinkLog.warn("screen.android.brightness_restore_failed", error)
         }
     }
 
@@ -188,7 +126,7 @@ class AndroidScreenPowerGuard(context: Context) {
             clearScreensaverSnapshot()
             EdgeLinkLog.info("screen.android.screensaver_restored reason=$reason enabled=${snapshot.enabled}")
         }.onFailure { error ->
-            EdgeLinkLog.warn("screen.android.screensaver_restore_failed reason=$reason", error)
+            EdgeLinkLog.warn("screen.android.screensaver_restore_failed", error)
         }
     }
 
@@ -210,49 +148,6 @@ class AndroidScreenPowerGuard(context: Context) {
                 EdgeLinkLog.warn("screen.android.screensaver_shizuku_failed reason=$reason message=${result.message}")
             }
         }
-    }
-
-    private fun readCurrentBrightnessSnapshot(): BrightnessSnapshot =
-        BrightnessSnapshot(
-            mode = Settings.System.getInt(
-                resolver,
-                Settings.System.SCREEN_BRIGHTNESS_MODE,
-                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
-            ),
-            brightness = Settings.System.getInt(resolver, Settings.System.SCREEN_BRIGHTNESS, 125)
-        )
-
-    private fun saveBrightnessSnapshot(snapshot: BrightnessSnapshot) {
-        prefs.edit()
-            .putBoolean(KEY_HAS_BRIGHTNESS_SNAPSHOT, true)
-            .putInt(KEY_BRIGHTNESS_MODE, snapshot.mode)
-            .putInt(KEY_BRIGHTNESS, snapshot.brightness)
-            .apply()
-    }
-
-    private fun loadBrightnessSnapshot(): BrightnessSnapshot? {
-        if (
-            !prefs.getBoolean(KEY_HAS_BRIGHTNESS_SNAPSHOT, false) &&
-            !prefs.getBoolean(KEY_LEGACY_HAS_SNAPSHOT, false)
-        ) {
-            return null
-        }
-        return BrightnessSnapshot(
-            mode = prefs.getInt(
-                KEY_BRIGHTNESS_MODE,
-                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
-            ),
-            brightness = prefs.getInt(KEY_BRIGHTNESS, 125)
-        )
-    }
-
-    private fun clearBrightnessSnapshot() {
-        prefs.edit()
-            .remove(KEY_HAS_BRIGHTNESS_SNAPSHOT)
-            .remove(KEY_LEGACY_HAS_SNAPSHOT)
-            .remove(KEY_BRIGHTNESS_MODE)
-            .remove(KEY_BRIGHTNESS)
-            .apply()
     }
 
     private fun readCurrentScreensaverSnapshot(): ScreensaverSnapshot =
@@ -283,11 +178,6 @@ class AndroidScreenPowerGuard(context: Context) {
             .apply()
     }
 
-    private data class BrightnessSnapshot(
-        val mode: Int,
-        val brightness: Int
-    )
-
     private data class ScreensaverSnapshot(
         val enabled: Int
     )
@@ -295,8 +185,5 @@ class AndroidScreenPowerGuard(context: Context) {
     companion object {
         fun canWriteSettings(context: Context): Boolean =
             Build.VERSION.SDK_INT < 23 || Settings.System.canWrite(context.applicationContext)
-
-        fun hasRequiredScreenPowerAccess(context: Context): Boolean =
-            canWriteSettings(context)
     }
 }

@@ -213,7 +213,6 @@ data class EdgeLinkUiState(
     val remoteInputAccessGranted: Boolean = false,
     val notificationAccessGranted: Boolean = false,
     val notificationPostGranted: Boolean = true,
-    val screenDimmingAccessGranted: Boolean = false,
     val smsAccessGranted: Boolean = false,
     val photoSyncEnabled: Boolean = false,
     val photoMediaAccessGranted: Boolean = false,
@@ -248,7 +247,6 @@ interface EdgeLinkActions {
     fun onRequestPhotoAccess()
     fun onOpenNotificationSettings()
     fun onOpenRemoteInputSettings()
-    fun onOpenScreenDimmingSettings()
     fun onOpenSmsSettings()
     fun onRequestShizukuPermission()
     fun onXiaomiTrustPair()
@@ -273,7 +271,6 @@ interface EdgeLinkActions {
         override fun onRequestPhotoAccess() = Unit
         override fun onOpenNotificationSettings() = Unit
         override fun onOpenRemoteInputSettings() = Unit
-        override fun onOpenScreenDimmingSettings() = Unit
         override fun onOpenSmsSettings() = Unit
         override fun onRequestShizukuPermission() = Unit
         override fun onXiaomiTrustPair() = Unit
@@ -914,13 +911,6 @@ private fun SettingsScreen(
                         onOpenSettings = actions::onOpenRemoteInputSettings
                     )
                     PermissionStatusRow(
-                        label = stringResource(R.string.permission_keep_screen_on),
-                        granted = state.screenDimmingAccessGranted,
-                        missingText = stringResource(R.string.permission_keep_screen_on_missing),
-                        actionLabel = permissionActionLabel(state),
-                        onOpenSettings = actions::onOpenScreenDimmingSettings
-                    )
-                    PermissionStatusRow(
                         label = "SMS",
                         granted = state.smsAccessGranted,
                         missingText = stringResource(R.string.permission_sms_missing),
@@ -1398,16 +1388,6 @@ private fun missingPermissions(state: EdgeLinkUiState, actions: EdgeLinkActions)
                     detail = stringResource(R.string.permission_remote_input_missing),
                     actionLabel = permissionActionLabel(state),
                     onOpen = actions::onOpenRemoteInputSettings
-                )
-            )
-        }
-        if (!state.screenDimmingAccessGranted) {
-            add(
-                MissingPermission(
-                    title = stringResource(R.string.permission_keep_screen_on),
-                    detail = stringResource(R.string.permission_keep_screen_on_missing),
-                    actionLabel = permissionActionLabel(state),
-                    onOpen = actions::onOpenScreenDimmingSettings
                 )
             )
         }
