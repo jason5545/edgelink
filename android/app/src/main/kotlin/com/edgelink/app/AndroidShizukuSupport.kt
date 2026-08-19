@@ -189,6 +189,20 @@ object AndroidShizukuSupport {
             results.toOperationResult("screen", allowPartial = true)
         }
 
+    // HyperOS keeps READ_CLIPBOARD at "foreground" in the uid-mode AppOps
+    // entry, which blocks background clipboard reads even when the package
+    // entry says allow. The uid mode wins, so both must be set.
+    suspend fun prepareClipboardAccess(context: Context): ShizukuOperationResult =
+        withService(context) { service ->
+            val results = listOf(
+                service.runCommandResult(arrayOf("cmd", "appops", "set", context.packageName, "READ_CLIPBOARD", "allow")),
+                service.runCommandResult(
+                    arrayOf("cmd", "appops", "set", "--uid", Process.myUid().toString(), "READ_CLIPBOARD", "allow")
+                )
+            )
+            results.toOperationResult("clipboard", allowPartial = true)
+        }
+
     suspend fun putSecureInt(context: Context, key: String, value: Int): ShizukuOperationResult =
         withService(context) { service ->
             val result = service.runCommandResult(
@@ -618,7 +632,19 @@ object AndroidShizukuSupport {
             .daemon(true)
             .processNameSuffix("shizuku")
             .tag("edgelink-shizuku")
-            .version(SHIZUKU_USER_SERVICE_VERSION)
+            .version(userServiceVersion(context))
+
+    // Shizuku only replaces a cached user-service process when the version
+    // changes, and a reinstall does not kill the old :shizuku process — it
+    // keeps running classes from the previous APK (e.g. a stale command
+    // policy). Folding the APK's lastUpdateTime into the version forces a
+    // respawn from the freshly installed APK on every reinstall.
+    private fun userServiceVersion(context: Context): Int {
+        val lastUpdateSeconds = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime / 1000
+        }.getOrDefault(0L)
+        return SHIZUKU_USER_SERVICE_VERSION * 10_000_000 + (lastUpdateSeconds % 10_000_000).toInt()
+    }
 
     private fun appendSecureComponent(
         service: IEdgeLinkShizukuService,

@@ -396,15 +396,25 @@ internal object EdgeLinkShizukuCommandPolicy {
     }
 
     private fun isAllowedAppOpsCommand(command: Array<String>): Boolean {
-        if (command.size != 6) {
+        if (command.size < 6 ||
+            command[0] != "cmd" ||
+            command[1] != "appops" ||
+            command[2] != "set"
+        ) {
             return false
         }
-        return command[0] == "cmd" &&
-            command[1] == "appops" &&
-            command[2] == "set" &&
-            command[3] == EDGE_LINK_PACKAGE_NAME &&
-            command[4] in allowedAppOps &&
-            command[5] == "allow"
+        // HyperOS splits AppOps into a package mode and a uid mode; the uid
+        // mode wins, so callers set both (e.g. READ_CLIPBOARD).
+        return when (command.size) {
+            6 -> command[3] == EDGE_LINK_PACKAGE_NAME &&
+                command[4] in allowedAppOps &&
+                command[5] == "allow"
+            7 -> command[3] == "--uid" &&
+                command[4].toIntOrNull() != null &&
+                command[5] in allowedAppOps &&
+                command[6] == "allow"
+            else -> false
+        }
     }
 
     private fun isAllowedPermissionGrantCommand(command: Array<String>): Boolean {
@@ -491,7 +501,8 @@ internal object EdgeLinkShizukuCommandPolicy {
             "PROJECT_MEDIA",
             "SYSTEM_ALERT_WINDOW",
             "WRITE_SETTINGS",
-            "MANAGE_ONGOING_CALLS"
+            "MANAGE_ONGOING_CALLS",
+            "READ_CLIPBOARD"
     )
     private val allowedRuntimePermissions = setOf(
             "android.permission.POST_NOTIFICATIONS",

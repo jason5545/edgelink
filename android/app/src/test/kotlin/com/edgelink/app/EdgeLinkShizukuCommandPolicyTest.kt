@@ -355,6 +355,45 @@ class EdgeLinkShizukuCommandPolicyTest {
     }
 
     @Test
+    fun allowsExactAppOpsCommands() {
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "com.edgelink.app", "READ_CLIPBOARD", "allow")
+            )
+        )
+        assertTrue(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "--uid", "10295", "READ_CLIPBOARD", "allow")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "com.edgelink.app", "READ_CLIPBOARD", "deny")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "--uid", "10295", "READ_CLIPBOARD", "foreground")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "--uid", "root", "READ_CLIPBOARD", "allow")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "--uid", "10295", "RUN_ANY_IN_BACKGROUND", "allow")
+            )
+        )
+        assertFalse(
+            EdgeLinkShizukuCommandPolicy.isAllowed(
+                arrayOf("cmd", "appops", "set", "--uid", "10295", "--user", "0", "READ_CLIPBOARD", "allow")
+            )
+        )
+    }
+
+    @Test
     fun allowsExactDistAudioMaintenanceCommands() {
         assertTrue(
             EdgeLinkShizukuCommandPolicy.isAllowed(

@@ -407,6 +407,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     @Volatile
     private var pendingPhotoItems: Map<String, AndroidPhotoSync.MediaItem> = emptyMap()
     private var shizukuAutoRepairJob: Job? = null
+    private var clipboardAppOpsJob: Job? = null
     private var phoneCallCompanionJob: Job? = null
     private var phoneCallCompanionRegistered = false
     @Volatile
@@ -476,6 +477,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                 if (shizukuState.uid == 0) {
                     pendingShizukuAction = null
                     runShizukuAutoRepairIfReady("permission_granted")
+                    runClipboardAppOpsRepairIfReady("permission_granted")
                 } else {
                     runPendingShizukuAction()
                 }
@@ -521,6 +523,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             run()
         }
         runShizukuAutoRepairIfReady("init")
+        runClipboardAppOpsRepairIfReady("init")
         runMiLinkRootProbeIfReady("init")
         runPhoneCallCompanionRegistrationIfReady("init")
     }
@@ -1175,6 +1178,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         if (AndroidShizukuSupport.hasPermission()) {
             runPendingShizukuAction()
             runShizukuAutoRepairIfReady(reason)
+            runClipboardAppOpsRepairIfReady(reason)
             runMiLinkRootProbeIfReady(reason)
             runPhoneCallCompanionRegistrationIfReady(reason)
         }
@@ -1261,6 +1265,33 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
                         "failed=${failures.joinToString { (target, result) -> "$target:${result.message}" }} " +
                         "remaining=${remaining.joinToString()}"
                 )
+            }
+        }
+    }
+
+    // HyperOS pins READ_CLIPBOARD to "foreground" in the uid-mode AppOps
+    // entry, blocking background clipboard reads. Re-assert both AppOps modes
+    // whenever the root Shizuku service is ready; the grant is idempotent and
+    // HyperOS may silently revert it.
+    private fun runClipboardAppOpsRepairIfReady(reason: String) {
+        val shizukuState = AndroidShizukuSupport.currentState()
+        if (!shizukuState.canUse || shizukuState.uid != 0) {
+            return
+        }
+        if (clipboardAppOpsJob?.isActive == true) {
+            return
+        }
+        clipboardAppOpsJob = scope.launch {
+            val result = runCatching {
+                AndroidShizukuSupport.prepareClipboardAccess(appContext)
+            }.getOrElse { error ->
+                EdgeLinkLog.warn("shizuku.android.clipboard_appops_exception reason=$reason", error)
+                ShizukuOperationResult(success = false, message = error.message.orEmpty())
+            }
+            if (result.success) {
+                EdgeLinkLog.info("shizuku.android.clipboard_appops_ok reason=$reason message=${result.message}")
+            } else {
+                EdgeLinkLog.warn("shizuku.android.clipboard_appops_failed reason=$reason message=${result.message}")
             }
         }
     }
