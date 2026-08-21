@@ -70,6 +70,13 @@ final class LyraMeshResponder {
     private var syncKeyCandidates: [SymmetricKey] = []
     private var syncAuthSharedSecret = Data()
     private var syncAnnounceEndpoint: String?
+    // Receive conn (miLyraShareTransfer) adopted from the ANNOUNCER's socket:
+    // sends that bypass `reply` (responseOfPeerPort, sync announces) must ride
+    // that socket — this one has no inbound connection to the phone's
+    // announcer-conn endpoint.
+    private var adoptedReceiveConnId: UInt32?
+    private var adoptedReceiveEndpointDescription: String?
+    private var adoptedReceiveSend: ((LyraMeshPack.Frame) -> Void)?
     private var syncCookieByEndpoint: [String: UInt64] = [:]
     private let syncTaskServer = LyraSyncTaskServer()
     private var expressDataKey = Data()
@@ -89,6 +96,14 @@ final class LyraMeshResponder {
 
     static let hkdfSalt = LyraMeshHkdf.salt
 
+    // The single live responder (set by attach). LyraMeshAnnouncer offers
+    // foreign conns its socket can't place to this instance: the phone's
+    // score-based phys-conn reuse can dial miLyraShareTransfer on the
+    // ANNOUNCER's conn (live 2026-08-21: the sync_info fell into
+    // announcer_stray_conn; the phone's 15s kcp timeout surfaced as
+    // 「連線失敗」).
+    static weak var shared: LyraMeshResponder?
+
     init(
         socket: LyraMeshSocket,
         deviceIdHexProvider: @escaping () -> String?,
@@ -106,6 +121,7 @@ final class LyraMeshResponder {
     }
 
     func attach() {
+        Self.shared = self
         socket.onFrame = { [weak self] frame, endpoint, reply in
             self?.handle(frame: frame, endpoint: endpoint, reply: reply)
         }
@@ -526,17 +542,18 @@ final class LyraMeshResponder {
         return key
     }
 
-    private func handlePayloadV2(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) {
+    @discardableResult
+    private func handlePayloadV2(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) -> Bool {
         let body = frame.payload
         guard body.count > 30 else {
-            return
+            return false
         }
         let flag = body[body.index(body.startIndex, offsetBy: 1)]
         guard flag == 1 else {
             DiagnosticsLog.info(
                 "xiaomi.mishare.channel_payload_plain from=\(endpoint.debugDescription) bytes=\(body.count)"
             )
-            return
+            return false
         }
         let nonce = body[body.index(body.startIndex, offsetBy: 2)..<body.index(body.startIndex, offsetBy: 14)]
         let ciphertext = body[body.index(body.startIndex, offsetBy: 14)..<body.index(body.endIndex, offsetBy: -16)]
@@ -546,7 +563,7 @@ final class LyraMeshResponder {
             ciphertext: Data(ciphertext),
             tag: Data(tag)
         ) else {
-            return
+            return false
         }
         var keys: [(String, SymmetricKey)] = []
         if let syncSessionKey {
@@ -576,14 +593,15 @@ final class LyraMeshResponder {
                         "hex=\(plaintext.prefix(400).map { String(format: "%02x", $0) }.joined())"
                 )
                 sendEncryptedSyncAnnounce(endpointDescription: endpoint.debugDescription, key: key)
-                return
+                return true
             }
             DiagnosticsLog.info(
                 "xiaomi.mishare.channel_payload from=\(endpoint.debugDescription) bytes=\(plaintext.count) " +
                     "hex=\(plaintext.prefix(96).map { String(format: "%02x", $0) }.joined())"
             )
+            // Decrypted with the channel key: ours regardless of the command.
             guard let (header, commandBody) = try? LyraChannelProtocol.decode(plaintext) else {
-                return
+                return true
             }
             if header.type == LyraChannelProtocol.CommandType.requestOfPeerPort.rawValue,
                let request = LyraChannelProtocol.PeerPortRequest(parsing: commandBody)
@@ -597,10 +615,84 @@ final class LyraMeshResponder {
                         "transKeyBytes=\(request.transKey.count)"
                 )
             }
-            return
+            return true
         }
         if channelKey != nil || !syncKeyCandidates.isEmpty || syncSessionKey != nil {
             DiagnosticsLog.warn("xiaomi.mishare.channel_payload_decrypt_failed bytes=\(body.count)")
+        }
+        return false
+    }
+
+    static func isMiShareTransferService(_ serviceName: String) -> Bool {
+        // The phone dials with its own package prefix
+        // (com.xiaomi.hyperConnect: / com.miui.mishare.connectivity:).
+        serviceName.hasSuffix("miLyraShareTransfer")
+    }
+
+    // LyraMeshAnnouncer offers foreign logi conns from its socket here.
+    // Returns true when the frame belongs to the receive flow adopted from
+    // there (a miLyraShareTransfer sync_info, or any frame on the adopted
+    // conn). Answers ride the announcer's `reply`; sends that have no reply
+    // context use the `send` override captured at adoption.
+    func handleAnnouncerLogiConn(
+        frame: LyraMeshPack.Frame,
+        logiConn: LogiConnFrame,
+        endpoint: NWEndpoint,
+        reply: LyraMeshSocket.ReplyHandler,
+        send: @escaping (LyraMeshPack.Frame) -> Void
+    ) -> Bool {
+        if logiConn.logiConnId == adoptedReceiveConnId {
+            if logiConn.flag {
+                handleEncryptedLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
+            } else {
+                handleLogiConn(frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply)
+            }
+            return true
+        }
+        guard !logiConn.flag,
+              let inner = LogiConnInnerFrame(parsing: logiConn.inner),
+              case let .syncInfo(syncInfoData) = inner.payload,
+              let fields = try? LyraProtoReader.readFields(from: syncInfoData),
+              let serviceData = fields.first(where: { $0.number == 4 && $0.wireType == 2 })?
+                  .lengthDelimitedValue,
+              let serviceName = String(data: serviceData, encoding: .utf8),
+              Self.isMiShareTransferService(serviceName)
+        else { return false }
+        // handleLogiSyncInfo's fallback branch runs resetChannelState()
+        // (clearing any previous adoption) before answering the sync-auth
+        // request via `reply`, so the adoption ivars go in AFTER it returns.
+        handleLogiSyncInfo(
+            syncInfoData: syncInfoData, frame: frame, logiConn: logiConn,
+            endpoint: endpoint, reply: reply
+        )
+        adoptedReceiveConnId = logiConn.logiConnId
+        adoptedReceiveEndpointDescription = endpoint.debugDescription
+        adoptedReceiveSend = send
+        DiagnosticsLog.info(
+            "xiaomi.mishare.mesh_receive_adopted connId=\(logiConn.logiConnId) " +
+                "from=\(endpoint.debugDescription)"
+        )
+        return true
+    }
+
+    // packType-5 payloads arriving on the announcer's socket: claimed only
+    // when a receive conn was adopted from there AND the payload decrypts
+    // with one of the receive-flow keys.
+    func handleAnnouncerPayloadV2(frame: LyraMeshPack.Frame, endpoint: NWEndpoint) -> Bool {
+        guard adoptedReceiveConnId != nil else { return false }
+        return handlePayloadV2(frame: frame, endpoint: endpoint)
+    }
+
+    // Sends a receive-flow frame on the socket the phone's conn is actually
+    // bound to: the adopted announcer conn when the target is its endpoint,
+    // else our own inbound connection.
+    private func sendReceiveSocketFrame(
+        _ frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String
+    ) {
+        if let send = adoptedReceiveSend, endpointDescription == adoptedReceiveEndpointDescription {
+            send(frame)
+        } else {
+            socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
         }
     }
 
@@ -778,6 +870,10 @@ final class LyraMeshResponder {
         body.append(sealed.tag)
 
         let dataFrame = LyraMeshPack.Frame(packType: 5, payload: body)
+        if let send = adoptedReceiveSend, endpointDescription == adoptedReceiveEndpointDescription {
+            send(dataFrame)
+            return
+        }
         try socket.sendInbound(frame: dataFrame, toEndpointDescription: endpointDescription)
     }
 
@@ -809,7 +905,7 @@ final class LyraMeshResponder {
         )
         let payload = LyraTrustedDeviceInfo.plaintextAnnounce(deviceInfo: deviceInfo)
         let frame = LyraMeshPack.Frame(packType: 5, payload: payload)
-        socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+        sendReceiveSocketFrame(frame, toEndpointDescription: endpointDescription)
         DiagnosticsLog.info(
             "xiaomi.mishare.announce_sent to=\(endpointDescription) bytes=\(payload.count)"
         )
@@ -1714,6 +1810,9 @@ final class LyraMeshResponder {
     }
 
     private func resetChannelState() {
+        adoptedReceiveConnId = nil
+        adoptedReceiveEndpointDescription = nil
+        adoptedReceiveSend = nil
         expressHandshakeDone = false
         expressListener?.cancel()
         expressListener = nil
@@ -1891,7 +1990,7 @@ final class LyraMeshResponder {
             payload.append(sealed.ciphertext)
             payload.append(sealed.tag)
             let frame = LyraMeshPack.Frame(packType: 5, payload: payload)
-            socket.sendInboundAsync(frame: frame, toEndpointDescription: endpointDescription)
+            sendReceiveSocketFrame(frame, toEndpointDescription: endpointDescription)
             DiagnosticsLog.info(
                 "xiaomi.mishare.sync_announce_sent to=\(endpointDescription) bytes=\(payload.count)"
             )

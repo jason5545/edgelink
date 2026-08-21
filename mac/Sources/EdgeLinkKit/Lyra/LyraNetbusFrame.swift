@@ -127,10 +127,14 @@ public struct LyraProtoReader {
                 fields.append(Field(number: fieldNumber, wireType: wireType, varintValue: value, lengthDelimitedValue: nil))
             case 2:
                 let length = try readVarint(from: data, index: &index)
-                let end = index + Int(length)
-                guard end <= data.endIndex else {
+                // Compare against the remaining bytes BEFORE the Int
+                // conversion: a garbage length (> Int.max, e.g. from a
+                // misaligned relay-reassembly frame) must throw, not trap
+                // (xctest crash 2026-08-21: announcer parsing a stray conn).
+                guard length <= UInt64(data.endIndex - index) else {
                     throw ReadError.truncated
                 }
+                let end = index + Int(length)
                 fields.append(Field(number: fieldNumber, wireType: wireType, varintValue: nil, lengthDelimitedValue: Data(data[index..<end])))
                 index = end
             default:

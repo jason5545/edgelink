@@ -864,6 +864,16 @@ final class LyraMeshAnnouncer {
             DiagnosticsLog.info("xiaomi.mishare.announcer_port_pinned port=\(endpointPort)")
         }
         if frame.packType == 5 {
+            // A miLyraShareTransfer receive conn adopted from this socket
+            // gets its channel payloads first (score-based reuse can put the
+            // phone's dial on the announcer's phys conn — live 2026-08-21).
+            // Returns false unless such a conn was adopted AND the payload
+            // decrypts with one of its keys, so our own announce sync
+            // payloads are unaffected.
+            if let responder = LyraMeshResponder.shared,
+               responder.handleAnnouncerPayloadV2(frame: frame, endpoint: endpoint) {
+                return
+            }
             var detail = ""
             if let sessionKey = meshSessionKey, frame.payload.count > 30 {
                 let body = frame.payload
@@ -1046,6 +1056,18 @@ final class LyraMeshAnnouncer {
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }
+                } else if let responder = LyraMeshResponder.shared,
+                          responder.handleAnnouncerLogiConn(
+                              frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply,
+                              send: { [weak self] sendFrame in
+                                  self?.send(frame: sendFrame, label: "mishare_adopted")
+                              }
+                          )
+                {
+                    // miLyraShareTransfer dialed on the announcer's phys conn
+                    // (score-based reuse, live 2026-08-21): the mesh responder
+                    // adopts it. Must precede the activeRelaySession fallback,
+                    // which would swallow the sync_info.
                 } else if let session = LyraRelayCallSession.activeRelaySession {
                     session.handleFrame(logiConn)
                 } else {

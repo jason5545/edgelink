@@ -73,6 +73,18 @@ final class LyraNetbusFrameTests: XCTestCase {
         XCTAssertEqual(fields[2].lengthDelimitedValue, Data([1, 2]))
     }
 
+    func testProtoReaderRejectsOversizedLengthDelimitedField() {
+        // Length varint encoding 1<<63: the Int(length) conversion used to
+        // trap (EXC_BREAKPOINT) instead of throwing — a garbage frame from
+        // the network could crash the process (xctest crash at
+        // LyraMeshAnnouncer.handle, 2026-08-21).
+        var data = Data([0x0A])
+        LyraProtoWriter.appendVarint(UInt64(1) << 63, to: &data)
+        XCTAssertThrowsError(try LyraProtoReader.readFields(from: data)) { error in
+            XCTAssertEqual(error as? LyraProtoReader.ReadError, .truncated)
+        }
+    }
+
     func testLogiConnFrameGolden() {
         let frame = LogiConnFrame(logiConnId: 0x01020304, localNetId: 0x10, remoteNetId: 0x20, flag: true, inner: Data([0x08, 0x01]))
         let bytes = frame.serialized()
