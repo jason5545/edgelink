@@ -35,7 +35,24 @@ public final class LyraMeshSocket: @unchecked Sendable {
     private var lastActivityByConnection: [ObjectIdentifier: Date] = [:]
     private var physKeepaliveTimer: DispatchSourceTimer?
 
-    public init() {}
+    // All mutable state above is confined to `queue`. Entry points that can
+    // be called from any thread (send, stop) must hop through `onQueue`;
+    // callers already on the queue (frame handlers replying inline) run
+    // directly so they can't deadlock. Without this, an off-queue send racing
+    // the receive loop corrupts the session dictionary (SIGSEGV observed
+    // 2026-08-21: channel-socket queue → responder → announcer send).
+    private let queueSpecificKey = DispatchSpecificKey<Void>()
+
+    public init() {
+        queue.setSpecific(key: queueSpecificKey, value: ())
+    }
+
+    private func onQueue<T>(_ work: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) != nil {
+            return try work()
+        }
+        return try queue.sync(execute: work)
+    }
 
     deinit {
         stop()
@@ -64,6 +81,12 @@ public final class LyraMeshSocket: @unchecked Sendable {
     }
 
     public func stop() {
+        onQueue {
+            stopOnQueue()
+        }
+    }
+
+    private func stopOnQueue() {
         physKeepaliveTimer?.cancel()
         physKeepaliveTimer = nil
         lastActivityByConnection.removeAll()
@@ -93,6 +116,12 @@ public final class LyraMeshSocket: @unchecked Sendable {
     }
 
     public func send(frame: LyraMeshPack.Frame, to host: String, port: UInt16) throws {
+        try onQueue {
+            try sendOnQueue(frame: frame, to: host, port: port)
+        }
+    }
+
+    private func sendOnQueue(frame: LyraMeshPack.Frame, to host: String, port: UInt16) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw SocketError.invalidEndpoint
         }
@@ -140,7 +169,7 @@ public final class LyraMeshSocket: @unchecked Sendable {
     }
 
     public func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription endpointDescription: String) throws {
-        try queue.sync {
+        try onQueue {
             try sendInboundOnQueue(frame: frame, toEndpointDescription: endpointDescription)
         }
     }

@@ -96,6 +96,18 @@ final class LyraMeshResponder {
 
     static let hkdfSalt = LyraMeshHkdf.salt
 
+    // Test hook: redirects MiShare receives away from ~/Downloads so tests can
+    // point them at a temp directory (nil in production).
+    static var miShareDownloadDirectoryOverride: URL?
+
+    private static func miShareDownloadDirectory() -> URL {
+        if let override = miShareDownloadDirectoryOverride {
+            return override
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads/EdgeLink-MiShare", isDirectory: true)
+    }
+
     // The single live responder (set by attach). LyraMeshAnnouncer offers
     // foreign conns its socket can't place to this instance: the phone's
     // score-based phys-conn reuse can dial miLyraShareTransfer on the
@@ -1149,8 +1161,7 @@ final class LyraMeshResponder {
             filename = taskId.isEmpty ? "mishare-\(Int(Date().timeIntervalSince1970))" : taskId
         }
         let sanitized = filename.replacingOccurrences(of: "/", with: "_")
-        let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Downloads/EdgeLink-MiShare", isDirectory: true)
+        let directory = Self.miShareDownloadDirectory()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let url = directory.appendingPathComponent(sanitized)
@@ -1205,9 +1216,7 @@ final class LyraMeshResponder {
             "xiaomi.mishare.stream_send_begin streamId=\(streamId) length=\(contentLength) name=\(filename)"
         )
 
-        let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Downloads", isDirectory: true)
-            .appendingPathComponent("EdgeLink-MiShare", isDirectory: true)
+        let directory = Self.miShareDownloadDirectory()
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let safeName = filename.components(separatedBy: "/").last ?? "stream-\(streamId)"
         let fileURL = directory.appendingPathComponent(safeName)

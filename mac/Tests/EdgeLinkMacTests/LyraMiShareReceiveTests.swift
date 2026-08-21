@@ -14,6 +14,12 @@ import XCTest
 // 「連線失敗」. The first test is the baseline dial on the responder's own
 // socket; the second recreates the announcer-conn dial and times out without
 // the responder-adoption fix.
+//
+// The remaining tests drive the actual file transfer past channel
+// negotiation: a small inline file (no stream), a chunked stream, and a 10GB
+// stream to prove very large files (update packages) survive the express
+// link. Receives are redirected to a temp directory via
+// LyraMeshResponder.miShareDownloadDirectoryOverride.
 final class LyraMiShareReceiveTests: XCTestCase {
     private static let defaultsKeys = [
         "xiaomiTrustIdentityPrivHex",
@@ -32,6 +38,8 @@ final class LyraMiShareReceiveTests: XCTestCase {
     private var responderSocket: LyraMeshSocket?
     private var responder: LyraMeshResponder?
     private var announcer: LyraMeshAnnouncer?
+    private var senders: [LyraMiShareSenderRole] = []
+    private var downloadDirs: [URL] = []
 
     override func setUp() {
         super.setUp()
@@ -53,6 +61,10 @@ final class LyraMiShareReceiveTests: XCTestCase {
     }
 
     override func tearDown() {
+        for sender in senders {
+            sender.stopTransfer()
+        }
+        senders = []
         announcer?.stop()
         announcer = nil
         responder = nil
@@ -60,6 +72,11 @@ final class LyraMiShareReceiveTests: XCTestCase {
         responderSocket = nil
         phone?.stop()
         phone = nil
+        LyraMeshResponder.miShareDownloadDirectoryOverride = nil
+        for dir in downloadDirs {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        downloadDirs = []
         let defaults = UserDefaults.standard
         for key in Self.defaultsKeys {
             if let value = savedValues[key] ?? nil {
@@ -120,6 +137,22 @@ final class LyraMiShareReceiveTests: XCTestCase {
         return phone
     }
 
+    // Redirects receives into a fresh temp directory and returns it.
+    private func makeDownloadDir() -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mishare-tests-\(UUID().uuidString)", isDirectory: true)
+        LyraMeshResponder.miShareDownloadDirectoryOverride = url
+        downloadDirs.append(url)
+        return url
+    }
+
+    private func makeSender(phone: LyraPhoneServer) -> LyraMiShareSenderRole {
+        let sender = LyraMiShareSenderRole(identity: phone.identity)
+        phone.mesh.register(sender)
+        senders.append(sender)
+        return sender
+    }
+
     // Baseline: the dial lands on the responder's published mesh socket (the
     // phone's own mesh conn winning the score). Validates the mock speaks the
     // receive flow the responder expects.
@@ -128,8 +161,7 @@ final class LyraMiShareReceiveTests: XCTestCase {
         let phone = try makePhone()
         self.phone = phone
 
-        let sender = LyraMiShareSenderRole(identity: phone.identity)
-        phone.mesh.register(sender)
+        let sender = makeSender(phone: phone)
         sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
 
         waitFor("responseOfPeerPort received") { sender.receivedChannelPort != nil }
@@ -158,13 +190,152 @@ final class LyraMiShareReceiveTests: XCTestCase {
             !phone.mesh.peer.endpointDescription.isEmpty
         }
 
-        let sender = LyraMiShareSenderRole(identity: phone.identity)
-        phone.mesh.register(sender)
+        let sender = makeSender(phone: phone)
         sender.dial(server: phone.mesh)
 
         waitFor("responseOfPeerPort received over announcer conn") {
             sender.receivedChannelPort != nil
         }
         XCTAssertEqual(sender.state, .channelReady)
+    }
+
+    // Small file: the bytes ride file-message field 4 and the responder
+    // writes them without a stream.
+    func testMiShareReceiveInlineSmallFile() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        var payload = Data(count: 48 * 1024)
+        payload.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, buffer.count) }
+        }
+
+        let sender = makeSender(phone: phone)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+        waitFor("channel ready") { sender.state == .channelReady }
+
+        sender.sendFile(name: "small.bin", mode: .inlineData(payload), host: "127.0.0.1")
+        waitFor("inline transfer done") { sender.state == .transferDone }
+
+        let fileURL = downloadDir.appendingPathComponent("small.bin")
+        waitFor("inline file written") {
+            (try? Data(contentsOf: fileURL)) == payload
+        }
+        XCTAssertEqual(sender.transferredBytes, Int64(payload.count))
+    }
+
+    // Streamed file: chunks ride the express TCP link.
+    func testMiShareReceiveStreamedFile() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        let chunkSize = 64 * 1024
+        let totalSize: Int64 = 8 * 1024 * 1024
+        let template = Self.makePatternTemplate(chunkSize)
+
+        let sender = makeSender(phone: phone)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+        waitFor("channel ready") { sender.state == .channelReady }
+
+        sender.sendFile(
+            name: "medium.bin",
+            mode: .stream(size: totalSize, chunkSize: chunkSize) { offset, count in
+                Self.patternChunk(template: template, chunkSize: chunkSize, offset: offset, count: count)
+            },
+            host: "127.0.0.1"
+        )
+        waitFor("stream transfer done", timeout: 120) { sender.state == .transferDone }
+        XCTAssertEqual(sender.transferredBytes, totalSize)
+
+        let fileURL = downloadDir.appendingPathComponent("medium.bin")
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        XCTAssertEqual(attributes[.size] as? Int64, totalSize)
+        try Self.verifyPattern(
+            fileURL: fileURL, template: template, chunkSize: chunkSize,
+            chunkIndices: [0, 1, 63, 127]
+        )
+    }
+
+    // Very large file: 10GB (an update package) through the express link.
+    // Exercises 64-bit stream offsets past the 4GB boundary; the chunk source
+    // generates data on demand so the test never holds the file in memory.
+    func testMiShareReceiveVeryLargeStream() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        let chunkSize = 1024 * 1024
+        let totalSize: Int64 = 10 * 1024 * 1024 * 1024
+        let template = Self.makePatternTemplate(chunkSize)
+
+        let sender = makeSender(phone: phone)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+        waitFor("channel ready") { sender.state == .channelReady }
+
+        sender.sendFile(
+            name: "huge.bin",
+            mode: .stream(size: totalSize, chunkSize: chunkSize) { offset, count in
+                Self.patternChunk(template: template, chunkSize: chunkSize, offset: offset, count: count)
+            },
+            host: "127.0.0.1"
+        )
+        waitFor("10GB stream transfer done", timeout: 900) { sender.state == .transferDone }
+        XCTAssertEqual(sender.transferredBytes, totalSize)
+
+        let fileURL = downloadDir.appendingPathComponent("huge.bin")
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        XCTAssertEqual(attributes[.size] as? Int64, totalSize)
+        // Chunk 4096 starts just past the 32-bit 4GB boundary.
+        try Self.verifyPattern(
+            fileURL: fileURL, template: template, chunkSize: chunkSize,
+            chunkIndices: [0, 4095, 4096, 4097, 7000, 10239]
+        )
+    }
+
+    // MARK: - Pattern helpers
+
+    // Deterministic per-chunk content: first 8 bytes are the chunk index
+    // (big-endian), the rest a position-derived pattern. The index header
+    // catches seek/offset bugs on the receive side even at multi-GB offsets.
+    private static func patternChunk(template: Data, chunkSize: Int, offset: Int64, count: Int) -> Data {
+        var chunk = Data(template.prefix(count))
+        let index = (UInt64(offset) / UInt64(chunkSize)).bigEndian
+        withUnsafeBytes(of: index) { chunk.replaceSubrange(0..<8, with: $0) }
+        return chunk
+    }
+
+    private static func makePatternTemplate(_ size: Int) -> Data {
+        var data = Data(count: size)
+        data.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for index in 0..<size {
+                base[index] = UInt8(truncatingIfNeeded: (index &* 2_654_435_761) >> 8)
+            }
+        }
+        return data
+    }
+
+    private static func verifyPattern(
+        fileURL: URL, template: Data, chunkSize: Int, chunkIndices: [UInt64]
+    ) throws {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        for index in chunkIndices {
+            try handle.seek(toOffset: index * UInt64(chunkSize))
+            let header = try handle.read(upToCount: 8) ?? Data()
+            let expectedIndex = index.bigEndian
+            let expectedHeader = withUnsafeBytes(of: expectedIndex) { Data($0) }
+            XCTAssertEqual(header, expectedHeader, "chunk \(index) header mismatch")
+            let sample = try handle.read(upToCount: 64) ?? Data()
+            XCTAssertEqual(
+                sample, Data(template[8..<72]),
+                "chunk \(index) body mismatch"
+            )
+        }
     }
 }
