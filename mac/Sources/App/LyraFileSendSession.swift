@@ -1227,6 +1227,10 @@ final class LyraFileSendSession {
                     self.fail(String(localized: "資料傳輸失敗：\(error.localizedDescription)"))
                     return
                 }
+                // Outgoing chunks are liveness too: the watchdog only saw
+                // inbound traffic, so a 10GB stream (minutes of one-way
+                // sending) tripped the 30s silence window mid-transfer.
+                self.lastProgress = Date()
                 if isEOF {
                     self.progress(.streamEndWait, String(localized: "等待手機確認 \(self.files[self.currentFileIndex].name)…"))
                     DiagnosticsLog.info(

@@ -157,6 +157,7 @@ targets:
       - path: Sources/App/LyraSyncReply.swift
       - path: Sources/App/LyraMeshAnnouncer.swift
       - path: Sources/App/LyraMeshResponder.swift
+      - path: Sources/App/LyraFileSendSession.swift
       - path: Sources/App/LyraTunnelManager.swift
       - path: Sources/App/TunnelManager.swift
       - path: Sources/App/LyraRelayCallSession.swift

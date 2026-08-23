@@ -44,20 +44,76 @@ public final class LyraDevRepoOracle {
         public var rejectionReasons: [String]
     }
 
+    // Dual-transport tests share one oracle between two mesh pipes that
+    // deliver on different queues — every state access funnels through this
+    // lock (2026-08-22 full-suite SIGSEGV: concurrent handleSyncPush on
+    // `records`). Public collections are computed copies so external reads
+    // (`oracle.records[...]` in tests) stay race-free too.
+    private let stateLock = NSRecursiveLock()
+    private var recordsStorage: [String: DeviceRecord] = [:]
+    private var deviceKeysStorage: [String: Data] = [:]
+    private var trustedPeerIdentitiesStorage: [Data] = []
+    private var trustedCertsStorage: [Data: Data] = [:]
+    private var accountCredTrustedTypeStorage: UInt32 = 1
+
     // Devices that completed registration, keyed by full device id.
-    public private(set) var records: [String: DeviceRecord] = [:]
+    public var records: [String: DeviceRecord] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recordsStorage
+    }
+
     // DeviceKeyManager: f13 keys seen in pushes, keyed by full device id.
-    public private(set) var deviceKeys: [String: Data] = [:]
+    public var deviceKeys: [String: Data] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return deviceKeysStorage
+    }
+
     // Registered peer identity pubkeys (paired devices) — the pubKeyCred
     // signature must verify against one of these.
-    public var trustedPeerIdentities: [Data] = []
+    public var trustedPeerIdentities: [Data] {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return trustedPeerIdentitiesStorage
+        }
+        set {
+            stateLock.lock()
+            trustedPeerIdentitiesStorage = newValue
+            stateLock.unlock()
+        }
+    }
+
     // Registered cert trust anchors: cert DER → its P-256 public key, so the
     // f15 {nonce, cert, sig(nonce)} entries can be verified without X.509.
-    public var trustedCerts: [Data: Data] = [:]
+    public var trustedCerts: [Data: Data] {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return trustedCertsStorage
+        }
+        set {
+            stateLock.lock()
+            trustedCertsStorage = newValue
+            stateLock.unlock()
+        }
+    }
 
     // trusted_type stamped when the account cert cred verifies (the phone's
     // GetDeviceInfo prints trusted type 1 for same-account devices).
-    public var accountCredTrustedType: UInt32 = 1
+    public var accountCredTrustedType: UInt32 {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return accountCredTrustedTypeStorage
+        }
+        set {
+            stateLock.lock()
+            accountCredTrustedTypeStorage = newValue
+            stateLock.unlock()
+        }
+    }
 
     public init() {}
 
@@ -75,7 +131,7 @@ public final class LyraDevRepoOracle {
 
         if let key = device.deviceKey {
             if key.count == 32 {
-                deviceKeys[device.fullDeviceIdHex] = key
+                deviceKeysStorage[device.fullDeviceIdHex] = key
             } else {
                 reasons.append("device key malformed (\(key.count) bytes)")
             }
@@ -93,7 +149,7 @@ public final class LyraDevRepoOracle {
             let account = checkCertCredSlot(3, in: groupInfo, kind: .accountCertCred)
             checks.append(account)
             if account.passed {
-                trustedType |= accountCredTrustedType
+                trustedType |= accountCredTrustedTypeStorage
             } else {
                 reasons.append("CheckCertCred failed: \(account.detail)")
             }
@@ -112,17 +168,19 @@ public final class LyraDevRepoOracle {
     public func handleSyncPush(
         device: LyraTrustedDevice, groupInfo: Data?, connHadFullHandshake: Bool
     ) -> DeviceRecord {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         var (trustedType, checks, reasons) = runCredChecks(device: device, groupInfo: groupInfo)
-        let online = trustedType != 0 && deviceKeys[device.fullDeviceIdHex] != nil
+        let online = trustedType != 0 && deviceKeysStorage[device.fullDeviceIdHex] != nil
         if !online {
             if trustedType == 0 {
                 reasons.append("AddOnlineDevice err trusted_type 0")
             }
-            if deviceKeys[device.fullDeviceIdHex] == nil {
+            if deviceKeysStorage[device.fullDeviceIdHex] == nil {
                 reasons.append("DeviceKeyManager: key is null")
             }
         }
-        let merged = mergedDevice(new: device, existing: records[device.fullDeviceIdHex]?.device)
+        let merged = mergedDevice(new: device, existing: recordsStorage[device.fullDeviceIdHex]?.device)
         let record = DeviceRecord(
             device: merged,
             trustedType: trustedType,
@@ -130,7 +188,7 @@ public final class LyraDevRepoOracle {
             checks: checks,
             rejectionReasons: reasons
         )
-        records[device.fullDeviceIdHex] = record
+        recordsStorage[device.fullDeviceIdHex] = record
         return record
     }
 
@@ -140,17 +198,19 @@ public final class LyraDevRepoOracle {
     // never runs cred checks, so a fresh device gets "err trusted_type 0".
     @discardableResult
     public func handleAnnounce(device: LyraTrustedDevice) -> DeviceRecord {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if let key = device.deviceKey, key.count == 32 {
-            deviceKeys[device.fullDeviceIdHex] = key
+            deviceKeysStorage[device.fullDeviceIdHex] = key
         }
-        let existing = records[device.fullDeviceIdHex]
+        let existing = recordsStorage[device.fullDeviceIdHex]
         let merged = mergedDevice(new: device, existing: existing?.device)
         let trustedType = existing?.trustedType ?? 0
         var reasons: [String] = []
         if device.deviceKey == nil {
             reasons.append("client not have device key")
         }
-        let online = trustedType != 0 && deviceKeys[device.fullDeviceIdHex] != nil
+        let online = trustedType != 0 && deviceKeysStorage[device.fullDeviceIdHex] != nil
         if trustedType == 0 {
             reasons.append("AddOnlineDevice err trusted_type 0")
         }
@@ -161,7 +221,7 @@ public final class LyraDevRepoOracle {
             checks: existing?.checks ?? [],
             rejectionReasons: reasons
         )
-        records[device.fullDeviceIdHex] = record
+        recordsStorage[device.fullDeviceIdHex] = record
         return record
     }
 
@@ -189,7 +249,9 @@ public final class LyraDevRepoOracle {
     // online with trusted_type 1 through the reply path alone).
     @discardableResult
     public func handleSyncReply(device: LyraTrustedDevice, groupInfo: Data? = nil) -> DeviceRecord {
-        let existing = records[device.fullDeviceIdHex]
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let existing = recordsStorage[device.fullDeviceIdHex]
         let group = groupInfo ?? existing?.device.credBlock
         var (trustedType, checks, reasons) = runCredChecks(
             device: device, groupInfo: group
@@ -198,7 +260,7 @@ public final class LyraDevRepoOracle {
             trustedType = existing?.trustedType ?? 0
             checks = existing?.checks ?? checks
         }
-        let online = trustedType != 0 && deviceKeys[device.fullDeviceIdHex] != nil
+        let online = trustedType != 0 && deviceKeysStorage[device.fullDeviceIdHex] != nil
         let record = DeviceRecord(
             device: mergedDevice(new: device, existing: existing?.device),
             trustedType: trustedType,
@@ -206,7 +268,7 @@ public final class LyraDevRepoOracle {
             checks: checks,
             rejectionReasons: online ? [] : reasons
         )
-        records[device.fullDeviceIdHex] = record
+        recordsStorage[device.fullDeviceIdHex] = record
         return record
     }
 
@@ -216,14 +278,18 @@ public final class LyraDevRepoOracle {
     // the phone's DeviceKeyManager. nil ⇒ the phone logs "key is null" and
     // the quick-conn dial dies.
     public func resolveDeviceKey(for fullDeviceIdHex: String) -> SymmetricKey? {
-        guard let key = deviceKeys[fullDeviceIdHex], key.count == 32 else { return nil }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let key = deviceKeysStorage[fullDeviceIdHex], key.count == 32 else { return nil }
         return SymmetricKey(data: key)
     }
 
     // MARK: - Online repo (what TeleService queries)
 
     public func onlineDevices() -> [DeviceRecord] {
-        records.values.filter(\.online)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recordsStorage.values.filter(\.online)
     }
 
     // TeleService's gate before dialing relayCall: an online device that
@@ -242,6 +308,8 @@ public final class LyraDevRepoOracle {
     public func checkCertCredSlot(
         _ slot: Int, in groupInfo: Data, kind: CredKind
     ) -> CredCheck {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard let entry = LyraTrustedDeviceParser.lengthDelimited(slot, in: groupInfo)
         else {
             return CredCheck(kind: kind, passed: false, detail: "slot absent")
@@ -253,7 +321,7 @@ public final class LyraDevRepoOracle {
         else {
             return CredCheck(kind: kind, passed: false, detail: "slot \(slot) malformed")
         }
-        guard let pubKeyData = trustedCerts[cert],
+        guard let pubKeyData = trustedCertsStorage[cert],
               let pubKey = try? P256.Signing.PublicKey(x963Representation: pubKeyData),
               let signature = try? P256.Signing.ECDSASignature(derRepresentation: sigDer),
               pubKey.isValidSignature(signature, for: nonce)
