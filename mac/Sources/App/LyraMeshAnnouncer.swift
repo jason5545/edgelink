@@ -79,7 +79,9 @@ final class LyraMeshAnnouncer {
 
     private static var announcedDeviceType: UInt32 {
         let override = UserDefaults.standard.integer(forKey: "xiaomiDeviceTypeOverride")
-        return override > 0 ? UInt32(override) : 14
+        // 21 = PC class — keeps the MiShare transfer dial on wlanConnect(128)
+        // and consistent with LyraSyncReply's sync-push tdi (see there).
+        return override > 0 ? UInt32(override) : 21
     }
 
     private static var announcedServices: [LyraTrustedDeviceInfo.Service] {

@@ -168,4 +168,24 @@ final class LyraNetbusFrameTests: XCTestCase {
         let parsed = MiConnectFrame(parsing: decoded.frame.payload)
         XCTAssertEqual(parsed?.logiConnFrames.first?.logiConnId, 1)
     }
+
+    // Live 2026-08-27: the phone's miLyraShareTransfer conn request carries
+    // two payload fields in one inner frame — .request plus a trailing
+    // .authHandshake block. Every payload must survive the parse (the old
+    // last-payload-wins `payload` alone drops the request).
+    func testLogiConnInnerFrameKeepsAllPayloads() {
+        let request = Data([0x0A, 0x05])
+        let authBlock = Data([0x08, 0x02])
+        let frame = LogiConnInnerFrame(
+            frameType: 1, payloads: [.request(request), .authHandshake(authBlock)]
+        )
+
+        let parsed = LogiConnInnerFrame(parsing: frame.serialized())
+        XCTAssertEqual(parsed?.frameType, 1)
+        XCTAssertEqual(parsed?.payloads, [.request(request), .authHandshake(authBlock)])
+        // `payload` stays the last field for legacy single-payload consumers.
+        XCTAssertEqual(parsed?.payload, .authHandshake(authBlock))
+        // Re-serializing a parsed frame preserves both fields.
+        XCTAssertEqual(parsed?.serialized(), frame.serialized())
+    }
 }

@@ -113,7 +113,13 @@ enum LyraSyncReply {
         let deviceTypeOverride = UserDefaults.standard.integer(forKey: "xiaomiDeviceTypeOverride")
         return LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
             deviceName: displayName,
-            deviceType: deviceTypeOverride > 0 ? UInt32(deviceTypeOverride) : 4,
+            // 21 = PC class in the phone's MiShare routing (s2/p.e()):
+            // L(21) branches to wlanConnect(medium 128) unconditionally —
+            // no p2p medium upgrade (4 falls into the p2p branch and wedges
+            // in kMediumUpgradeAsClient; 14 would need the Apple
+            // discovery-medium gate). Must stay consistent with the announce
+            // tdi type or the DevRepo entry flips on every exchange.
+            deviceType: deviceTypeOverride > 0 ? UInt32(deviceTypeOverride) : 21,
             fullDeviceIdHex: fullDeviceIdHex(shortDeviceIdHex: deviceIdHex),
             shortDeviceIdHex: deviceIdHex,
             uidHash: "61F250B63BE702E35785999767C221163AF7238995757F598034B753E3AF0733",

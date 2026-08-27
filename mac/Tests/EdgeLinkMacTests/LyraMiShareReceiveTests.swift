@@ -15,6 +15,24 @@ import XCTest
 // socket; the second recreates the announcer-conn dial and times out without
 // the responder-adoption fix.
 //
+// Live 2026-08-27: the real phone's conn request carries a trailing
+// .authHandshake payload after the .request in the same inner frame, which
+// last-payload-wins parsing dropped — the Mac never answered and the phone
+// showed 傳送失敗 again. The sender role appends that block by default.
+// Same day, second root cause: the phone's conn request carries a tunnel
+// profile (private_data field 5), and its CheckTunnelCapacity then requires
+// the response to carry TunnelCapacity — the responder's empty response was
+// rejected (15s timeout, sync_auth 15006, then 15071 "logical conn secret
+// decrypt failed" while we probed a wrong-direction key). The sender role
+// now sends the captured profile block and rejects capacity-less responses,
+// so these tests fail against an empty-body responder.
+//
+// Same day, third root cause: with a cast trust session live, the phone's
+// score-based phys-conn reuse dials the service on the CAST TRUST socket,
+// whose sync_info dispatch swallowed it (stage != .syncAuth). The session
+// now forwards the dial to the responder for adoption; sends without a
+// reply context (responseOfPeerPort) ride the session's inbound connection.
+//
 // The remaining tests drive the actual file transfer past channel
 // negotiation: a small inline file (no stream), a chunked stream, and a 10GB
 // stream to prove very large files (update packages) survive the express
@@ -26,6 +44,7 @@ final class LyraMiShareReceiveTests: XCTestCase {
         "xiaomiTrustIdentityPubB64",
         "xiaomiTrustPeerIdentityPubB64",
         "xiaomiTrustPeerAccountPubB64",
+        "xiaomiTrustDeviceUUID",
         "xiaomiTrustSessionKeyHex",
         "xiaomiTrustTicketHex",
         "xiaomiTrustUidHashB64",
@@ -38,6 +57,7 @@ final class LyraMiShareReceiveTests: XCTestCase {
     private var responderSocket: LyraMeshSocket?
     private var responder: LyraMeshResponder?
     private var announcer: LyraMeshAnnouncer?
+    private var castSession: LyraCastTrustSession?
     private var senders: [LyraMiShareSenderRole] = []
     private var downloadDirs: [URL] = []
 
@@ -52,6 +72,7 @@ final class LyraMiShareReceiveTests: XCTestCase {
                      forKey: "xiaomiTrustIdentityPrivHex")
         defaults.set(macIdentity.publicKey.x963Representation.base64EncodedString(),
                      forKey: "xiaomiTrustIdentityPubB64")
+        defaults.set(UUID().uuidString, forKey: "xiaomiTrustDeviceUUID")
         defaults.removeObject(forKey: "xiaomiTrustSessionKeyHex")
         defaults.removeObject(forKey: "xiaomiTrustTicketHex")
         // Endpoint learning must not be gated by a pinned LAN IP from the
@@ -65,6 +86,8 @@ final class LyraMiShareReceiveTests: XCTestCase {
             sender.stopTransfer()
         }
         senders = []
+        castSession?.cancel()
+        castSession = nil
         announcer?.stop()
         announcer = nil
         responder = nil
@@ -197,6 +220,89 @@ final class LyraMiShareReceiveTests: XCTestCase {
             sender.receivedChannelPort != nil
         }
         XCTAssertEqual(sender.state, .channelReady)
+    }
+
+    // Regression: the real phone's encrypted conn request carries TWO
+    // payload fields — .request plus a trailing .authHandshake block. Live
+    // 2026-08-27: the responder's last-payload-wins parse dropped the
+    // request, never answered, and the phone's 15s kcp timeout surfaced as
+    // 傳送失敗. The sender role appends the block by default, so the
+    // baseline dial above recreates the phone's frame; this test pins the
+    // full flow (through file delivery) on that frame shape.
+    func testMiShareReceiveWhenConnRequestCarriesAuthHandshakeTrailer() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        var payload = Data(count: 32 * 1024)
+        payload.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, buffer.count) }
+        }
+
+        let sender = makeSender(phone: phone)
+        XCTAssertTrue(sender.appendsAuthHandshakeToConnRequest)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+        waitFor("channel ready") { sender.state == .channelReady }
+
+        sender.sendFile(name: "trailer.bin", mode: .inlineData(payload), host: "127.0.0.1")
+        waitFor("transfer done") { sender.state == .transferDone }
+        let fileURL = downloadDir.appendingPathComponent("trailer.bin")
+        waitFor("file written") { (try? Data(contentsOf: fileURL)) == payload }
+    }
+
+    // Legacy frame shape: a single .request payload (pre-2026-08-27 mock and
+    // older phone builds) must keep working alongside the dual-payload one.
+    func testMiShareReceiveWithLegacySinglePayloadConnRequest() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+
+        let sender = makeSender(phone: phone)
+        sender.appendsAuthHandshakeToConnRequest = false
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+
+        waitFor("responseOfPeerPort received") { sender.receivedChannelPort != nil }
+        XCTAssertEqual(sender.state, .channelReady)
+    }
+
+    // Regression: with a cast trust session live (the mirror trust flow
+    // starts one on session connect), the phone's score-based phys-conn
+    // reuse dials miLyraShareTransfer on the CAST TRUST socket. Live
+    // 2026-08-27: the session swallowed the sync_info at stage != .syncAuth
+    // (trust_sync_info_ignored) and the phone hit its 15s kcp timeout
+    // (33006, 連線失敗). The session must forward the dial to the responder
+    // for adoption, like the announcer socket does since 2026-08-21.
+    func testMiShareReceiveWhenPhoneDialsOnCastTrustSocket() throws {
+        _ = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        let session = LyraCastTrustSession(
+            endpoints: [("127.0.0.1", 9)],
+            deviceIdHex: "721572C3",
+            displayName: "EdgeLinkMacTests",
+            trustManager: MacTrustManager()
+        )
+        castSession = session
+        session.start()
+        waitFor("cast trust socket bound") { session.meshSocketBoundPort != nil }
+        let castPort = try XCTUnwrap(session.meshSocketBoundPort)
+
+        var payload = Data(count: 24 * 1024)
+        payload.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, buffer.count) }
+        }
+
+        let sender = makeSender(phone: phone)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: castPort)
+        waitFor("channel ready via cast trust socket") { sender.state == .channelReady }
+
+        sender.sendFile(name: "cast-conn.bin", mode: .inlineData(payload), host: "127.0.0.1")
+        waitFor("transfer done") { sender.state == .transferDone }
+        let fileURL = downloadDir.appendingPathComponent("cast-conn.bin")
+        waitFor("file written") { (try? Data(contentsOf: fileURL)) == payload }
     }
 
     // Small file: the bytes ride file-message field 4 and the responder

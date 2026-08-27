@@ -23,6 +23,10 @@ import Network
 // 64-bit-offset bugs past the 4GB boundary.
 public final class LyraMiShareReceiverRole: LyraServiceHandler {
     public static let defaultServiceName = "com.miui.mishare.connectivity:miLyraShareTransfer"
+    // Test node id for the conn-response UserInfo (95-char colon-hex, like the
+    // official servers' own 32B ids — never the client's).
+    public static let nodeIdColonHex = (0..<32).map { String(format: "%02X", $0 * 7 & 0xFF) }
+        .joined(separator: ":")
 
     public let serviceName: String
 
@@ -160,10 +164,25 @@ public final class LyraMiShareReceiverRole: LyraServiceHandler {
                 switch inner.payload {
                 case .request:
                     // The Mac's conn request; our encrypted .response lets it
-                    // proceed to responseAck + requestOfPeerPort.
+                    // proceed to responseAck + requestOfPeerPort. Official
+                    // shape (SetConnResponseFrame): f1 = accept 0, f2 = server
+                    // UserInfo (package + node id + system_data), f3 = 1,
+                    // plus TunnelCapacity since the Mac's request carries a
+                    // tunnel profile in private_data field 5.
+                    var responseBody = Data()
+                    LyraProtoWriter.appendVarintField(1, value: 0, to: &responseBody)
+                    let userInfo = LyraMitrustResponse.serverUserInfo(
+                        package: "com.miui.mishare.connectivity",
+                        nodeIdColonHex: Self.nodeIdColonHex
+                    )
+                    LyraProtoWriter.appendLengthDelimitedField(2, value: userInfo, to: &responseBody)
+                    LyraProtoWriter.appendVarintField(3, value: 1, to: &responseBody)
+                    var capacity = Data()
+                    LyraProtoWriter.appendVarintField(1, value: 1, to: &capacity)
+                    LyraProtoWriter.appendLengthDelimitedField(4, value: capacity, to: &responseBody)
                     server.sendLogi(
                         connId: self.connId,
-                        inner: LogiConnInnerFrame(frameType: 2, payload: .response(Data())),
+                        inner: LogiConnInnerFrame(frameType: 2, payload: .response(responseBody)),
                         encryptWith: self.channelKeySC
                     )
                     self.state = .peerPortWait

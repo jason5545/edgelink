@@ -1676,6 +1676,16 @@ final class LyraCastTrustSession {
         lastProgress = Date()
         DiagnosticsLog.info("xiaomi.cast.trust_frame_rx packType=\(frame.packType) bytes=\(frame.payload.count)")
         if frame.packType == 5 {
+            // The phone's score-based reuse can land its miLyraShareTransfer
+            // receive-flow dial on THIS socket (live 2026-08-27: the cast
+            // trust session swallowed the sync_info at stage != .syncAuth
+            // and the phone hit its 15s kcp timeout, 連線失敗). The
+            // responder claims packType-5 only once it adopted that conn.
+            if let responder = LyraMeshResponder.shared,
+               responder.handleAnnouncerPayloadV2(frame: frame, endpoint: endpoint)
+            {
+                return
+            }
             handlePayloadV2(frame: frame)
             return
         }
@@ -1758,6 +1768,29 @@ final class LyraCastTrustSession {
         endpoint: NWEndpoint,
         reply: LyraMeshSocket.ReplyHandler
     ) {
+        // Offer the frame to the MiShare responder before anything else can
+        // consume it (the stage-guarded sync_info catch-all, or the encrypted
+        // decrypt attempt below): the phone's miLyraShareTransfer dial may be
+        // bound to this socket by phys-conn reuse. The responder claims only
+        // its adopted conn or a fresh miLyraShareTransfer sync_info; answers
+        // ride this socket's reply/send.
+        if let responder = LyraMeshResponder.shared,
+           responder.handleAnnouncerLogiConn(
+               frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply,
+               send: { [weak self] responseFrame in
+                   // Sends without a reply context (responseOfPeerPort, sync
+                   // announce) must ride the inbound connection (this
+                   // listener's port as the source) — a fresh outbound
+                   // connection leaves from an ephemeral port the phone's
+                   // socket never delivers.
+                   self?.socket.sendInboundAsync(
+                       frame: responseFrame, toEndpointDescription: endpoint.debugDescription
+                   )
+               }
+           )
+        {
+            return
+        }
         if syncTaskServer.handles(logiConn: logiConn) {
             let replies = syncTaskServer.handleLogiConn(logiConn)
             if !replies.isEmpty {

@@ -420,17 +420,28 @@ public enum LogiConnInnerPayload: Equatable, Sendable {
 
 public struct LogiConnInnerFrame: Equatable, Sendable {
     public var frameType: UInt32
+    // Last payload field on the wire. Real phone frames can carry more than
+    // one (live 2026-08-27: the miLyraShareTransfer conn request arrives as
+    // .request followed by a trailing .authHandshake block), so consumers
+    // that match a specific payload kind must use `payloads`, not this.
     public var payload: LogiConnInnerPayload?
+    // Every payload field in wire order.
+    public var payloads: [LogiConnInnerPayload]
 
     public init(frameType: UInt32 = 0, payload: LogiConnInnerPayload? = nil) {
+        self.init(frameType: frameType, payloads: payload.map { [$0] } ?? [])
+    }
+
+    public init(frameType: UInt32 = 0, payloads: [LogiConnInnerPayload]) {
         self.frameType = frameType
-        self.payload = payload
+        self.payload = payloads.last
+        self.payloads = payloads
     }
 
     public func serialized() -> Data {
         var data = Data()
         LyraProtoWriter.appendVarintField(1, value: UInt64(frameType), to: &data)
-        if let payload {
+        for payload in payloads {
             LyraProtoWriter.appendLengthDelimitedField(payload.fieldNumber, value: payload.data, to: &data)
         }
         return data
@@ -441,18 +452,20 @@ public struct LogiConnInnerFrame: Equatable, Sendable {
             return nil
         }
         var frameType: UInt32 = 0
-        var payload: LogiConnInnerPayload?
+        var payloads: [LogiConnInnerPayload] = []
         for field in fields {
             switch (field.number, field.wireType) {
             case (1, 0): frameType = UInt32(field.varintValue ?? 0)
             case (1...8, 2):
-                if let value = field.lengthDelimitedValue {
-                    payload = LogiConnInnerPayload(fieldNumber: field.number, data: value)
+                if let value = field.lengthDelimitedValue,
+                   let payload = LogiConnInnerPayload(fieldNumber: field.number, data: value)
+                {
+                    payloads.append(payload)
                 }
             default: continue
             }
         }
-        self.init(frameType: frameType, payload: payload)
+        self.init(frameType: frameType, payloads: payloads)
     }
 }
 

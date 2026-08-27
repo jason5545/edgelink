@@ -52,6 +52,11 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
     public private(set) var receivedChannelPort: UInt32?
     // Bytes pushed through the express link during the current transfer.
     public private(set) var transferredBytes: Int64 = 0
+    // Live 2026-08-27: the real phone's encrypted conn request carries the
+    // .request payload followed by a trailing .authHandshake block in the
+    // same inner frame. On by default so tests speak the phone's actual
+    // frame shape; flip off to exercise the legacy single-payload request.
+    public var appendsAuthHandshakeToConnRequest = true
 
     private let identity: LyraPhoneIdentity
     private var connId: UInt32 = 0
@@ -147,9 +152,42 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
                   let inner = LogiConnInnerFrame(parsing: plaintext)
             else { return }
             switch inner.payload {
-            case .response:
+            case let .response(responseData):
+                // CheckTunnelCapacity + server-UserInfo recreation (official
+                // LogiStateRequestRemoteConfirm / SetConnResponseFrame): our
+                // conn request carries a tunnel profile, so the response MUST
+                // carry TunnelCapacity, and it MUST carry the server's
+                // UserInfo (package + node id) — the real phone ignores a
+                // response without them and lets the conn time out (live
+                // 2026-08-27: an empty response AND a {f3,f4}-only response
+                // were both rejected, 15s timeout → sync_auth_status 15006).
+                let responseFields = (try? LyraProtoReader.readFields(from: responseData)) ?? []
+                guard responseFields.contains(where: {
+                    $0.number == 4 && $0.wireType == 2 && !($0.lengthDelimitedValue?.isEmpty ?? true)
+                }) else {
+                    state = .failed("response missing tunnel capacity")
+                    onEvent("mishare sender response rejected: no tunnel capacity")
+                    return
+                }
+                guard let userInfo = responseFields.first(where: {
+                    $0.number == 2 && $0.wireType == 2
+                })?.lengthDelimitedValue,
+                    !userInfo.isEmpty,
+                    let infoFields = try? LyraProtoReader.readFields(from: userInfo),
+                    infoFields.contains(where: {
+                        $0.number == 2 && $0.wireType == 2 && !($0.lengthDelimitedValue?.isEmpty ?? true)
+                    }),
+                    infoFields.contains(where: {
+                        $0.number == 3 && $0.wireType == 2 && !($0.lengthDelimitedValue?.isEmpty ?? true)
+                    })
+                else {
+                    state = .failed("response missing server user info")
+                    onEvent("mishare sender response rejected: no user info")
+                    return
+                }
                 // The Mac acked the conn request; the responseAck kicks off
-                // its channel listener, then we ask for its port.
+                // its channel listener, then we ask for its port. Both ride
+                // the client→server key.
                 send(
                     inner: LogiConnInnerFrame(frameType: 3, payload: .responseAck(Data())),
                     server: server, encryptWith: key
@@ -593,27 +631,34 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
             onEvent("mishare sender upgrade reply parse failed")
             return
         }
-        // The Mac tries clientRandom+serverRandom ("cs") first and keeps the
-        // variant that decrypts; it answers with that same variant.
-        let key = HKDF<SHA256>.deriveKey(
+        // One session key (clientRandom+serverRandom) serves both
+        // directions — an opposite-order SC key is rejected by the real
+        // phone outright (live 2026-08-27: 15071 "logical conn secret
+        // decrypt failed").
+        channelKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: secret),
             salt: LyraMeshHkdf.salt,
             info: clientRandom + serverRandom,
             outputByteCount: 32
         )
-        channelKey = key
+        guard let key = channelKey else { return }
 
         var channelRequest = Data()
         LyraProtoWriter.appendVarintField(1, value: UInt64(channelId), to: &channelRequest)
         LyraProtoWriter.appendLengthDelimitedField(4, value: transKey, to: &channelRequest)
         LyraProtoWriter.appendLengthDelimitedField(5, value: transRandom, to: &channelRequest)
         var privateData = Data()
+        LyraProtoWriter.appendLengthDelimitedField(5, value: Self.tunnelProfileBlock, to: &privateData)
         LyraProtoWriter.appendLengthDelimitedField(10, value: channelRequest, to: &privateData)
         var request = Data()
         LyraProtoWriter.appendLengthDelimitedField(2, value: Data(serviceName.utf8), to: &request)
         LyraProtoWriter.appendLengthDelimitedField(3, value: privateData, to: &request)
+        var payloads: [LogiConnInnerPayload] = [.request(request)]
+        if appendsAuthHandshakeToConnRequest {
+            payloads.append(.authHandshake(Self.connRequestAuthHandshakeBlock()))
+        }
         send(
-            inner: LogiConnInnerFrame(frameType: 1, payload: .request(request)),
+            inner: LogiConnInnerFrame(frameType: 1, payloads: payloads),
             server: server, encryptWith: key
         )
         state = .requesting
@@ -653,11 +698,53 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
         }
     }
 
+    // The tcp_tunnel_profile block the real phone's miLyraShareTransfer conn
+    // request carries in private_data field 5 (captured live 2026-08-27).
+    // Its presence is what obliges the receiver to answer with a
+    // TunnelCapacity (CheckTunnelCapacity).
+    private static let tunnelProfileBlock = Data([
+        0x01, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x15, 0x00, 0x03,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0xff, 0x00,
+        0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01,
+    ])
+
     private static func randomBytes(_ count: Int) -> Data {
         var data = Data(count: count)
         data.withUnsafeMutableBytes { buffer in
             if let base = buffer.baseAddress { arc4random_buf(base, count) }
         }
         return data
+    }
+
+    // The trailing .authHandshake payload the real phone appends to its
+    // miLyraShareTransfer conn request (captured live 2026-08-27): feature
+    // sizes 32/44 plus a 28-char task id, then a 32/32 capability pair. The
+    // Mac ignores the contents; reproducing the exact shape matters because
+    // it shares the inner frame with the .request payload.
+    private static func connRequestAuthHandshakeBlock() -> Data {
+        let taskId = randomBytes(21).base64EncodedString()
+        var capability = Data()
+        LyraProtoWriter.appendVarintField(1, value: 32, to: &capability)
+        LyraProtoWriter.appendVarintField(2, value: 44, to: &capability)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: Data(taskId.utf8), to: &capability)
+        var flags = Data()
+        LyraProtoWriter.appendVarintField(1, value: 4, to: &flags)
+        LyraProtoWriter.appendVarintField(2, value: 3, to: &flags)
+        LyraProtoWriter.appendVarintField(4, value: 1, to: &flags)
+        LyraProtoWriter.appendVarintField(8, value: 1, to: &flags)
+        var featurePair = Data()
+        LyraProtoWriter.appendVarintField(1, value: 32, to: &featurePair)
+        LyraProtoWriter.appendVarintField(2, value: 32, to: &featurePair)
+        LyraProtoWriter.appendLengthDelimitedField(3, value: flags, to: &featurePair)
+        var body = Data()
+        LyraProtoWriter.appendLengthDelimitedField(1, value: capability, to: &body)
+        LyraProtoWriter.appendVarintField(2, value: 1, to: &body)
+        LyraProtoWriter.appendVarintField(3, value: 0, to: &body)
+        LyraProtoWriter.appendVarintField(4, value: 1, to: &body)
+        LyraProtoWriter.appendLengthDelimitedField(5, value: featurePair, to: &body)
+        var block = Data()
+        LyraProtoWriter.appendVarintField(1, value: 2, to: &block)
+        LyraProtoWriter.appendLengthDelimitedField(3, value: body, to: &block)
+        return block
     }
 }

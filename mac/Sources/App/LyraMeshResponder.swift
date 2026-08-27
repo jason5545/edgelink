@@ -48,6 +48,11 @@ final class LyraMeshResponder {
     private var authServerRandom = Data()
     private var authSharedSecret = Data()
     private var channelKey: SymmetricKey?
+    // Set when the phone's conn request carried a tunnel profile in its
+    // private_data (LogiConnRequestOptions field 5): the conn response must
+    // then carry TunnelCapacity or the phone's CheckTunnelCapacity fails
+    // the conn (official LogiConnProtocol::SetConnResponseFrame behavior).
+    private var requestTunnelProfiled = false
     private var expressHandshakeDone = false
     private var expressListener: NWListener?
     private let expressQueue = DispatchQueue(label: "edgelink.lyra.express")
@@ -458,15 +463,27 @@ final class LyraMeshResponder {
                         "variant=\(label) hex=\(plaintext.map { String(format: "%02x", $0) }.joined())"
                 )
                 if let innerFrame = LogiConnInnerFrame(parsing: plaintext) {
-                    if case let .request(requestData) = innerFrame.payload {
-                        parseLogiConnRequest(requestData)
-                        sendLogiConnResponse(
-                            frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
-                        )
-                    } else if case .responseAck = innerFrame.payload {
-                        startChannelNegotiation(
-                            frame: frame, logiConn: logiConn, endpoint: endpoint
-                        )
+                    // The real phone's conn request carries two payload
+                    // fields — .request plus a trailing .authHandshake block
+                    // (live 2026-08-27: last-payload-wins parsing dropped the
+                    // request, the Mac never answered, and the phone's 15s
+                    // kcp timeout surfaced as 傳送失敗). Match against every
+                    // payload, not just the last one.
+                    for payload in innerFrame.payloads {
+                        switch payload {
+                        case let .request(requestData):
+                            parseLogiConnRequest(requestData)
+                            sendLogiConnResponse(
+                                frame: frame, logiConn: logiConn, endpoint: endpoint, reply: reply
+                            )
+                        case .responseAck:
+                            startChannelNegotiation(
+                                frame: frame, logiConn: logiConn, endpoint: endpoint
+                            )
+                        default:
+                            continue
+                        }
+                        break
                     }
                 }
                 return
@@ -501,6 +518,8 @@ final class LyraMeshResponder {
                     if let colonKey = Self.parseColonHexKey(value) {
                         phoneColonHexKey = colonKey
                     }
+                } else if field.number == 5, let value = field.lengthDelimitedValue, !value.isEmpty {
+                    requestTunnelProfiled = true
                 } else if field.number == 10, let value = field.lengthDelimitedValue,
                           let innerFields = try? LyraProtoReader.readFields(from: value)
                 {
@@ -534,6 +553,20 @@ final class LyraMeshResponder {
                 "privateDataBytes=\(privateData.count) transKeyBytes=\(transKey.count) channelId=\(channelId) " +
                 "privateDataHex=\(privateData.map { String(format: "%02x", $0) }.joined())"
         )
+    }
+
+    // Same node id the mitrust responses use (one per Mac, persisted in
+    // defaults): the phone's channel client rejects a response UserInfo that
+    // echoes its own id.
+    private static var localNodeIdColonHex: String {
+        let defaults = UserDefaults.standard
+        if let existing = defaults.string(forKey: "xiaomiTrustLocalNodeIdHex"), existing.count == 95 {
+            return existing
+        }
+        let generated = (0..<32).map { _ in String(format: "%02X", UInt8.random(in: 0...255)) }
+            .joined(separator: ":")
+        defaults.set(generated, forKey: "xiaomiTrustLocalNodeIdHex")
+        return generated
     }
 
     private static func parseColonHexKey(_ data: Data) -> Data? {
@@ -1388,7 +1421,27 @@ final class LyraMeshResponder {
         guard let channelKey else {
             return
         }
-        let responseInner = LogiConnInnerFrame(frameType: 2, payload: .response(Data()))
+        // Official response shape (LogiConnProtocol::SetConnResponseFrame):
+        // f1 = accept code 0, f2 = server UserInfo (package + own node id +
+        // system_data, same schema as the mitrust response the phone
+        // accepts), f3 = confirm flag 1; when the request carried a tunnel
+        // profile the response MUST also carry TunnelCapacity{f1:1} or the
+        // phone's CheckTunnelCapacity kills the conn (live 2026-08-27: a
+        // response without UserInfo was ignored, 15s timeout → 傳送失敗).
+        var responseBody = Data()
+        LyraProtoWriter.appendVarintField(1, value: 0, to: &responseBody)
+        let userInfo = LyraMitrustResponse.serverUserInfo(
+            package: "com.miui.mishare.connectivity",
+            nodeIdColonHex: Self.localNodeIdColonHex
+        )
+        LyraProtoWriter.appendLengthDelimitedField(2, value: userInfo, to: &responseBody)
+        LyraProtoWriter.appendVarintField(3, value: 1, to: &responseBody)
+        if requestTunnelProfiled {
+            var capacity = Data()
+            LyraProtoWriter.appendVarintField(1, value: 1, to: &capacity)
+            LyraProtoWriter.appendLengthDelimitedField(4, value: capacity, to: &responseBody)
+        }
+        let responseInner = LogiConnInnerFrame(frameType: 2, payload: .response(responseBody))
         do {
             let nonce = AES.GCM.Nonce()
             let sealed = try AES.GCM.seal(responseInner.serialized(), using: channelKey, nonce: nonce)
@@ -1407,9 +1460,11 @@ final class LyraMeshResponder {
             let miResponse = MiConnectFrame(version: 0, logiConnFrames: [responseLogiConn])
             let responseFrame = LyraMeshPack.Frame(packType: frame.packType, payload: miResponse.serialized())
             try reply(responseFrame)
+            let responsePayload = (try? LyraMeshPack.encode(responseFrame)) ?? Data()
             DiagnosticsLog.info(
                 "xiaomi.mishare.mesh_logi_response to=\(endpoint.debugDescription) " +
-                    "logiConnId=\(logiConn.logiConnId) encryptedBytes=\(encryptedInner.count)"
+                    "logiConnId=\(logiConn.logiConnId) encryptedBytes=\(encryptedInner.count) " +
+                    "hex=\(responsePayload.map { String(format: "%02x", $0) }.joined())"
             )
         } catch {
             DiagnosticsLog.error("xiaomi.mishare.mesh_logi_response_failed", error)
@@ -1830,6 +1885,7 @@ final class LyraMeshResponder {
         channelSocket = nil
         channelServerKey = Data()
         phoneTransKey = Data()
+        requestTunnelProfiled = false
         peerChannelId = 0
         expressDataKey = Data()
         eventBytesBuffer = Data()
