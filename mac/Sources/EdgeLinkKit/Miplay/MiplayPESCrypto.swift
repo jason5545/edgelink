@@ -1,3 +1,4 @@
+import CommonCrypto
 import Foundation
 
 public enum MiplayPESCrypto {
@@ -43,31 +44,82 @@ public enum MiplayPESCrypto {
         crypt(plaintext, iv: iv, key: key, encrypt: true)
     }
 
+    // The phone encrypts only the FIRST `encryptedDataLen` bytes of each PES
+    // payload (AES-128-CBC, per-PES IV) and sends the rest as plaintext — the
+    // official 小米互聯服務 sink decrypts exactly min(encLen, aligned(payload))
+    // bytes (ATSParser::onPayloadData → AES_ctx_set_iv + AES_CBC_decrypt_buffer
+    // with the mEncrypDataLen clamp) and appends the tail untouched. encLen
+    // comes from our own WFD negotiation
+    // ("wfd_content_SP_protection: 4 1 256 3 1 1 1 1" — third value 256).
+    // Full-payload decryption corrupts everything past 256 bytes: CABAC dies
+    // ~1-2 CTU rows in, decoders abort the slice and the mirror shows green.
+    // Verified 2026-08-28: partial-256 replays the live capture at 0 decode
+    // warnings / 1308 frames (full-payload: 124 warnings) and restores clean
+    // audio PCM.
+    public static let encryptedDataLen = 256
+
+    public static func decryptPESScope(_ payload: Data, iv: Data, key: Data = videoKey) -> Data {
+        cryptPESScope(payload, iv: iv, key: key, encrypt: false)
+    }
+
+    public static func encryptPESScope(_ payload: Data, iv: Data, key: Data = videoKey) -> Data {
+        cryptPESScope(payload, iv: iv, key: key, encrypt: true)
+    }
+
+    private static func cryptPESScope(_ payload: Data, iv: Data, key: Data, encrypt: Bool) -> Data {
+        let aligned = (payload.count / 16) * 16
+        guard aligned > 0 else { return payload }
+        let scope = min(encryptedDataLen, aligned)
+        guard scope > 0 else { return payload }
+        let head = crypt(payload.prefix(scope), iv: iv, key: key, encrypt: encrypt)
+        var out = head
+        out.append(payload[scope...])
+        return out
+    }
+
+    // AES-128-CBC, no padding; only whole 16-byte blocks are transformed and
+    // the non-aligned tail is copied through (official miplay scheme).
+    // CommonCrypto's hardware-backed AES replaced the original pure-Swift
+    // loop: identical wire output (known-answer tests pin it), ~100× the
+    // throughput — the Swift version measured 352ms/MB, which saturated the
+    // sink pipeline under the phone's real-time ~15Mbps stream.
     private static func crypt(_ input: Data, iv: Data, key: Data, encrypt: Bool) -> Data {
         precondition(iv.count == 16)
-        guard let aes = AES128(key: key), input.count >= 16 else { return input }
-        let blockCount = input.count / 16
+        guard key.count == kCCKeySizeAES128, input.count >= 16 else { return input }
+        let aligned = (input.count / 16) * 16
         var output = Data(count: input.count)
-        var chain = [UInt8](iv)
-        input.withUnsafeBytes { inBuf in
-            output.withUnsafeMutableBytes { outBuf in
+        let status = output.withUnsafeMutableBytes { outBuf -> CCCryptorStatus in
+            input.withUnsafeBytes { inBuf -> CCCryptorStatus in
                 guard let inBase = inBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
                       let outBase = outBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
-                else { return }
-                for block in 0..<blockCount {
-                    let offset = block * 16
-                    var value = [UInt8](repeating: 0, count: 16)
-                    for i in 0..<16 {
-                        value[i] = inBase[offset + i] ^ (encrypt ? chain[i] : 0)
-                    }
-                    let transformed = encrypt ? aes.encryptBlock(value) : aes.decryptBlock(value)
-                    for i in 0..<16 {
-                        outBase[offset + i] = transformed[i] ^ (encrypt ? 0 : chain[i])
-                        chain[i] = encrypt ? transformed[i] : inBase[offset + i]
-                    }
+                else {
+                    return CCCryptorStatus(kCCMemoryFailure)
                 }
-                for i in (blockCount * 16)..<input.count {
-                    outBase[i] = inBase[i]
+                var dataMoved = 0
+                return CCCryptorStatus(CCCrypt(
+                    encrypt ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    CCOptions(0),
+                    (key as NSData).bytes, key.count,
+                    (iv as NSData).bytes,
+                    inBase, aligned,
+                    outBase, outBuf.count,
+                    &dataMoved
+                ))
+            }
+        }
+        guard status == kCCSuccess else {
+            return input
+        }
+        if aligned < input.count {
+            input.withUnsafeBytes { inBuf in
+                output.withUnsafeMutableBytes { outBuf in
+                    guard let inBase = inBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let outBase = outBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                    else { return }
+                    for i in aligned..<input.count {
+                        outBase[i] = inBase[i]
+                    }
                 }
             }
         }

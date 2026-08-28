@@ -144,6 +144,9 @@ targets:
     platform: macOS
     sources:
       - Tests/EdgeLinkMacTests
+      - path: Tests/EdgeLinkMacTests/Resources
+        type: folder
+        buildPhase: resources
       - path: Sources/App/DiagnosticsLog.swift
       - path: Sources/App/LANPinnedPhoneIP.swift
       - path: Sources/App/BiometricAuthManager.swift
