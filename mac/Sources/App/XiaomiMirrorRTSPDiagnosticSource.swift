@@ -511,13 +511,21 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
 
     // Official PC-client route media receive: the phone dials UDP MPT to
     // clientPort after our WFD SETUP. PES decryption is always on here — the
-    // phone encrypts with the constant SPKI-prefix key + per-PES IV.
-    func startOfficialMirrorMediaReceiver(peerHost: String, clientPort: UInt16, serverPort: UInt16) {
+    // phone encrypts with the constant SPKI-prefix key + per-PES IV. The
+    // flag exists as a parameter only so tests can recreate the dark
+    // ciphertext stream (2026-08-28 regression).
+    func startOfficialMirrorMediaReceiver(
+        peerHost: String,
+        clientPort: UInt16,
+        serverPort: UInt16,
+        pesDecryption: Bool = true
+    ) {
         performOnQueue {
             self.startOfficialMirrorMediaReceiverOnQueue(
                 peerHost: peerHost,
                 clientPort: clientPort,
-                serverPort: serverPort
+                serverPort: serverPort,
+                pesDecryption: pesDecryption
             )
         }
     }
@@ -531,7 +539,8 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
     private func startOfficialMirrorMediaReceiverOnQueue(
         peerHost: String,
         clientPort: UInt16,
-        serverPort: UInt16
+        serverPort: UInt16,
+        pesDecryption: Bool
     ) {
         stopOfficialMirrorMediaReceiverOnQueue(reason: "replace")
         officialMirrorFirstFrameNotified = false
@@ -574,7 +583,7 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
                     }
                 }
             )
-            receiver.mptSinkPESDecryptionEnabled = true
+            receiver.mptSinkPESDecryptionEnabled = pesDecryption
             officialMirrorReceiver = receiver
             receiver.start()
             DiagnosticsLog.info(
@@ -3128,7 +3137,16 @@ private final class XiaomiMirrorRTPMediaSender {
     // Set for the official PC-client route (real cast channel → WFD): the
     // phone's PES payloads are AES-128-CBC encrypted with the constant
     // SPKI-prefix key and per-PES IVs from PES_private_data.
-    var mptSinkPESDecryptionEnabled = false
+    // Live 2026-08-27: the phone flipped this scheme on and the flag — set
+    // right after receiver init — never reached the already-constructed
+    // demuxer, so every PES arrived as ciphertext: no Annex-B start codes,
+    // zero AUs, decodedFrames=0 forever, mirror UI pinned at "connecting".
+    // The didSet keeps the demuxer in sync with any post-init write.
+    var mptSinkPESDecryptionEnabled = false {
+        didSet {
+            mptSinkTSDemuxer?.pesDecryptionEnabled = mptSinkPESDecryptionEnabled
+        }
+    }
     private var mptSinkHEVCDecoder: XiaomiMirrorHEVCDecoder?
     private var mptSinkJitterBuffer: XiaomiMirrorAccessUnitJitterBuffer?
     private var mptSinkAudioPlayer: XiaomiMirrorMPTPrivateAudioPlayer?
@@ -4633,7 +4651,7 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
             }
             return
         }
-        if parsed.kind == "ff03" {
+        if parsed.kind == "ff03" || parsed.kind == "ff07" {
             privateAudioFormatPrimed = true
         }
         if needsSelfPrime {
@@ -4752,7 +4770,13 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
             return nil
         }
         switch payload[1] {
-        case 0x03:
+        // Live 2026-08-27: the phone's firmware moved the format-bearing
+        // private-audio kind from 0x03 to 0x07 with an identical field
+        // layout (packedFormat@6, sampleRate@8, frames@12, bits@16,
+        // declaredBytes@20, privatePTS@28, PCM from 32 — verified against
+        // the decrypted live capture: 02 10 / 48000 / 310 / 16 / 1240).
+        case 0x03, 0x07:
+            let kind = payload[1] == 0x03 ? "ff03" : "ff07"
             guard payload.count >= 32,
                   let packedFormat = payload.readUInt16BE(at: 6),
                   let sampleRate = payload.readUInt32BE(at: 8),
@@ -4770,7 +4794,7 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
             )
             let pcmPayload = trimmedAudioPayload(payload, headerLength: 32, declaredPayloadBytes: Int(declaredPayloadBytes))
             return XiaomiMirrorMPTPrivateAudioPayload(
-                kind: "ff03",
+                kind: kind,
                 format: format,
                 declaredFrames: Int(declaredFrames),
                 declaredPayloadBytes: Int(declaredPayloadBytes),
@@ -5534,7 +5558,7 @@ private final class XiaomiMirrorMPEGTSHEVCDemuxer {
             }
             return payload
         }
-        return MiplayPESCrypto.decrypt(payload, iv: iv)
+        return MiplayPESCrypto.decryptPESScope(payload, iv: iv)
     }
 
     private func flushCurrentAudioPES() {
@@ -5813,6 +5837,16 @@ private final class XiaomiMirrorHEVCDecoder {
     // DecodeFrame waited on its callback, and the whole decode pipeline
     // froze at 16 frames while media kept arriving.
     private var pendingSessionTearDown = false
+    // Hardware-decoder incompatibility fallback (live 2026-08-28): the
+    // phone's updated firmware emits an HEVC stream Apple's hardware HEVC
+    // decoder rejects on every frame with -12909 (kVTVideoDecoderBadDataErr)
+    // while the software HEVC decoder decodes it fine. After a run of
+    // consecutive -12909s the session is rebuilt with hardware decoding
+    // disabled; the existing IDR-request flow resyncs the stream.
+    private var usesSoftwareDecoder = false
+    private var consecutiveBadDataFailures = 0
+    private static let softwareFallbackBadDataThreshold = 4
+    private static let badDataStatus = OSStatus(kVTVideoDecoderBadDataErr)
     var callbacksReceived: UInt64 = 0
     var callbacksErrorStatus: UInt64 = 0
     var callbacksWithoutImage: UInt64 = 0
@@ -5951,6 +5985,7 @@ private final class XiaomiMirrorHEVCDecoder {
             infoFlagsOut: &infoFlags
         )
         if status != noErr {
+            noteDecodeBadData(status)
             onDecodeFailed?()
             requireRandomAccess(reason: "decode_failed_status_\(status)")
             DiagnosticsLog.warn(
@@ -6033,11 +6068,17 @@ private final class XiaomiMirrorHEVCDecoder {
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ] as CFDictionary
+        var decoderSpecification: CFDictionary?
+        if usesSoftwareDecoder {
+            decoderSpecification = [
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: false
+            ] as CFDictionary
+        }
         var session: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: description,
-            decoderSpecification: nil,
+            decoderSpecification: decoderSpecification,
             imageBufferAttributes: attributes,
             outputCallback: &callback,
             decompressionSessionOut: &session
@@ -6051,9 +6092,32 @@ private final class XiaomiMirrorHEVCDecoder {
         decompressionSession = session
         DiagnosticsLog.info(
             "xiaomi.mirror.mpt.hevc_decoder_ready session=\(sessionID.uuidString) " +
-                "vps=\(vps.count) sps=\(sps.count) pps=\(pps.count)"
+                "vps=\(vps.count) sps=\(sps.count) pps=\(pps.count) " +
+                "decoder=\(usesSoftwareDecoder ? "software" : "hardware")"
         )
         return true
+    }
+
+    // Called from the VT output-callback queue and the decode queue when a
+    // frame is rejected. Runs of -12909 mean the hardware decoder cannot
+    // parse this stream; rebuild the session on software decoding.
+    private func noteDecodeBadData(_ status: OSStatus) {
+        guard status == Self.badDataStatus else {
+            return
+        }
+        consecutiveBadDataFailures += 1
+        guard consecutiveBadDataFailures >= Self.softwareFallbackBadDataThreshold,
+              !usesSoftwareDecoder else {
+            return
+        }
+        usesSoftwareDecoder = true
+        // Thread-safe teardown: applied by decode() on the decode queue.
+        pendingSessionTearDown = true
+        DiagnosticsLog.warn(
+            "xiaomi.mirror.mpt.hevc_decoder_software_fallback session=\(sessionID.uuidString) " +
+                "consecutiveBadData=\(consecutiveBadDataFailures) " +
+                "reason=hardware_rejects_phone_stream"
+        )
     }
 
     private func makeFormatDescription(vps: Data, sps: Data, pps: Data) -> CMVideoFormatDescription? {
@@ -6205,6 +6269,7 @@ private final class XiaomiMirrorHEVCDecoder {
 
     private func handleDecoded(pixelBuffer: CVPixelBuffer) {
         decodedFrames += 1
+        consecutiveBadDataFailures = 0
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         if decodedFrames <= 5 || decodedFrames % 60 == 0 {
@@ -6243,6 +6308,7 @@ private final class XiaomiMirrorHEVCDecoder {
         decoder.callbacksReceived += 1
         if status != noErr {
             decoder.callbacksErrorStatus += 1
+            decoder.noteDecodeBadData(status)
             decoder.onDecodeFailed?()
             decoder.requireRandomAccess(reason: "decoder_output_status_\(status)")
             DiagnosticsLog.warn(

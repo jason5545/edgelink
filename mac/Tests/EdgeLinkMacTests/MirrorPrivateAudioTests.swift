@@ -119,4 +119,51 @@ final class MirrorPrivateAudioTests: XCTestCase {
         let stats = player.pcmS16LEStats(parsed.pcmPayload)
         XCTAssertTrue(player.isPrivateAudioPayloadSafe(parsed, stats: stats, allowUnprimedFF02: true))
     }
+
+    // MARK: - ff07 (live 2026-08-27: firmware moved the format-bearing kind
+    // from 0x03 to 0x07 with an identical 32-byte header layout; decrypted
+    // live capture: ff 07 | 00 00 00 0e | 02 10 | 48000 | 310 | 16 | 1240)
+
+    private func makeFF07Packet(pcm: Data, sampleRate: UInt32 = 48_000) -> Data {
+        var packet = Data([0xFF, 0x07, 0x00, 0x00, 0x00, 0x0E])
+        packet.append(contentsOf: [0x02, 0x10]) // packedFormat: 2ch / 16-bit
+        packet.append(contentsOf: [
+            UInt8((sampleRate >> 24) & 0xFF), UInt8((sampleRate >> 16) & 0xFF),
+            UInt8((sampleRate >> 8) & 0xFF), UInt8(sampleRate & 0xFF)
+        ])
+        let frames = UInt32(pcm.count / 4)
+        packet.append(contentsOf: [
+            UInt8((frames >> 24) & 0xFF), UInt8((frames >> 16) & 0xFF),
+            UInt8((frames >> 8) & 0xFF), UInt8(frames & 0xFF)
+        ])
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x10]) // bits = 16
+        packet.append(contentsOf: [
+            UInt8((pcm.count >> 24) & 0xFF), UInt8((pcm.count >> 16) & 0xFF),
+            UInt8((pcm.count >> 8) & 0xFF), UInt8(pcm.count & 0xFF)
+        ])
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // reserved
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // private PTS
+        packet.append(pcm)
+        return packet
+    }
+
+    func testFF07ParseExtractsFormatAndPayload() {
+        let player = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: UUID())
+        let pcm = quietPCM()
+        let parsed = player.parsePrivatePayload(makeFF07Packet(pcm: pcm))
+        XCTAssertNotNil(parsed, "ff07 must parse — live 2026-08-27 stream went dark here")
+        XCTAssertEqual(parsed?.kind, "ff07")
+        XCTAssertEqual(parsed?.format.sampleRate, 48_000)
+        XCTAssertEqual(parsed?.format.channels, 2)
+        XCTAssertEqual(parsed?.format.bitsPerSample, 16)
+        XCTAssertEqual(parsed?.pcmPayload.count, pcm.count)
+        XCTAssertEqual(parsed?.declaredFrames, 310)
+    }
+
+    func testFF07QuietPCMPassesSafetyGate() {
+        let player = XiaomiMirrorMPTPrivateAudioPlayer(sessionID: UUID())
+        let parsed = player.parsePrivatePayload(makeFF07Packet(pcm: quietPCM()))!
+        let stats = player.pcmS16LEStats(parsed.pcmPayload)
+        XCTAssertTrue(player.isPrivateAudioPayloadSafe(parsed, stats: stats))
+    }
 }

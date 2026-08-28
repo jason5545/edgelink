@@ -82,8 +82,186 @@ final class XiaomiMirrorMediaLoadTests: XCTestCase {
         XCTAssertLessThan(probe.secondsSinceLastDecodedFrame, 2.0,
                           "decoded frames must still flow at the end of the soak")
         XCTAssertGreaterThan(media.datagramsSent, 500,
-                             "the soak must actually push high traffic (sent \(media.datagramsSent))")
+                              "the soak must actually push high traffic (sent \(media.datagramsSent))")
         XCTAssertGreaterThan(media.acksReceived, 0, "the sink must ACK the media stream")
+    }
+
+    // MARK: - Official receiver: phone-side PES encryption (2026-08-28 regression)
+
+    // Live 2026-08-27 23:33–00:12: the phone flipped its PES encryption on
+    // and the receiver's decryption flag — set right after init — never
+    // reached the already-constructed demuxer. Every PES arrived as
+    // ciphertext: no Annex-B start codes, zero AUs, decodedFrames=0 for the
+    // whole session while RTP/TS kept flowing, mirror UI pinned at
+    // "connecting". Both tests below dial startOfficialMirrorMediaReceiver
+    // directly (the prod topology: official.receiver_start + KCP push to the
+    // sink port) with a fake that encrypts exactly like the live capture
+    // (flags2 0x81, 22-byte header, 0x80 ext + 16B IV, AES-128-CBC static
+    // SPKI-prefix key — verified against /private/tmp/edgelink-xiaomi-mirror.ts).
+    func testOfficialReceiverDecryptsEncryptedPESStream() async throws {
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onRecoveryRequired = { probe.noteRecovery($0) }
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+
+        let media = FakePhoneMPTMediaSource(
+            width: 640, height: 360, averageBitRate: 8_000_000,
+            pesEncrypted: true
+        )
+        media.sinkPort = sinkPort
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        source.startOfficialMirrorMediaReceiver(
+            peerHost: "127.0.0.1",
+            clientPort: sinkPort,
+            serverPort: 9
+        )
+        defer { source.stop(reason: "test_teardown") }
+        media.start()
+        defer { media.stop() }
+
+        var lastObservedSent: UInt64 = 0
+        try await waitFor("decrypted frames flow", timeout: 12) {
+            lastObservedSent = media.datagramsSent
+            return probe.decodedFrames > 30
+        }
+        XCTAssertGreaterThan(lastObservedSent, 300, "the fake must actually stream")
+        XCTAssertTrue(
+            probe.recoveryEvents.isEmpty,
+            "the decrypt path must not trip recovery on a healthy encrypted stream: \(probe.recoveryEvents)"
+        )
+    }
+
+    // Hardware-decoder incompatibility (live 2026-08-28): the phone's updated
+    // firmware emits HEVC Apple's hardware decoder rejects on every frame
+    // (-12909) while the software decoder handles it fine — fixture is real
+    // capture bytes. After 4 consecutive -12909s the sink must rebuild its
+    // VT session with hardware disabled and recover frames from the same
+    // stream. Without the fallback this stays dark forever (the live
+    // post-deploy symptom: pipeline alive, VideoToolbox -12909, UI connected
+    // but black).
+    func testOfficialReceiverFallsBackToSoftwareDecoderWhenHardwareRejectsPhoneStream() async throws {
+        let aus = try Self.phoneHardwareRejectAUs()
+        XCTAssertGreaterThanOrEqual(aus.count, 3, "fixture must carry params + IDR + trail")
+
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+
+        let media = FakePhoneMPTMediaSource(preEncodedAUs: aus)
+        media.sinkPort = sinkPort
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        source.startOfficialMirrorMediaReceiver(
+            peerHost: "127.0.0.1",
+            clientPort: sinkPort,
+            serverPort: 9
+        )
+        defer { source.stop(reason: "test_teardown") }
+        media.start()
+        defer { media.stop() }
+
+        try await waitFor("software-fallback frames decode", timeout: 20) {
+            probe.decodedFrames > 2
+        }
+    }
+
+    // Loads Resources/phone-hw-reject-hevc.265 (live capture: VPS/SPS/PPS AU,
+    // params+IDR AU, trail AU) and groups NALs into access units exactly like
+    // the production assembler: everything before the next VCL NAL belongs to
+    // that VCL NAL's AU.
+    private static func phoneHardwareRejectAUs() throws -> [[Data]] {
+        guard let url = Bundle(for: XiaomiMirrorMediaLoadTests.self)
+            .url(forResource: "phone-hw-reject-hevc", withExtension: "265", subdirectory: "Resources") else {
+            throw XCTSkip("fixture resource missing")
+        }
+        let data = try Data(contentsOf: url)
+        let bytes = [UInt8](data)
+        // Annex-B split, production-exact (mirrors annexBNALUnits).
+        var starts: [(startCode: Int, nalStart: Int)] = []
+        var index = 0
+        while index + 3 < bytes.count {
+            if bytes[index] == 0, bytes[index + 1] == 0 {
+                if bytes[index + 2] == 1 {
+                    starts.append((index, index + 3))
+                    index += 3
+                    continue
+                }
+                if index + 3 < bytes.count, bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                    starts.append((index, index + 4))
+                    index += 4
+                    continue
+                }
+            }
+            index += 1
+        }
+        var nals: [Data] = []
+        for si in starts.indices {
+            let nalStart = starts[si].nalStart
+            let nalEnd = si + 1 < starts.count ? starts[si + 1].startCode : bytes.count
+            if nalEnd > nalStart {
+                nals.append(Data(bytes[nalStart..<nalEnd]))
+            }
+        }
+        func nalType(_ nal: Data) -> UInt8 { (nal[0] >> 1) & 0x3F }
+        // AU boundaries mirror the capture's PES layout: a VPS starts a new
+        // AU (PES[0] params-only, PES[1] params+IDR, PES[2+] trail slices).
+        var aus: [[Data]] = []
+        var current: [Data] = []
+        for nal in nals where nal.count >= 2 {
+            let t = nalType(nal)
+            if t == 32, !current.isEmpty {
+                aus.append(current)
+                current = []
+            }
+            current.append(nal)
+            if t <= 31 {
+                aus.append(current)
+                current = []
+            }
+        }
+        if !current.isEmpty { aus.append(current) }
+        return aus
+    }
+
+    // Negative control: with decryption disabled the ciphertext stream flows
+    // but nothing may decode — recreating the live stuck-connecting state so
+    // a future propagation regression fails here instead of on the device.
+    func testOfficialReceiverWithoutPESDecryptionRecreatesDarkStream() async throws {
+        let source = XiaomiMirrorRTSPDiagnosticSource()
+        let probe = MediaLoadProbe()
+        source.onDecodedFrame = { _, _, _ in probe.noteDecodedFrame() }
+
+        let media = FakePhoneMPTMediaSource(
+            width: 640, height: 360, averageBitRate: 8_000_000,
+            pesEncrypted: true
+        )
+        media.bindPort = rtspPort + 2
+        media.sinkPort = sinkPort
+        media.onDatagram = { [weak media] datagram in
+            media?.sendUDP(datagram)
+        }
+        source.startOfficialMirrorMediaReceiver(
+            peerHost: "127.0.0.1",
+            clientPort: sinkPort,
+            serverPort: media.bindPort!,
+            pesDecryption: false
+        )
+        defer { source.stop(reason: "test_teardown") }
+        media.start()
+        defer { media.stop() }
+
+        // The stream itself must flow: the live failure was not a transport
+        // outage — RTP/TS kept arriving for minutes.
+        try await waitFor("encrypted stream flows", timeout: 8) { media.datagramsSent > 300 }
+        XCTAssertTrue(source.hasReceivedMPTMedia, "media must have reached the sink")
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+        XCTAssertEqual(
+            probe.decodedFrames, 0,
+            "ciphertext PES must not decode — this is the live stuck-connecting state"
+        )
     }
 
     // MARK: - Relay: cloudflare/TURN receiver with the same flood
@@ -442,7 +620,9 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         loss: Double = 0,
         duplicate: Double = 0,
         retransmitsLost: Bool = false,
-        ptsClockFactor: Double = 1.0
+        ptsClockFactor: Double = 1.0,
+        pesEncrypted: Bool = false,
+        preEncodedAUs: [[Data]] = []
     ) {
         self.width = width
         self.height = height
@@ -452,13 +632,20 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         self.duplicate = duplicate
         self.retransmitsLost = retransmitsLost
         self.ptsClockFactor = ptsClockFactor
+        self.muxer = FakePhoneTSMuxer(encryptsPES: pesEncrypted)
+        self.preEncodedAUs = preEncodedAUs
     }
     private var encoder: FakePhoneHEVCEncoder?
+    // When set, start() streams these annex-B AUs cyclically instead of
+    // running a VT encoder — lets tests feed a captured bitstream (e.g. the
+    // hardware-decoder-rejecting phone firmware output) through the sink.
+    private let preEncodedAUs: [[Data]]
+    private var preEncodedTimer: DispatchSourceTimer?
     private var udpSocketFD: Int32 = -1
     private var udpReadSource: DispatchSourceRead?
     private var rtpSequence: UInt16 = 0
     private let ssrc: UInt32 = 0xdeadbeef
-    private let muxer = FakePhoneTSMuxer()
+    private let muxer: FakePhoneTSMuxer
     private var forceKeyframe = false
 
     func start() {
@@ -496,6 +683,26 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
                 timer.resume()
             }
             self.openUDPSocket()
+            if !self.preEncodedAUs.isEmpty {
+                let frameTicks: UInt64 = UInt64(90_000 / self.frameRate)
+                var nextAUIndex = 0
+                var nextPTS90k: UInt64 = 9_000
+                let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.schedule(
+                    deadline: .now(),
+                    repeating: .milliseconds(1000 / self.frameRate)
+                )
+                timer.setEventHandler { [weak self] in
+                    guard let self, !self.preEncodedAUs.isEmpty else { return }
+                    let nalUnits = self.preEncodedAUs[nextAUIndex % self.preEncodedAUs.count]
+                    nextAUIndex += 1
+                    nextPTS90k &+= frameTicks
+                    self.sendAccessUnit(nalUnits, pts90k: nextPTS90k)
+                }
+                self.preEncodedTimer = timer
+                timer.resume()
+                return
+            }
             let encoder = FakePhoneHEVCEncoder(width: self.width, height: self.height, frameRate: self.frameRate, averageBitRate: self.averageBitRate, ptsClockFactor: self.ptsClockFactor)
             encoder.onAccessUnit = { [weak self] nalUnits, pts90k in
                 self?.queue.async {
@@ -511,6 +718,8 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
         queue.sync {
             retransmitTimer?.cancel()
             retransmitTimer = nil
+            preEncodedTimer?.cancel()
+            preEncodedTimer = nil
             unacked.removeAll()
             pendingSend.removeAll()
             encoder?.stop()
@@ -649,11 +858,32 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
     // The Mac sink's UDP port (prod: 15550; these tests override it to stay
     // clear of a running prod app).
     var sinkPort: UInt16 = 15_550
+    // Optional fixed local port so the sink's ACK destination (serverPort)
+    // can be pointed back at this socket. Nil keeps the ephemeral socket.
+    var bindPort: UInt16?
+    private(set) var boundPort: UInt16?
 
     private func openUDPSocket() {
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { return }
         _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+        if let bindPort {
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = bindPort.bigEndian
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let bindResult = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPointer in
+                    Darwin.bind(fd, sockPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bindResult == 0 else {
+                Darwin.close(fd)
+                return
+            }
+            boundPort = bindPort
+        }
         udpSocketFD = fd
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
@@ -681,8 +911,12 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
     }
 
     private func sendUDPOnQueue(_ datagram: Data) {
-        guard udpSocketFD >= 0 else { return }
+        guard udpSocketFD >= 0 else {
+            udpSendErrors += 1
+            return
+        }
         var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = sinkPort.bigEndian
         address.sin_addr.s_addr = inet_addr("127.0.0.1")
@@ -690,14 +924,22 @@ private final class FakePhoneMPTMediaSource: @unchecked Sendable {
             guard let base = rawBuffer.baseAddress else { return }
             withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                    _ = Darwin.sendto(
+                    let sent = Darwin.sendto(
                         udpSocketFD, base, datagram.count, 0,
                         sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size)
                     )
+                    if sent < 0 {
+                        udpSendErrors += 1
+                        if udpSendErrors <= 3 {
+                            DiagnosticsLog.info("fakephone_udp sendto failed errno=\(errno) fd=\(udpSocketFD) sinkPort=\(sinkPort)")
+                        }
+                    }
                 }
             }
         }
     }
+
+    private(set) var udpSendErrors = 0
 
     // MARK: AU → TS → RTP → interleaved → KCP
 
@@ -975,6 +1217,16 @@ private final class FakePhoneHEVCEncoder: @unchecked Sendable {
 private final class FakePhoneTSMuxer {
     private var continuityCounters: [UInt16: UInt8] = [:]
     private var packetsSinceTables = Int.max
+    // Live 2026-08-27: the real phone AES-encrypts every PES payload
+    // (AES-128-CBC, MiplayPESCrypto's constant SPKI-prefix key, per-PES IV
+    // carried in the PES private-data extension). Model it so the sink's
+    // decrypt path is exercised end-to-end; default off keeps the older
+    // plaintext soaks untouched.
+    private let encryptsPES: Bool
+
+    init(encryptsPES: Bool = false) {
+        self.encryptsPES = encryptsPES
+    }
 
     func muxAccessUnit(_ nalUnits: [Data], pts90k: UInt64) -> [Data] {
         var pesPayload = Data()
@@ -984,9 +1236,26 @@ private final class FakePhoneTSMuxer {
         }
         var pes = Data([0x00, 0x00, 0x01, 0xE0])
         pes.append(contentsOf: [0x00, 0x00]) // unbounded length
-        pes.append(contentsOf: [0x80, 0x80, 0x05])
-        Self.encodePTS(pts90k, into: &pes)
-        pes.append(pesPayload)
+        if encryptsPES {
+            // Live capture shape: flags2 0x81 (PTS-only + private-data
+            // extension), headerLength 22 = 5B PTS + 0x80 ext marker +
+            // 16B IV, then the AES-CBC ciphertext.
+            pes.append(contentsOf: [0x80, 0x81, 0x16])
+            Self.encodePTS(pts90k, into: &pes)
+            var iv = Data(count: 16)
+            iv.withUnsafeMutableBytes { buffer in
+                if let base = buffer.baseAddress { arc4random_buf(base, 16) }
+            }
+            pes.append(0x80)
+            pes.append(iv)
+            // Live scheme: only the first 256 bytes of each PES payload are
+            // encrypted; the tail rides as plaintext.
+            pes.append(MiplayPESCrypto.encryptPESScope(pesPayload, iv: iv))
+        } else {
+            pes.append(contentsOf: [0x80, 0x80, 0x05])
+            Self.encodePTS(pts90k, into: &pes)
+            pes.append(pesPayload)
+        }
 
         var packets: [Data] = []
         if packetsSinceTables >= 20 {

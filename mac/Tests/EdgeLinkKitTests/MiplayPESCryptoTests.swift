@@ -62,6 +62,27 @@ final class MiplayPESCryptoTests: XCTestCase {
         XCTAssertNil(MiplayPESCrypto.extractPrivateDataIV(fromPES: Data([1, 2, 3])))
     }
 
+    // Live 2026-08-28: the phone encrypts only the first 256 bytes of each
+    // PES payload (mEncrypDataLen from our wfd_content_SP_protection
+    // negotiation); the tail rides as plaintext. Full-payload decryption
+    // corrupts everything past 256 bytes — CABAC dies a couple of CTU rows
+    // in, decoders abort the slice and the mirror renders green. The scope
+    // helpers must transform exactly the 256-byte prefix and copy the tail.
+    func testPESScopeCoversOnlyFirst256Bytes() {
+        var payload = Data((0..<512).map { UInt8($0 & 0xFF) })
+        let iv = Self.data("000102030405060708090a0b0c0d0e0f")
+        let encrypted = MiplayPESCrypto.encryptPESScope(payload, iv: iv)
+        XCTAssertEqual(encrypted.prefix(256), MiplayPESCrypto.encrypt(payload.prefix(256), iv: iv))
+        XCTAssertEqual(encrypted[256...], payload[256...], "tail must stay plaintext")
+        let decrypted = MiplayPESCrypto.decryptPESScope(encrypted, iv: iv)
+        XCTAssertEqual(decrypted, payload)
+        // payloads shorter than the scope decrypt whole (aligned)
+        payload = Data((0..<40).map { UInt8($0 & 0xFF) })
+        let roundTrip = MiplayPESCrypto.decryptPESScope(
+            MiplayPESCrypto.encryptPESScope(payload, iv: iv), iv: iv)
+        XCTAssertEqual(roundTrip, payload)
+    }
+
     func testKeyAnnouncementDetection() {
         let announcement = Self.data("8648ce3d03010703420004") + Data(repeating: 0x11, count: 64)
         XCTAssertTrue(MiplayPESCrypto.isKeyAnnouncementPayload(announcement))
