@@ -403,6 +403,70 @@ final class LyraMiShareReceiveTests: XCTestCase {
         )
     }
 
+    // Routing regression (live 2026-08-27, fifth root cause): the phone's
+    // MiShare sender dispatches on KEY_DEVICE_TYPE. Presented as type 21
+    // (PC class) it takes the wlan route — createChannel(mediumType=128),
+    // judge_result={upgrade=0}, straight to kConnected, transfer completes.
+    // Presented as our old type 4 it took p2pConnect: the LAN phys conn is
+    // only a bootstrap and the phone demands a WiFi-P2P SoftAP medium
+    // upgrade; nothing on the Mac answers the ClientIntroduction, the FSM
+    // wedges at kMediumUpgradeAsClient for ~15s, OnConnectTimeoutEvent
+    // res=15004 / err_code=15006, mapP2pConflict -3014, share sheet shows
+    // 「裝置正忙」(errCode 35). The wlan route below pins the working path;
+    // the p2p route recreates the wedge so a future change that drops the
+    // PC-class presentation fails here instead of on the device.
+    func testMiShareReceiveOverWlanRoutingCompletesTransfer() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+        let downloadDir = makeDownloadDir()
+
+        var payload = Data(count: 32 * 1024)
+        payload.withUnsafeMutableBytes { buffer in
+            if let base = buffer.baseAddress { arc4random_buf(base, buffer.count) }
+        }
+
+        let sender = makeSender(phone: phone)
+        XCTAssertEqual(sender.routingMode, .wlanRouting)
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+        waitFor("channel ready via wlan routing") { sender.state == .channelReady }
+        XCTAssertNil(sender.sentMediumUpgradeAt, "wlan route must not demand a medium upgrade")
+
+        sender.sendFile(name: "wlan-route.bin", mode: .inlineData(payload), host: "127.0.0.1")
+        waitFor("transfer done") { sender.state == .transferDone }
+        let fileURL = downloadDir.appendingPathComponent("wlan-route.bin")
+        waitFor("file written") { (try? Data(contentsOf: fileURL)) == payload }
+    }
+
+    func testMiShareReceiveWithLegacyP2pRoutingWedgesOnMediumUpgrade() throws {
+        let responderPort = try startResponder()
+        let phone = try makePhone()
+        self.phone = phone
+
+        let sender = makeSender(phone: phone)
+        sender.routingMode = .p2pRouting
+        sender.mediumUpgradeTimeout = 2
+        sender.dial(server: phone.mesh, toHost: "127.0.0.1", port: responderPort)
+
+        // The conn request itself is still accepted (valid response with
+        // capacity + user info), but then the role demands the medium
+        // upgrade and no Ack ever comes from the Mac.
+        waitFor("medium upgrade introduction sent") { sender.sentMediumUpgradeAt != nil }
+        waitFor("medium upgrade wedge timeout", timeout: 10) {
+            if case .failed = sender.state { return true }
+            return false
+        }
+        XCTAssertFalse(sender.receivedUpgradeAck)
+        XCTAssertNil(sender.receivedChannelPort, "no channel may be negotiated on the wedged route")
+        guard case let .failed(reason) = sender.state else {
+            return XCTFail("expected failed state")
+        }
+        XCTAssertTrue(
+            reason.contains("medium upgrade"),
+            "expected medium-upgrade wedge failure, got: \(reason)"
+        )
+    }
+
     // MARK: - Pattern helpers
 
     // Deterministic per-chunk content: first 8 bytes are the chunk index

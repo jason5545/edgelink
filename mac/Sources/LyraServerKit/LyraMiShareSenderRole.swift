@@ -33,6 +33,9 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
         case dialing
         case upgrading
         case requesting
+        // The .p2pRouting route: the conn request was accepted but the role
+        // demands a WiFi-P2P SoftAP medium upgrade before any channel work.
+        case mediumUpgrading
         case channelNegotiating
         case channelReady
         case channelConnecting
@@ -46,6 +49,28 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
         case failed(String)
     }
 
+    // How the phone's MiShare sender routes a dial, modeled on
+    // s2/p.e(RemoteDevice)'s KEY_DEVICE_TYPE dispatch (live + jadx,
+    // 2026-08-27):
+    //
+    // - j3/i.v(): device types 11–17 (Apple family) pass the e() gate
+    //   (discovery_medium_type mask 0x20002) and use wlan;
+    // - j3/i.L(): type 21 (PC class) uses Q()/wlanConnect(medium 128)
+    //   unconditionally;
+    // - anything else (our old presented type 4) falls to P()/p2pConnect
+    //   (medium 32): the LAN phys conn is reused merely as bootstrap and the
+    //   flow demands a WiFi-P2P SoftAP medium upgrade. A peer without that
+    //   protocol never answers the ClientIntroduction, the FSM wedges at
+    //   kMediumUpgradeAsClient until OnConnectTimeoutEvent res=15004 /
+    //   DoLogiConnConnectFailed err_code=15006, mapP2pConflict maps -3014 and
+    //   the share sheet reports errCode 35「裝置正忙」.
+    public enum RoutingMode: Sendable, Equatable {
+        // Type 21 presentation: straight wifi-lan, no medium upgrade.
+        case wlanRouting
+        // Legacy type 4-style presentation: medium upgrade demanded.
+        case p2pRouting
+    }
+
     public var onEvent: (String) -> Void = { _ in }
     public private(set) var state: State = .idle
     // The Mac's channel listener port, from its responseOfPeerPort.
@@ -57,6 +82,15 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
     // same inner frame. On by default so tests speak the phone's actual
     // frame shape; flip off to exercise the legacy single-payload request.
     public var appendsAuthHandshakeToConnRequest = true
+    // Routing faithful to s2/p.e's device-type dispatch. Default is the type
+    // 21 (PC class) route that passes on a real device since commit
+    // 836316183; switch to .p2pRouting to model what our old type 4
+    // presentation drove the phone into.
+    public var routingMode: RoutingMode = .wlanRouting
+    // .p2pRouting only: how long to wait for a medium-upgrade ClientIntro
+    // Ack before declaring the wedge failure. Short so suites stay fast; the
+    // real phone wedges ~15s here.
+    public var mediumUpgradeTimeout: TimeInterval = 2
 
     private let identity: LyraPhoneIdentity
     private var connId: UInt32 = 0
@@ -68,6 +102,10 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
     private var channelKey: SymmetricKey?
     private var dialHost: String?
     private var dialPort: UInt16?
+    // Set when the medium-upgrade ClientIntroduction goes out; used both to
+    // observe the upgrade request from tests and to arm the wedge timeout.
+    public private(set) var sentMediumUpgradeAt: Date?
+    public private(set) var receivedUpgradeAck = false
 
     // MARK: - Transfer state
 
@@ -185,9 +223,16 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
                     onEvent("mishare sender response rejected: no user info")
                     return
                 }
-                // The Mac acked the conn request; the responseAck kicks off
-                // its channel listener, then we ask for its port. Both ride
-                // the client→server key.
+                // The Mac acked the conn request. On the type 21 wlan route
+                // the responseAck kicks off its channel listener and we ask
+                // for the port; on the legacy p2p route the phone instead
+                // demands a WiFi-P2P SoftAP medium upgrade over this same
+                // conn (LogiConnUpgradeFrame carrying a ClientIntroduction)
+                // and refuses to proceed until it is acked.
+                if routingMode == .p2pRouting {
+                    sendMediumUpgradeIntroduction(server: server, key: key)
+                    return
+                }
                 send(
                     inner: LogiConnInnerFrame(frameType: 3, payload: .responseAck(Data())),
                     server: server, encryptWith: key
@@ -198,6 +243,13 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
             case let .disconnect(data):
                 state = .failed("disconnect \(data.map { String(format: "%02x", $0) }.joined())")
                 onEvent("mishare sender disconnect")
+            case let .upgrade(upgradeData) where state == .mediumUpgrading:
+                // .p2pRouting: a ClientIntroductionAck wrapped in an upgrade
+                // frame. The production responder never sends one (it has no
+                // SoftAP server), so reaching this means the wedge cleared.
+                receivedUpgradeAck = true
+                onEvent("mishare sender medium upgrade ack received")
+                _ = upgradeData
             default:
                 break
             }
@@ -577,6 +629,41 @@ public final class LyraMiShareSenderRole: LyraServiceHandler {
     }
 
     // MARK: - Flow steps
+
+    // .p2pRouting only: after a valid conn response, the legacy device-type
+    // route demands a WiFi-P2P SoftAP medium upgrade. The phone wraps a
+    // ClientIntroduction (device_id / need_ack / mac per the official
+    // PrintFrame strings) in a LogiConnUpgradeFrame and sends it over the
+    // encrypted logi conn; without an Ack the FSM wedges at
+    // kMediumUpgradeAsClient until OnConnectTimeoutEvent res=15004 (live
+    // 2026-08-27, type 4 presentation). The frame shape here follows the
+    // upgrade handshake family the responder already parses (.upgrade,
+    // frameType 6); what matters for the regression is that nothing on the
+    // Mac side answers it and no channel work happens.
+    private func sendMediumUpgradeIntroduction(server: LyraPhoneMeshServer, key: SymmetricKey) {
+        state = .mediumUpgrading
+        sentMediumUpgradeAt = Date()
+        var introduction = Data()
+        LyraProtoWriter.appendLengthDelimitedField(
+            1, value: Data("7EB0A7A3".utf8), to: &introduction
+        )
+        LyraProtoWriter.appendVarintField(2, value: 1, to: &introduction)
+        LyraProtoWriter.appendLengthDelimitedField(
+            3, value: Data(identity.identityPubB64.utf8), to: &introduction
+        )
+        var upgradeFrame = Data()
+        LyraProtoWriter.appendLengthDelimitedField(4, value: introduction, to: &upgradeFrame)
+        send(
+            inner: LogiConnInnerFrame(frameType: 6, payload: .upgrade(upgradeFrame)),
+            server: server, encryptWith: key
+        )
+        onEvent("mishare sender medium upgrade introduction sent")
+        transferQueue.asyncAfter(deadline: .now() + mediumUpgradeTimeout) { [weak self] in
+            guard let self, self.state == .mediumUpgrading, !self.receivedUpgradeAck else { return }
+            self.state = .failed("medium upgrade timeout (kMediumUpgradeAsClient wedge)")
+            self.onEvent("mishare sender medium upgrade ack timeout")
+        }
+    }
 
     private func sendUpgrade(server: LyraPhoneMeshServer) {
         let privateKey = P256.KeyAgreement.PrivateKey()
