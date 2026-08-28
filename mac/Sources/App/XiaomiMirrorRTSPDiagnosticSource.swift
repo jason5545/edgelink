@@ -4710,7 +4710,7 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
               parsed.pcmPayload.count % bytesPerFrame == 0 else {
             return false
         }
-        if parsed.kind == "ff03",
+        if parsed.kind == "ff03" || parsed.kind == "ff06",
            (parsed.declaredPayloadBytes < 0 || parsed.declaredPayloadBytes > Self.maxPrivateAudioPayloadBytes) {
             return false
         }
@@ -4773,8 +4773,9 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
         // Live 2026-08-27: the phone's firmware moved the format-bearing
         // private-audio kind from 0x03 to 0x07 with an identical field
         // layout (packedFormat@6, sampleRate@8, frames@12, bits@16,
-        // declaredBytes@20, privatePTS@28, PCM from 32 — verified against
-        // the decrypted live capture: 02 10 / 48000 / 310 / 16 / 1240).
+        // declaredBytes@20, privatePTS@28 — verified against the decrypted
+        // live capture: 02 10 / 48000 / 310 / 16 / 1240). It now appears
+        // once per session; the audio data itself rides kind 0x06 below.
         case 0x03, 0x07:
             let kind = payload[1] == 0x03 ? "ff03" : "ff07"
             guard payload.count >= 32,
@@ -4785,6 +4786,18 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
                   let declaredPayloadBytes = payload.readUInt32BE(at: 20) else {
                 return nil
             }
+            // Live 2026-08-28: the 8/27 firmware also appends a session-ID
+            // field between the fixed header and the PCM — u32 length at 32
+            // (including its own 4 bytes) followed by a 32-char ASCII id,
+            // so PCM starts at 32 + length, not 32. Only trust it when the
+            // length accounts for the record exactly; older records without
+            // the field keep the 32-byte header.
+            var headerLength = 32
+            if let sessionIDFieldLength = payload.readUInt32BE(at: 32),
+               sessionIDFieldLength >= 4, sessionIDFieldLength <= 128,
+               payload.count == 32 + Int(sessionIDFieldLength) + Int(declaredPayloadBytes) {
+                headerLength = 32 + Int(sessionIDFieldLength)
+            }
             let packedChannels = AVAudioChannelCount(max(1, Int((packedFormat >> 8) & 0xff)))
             let packedBits = Int(packedFormat & 0xff)
             let format = XiaomiMirrorMPTPrivateAudioFormat(
@@ -4792,13 +4805,41 @@ final class XiaomiMirrorMPTPrivateAudioPlayer {
                 channels: packedChannels > 0 ? packedChannels : activeFormat.channels,
                 bitsPerSample: bitsPerSample > 0 ? Int(bitsPerSample) : (packedBits > 0 ? packedBits : activeFormat.bitsPerSample)
             )
-            let pcmPayload = trimmedAudioPayload(payload, headerLength: 32, declaredPayloadBytes: Int(declaredPayloadBytes))
+            let pcmPayload = trimmedAudioPayload(payload, headerLength: headerLength, declaredPayloadBytes: Int(declaredPayloadBytes))
             return XiaomiMirrorMPTPrivateAudioPayload(
                 kind: kind,
                 format: format,
                 declaredFrames: Int(declaredFrames),
                 declaredPayloadBytes: Int(declaredPayloadBytes),
                 privatePTS90k: payload.readUInt32BE(at: 28).map(UInt64.init),
+                pcmPayload: pcmPayload
+            )
+
+        // Live 2026-08-28: the 8/27 firmware carries the actual audio data in
+        // kind 0x06 records (ff07 is now only the per-session format record).
+        // Layout from the decrypted live capture (uniform across all 3241
+        // records): u32@2 = 16, u32@6 = declared PCM bytes (1240),
+        // u32@10 = 0, u32@14 = private PTS (microseconds), u32@18 =
+        // session-ID field length including its own 4 bytes (36), then a
+        // 32-char ASCII session id, then PCM. No format fields — the stream
+        // stays 48kHz stereo 16-bit, so use the primed/fallback format.
+        case 0x06:
+            guard payload.count >= 22,
+                  let declaredPayloadBytes = payload.readUInt32BE(at: 6),
+                  let sessionIDFieldLength = payload.readUInt32BE(at: 18),
+                  sessionIDFieldLength >= 4, sessionIDFieldLength <= 128 else {
+                return nil
+            }
+            let headerLength = 18 + Int(sessionIDFieldLength)
+            let format = activeFormat
+            let pcmPayload = trimmedAudioPayload(payload, headerLength: headerLength, declaredPayloadBytes: Int(declaredPayloadBytes))
+            let frames = format.bytesPerFrame > 0 ? pcmPayload.count / format.bytesPerFrame : nil
+            return XiaomiMirrorMPTPrivateAudioPayload(
+                kind: "ff06",
+                format: format,
+                declaredFrames: frames,
+                declaredPayloadBytes: Int(declaredPayloadBytes),
+                privatePTS90k: payload.readUInt32BE(at: 14).map(UInt64.init),
                 pcmPayload: pcmPayload
             )
 
