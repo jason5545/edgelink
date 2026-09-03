@@ -175,6 +175,7 @@ targets:
       - path: Sources/App/XiaomiMirrorFlowController.swift
       - path: Sources/App/XiaomiMirrorRTSPDiagnosticSource.swift
       - path: Sources/App/MirrorPointerRouting.swift
+      - path: Sources/App/LiveDTMF.swift
     dependencies:
       - target: EdgeLinkKit
       - target: LyraServerKit

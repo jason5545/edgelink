@@ -511,21 +511,95 @@ private struct ConnectionActions: View {
     }
 }
 
+/// 通話中即時送鍵的本機按鍵監聽：面板開著且通話中時，0-9 / * / # 按下即送單一
+/// DTMF tone 並吞掉事件（不進輸入欄、不觸發輸入法組字——實測 Rime/注音 會把
+/// 輸入欄焦點下的數字鍵組成 ㄓ，見 2026-09-03 實測）；Cmd+V 貼上、Esc、Tab 等
+/// 其餘按鍵原樣放行。local monitor 只作用於本 app；popover 關閉即 stop。
+private final class LiveDTMFKeyMonitor {
+    private static let toneCharacters: Set<Character> = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#"]
+
+    private var monitor: Any?
+
+    /// 重複呼叫安全：已有 monitor 在跑就直接略過。
+    func start(onTone: @escaping (String) -> Void) {
+        guard monitor == nil else {
+            return
+        }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let tone = Self.dtmfTone(for: event) else {
+                return event
+            }
+            onTone(tone)
+            return nil
+        }
+        DiagnosticsLog.info("phone.mac.live_dtmf_monitor_start")
+    }
+
+    /// 重複呼叫安全。
+    func stop() {
+        guard let monitor else {
+            return
+        }
+        self.monitor = nil
+        NSEvent.removeMonitor(monitor)
+        DiagnosticsLog.info("phone.mac.live_dtmf_monitor_stop")
+    }
+
+    /// 單一 DTMF 字元才回傳；`*` 可能來自 Shift+8 或數字鍵盤、`#` 來自 Shift+3，
+    /// 所以用套用 shift 後的 `characters` 判定。Shift / numericPad / function
+    /// 之外的 modifier（Cmd、Option…）一律放行給系統。
+    private static func dtmfTone(for event: NSEvent) -> String? {
+        guard event.modifierFlags.subtracting([.shift, .numericPad, .function]).isEmpty else {
+            return nil
+        }
+        guard let characters = event.characters ?? event.charactersIgnoringModifiers,
+              characters.count == 1,
+              let character = characters.first,
+              toneCharacters.contains(character)
+        else {
+            return nil
+        }
+        return String(character)
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 private struct PhoneControlPanel: View {
     @ObservedObject var runtime: EdgeLinkRuntime
     @State private var phoneNumber = ""
+    /// 本次通話最近送出的 DTMF tone（最多保留 16 個），通話開始/結束時清空。
+    @State private var sentToneTrail = ""
+    /// 焦點只為貼上方便；單鍵送出靠 dtmfKeyMonitor，不依賴焦點或輸入法狀態。
+    @FocusState private var phoneFieldFocused: Bool
+    @State private var dtmfKeyMonitor = LiveDTMFKeyMonitor()
 
     private var trimmedPhoneNumber: String {
         phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func submitPhoneInput() {
-        if runtime.isPhoneCallActive {
-            if runtime.sendPhoneDTMF(sequence: trimmedPhoneNumber) != nil {
-                phoneNumber = ""
-            }
-        } else if runtime.dialPhone(number: trimmedPhoneNumber) != nil {
+        // 通話中單鍵由 dtmfKeyMonitor 即時送出、貼上由 onChange 整段送出，
+        // Enter 不需做任何事。
+        guard !runtime.isPhoneCallActive else {
+            return
+        }
+        if runtime.dialPhone(number: trimmedPhoneNumber) != nil {
             phoneNumber = ""
+        }
+    }
+
+    private func sendLiveDTMF(_ sequence: String) {
+        guard runtime.isPhoneCallActive else {
+            return
+        }
+        if runtime.sendPhoneDTMF(sequence: sequence) != nil {
+            sentToneTrail.append(contentsOf: sequence)
+            if sentToneTrail.count > 16 {
+                sentToneTrail = String(sentToneTrail.suffix(16))
+            }
         }
     }
 
@@ -534,22 +608,19 @@ private struct PhoneControlPanel: View {
             HStack(spacing: 8) {
                 TextField(runtime.isPhoneCallActive ? "客服按鍵" : "電話號碼", text: $phoneNumber)
                     .textFieldStyle(.roundedBorder)
+                    .focused($phoneFieldFocused)
                     .onSubmit {
                         submitPhoneInput()
                     }
 
-                Button {
-                    submitPhoneInput()
-                } label: {
-                    if runtime.isPhoneCallActive {
-                        Label("送按鍵", systemImage: "keypad")
-                    } else {
+                if !runtime.isPhoneCallActive {
+                    Button {
+                        submitPhoneInput()
+                    } label: {
                         Label("撥號", systemImage: "phone.arrow.up.right")
                     }
-                }
-                .disabled(!runtime.isConnected || trimmedPhoneNumber.isEmpty)
+                    .disabled(!runtime.isConnected || trimmedPhoneNumber.isEmpty)
 
-                if !runtime.isPhoneCallActive {
                     Button {
                         if runtime.redialLastPhoneNumber() != nil {
                             phoneNumber = ""
@@ -571,6 +642,15 @@ private struct PhoneControlPanel: View {
                 .disabled(!runtime.isConnected)
             }
 
+            if runtime.isPhoneCallActive && !sentToneTrail.isEmpty {
+                Text("已送：\(sentToneTrail)")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help("本次通話最近送出的按鍵（最多保留 16 個）")
+            }
+
             if !runtime.phoneCallStatus.isEmpty {
                 Text(runtime.phoneCallStatus)
                     .font(.caption)
@@ -579,13 +659,41 @@ private struct PhoneControlPanel: View {
             }
         }
         .onAppear {
-            if phoneNumber.isEmpty && !runtime.isPhoneCallActive {
+            if runtime.isPhoneCallActive {
+                dtmfKeyMonitor.start(onTone: sendLiveDTMF)
+                phoneFieldFocused = true
+            } else if phoneNumber.isEmpty {
                 phoneNumber = runtime.lastDialedPhoneNumber
             }
         }
+        .onDisappear {
+            dtmfKeyMonitor.stop()
+        }
+        .onChange(of: phoneNumber) { previous, current in
+            // 通話中只剩貼上會進到這裡（單鍵已被 monitor 吞掉）；delta 非法
+            // （刪除、取代、非法字元）時直接清空，不讓殘字影響下一次 delta。
+            guard runtime.isPhoneCallActive else {
+                return
+            }
+            guard let sequence = LiveDTMF.liveDTMFDelta(previous: previous, current: current) else {
+                if !current.isEmpty {
+                    phoneNumber = ""
+                }
+                return
+            }
+            sendLiveDTMF(sequence)
+            phoneNumber = ""
+        }
         .onChange(of: runtime.isPhoneCallActive) { isActive in
-            if isActive && phoneNumber == runtime.lastDialedPhoneNumber {
-                phoneNumber = ""
+            sentToneTrail = ""
+            if isActive {
+                dtmfKeyMonitor.start(onTone: sendLiveDTMF)
+                if phoneNumber == runtime.lastDialedPhoneNumber {
+                    phoneNumber = ""
+                }
+                phoneFieldFocused = true
+            } else {
+                dtmfKeyMonitor.stop()
             }
         }
     }

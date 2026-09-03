@@ -162,6 +162,8 @@ final class EdgeLinkRuntime: ObservableObject {
     private var systemSleepWakeCancellables = Set<AnyCancellable>()
     private var pendingSmsSends: [String: SmsSendBody] = [:]
     private var pendingPhoneActions: [String: PhoneActionBody] = [:]
+    /// 即時 DTMF 等「成功不更新 phoneCallStatus」的 action；失敗仍照常更新。
+    private var quietPhoneActionRequestIds = Set<String>()
     private var activePhoneRelaySessionId: String?
     private var phoneRelaySourceSequence = 0
     private var phoneRelaySourceSendFailed = false
@@ -1517,17 +1519,19 @@ final class EdgeLinkRuntime: ObservableObject {
         sendPhoneAction(action: "hangup")
     }
 
+    /// 通話中即時送鍵（IVR）的唯一入口：每個按鍵各自一個 dtmf action。
+    /// 成功時不覆寫 `phoneCallStatus`（避免單鍵洗掉通話狀態），失敗仍更新。
     @discardableResult
     func sendPhoneDTMF(sequence rawSequence: String) -> String? {
         guard isPhoneCallActive else {
             phoneCallStatus = String(localized: "通話中才能送按鍵")
             return nil
         }
-        guard let sequence = Self.sanitizeDTMFSequence(rawSequence) else {
+        guard let sequence = LiveDTMF.sanitizeDTMFSequence(rawSequence) else {
             phoneCallStatus = String(localized: "請輸入客服按鍵")
             return nil
         }
-        return sendPhoneAction(action: "dtmf", number: sequence)
+        return sendPhoneAction(action: "dtmf", number: sequence, quietOnSuccess: true)
     }
 
     func sendFilesWithXiaomiHyperConnect() {
@@ -3712,7 +3716,7 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     @discardableResult
-    private func sendPhoneAction(action: String, number: String? = nil, skipDial: Bool = false) -> String? {
+    private func sendPhoneAction(action: String, number: String? = nil, skipDial: Bool = false, quietOnSuccess: Bool = false) -> String? {
         guard let session = currentSession, isConnected else {
             phoneCallStatus = String(localized: "電話目前不可用")
             DiagnosticsLog.warn("phone.mac.action_ignored action=\(action) not_connected")
@@ -3720,7 +3724,11 @@ final class EdgeLinkRuntime: ObservableObject {
         }
 
         let requestId = UUID().uuidString
-        phoneCallStatus = Self.localizedPhoneActionInProgress(action)
+        if quietOnSuccess {
+            quietPhoneActionRequestIds.insert(requestId)
+        } else {
+            phoneCallStatus = Self.localizedPhoneActionInProgress(action)
+        }
         if action == "dial" || action == "answer" {
             Task { @MainActor [weak self] in
                 guard let self else {
@@ -3907,6 +3915,7 @@ final class EdgeLinkRuntime: ObservableObject {
             )
         } catch {
             pendingPhoneActions.removeValue(forKey: body.requestId)
+            quietPhoneActionRequestIds.remove(body.requestId)
             if body.action == "dial" || body.action == "answer" {
                 stopPhoneCallRelayAudio(reason: "phone_action_send_failed_\(body.action)")
             }
@@ -5913,6 +5922,7 @@ final class EdgeLinkRuntime: ObservableObject {
 
     private func handlePhoneActionResult(_ result: PhoneActionResultBody) {
         let pendingAction = pendingPhoneActions.removeValue(forKey: result.requestId)
+        let quietOnSuccess = quietPhoneActionRequestIds.remove(result.requestId) != nil
         if result.requestId == phoneRelayDebugDialRequestID && !result.success {
             phoneRelayDebugDialError = result.error ?? "unknown"
         }
@@ -5933,7 +5943,9 @@ final class EdgeLinkRuntime: ObservableObject {
                 )
                 return
             }
-            phoneCallStatus = Self.localizedPhoneActionSent(result.action)
+            if !quietOnSuccess {
+                phoneCallStatus = Self.localizedPhoneActionSent(result.action)
+            }
             DiagnosticsLog.info("phone.mac.action_result requestId=\(result.requestId) action=\(result.action) success=true")
         } else {
             if result.action == "dial" || result.action == "answer" {
@@ -6110,33 +6122,6 @@ final class EdgeLinkRuntime: ObservableObject {
         default:
             return String(localized: "手機通話：\(caller)")
         }
-    }
-
-    private static func sanitizeDTMFSequence(_ raw: String) -> String? {
-        var normalized = ""
-        for character in raw.trimmingCharacters(in: .whitespacesAndNewlines) {
-            switch character {
-            case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#", ",":
-                normalized.append(character)
-            case "＊":
-                normalized.append("*")
-            case "＃":
-                normalized.append("#")
-            case "，", "p", "P":
-                normalized.append(",")
-            case " ", "\t", "\n", "\r", "-":
-                continue
-            default:
-                return nil
-            }
-        }
-        guard !normalized.isEmpty,
-              normalized.count <= 32,
-              normalized.contains(where: { $0.isNumber || $0 == "*" || $0 == "#" }),
-              normalized.allSatisfy({ $0.isNumber || $0 == "*" || $0 == "#" || $0 == "," }) else {
-            return nil
-        }
-        return normalized
     }
 
     private static func fingerprint(_ value: String) -> String {

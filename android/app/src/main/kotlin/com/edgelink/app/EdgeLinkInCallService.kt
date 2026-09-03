@@ -79,6 +79,9 @@ class EdgeLinkInCallService : InCallService() {
 private object EdgeLinkInCallCallStore {
     private val lock = Any()
 
+    /** 連續 dtmf action 共用這把鎖，確保依序播放、不會同時 playDtmfTone。 */
+    private val dtmfLock = Any()
+
     @Volatile
     var telecomManager: TelecomManager? = null
 
@@ -192,31 +195,34 @@ private object EdgeLinkInCallCallStore {
                 success = false,
                 message = "phone:dtmf no_active_call ${diagnosticState()}"
             )
-        var sent = 0
         return runCatching {
-            for ((index, tone) in sequence.withIndex()) {
-                if (tone == ',') {
-                    Thread.sleep(PHONE_DTMF_SEQUENCE_PAUSE_MS)
-                    continue
+            // 整個播放迴圈共用 dtmfLock，連續 dtmf action 依序播完才放行下一個。
+            synchronized(dtmfLock) {
+                var sent = 0
+                for ((index, tone) in sequence.withIndex()) {
+                    if (tone == ',') {
+                        Thread.sleep(PHONE_DTMF_SEQUENCE_PAUSE_MS)
+                        continue
+                    }
+                    if (!PhoneDtmfKeyMapper.isTone(tone)) {
+                        return@runCatching ShizukuOperationResult(
+                            success = false,
+                            message = "phone:dtmf invalid_tone"
+                        )
+                    }
+                    call.playDtmfTone(tone)
+                    Thread.sleep(PHONE_DTMF_TONE_DURATION_MS)
+                    call.stopDtmfTone()
+                    sent += 1
+                    if (index < sequence.lastIndex) {
+                        Thread.sleep(PHONE_DTMF_TONE_GAP_MS)
+                    }
                 }
-                if (!PhoneDtmfKeyMapper.isTone(tone)) {
-                    return@runCatching ShizukuOperationResult(
-                        success = false,
-                        message = "phone:dtmf invalid_tone"
-                    )
+                if (sent == 0) {
+                    ShizukuOperationResult(success = false, message = "phone:dtmf empty")
+                } else {
+                    ShizukuOperationResult(success = true, message = "phone:dtmf incall_service count=$sent")
                 }
-                call.playDtmfTone(tone)
-                Thread.sleep(PHONE_DTMF_TONE_DURATION_MS)
-                call.stopDtmfTone()
-                sent += 1
-                if (index < sequence.lastIndex) {
-                    Thread.sleep(PHONE_DTMF_TONE_GAP_MS)
-                }
-            }
-            if (sent == 0) {
-                ShizukuOperationResult(success = false, message = "phone:dtmf empty")
-            } else {
-                ShizukuOperationResult(success = true, message = "phone:dtmf incall_service count=$sent")
             }
         }.getOrElse { error ->
             runCatching { call.stopDtmfTone() }
