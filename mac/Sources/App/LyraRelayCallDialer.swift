@@ -25,9 +25,17 @@ final class LyraRelayCallDialer {
     static let serviceName = "com.android.phone:relayPhoneCall"
     static let servicePackage = "com.android.phone"
     private static let clientChannelId: UInt64 = 7
-    private static let overallTimeout: TimeInterval = 20
+    // Internal var (not let) so the E2E tests can shrink it.
+    static var overallTimeout: TimeInterval = 20
 
-    private let socket = LyraMeshSocket()
+    // The LAN UDP socket is the default mesh transport. A relay-routed dial
+    // swaps in a fresh relay mesh/channel flow per dial
+    // (LyraRelayTransportBridge.meshFlow / channelFlow) — the phone bridge
+    // binds each flow index to its own UDP socket, so the mesh service sees
+    // a fresh peer and answers phys sync.
+    private let lanSocket = LyraMeshSocket()
+    private var socket: LyraMeshDatagramPipe
+    private var channelTransport: LyraChannelDatagramPipe?
     private let queue = DispatchQueue(label: "edgelink.lyra.relaydialer")
     private var host: String?
     private var port: UInt16 = 0
@@ -45,7 +53,7 @@ final class LyraRelayCallDialer {
     private var authServerEphPub = Data()
     private var meshSessionKey: SymmetricKey?
     private var transKey = Data()
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
     private var methodId = "1"
     private var timeoutItem: DispatchWorkItem?
     private var authIsAccountPair = false
@@ -91,19 +99,24 @@ final class LyraRelayCallDialer {
     ) {
         self.deviceIdHexProvider = deviceIdHexProvider
         self.displayNameProvider = displayNameProvider
+        self.socket = lanSocket
     }
 
     static func currentDeviceIdHex() -> String {
         UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId") ?? "721572C3"
     }
 
-    func dial(number: String, host: String, ports: [UInt16]) {
+    func dial(
+        number: String, host: String, ports: [UInt16],
+        meshTransport: LyraMeshDatagramPipe? = nil,
+        channelTransport: LyraChannelDatagramPipe? = nil
+    ) {
         queue.async { [weak self] in
             guard let self, !ports.isEmpty else { return }
             self.stopLocked()
+            self.socket = meshTransport ?? self.lanSocket
+            self.channelTransport = channelTransport
             self.outcomeReported = false
-            self.redialStage = 0
-            self.dialAcked = false
             Self.activeDialer = self
             self.number = number
             self.host = host
@@ -115,11 +128,20 @@ final class LyraRelayCallDialer {
             self.socket.onFrame = { [weak self] frame, endpoint, reply in
                 self?.handle(frame: frame, endpoint: endpoint, reply: reply)
             }
-            DiagnosticsLog.info("xiaomi.relaydial.start number_len=\(number.count) to=\(host):\(self.candidatePorts)")
+            DiagnosticsLog.info(
+                "xiaomi.relaydial.start number_len=\(number.count) to=\(host):\(self.candidatePorts) relay=\(meshTransport != nil)"
+            )
             self.sendPhysSyncRequest()
             let timeout = DispatchWorkItem { [weak self] in
                 guard let self, self.state != .done, self.state != .channelUp else { return }
                 DiagnosticsLog.warn("xiaomi.relaydial.timeout state=\(self.state)")
+                // A dial that never got ANY answer sits in .idle — exactly the
+                // off-LAN case (stale endpoints black-hole phys sync).
+                // stopLocked() treats .idle as "nothing in flight" and would
+                // eat the outcome, leaving the bridge-dial fallback pending
+                // forever (live 2026-09-02: relay/hotspot dial sent, the
+                // phone never responded, no fallback call was placed).
+                self.reportOutcome(false)
                 self.stopLocked()
             }
             timeoutItem = timeout
@@ -136,19 +158,6 @@ final class LyraRelayCallDialer {
     private var outcomeReported = false
 
     private(set) static var activeDialer: LyraRelayCallDialer?
-
-    // TeleService's handleRelayDialRequest calls setDeviceInRelay immediately
-    // after placeCall, before the relayed Connection exists, so
-    // mConnectRelayAudio is never armed and DistAudio never connects. A second
-    // dial while the first call is still DIALING gets its duplicate placeCall
-    // dropped by Telecom (observed 2026-08-06, bridge double-dial race) but
-    // re-runs setDeviceInRelay with the connection present, arming the
-    // ACTIVE-state connectDistAudioDevice.
-    func redialForRelayedAudio() {
-        queue.async { [weak self] in
-            self?.redialForRelayedAudioLocked()
-        }
-    }
 
     private func reportOutcome(_ sent: Bool) {
         guard !outcomeReported else { return }
@@ -581,7 +590,7 @@ final class LyraRelayCallDialer {
 
     private func connectChannel(port peerPort: UInt16, serverChannelId: UInt32) {
         guard let host else { return }
-        let socket = LyraChannelSocket()
+        let socket: LyraChannelDatagramPipe = channelTransport ?? LyraChannelSocket()
         socket.suppressNegotiationReply = true
         socket.onNegotiated = { [weak self] serverChannelId, mtu in
             guard let self else { return }
@@ -628,61 +637,13 @@ final class LyraRelayCallDialer {
         }
     }
 
-    private func sendDialRequest(deviceIdOverride: String? = nil) {
-        let deviceId = deviceIdOverride ?? Self.currentDeviceIdHex()
+    private func sendDialRequest() {
+        let deviceId = Self.currentDeviceIdHex()
         let json =
             "{\"address\":\"\(number)\",\"requestDeviceId\":\"\(deviceId)\",\"videoState\":0}"
         let uri = "relay://dial:\(methodId)/request?\(json)"
         sendChannelText(uri)
         reportOutcome(true)
-        // The back-channel update_call_state(DIALING) is not guaranteed to
-        // arrive (channel negotiation can lag), so also schedule the
-        // audio-arming redials after the dial — cellular calls stay DIALING
-        // for several seconds, and Telecom drops the duplicate placeCall
-        // while re-running setDeviceInRelay with the connection present.
-        queue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.redialForRelayedAudio()
-        }
-        queue.asyncAfter(deadline: .now() + 2.2) { [weak self] in
-            self?.redialForRelayedAudio()
-        }
-    }
-
-    private var dialAcked = false
-    private var redialStage = 0
-
-    // TeleService's handleRelayDialRequest calls setDeviceInRelay right after
-    // placeCall, before the relayed Connection exists, so mConnectRelayAudio
-    // is never armed and DistAudio never connects. Re-dialing while DIALING
-    // makes Telecom drop the duplicate placeCall but re-run setDeviceInRelay
-    // with the connection present — but only when the device id CHANGES (the
-    // whole body sits inside an old!=new guard). So redial #2 uses a
-    // lowercased id to arm mConnectRelayAudio, and redial #3 restores the
-    // exact id so the ACTIVE-state connectDistAudioDevice lookup matches our
-    // published DistAudio device.
-    private func redialForRelayedAudioLocked() {
-        guard state == .done || state == .channelUp, dialAcked, channelSocket != nil else { return }
-        switch redialStage {
-        case 0:
-            redialStage = 1
-            methodId = String(UInt32.random(in: 1...UInt32(Int32.max)))
-            DiagnosticsLog.info("xiaomi.relaydial.redial_for_audio stage=lowercase")
-            sendDialRequest(deviceIdOverride: Self.currentDeviceIdHex().lowercased())
-        case 1:
-            redialStage = 2
-            methodId = String(UInt32.random(in: 1...UInt32(Int32.max)))
-            DiagnosticsLog.info("xiaomi.relaydial.redial_for_audio stage=restore")
-            sendDialRequest()
-        default:
-            return
-        }
-    }
-
-    // Suppress the scheduled audio redials (call ended / channel lost).
-    func cancelRedial() {
-        queue.async { [weak self] in
-            self?.redialStage = 99
-        }
     }
 
     // Call ended: close the dial channel now, while no call is in flight.
@@ -697,7 +658,6 @@ final class LyraRelayCallDialer {
     func callEnded() {
         queue.async { [weak self] in
             guard let self else { return }
-            self.redialStage = 99
             guard self.state == .done || self.state == .channelUp else { return }
             // Same shape as the phone's own release (code 33006, observed in
             // TeleService's onChannelRelease for the relay channel pair).
@@ -746,7 +706,6 @@ final class LyraRelayCallDialer {
         if text == "ok" {
             // Transport-level ack on the dial channel; the real dial response
             // (code 200) arrives on the back-channel.
-            dialAcked = true
             if state == .channelUp { state = .done }
             return
         }

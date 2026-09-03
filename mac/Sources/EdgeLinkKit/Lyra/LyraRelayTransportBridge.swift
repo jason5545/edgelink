@@ -11,8 +11,20 @@ import Foundation
 // uses flow 0 while the cast trust dial uses flow 1, so the phone side can
 // present each flow from its own UDP socket — the Xiaomi mesh service keys
 // peers by source endpoint and only answers phys sync from a fresh peer.
+// The Mac-initiated relayCall DIAL takes random mesh flow indexes above
+// `dialFlowIndexFloor` so a dial never retires (or is retired by) a cast
+// dial on the phone bridge. Channel flows are indexed the same way: flow 0
+// is the shared cast/relayCall channel pipe, non-zero flows are Mac-dialed
+// relayCall dial channels (one per dial, so a dial mid-mirror does not
+// clobber the cast channel).
 public final class LyraRelayTransportBridge: @unchecked Sendable {
     public typealias SendHandler = @Sendable (Data) async throws -> Void
+
+    // Mac-initiated relayCall dials take mesh/channel flow indexes at or
+    // above this floor; the phone bridge retires only same-partition flows
+    // when a fresh index arrives, so a dial never kills a cast dial's
+    // socket (and vice versa).
+    public static let dialFlowIndexFloor = 1_000_000_001
 
     public let mesh: LyraVirtualMeshPipe
     public let channel: LyraVirtualChannelPipe
@@ -27,6 +39,9 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
     // with "p" route here; unstamped envelopes keep landing on `channel` (the
     // Mac-dialed cast/relayCall pipe) for backward compatibility.
     private var channelPipes: [Int: LyraVirtualChannelPipe] = [:]
+    // Mac-dialed channel pipes keyed by flow index (the relayCall dial
+    // channel on a relay-routed session). Flow 0 is the shared `channel`.
+    private var dialedChannelFlows: [Int: LyraVirtualChannelPipe] = [:]
     // Server channel ports the PEER announced out-of-band via
     // relay.channel.listen (the peer hosts a phone-dialed server channel and
     // wants our reverse listener up before its responseOfPeerPort arrives).
@@ -72,6 +87,28 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
         meshFlows[index] = pipe
         pipe.attachOutbound { [weak self] datagram in
             self?.enqueue(EnvelopeType.relayMeshDatagram, datagram, flow: index)
+        }
+        return pipe
+    }
+
+    // The channel pipe for a Mac-dialed channel flow (the relayCall dial
+    // when the cast session already owns `channel`). Index 0 is `channel`
+    // itself. Each pipe's outbound envelopes carry the flow index plus the
+    // dialed Xiaomi channel port, so the phone bridge binds a per-flow local
+    // forward to that port — exactly like a fresh LAN UDP socket.
+    public func channelFlow(index: Int) -> LyraVirtualChannelPipe {
+        if index == 0 { return channel }
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = dialedChannelFlows[index] { return existing }
+        let pipe = LyraVirtualChannelPipe()
+        dialedChannelFlows[index] = pipe
+        pipe.attachOutbound { [weak self, weak pipe] datagram in
+            guard let self else { return }
+            self.enqueue(
+                EnvelopeType.relayChannelDatagram, datagram, flow: index,
+                dialPort: pipe?.dialedPeerPortOnQueue()
+            )
         }
         return pipe
     }
@@ -142,11 +179,22 @@ public final class LyraRelayTransportBridge: @unchecked Sendable {
         case EnvelopeType.relayChannelDatagram:
             // The phone bridge stamps the Mac-side port it dialed ("p") onto
             // phone-initiated channel envelopes; route those to the matching
-            // server pipe. Unstamped (or unknown-port) envelopes keep the
-            // legacy behavior: everything lands on the Mac-dialed pipe.
+            // server pipe. Non-zero flow indexes are Mac-dialed relayCall
+            // dial channels. Unstamped flow-0 envelopes keep the legacy
+            // behavior: everything lands on the Mac-dialed cast/relayCall
+            // pipe.
             if let port = envelope.b.p {
                 lock.lock()
                 let pipe = channelPipes[port]
+                lock.unlock()
+                if let pipe {
+                    pipe.deliver(datagram: datagram)
+                    return
+                }
+            }
+            if flow != 0 {
+                lock.lock()
+                let pipe = dialedChannelFlows[flow]
                 lock.unlock()
                 if let pipe {
                     pipe.deliver(datagram: datagram)

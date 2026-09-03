@@ -268,7 +268,6 @@ final class LyraRelayCallSession {
         case let .disconnect(data):
             let code = varint(1, in: data) ?? 0
             DiagnosticsLog.warn("xiaomi.relaycall.disconnect code=\(code)")
-            LyraRelayCallDialer.activeDialer?.cancelRedial()
             teardown()
             if Self.activeRelaySession === self {
                 Self.activeRelaySession = nil
@@ -811,11 +810,6 @@ final class LyraRelayCallSession {
                 fields: ["code": "200", "msg": "ok", "address": number, "callstate": state]
             )
         case ("call_state_idle", "request"), ("update_call_state", "request"):
-            // callState 3 = DIALING: arm the phone's DistAudio connect by
-            // re-dialing once (see LyraRelayCallDialer.redialForRelayedAudio).
-            if parsed.method == "update_call_state", parsed.jsonInt("callState") == 3 {
-                LyraRelayCallDialer.activeDialer?.redialForRelayedAudio()
-            }
             // Native mirror-call uplink: 4 = ACTIVE starts the phone's
             // PHONERELAY sink at our audio source; idle/disconnect stops it.
             // Call end also closes the dialer's channel so the phone's

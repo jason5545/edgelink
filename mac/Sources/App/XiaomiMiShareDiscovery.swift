@@ -262,6 +262,21 @@ final class XiaomiMiShareDiscovery: NSObject {
         currentPhoneMeshEndpoints().first
     }
 
+    // True when a phone peer is currently visible via mDNS on this network.
+    // currentPhoneMeshEndpoints() also merges pinned/persisted endpoints that
+    // survive a network switch — after a WiFi→hotspot move those black-hole
+    // phys sync silently (live 2026-09-02: 9 cached endpoints, zero replies),
+    // so only a fresh mDNS sighting proves the phone answers on the LAN.
+    func hasLivePhonePeer(freshness: TimeInterval = 120) -> Bool {
+        let cutoff = Date().addingTimeInterval(-freshness)
+        return peersByServiceName.values.contains { peer in
+            guard peer.seenAt >= cutoff,
+                  let appData = peer.appDataBase64.flatMap(XiaomiMiShareDiscoveryAppData.init(base64Encoded:))
+            else { return false }
+            return appData.deviceType == XiaomiMiShareDiscoveryAppData.deviceTypePhone
+        }
+    }
+
     func currentPhoneMeshEndpoints() -> [(host: String, port: UInt16)] {
         // When the EdgeLink phone's LAN-session IP is known, pin mesh traffic
         // to it — other HyperConnect phones on the network also answer phys

@@ -799,4 +799,105 @@ class AndroidLyraRelayTransportBridgeTest {
             scope.cancel()
         }
     }
+
+    @Test
+    fun dialChannelFlowKeepsCastChannelFlowIntact() = runBlocking {
+        // 2026-09-02: the Mac-initiated relayCall dial rides its own indexed
+        // channel flow. Its stamped target port must bind only the dial
+        // flow's socket — never rebind the cast channel's flow 0 — and both
+        // flows' responses must carry their own flow index back.
+        val castEcho = startEchoUdpServer()
+        val dialEcho = startEchoUdpServer()
+        val emitted = java.util.Collections.synchronizedList(mutableListOf<RelayDatagramBody>())
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, body -> emitted.add(body as RelayDatagramBody) }
+        )
+        val dialFlow = AndroidLyraRelayTransportBridge.DIAL_FLOW_INDEX_FLOOR
+        try {
+            bridge.startChannel("127.0.0.1", castEcho.localPort)
+
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, relayBody(byteArrayOf(0x61)))
+            assertTrue("cast flow echo", waitFor {
+                emitted.any { (it.f ?: 0) == 0 && RelayDatagram.decode(it)?.contentEquals(byteArrayOf(0x61)) == true }
+            })
+
+            // The dial channel's first datagram arrives stamped with the
+            // phone's relayPhoneCall channel port on its own flow index.
+            val stamped = EnvelopeCodec.json.encodeToJsonElement(
+                RelayDatagram.encode(byteArrayOf(0x62), dialFlow, p = dialEcho.localPort)
+            ) as JsonObject
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, stamped)
+            assertTrue("dial flow echo on its own index", waitFor {
+                emitted.any { it.f == dialFlow && RelayDatagram.decode(it)?.contentEquals(byteArrayOf(0x62)) == true }
+            })
+
+            // The cast flow must still be bound to its own target.
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, relayBody(byteArrayOf(0x63)))
+            assertTrue("cast flow still alive and unrebound", waitFor {
+                emitted.any { (it.f ?: 0) == 0 && RelayDatagram.decode(it)?.contentEquals(byteArrayOf(0x63)) == true }
+            })
+        } finally {
+            bridge.stop()
+            castEcho.close()
+            dialEcho.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun dialMeshFlowDoesNotRetireCastMeshFlow() = runBlocking {
+        // The fresh-peer replacement must stay within its partition: a
+        // Mac-initiated relayCall dial (index >= DIAL_FLOW_INDEX_FLOOR) must
+        // not drop a streaming cast dial's socket, and a later dial flow
+        // retires only the previous dial flow.
+        val echo = startEchoUdpServer()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val bridge = AndroidLyraRelayTransportBridge(
+            scope = scope,
+            log = { },
+            sendEnvelope = { _, _ -> }
+        )
+        val dialFlowA = AndroidLyraRelayTransportBridge.DIAL_FLOW_INDEX_FLOOR
+        val dialFlowB = AndroidLyraRelayTransportBridge.DIAL_FLOW_INDEX_FLOOR + 1
+        try {
+            bridge.startMesh("127.0.0.1", echo.localPort)
+            bridge.handleEnvelope(EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x31), flow = 1))
+            assertTrue("cast flow 1 started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == 1 }?.let { it.outboundCount > 0 } == true
+            })
+
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x32), flow = dialFlowA)
+            )
+            assertTrue("dial flow started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == dialFlowA }?.let { it.outboundCount > 0 } == true
+            })
+            assertTrue(
+                "cast flow survives the relayCall dial",
+                bridge.meshFlowStats().any { it.flowIndex == 1 }
+            )
+
+            bridge.handleEnvelope(
+                EnvelopeTypes.RELAY_MESH_DATAGRAM, relayBody(byteArrayOf(0x33), flow = dialFlowB)
+            )
+            assertTrue("second dial flow started", waitFor {
+                bridge.meshFlowStats().firstOrNull { it.flowIndex == dialFlowB }?.let { it.outboundCount > 0 } == true
+            })
+            assertTrue(
+                "same-partition replacement retires the first dial flow",
+                bridge.meshFlowStats().none { it.flowIndex == dialFlowA }
+            )
+            assertTrue(
+                "cast flow still survives",
+                bridge.meshFlowStats().any { it.flowIndex == 1 }
+            )
+        } finally {
+            bridge.stop()
+            echo.close()
+            scope.cancel()
+        }
+    }
 }

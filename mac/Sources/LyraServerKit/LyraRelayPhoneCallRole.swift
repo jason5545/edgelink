@@ -21,6 +21,12 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
 
     public var onEvent: (String) -> Void = { _ in }
 
+    // Relay mode: when set (a LyraRelayTransportBridge channel flow on the
+    // phone side), the dial channel rides the relay pipe instead of a real
+    // UDP listener — mirrors AndroidLyraRelayTransportBridge's per-flow
+    // channel socket that forwards to the phone's local channel listener.
+    public var channelPipe: LyraVirtualChannelPipe?
+
     // MARK: - Assertion surface
 
     public struct DialRequest: Equatable {
@@ -283,7 +289,13 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
     }
 
     private func sendPeerPortResponse(conn: DialConn, server: LyraPhoneMeshServer) {
-        guard let key = sessionKey, let port = conn.channelListener?.port?.rawValue, port != 0 else { return }
+        let channelPort: UInt16?
+        if let pipe = channelPipe {
+            channelPort = pipe.boundPort
+        } else {
+            channelPort = conn.channelListener?.port?.rawValue
+        }
+        guard let key = sessionKey, let port = channelPort, port != 0 else { return }
         conn.serverChannelId = UInt64.random(in: 40...60)
         var body = Data()
         LyraProtoWriter.appendVarintField(2, value: conn.serverChannelId, to: &body)
@@ -299,6 +311,30 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
     // MARK: - Dial channel server
 
     private func listenDialChannel(conn: DialConn) {
+        if let pipe = channelPipe {
+            // Relay pipe mode: the pipe terminates KCP, answers the client
+            // negotiation TLV itself, and delivers decrypted payloads.
+            pipe.onNegotiated = { [weak self] _, _ in
+                guard let self else { return }
+                self.queue.async {
+                    if !self.dialChannelUpConnIds.contains(conn.connId) {
+                        self.dialChannelUpConnIds.append(conn.connId)
+                    }
+                    self.onEvent("relaydial channel negotiated connId=\(conn.connId) relayPipe=true")
+                }
+            }
+            pipe.onMessage = { [weak self] message, _ in
+                self?.queue.async { self?.handleDialChannelMessage(message, conn: conn) }
+            }
+            do {
+                // The pipe ignores serverChannelId; boundPort = defaultPort.
+                try pipe.start(socketKey: conn.transKey, serverChannelId: 0)
+                onEvent("relaydial channel pipe up port=\(pipe.boundPort ?? 0) connId=\(conn.connId)")
+            } catch {
+                onEvent("relaydial channel pipe start failed: \(error)")
+            }
+            return
+        }
         do {
             let listener = try NWListener(using: .udp, on: .any)
             conn.channelListener = listener
@@ -407,8 +443,31 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
         onEvent("relaydial dial answered connId=\(conn.connId) address=\(address)")
     }
 
+    // Pipe-mode entry: KCP/negotiation/81-04 layers already terminated by
+    // the pipe; the message is the decrypted channel frame.
+    private func handleDialChannelMessage(_ message: Data, conn: DialConn) {
+        guard let (tag, child) = try? LyraExpressTLVParser.parseOneOf(message), tag == 1,
+              let payloadNode = LyraExpressTLVParser.firstChild(0, in: LyraExpressTLVParser.children(of: child)),
+              let text = String(data: payloadNode.payload, encoding: .utf8)
+        else { return }
+        onEvent("relaydial uri rx \(text)")
+        handleDialURI(text, conn: conn)
+    }
+
     private func sendChannelText(_ text: String, conn: DialConn) {
         guard !conn.transKey.isEmpty else { return }
+        if let pipe = channelPipe {
+            do {
+                try pipe.sendVariant(
+                    channelFrame: LyraChannelSocket.wrapChannelFrame(Data(text.utf8)),
+                    key: conn.transKey,
+                    singleLayer: true
+                )
+            } catch {
+                onEvent("relaydial channel pipe tx failed: \(error)")
+            }
+            return
+        }
         do {
             let packet = try LyraSocketPacket.encode(
                 plaintext: LyraChannelSocket.wrapChannelFrame(Data(text.utf8)),
