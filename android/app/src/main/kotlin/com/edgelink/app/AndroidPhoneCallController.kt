@@ -4,6 +4,8 @@ import android.content.Context
 import com.edgelink.core.PhoneActionBody
 import com.edgelink.core.PhoneActionResultBody
 import java.time.Instant
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private const val PHONE_ACTION_DIAL = "dial"
 private const val PHONE_ACTION_ANSWER = "answer"
@@ -12,6 +14,9 @@ private const val PHONE_ACTION_DTMF = "dtmf"
 
 class AndroidPhoneCallController(context: Context) {
     private val appContext = context.applicationContext
+
+    /** 連續 dtmf action 依到達順序 FIFO 執行；dial/answer/hangup 不走這把鎖。 */
+    private val dtmfMutex = Mutex()
 
     suspend fun handle(body: PhoneActionBody): PhoneActionResultBody {
         val now = Instant.now().epochSecond
@@ -94,36 +99,38 @@ class AndroidPhoneCallController(context: Context) {
                 error = "invalid_dtmf",
                 ts = now
             )
-        return runCatching {
-            AndroidShizukuSupport.sendPhoneDtmfSequence(appContext, sequence)
-        }.fold(
-            onSuccess = { result ->
-                EdgeLinkLog.info(
-                    "phone.android.action_result action=dtmf success=${result.success} " +
-                        "sequenceFp=${AndroidSmsSync.fingerprint(sequence)}"
-                )
-                PhoneActionResultBody(
-                    requestId = body.requestId,
-                    action = body.action,
-                    success = result.success,
-                    error = result.message.takeUnless { result.success },
-                    ts = now
-                )
-            },
-            onFailure = { error ->
-                EdgeLinkLog.error(
-                    "phone.android.action_failed action=dtmf sequenceFp=${AndroidSmsSync.fingerprint(sequence)}",
-                    error
-                )
-                PhoneActionResultBody(
-                    requestId = body.requestId,
-                    action = body.action,
-                    success = false,
-                    error = error.phoneActionErrorMessage(),
-                    ts = now
-                )
-            }
-        )
+        return dtmfMutex.withLock {
+            runCatching {
+                AndroidShizukuSupport.sendPhoneDtmfSequence(appContext, sequence)
+            }.fold(
+                onSuccess = { result ->
+                    EdgeLinkLog.info(
+                        "phone.android.action_result action=dtmf success=${result.success} " +
+                            "sequenceFp=${AndroidSmsSync.fingerprint(sequence)}"
+                    )
+                    PhoneActionResultBody(
+                        requestId = body.requestId,
+                        action = body.action,
+                        success = result.success,
+                        error = result.message.takeUnless { result.success },
+                        ts = now
+                    )
+                },
+                onFailure = { error ->
+                    EdgeLinkLog.error(
+                        "phone.android.action_failed action=dtmf sequenceFp=${AndroidSmsSync.fingerprint(sequence)}",
+                        error
+                    )
+                    PhoneActionResultBody(
+                        requestId = body.requestId,
+                        action = body.action,
+                        success = false,
+                        error = error.phoneActionErrorMessage(),
+                        ts = now
+                    )
+                }
+            )
+        }
     }
 
     private suspend fun pressKey(body: PhoneActionBody, keyCode: String, now: Long): PhoneActionResultBody {

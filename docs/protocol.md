@@ -497,6 +497,10 @@ PHONERELAY 通話音訊已於真實通話（IVR）驗證，現由正式通話流
 2. LAN direct（同網段且 reachability probe 通過）：手機直接連 Mac 正式
    `MacPhoneRelaySession` 的 RTSP listener（TCP/UDP 7102），RTP 不走 secure channel。
 
+DTMF 即時模式：Mac 通話中面板採即時送鍵，每個按鍵各自送一個 `phone.action`
+（`action="dtmf"`，`number` 可為單一 tone；一次貼上的多字元仍送單一 sequence）。
+Android 端把連續 dtmf action 依到達順序序列化執行，不會同時播放多個 tone。
+
 埠號：
 
 - RTSP：TCP 7102（雙向控制；兩端都同時實作 server 與 client 角色）。

@@ -1460,6 +1460,10 @@ final class MirrorFlowE2ETests: XCTestCase {
     // so unlock #2's 562 went nowhere (kcp trans timeout) and the auth came
     // back code=1. The redial must use a fresh conn id so the same session
     // — and its live mitrust conn — survives, and unlock #2 works.
+    // 2026-09-03 (f)（commit cc7936af2）：原位 redial 已廢除——cast channel
+    // release 後 redial 會 fail-fast（trust_channel_redial_unsupported），舊
+    // session finish，runtime rebuild fresh session 重開 channel；第二次
+    // unlock 走新 session 重跑的 mitrust ceremony。
     func testSecondUnlockAfterCastChannelReleaseAndRedial() async throws {
         try makeEnvironment(locked: true)
         session.start()
@@ -1479,23 +1483,23 @@ final class MirrorFlowE2ETests: XCTestCase {
 
         phone.releaseCastChannel()
 
-        try await waitFor("channel marked down") { [self] in
-            self.session?.isChannelReady == false
+        // 等舊 session finish 且 factory 建好的 fresh session channel ready；
+        // onFinish 與 sessionFactory 之間 session 會短暫為 nil，條件需容忍。
+        try await waitFor("fresh session rebuilt with ready channel") { [self] in
+            guard let current = self.session, current !== unlockSession else { return false }
+            return current.isChannelReady
         }
-        try await waitFor("channel redialed on the same session") { [self] in
-            self.session?.isChannelReady == true
-        }
-        let recoveredSession: LyraCastTrustSession? = session
+        XCTAssertNotNil(session, "release 後應 rebuild 出 fresh session")
         XCTAssertTrue(
-            recoveredSession != nil && recoveredSession === unlockSession,
-            "redial after release must succeed on the same session (fresh conn id), not rebuild"
+            session !== unlockSession,
+            "redial 已改為 fail-fast：release 後應建立新 session / 新 channel，不沿用同一 session"
         )
         try await waitFor("streaming again after release") { [self] in
             self.controller.stage == .streaming && self.controller.mask == nil
         }
 
-        // User re-locks the phone; unlock #2 rides the same session's
-        // (still alive) mitrust conn.
+        // User re-locks the phone; unlock #2 rides the rebuilt session's
+        // fresh mitrust ceremony.
         phone.setLocked(true)
         controller.unlockRequested()
         try await waitFor("unlock #2 completed") { [self] in
