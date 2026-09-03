@@ -86,7 +86,10 @@ object AndroidCallRelayBridge {
     }
 
     suspend fun handleMedia(body: PhoneRelayMediaBody) {
-        if (body.direction != MAC_TO_ANDROID || body.kind != "rtp") {
+        if (body.direction != MAC_TO_ANDROID) {
+            return
+        }
+        if (body.kind != "rtp" && body.kind != "source_rtsp") {
             return
         }
         val session = activeSession
@@ -97,7 +100,53 @@ object AndroidCallRelayBridge {
             )
             return
         }
+        if (body.kind == "source_rtsp") {
+            handleSourceRTSPHint(session, body)
+            return
+        }
         session.enqueueSourceRTP(body)
+    }
+
+    // Live 2026-09-03: MirrorCallService walks its source listen port when
+    // 7102 is occupied (7102 -> 7105 -> 7108, Mirror.apk G.java p(int)), so
+    // the configured port alone can be dead while the Mac already knows the
+    // real endpoint from the event-23 KeyData. The Mac forwards it as
+    // kind=source_rtsp with dataBase64 = base64(ascii "host:port").
+    private fun handleSourceRTSPHint(session: AndroidCallRelayBridgeSession, body: PhoneRelayMediaBody) {
+        val decoded = body.dataBase64
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
+            ?.toString(Charsets.US_ASCII)
+        val hint = decoded?.let { parseSourceRTSPEndpointHint(it) }
+        if (hint == null) {
+            EdgeLinkLog.info(
+                "callrelay.android.local_rtsp_source_hint_bad sessionId=${body.sessionId} " +
+                    "bytes=${body.dataBase64?.length ?: -1}"
+            )
+            return
+        }
+        session.addSourceEndpointHint(hint.first, hint.second)
+    }
+
+    internal fun parseSourceRTSPEndpointHint(raw: String): Pair<String, Int>? {
+        val text = raw.trim()
+        val colon = text.lastIndexOf(':')
+        if (colon <= 0 || colon >= text.length - 1) {
+            return null
+        }
+        val host = text.substring(0, colon)
+        val port = text.substring(colon + 1).toIntOrNull()?.takeIf { it in 1..65_535 } ?: return null
+        if (!isIPv4Literal(host)) {
+            return null
+        }
+        return host to port
+    }
+
+    private fun isIPv4Literal(host: String): Boolean {
+        val parts = host.split('.')
+        return parts.size == 4 && parts.all { part ->
+            part.length in 1..3 && part.all { it.isDigit() } && (part.toIntOrNull() ?: 256) <= 255
+        }
     }
 
     fun stop(reason: String) {
@@ -203,6 +252,10 @@ object AndroidCallRelayBridge {
             }
         }
 
+        fun addSourceEndpointHint(host: String?, port: Int) {
+            localBridge.addSourceEndpointHint(host, port)
+        }
+
         suspend fun acceptSourceRTP(body: PhoneRelayMediaBody) {
             val packet = body.dataBase64
                 ?.takeIf { it.isNotEmpty() }
@@ -252,12 +305,24 @@ object AndroidCallRelayBridge {
         }
     }
 
-    private class LocalMiLinkRTSPBridge(
+    internal class LocalMiLinkRTSPBridge(
         private val relaySessionId: String,
         private val localRtspPorts: List<Int>,
         private val rtpHandler: suspend (ByteArray) -> Unit,
         private val statusHandler: suspend (String) -> Unit
     ) {
+        // The hint/connect path is unit-tested on the JVM, where EdgeLinkLog's
+        // android.util.Log/HandlerThread backend is unavailable; tests swap
+        // this hook (same pattern as AndroidLockStateReporter.log).
+        internal var log: (String) -> Unit = { EdgeLinkLog.info(it) }
+
+        // Source endpoint the Mac learned from the phone's event-23 KeyData
+        // and forwarded as kind=source_rtsp. Authoritative: it leads the next
+        // connect round's candidates. Read once per round so a hint landing
+        // mid-round is picked up within ~one 500ms round.
+        @Volatile
+        private var sourceEndpointHint: Pair<String?, Int>? = null
+
         private val pendingRequests = mutableMapOf<String, String>()
         private val pendingRequestSentAtMs = mutableMapOf<String, Long>()
         private val rtspCharset: Charset = Charsets.ISO_8859_1
@@ -326,6 +391,28 @@ object AndroidCallRelayBridge {
             }
         }
 
+        fun addSourceEndpointHint(host: String?, port: Int) {
+            if (port !in 1..65_535) {
+                log("callrelay.android.local_rtsp_source_hint_bad sessionId=$relaySessionId port=$port")
+                return
+            }
+            val normalizedHost = host?.trim()?.takeIf { it.isNotEmpty() }
+            if (socket != null) {
+                // The source is already connected — never tear down a live
+                // RTSP control connection on a late hint.
+                log(
+                    "callrelay.android.local_rtsp_source_hint sessionId=$relaySessionId " +
+                        "host=${normalizedHost ?: "-"} port=$port ignored=already_connected"
+                )
+                return
+            }
+            sourceEndpointHint = normalizedHost to port
+            log(
+                "callrelay.android.local_rtsp_source_hint sessionId=$relaySessionId " +
+                    "host=${normalizedHost ?: "-"} port=$port"
+            )
+        }
+
         suspend fun sendSourceRTP(packet: ByteArray) {
             sinkServer.sendRTP(packet)
         }
@@ -343,14 +430,21 @@ object AndroidCallRelayBridge {
             presentationURL = null
         }
 
-        private suspend fun connectRTSPWithRetry() {
+        internal suspend fun connectRTSPWithRetry() {
             val deadline = System.currentTimeMillis() + 30_000L
             var attempt = 0
             var lastError: Throwable? = null
             while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
                 attempt += 1
-                for (port in localRtspPorts) {
-                    for (host in localRTSPHostCandidates()) {
+                // Snapshot the hint once per round: the phone's advertised
+                // source endpoint (event-23 KeyData, relayed by the Mac) is
+                // authoritative and leads the port candidates; the hinted host
+                // joins the host candidates if not already present.
+                val hint = sourceEndpointHint
+                val ports = (listOfNotNull(hint?.second) + localRtspPorts).distinct()
+                val hosts = (listOfNotNull(hint?.first) + localRTSPHostCandidates()).distinct()
+                for (port in ports) {
+                    for (host in hosts) {
                         try {
                             val nextSocket = Socket()
                             try {
@@ -361,7 +455,7 @@ object AndroidCallRelayBridge {
                                 nextSocket.soTimeout = 2_000
                                 socket = nextSocket
                                 writer = BufferedWriter(OutputStreamWriter(nextSocket.getOutputStream(), rtspCharset))
-                                EdgeLinkLog.info(
+                                log(
                                     "callrelay.android.local_rtsp_connected host=$host port=$port attempt=$attempt"
                                 )
                                 return
@@ -371,7 +465,7 @@ object AndroidCallRelayBridge {
                             }
                         } catch (error: Throwable) {
                             lastError = error
-                            EdgeLinkLog.info(
+                            log(
                                 "callrelay.android.local_rtsp_connect_failed host=$host port=$port " +
                                     "attempt=$attempt error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
                             )

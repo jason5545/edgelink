@@ -129,6 +129,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private let callRelayCloudflareBridge: CallRelayCloudflareBridge
     private let phoneRelaySession = MacPhoneRelaySession()
     private let phoneRelayProbe = MiLinkPhoneRelayProbe()
+    private let mirrorCallTrigger = MirrorCallTriggerDriver()
     private let xiaomiMirrorRTSPDiagnosticSource = XiaomiMirrorRTSPDiagnosticSource()
     private let xiaomiMiShareDiscovery = XiaomiMiShareDiscovery()
     private var lyraFileSendSession: LyraFileSendSession?
@@ -310,6 +311,47 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         xiaomiMirrorFlow.hasRemoteMedia = { [weak self] in
             self?.xiaomiMirrorRTSPDiagnosticSource.hasReceivedMPTMedia ?? false
+        }
+        // Mirror-call relay trigger: EdgeLink's own phone.call_status drives
+        // the phone's PHONERELAY machinery (events 23/24/31/25 on the cast
+        // trust channel) now that TeleService's update_call_state
+        // back-channel filters this deviceType out (live 2026-09-02).
+        mirrorCallTrigger.hasCastSession = { [weak self] in
+            self?.lyraCastTrustSession != nil
+        }
+        mirrorCallTrigger.castChannelNeedsRedial = { [weak self] in
+            guard let session = self?.lyraCastTrustSession else { return false }
+            return session.channelWasEstablishedBefore && !session.isChannelReady
+        }
+        mirrorCallTrigger.isMirrorFlowBusy = { [weak self] in
+            (self?.xiaomiMirrorFlow.stage ?? .idle) != .idle
+        }
+        mirrorCallTrigger.ensureChannel = { [weak self] reason in
+            _ = self?.ensureCastTrustChannel(reason: reason)
+        }
+        mirrorCallTrigger.setCallActive = { active in
+            // Pending state first: a session built after this drive (the
+            // cast channel was still dialing when the call went active)
+            // applies it in start().
+            LyraMirrorCallRelaySession.pendingCallActive = active
+            LyraMirrorCallRelaySession.activeSession?.setCallActive(active)
+        }
+        mirrorCallTrigger.redialChannel = { [weak self] in
+            self?.lyraCastTrustSession?.redialCastChannel()
+        }
+        mirrorCallTrigger.setRelayAdvertiseEndpoint = {
+            LyraMirrorCallRelaySession.preferRelayAdvertise = true
+            LyraMirrorCallRelaySession.activeSession?.setAdvertiseEndpoint(
+                ("127.0.0.1", LyraMirrorCallRelaySession.relaySinkAdvertisePort)
+            )
+        }
+        mirrorCallTrigger.clearPendingState = {
+            LyraMirrorCallRelaySession.resetPendingCallState()
+        }
+        LyraMirrorCallRelaySession.onPhoneSourceEndpointChanged = { [weak self] host, port in
+            Task { @MainActor in
+                self?.handlePhoneMirrorCallSourceEndpoint(host: host, port: port)
+            }
         }
         xiaomiMirrorFlow.onChanged = { [weak self] _, mask in
             self?.screenSession.xiaomiMirrorMask = mask
@@ -1393,19 +1435,48 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         var host: String?
         var ports: [UInt16] = []
-        var candidates = UserDefaults.standard.stringArray(forKey: "lyraPhoneMeshEndpointHistory") ?? []
-        if let live = UserDefaults.standard.string(forKey: "lyraLastPhoneMeshEndpoint") {
-            candidates.insert(live, at: 0)
-        }
-        for description in candidates {
-            guard let parsed = LyraMeshResponder.parseEndpoint(description) else { continue }
-            host = parsed.host
-            if !ports.contains(parsed.port) { ports.append(parsed.port) }
-        }
-        for endpoint in xiaomiMiShareDiscovery.currentPhoneMeshEndpoints() {
-            if host == nil { host = endpoint.host }
-            guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
-            ports.append(endpoint.port)
+        var meshTransport: LyraMeshDatagramPipe?
+        var channelTransport: LyraChannelDatagramPipe?
+        // Relay-routed dial: the secure session rides the cloud relay and the
+        // phone has no live LAN presence (mDNS). The dialer's handshake then
+        // rides its own relay mesh/channel flows — fresh flow indexes per
+        // dial, like the cast dial: the phone bridge binds each index to its
+        // own UDP socket, and the mesh service only answers phys sync from a
+        // fresh peer. Cached LAN endpoints are NOT a reachability signal —
+        // after a WiFi→hotspot move they black-hole phys sync silently (live
+        // 2026-09-02: phys_sync to the stale WiFi IP, 20s timeout, no call).
+        if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort(),
+           LyraRelayTransportGlue.preferRelayMirrorTransport(
+               relayBridgeAvailable: true,
+               lanPhoneReachable: xiaomiMiShareDiscovery.hasLivePhonePeer()
+           )
+        {
+            let dialMesh = bridge.meshFlow(
+                index: Int.random(in: LyraRelayTransportBridge.dialFlowIndexFloor...2_000_000_000)
+            )
+            dialMesh.peerPort = phoneMeshPort
+            meshTransport = dialMesh
+            channelTransport = bridge.channelFlow(
+                index: Int.random(in: LyraRelayTransportBridge.dialFlowIndexFloor...2_000_000_000)
+            )
+            host = "127.0.0.1"
+            ports = [phoneMeshPort]
+            DiagnosticsLog.info("xiaomi.relaydial.route transport=relay port=\(phoneMeshPort)")
+        } else {
+            var candidates = UserDefaults.standard.stringArray(forKey: "lyraPhoneMeshEndpointHistory") ?? []
+            if let live = UserDefaults.standard.string(forKey: "lyraLastPhoneMeshEndpoint") {
+                candidates.insert(live, at: 0)
+            }
+            for description in candidates {
+                guard let parsed = LyraMeshResponder.parseEndpoint(description) else { continue }
+                host = parsed.host
+                if !ports.contains(parsed.port) { ports.append(parsed.port) }
+            }
+            for endpoint in xiaomiMiShareDiscovery.currentPhoneMeshEndpoints() {
+                if host == nil { host = endpoint.host }
+                guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
+                ports.append(endpoint.port)
+            }
         }
         guard let host, !ports.isEmpty else {
             onOutcome(false)
@@ -1425,7 +1496,10 @@ final class EdgeLinkRuntime: ObservableObject {
             )
         }
         relayCallDialer?.onDialOutcome = onOutcome
-        relayCallDialer?.dial(number: number, host: host, ports: ports)
+        relayCallDialer?.dial(
+            number: number, host: host, ports: ports,
+            meshTransport: meshTransport, channelTransport: channelTransport
+        )
     }
 
     @discardableResult
@@ -1669,7 +1743,14 @@ final class EdgeLinkRuntime: ObservableObject {
         if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort(),
            LyraRelayTransportGlue.preferRelayMirrorTransport(
                relayBridgeAvailable: true,
-               lanPhoneReachable: !lanPhoneEndpoints.isEmpty
+               // Same rule as the call dialer (startNativeRelayDial): only a
+               // fresh mDNS sighting proves the phone answers on the LAN.
+               // currentPhoneMeshEndpoints merges pinned/persisted entries
+               // that survive a network switch and black-hole phys sync
+               // silently (live 2026-09-03 relay call: 8 stale WiFi
+               // endpoints, 30s physSync stalls, channel never came up
+               // during the call).
+               lanPhoneReachable: xiaomiMiShareDiscovery.hasLivePhonePeer()
            )
         {
             // Relay-connected and the phone is not on the LAN: the cast dial
@@ -1730,12 +1811,17 @@ final class EdgeLinkRuntime: ObservableObject {
                 // Phone released the cast channel mid-stream (e.g. reboot):
                 // restart the mirror flow so it redials and re-OPENs.
                 self?.xiaomiMirrorFlow.notifyChannelReleased()
+                self?.mirrorCallTrigger.handleChannelReleased(callOngoing: self?.isPhoneCallActive == true)
             }
         }
         session.onFinish = { [weak self, weak session] in
             Task { @MainActor in
                 guard let self, let session, self.lyraCastTrustSession === session else { return }
                 self.lyraCastTrustSession = nil
+                // A session that dies while a call is ongoing must be
+                // replaced immediately — call_status is not a heartbeat and
+                // may not deliver another state for the driver to act on.
+                self.mirrorCallTrigger.handleSessionFinished(callOngoing: self.isPhoneCallActive)
                 // The announcer kept running on mesh flow 0 while the cast
                 // session owned its own flow; only re-arm if it was torn
                 // down in the meantime (disconnect / transport switch).
@@ -1782,8 +1868,10 @@ final class EdgeLinkRuntime: ObservableObject {
                 // the mirror flow's onTrustState passthrough.
                 macTrustManager.start()
             } else if session.channelWasEstablishedBefore {
-                // Phone released the channel; redial just the cast conn like
-                // the mirror flow does — the ready callback runs the query.
+                // Phone released the channel; the in-place redial is never
+                // answered (live 2026-09-03), so this fails the session fast
+                // and the reconnect path rebuilds it — the fresh session's
+                // ready callback runs the query.
                 session.redialCastChannel()
             }
             // A mid-dial session runs the query from its own ready callback.
@@ -2240,6 +2328,15 @@ final class EdgeLinkRuntime: ObservableObject {
         guard !phoneRelayProbeRunning else {
             DiagnosticsLog.warn(
                 "xiaomi.mirror.rtsp.listener_start_skipped reason=\(reason) phoneRelayProbeRunning=true " +
+                    "port=\(Self.xiaomiMirrorRTSPDiagnosticPort)"
+            )
+            return
+        }
+        // A phone call owns TCP 7102 while it runs (startPhoneRelaySession
+        // stops this listener); never snatch the port back mid-call.
+        guard !phoneRelaySessionRunning else {
+            DiagnosticsLog.warn(
+                "xiaomi.mirror.rtsp.listener_start_skipped reason=\(reason) phoneRelaySessionRunning=true " +
                     "port=\(Self.xiaomiMirrorRTSPDiagnosticPort)"
             )
             return
@@ -3707,6 +3804,18 @@ final class EdgeLinkRuntime: ObservableObject {
             )
             return
         }
+        // The mirror RTSP diagnostic source holds TCP 7102 from app launch
+        // (xiaomiMirrorRTSPDiagnosticEnabled defaults to true), so every call
+        // used to fail its listener bind with "Address already in use" and
+        // the LAN-direct media path was structurally dead (live 2026-09-02).
+        // The call takes the port; the mirror listener restarts on the next
+        // mirror action once the call ends.
+        if xiaomiMirrorRTSPDiagnosticSource.isListenerReady() {
+            stopXiaomiMirrorRTSPDiagnosticSource(reason: "phone_relay_session")
+            DiagnosticsLog.info(
+                "phonerelay.mac.diagnostic_source_stopped reason=\(reason) port=\(Self.xiaomiMirrorRTSPDiagnosticPort)"
+            )
+        }
         do {
             try phoneRelaySession.start(port: Self.phoneRelayProbePort)
             phoneRelaySessionRunning = true
@@ -3885,8 +3994,65 @@ final class EdgeLinkRuntime: ObservableObject {
         case "source_stop", "bridge_failed", "bridge_stopped":
             stopPhoneRelayUplink(reason: "cloudflare_\(event)")
             phoneRelayProbe.stopExternalSourceRTP(reason: "cloudflare_\(event)")
+        case "sink_rtsp_listening":
+            // The Android cloud bridge's phone-local RTSP sink server
+            // (LocalMiLinkRTSPSinkServer, 127.0.0.1:15550) is up: over the
+            // relay the Mac mic uplink reaches the phone's
+            // MirrorCallService sink through it, so the mirror-call
+            // KeyData must advertise that endpoint instead of the Mac's
+            // LAN address.
+            mirrorCallTrigger.handleCloudBridgeEngaged()
+            // The bridge's source pull may predate the cast channel (and
+            // thus the phone's KeyData); if we already know the phone's
+            // real source port, re-send the hint now that a bridge exists.
+            sendPhoneMirrorCallSourceHintIfNeeded()
         default:
             break
+        }
+    }
+
+    // The phone's MirrorCallService source endpoint as learned from its
+    // event-23 KeyData (its getUnUsedPort walk means it is NOT always 7102).
+    private var lastPhoneMirrorCallSourceEndpoint: (host: String, port: Int)?
+
+    private func handlePhoneMirrorCallSourceEndpoint(host: String, port: Int) {
+        guard port > 0 else { return }
+        if lastPhoneMirrorCallSourceEndpoint?.host == host,
+           lastPhoneMirrorCallSourceEndpoint?.port == port {
+            return
+        }
+        lastPhoneMirrorCallSourceEndpoint = (host, port)
+        DiagnosticsLog.info("callrelay.mac.source_endpoint_rx host=\(host) port=\(port)")
+        sendPhoneMirrorCallSourceHintIfNeeded()
+    }
+
+    // Tells the Android bridge where the phone's MirrorCallService source
+    // actually listens (kind=source_rtsp, "host:port" in dataBase64) so its
+    // connect retry loop dials the right port instead of burning 30s on a
+    // dead 7102 (live 2026-09-03).
+    private func sendPhoneMirrorCallSourceHintIfNeeded() {
+        guard let endpoint = lastPhoneMirrorCallSourceEndpoint,
+              let session = currentSession, isConnected,
+              let sessionId = activePhoneRelaySessionId else {
+            return
+        }
+        let body = PhoneRelayMediaBody(
+            sessionId: sessionId,
+            direction: "mac_to_android",
+            kind: "source_rtsp",
+            dataBase64: Data("\(endpoint.host):\(endpoint.port)".utf8).base64EncodedString(),
+            ts: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        Task { @MainActor [weak self] in
+            do {
+                let data = try self?.encoder.encode(Envelope(t: EnvelopeType.phoneRelayMedia, b: body))
+                if let data { try await session.sendPlaintext(data) }
+                DiagnosticsLog.info(
+                    "callrelay.mac.source_hint_tx host=\(endpoint.host) port=\(endpoint.port)"
+                )
+            } catch {
+                DiagnosticsLog.error("callrelay.mac.source_hint_failed", error)
+            }
         }
     }
 
@@ -5689,6 +5855,7 @@ final class EdgeLinkRuntime: ObservableObject {
             isPhoneCallActive = false
             phoneCallStatus = String(localized: "通話已結束")
             DiagnosticsLog.info("phone.mac.call_status_all reason=\(status.reason) state=\(status.state)")
+            mirrorCallTrigger.handleCallStatus(state: "all", ongoingCallCount: 0)
             return
         }
 
@@ -5727,6 +5894,7 @@ final class EdgeLinkRuntime: ObservableObject {
             "phone.mac.call_status callId=\(status.callId) state=\(status.state) " +
                 "direction=\(status.direction ?? "unknown") canAnswer=\(status.canAnswer) reason=\(status.reason)"
         )
+        mirrorCallTrigger.handleCallStatus(state: status.state, ongoingCallCount: phoneCallStatuses.count)
     }
 
     private func handleIncomingCallUIAnswer(callId: String) {
@@ -5790,6 +5958,11 @@ final class EdgeLinkRuntime: ObservableObject {
         activePhoneRelaySessionId = nil
         phoneRelaySourceSequence = 0
         phoneRelaySourceSendFailed = false
+        // Reset the driver's throttle/flags only: event 25 (call stop) is
+        // owned by the driver's terminal-status path, and this also runs on
+        // transport_interrupted mid-call, where the secure session is gone
+        // and the phone couldn't receive a stop event anyway.
+        mirrorCallTrigger.reset()
     }
 
     private func handleAndroidMicStatus(_ status: AndroidMicStatusBody) {

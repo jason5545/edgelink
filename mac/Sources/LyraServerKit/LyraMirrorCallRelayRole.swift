@@ -450,9 +450,15 @@ public final class LyraMirrorCallRelayRole {
             )
             mediaListener = listener
             listener.newConnectionHandler = { [weak self] connection in
-                connection.start(queue: self!.queue)
-                self?.mediaConnection = connection
-                self?.receiveMedia(connection)
+                // A late datagram can arrive after teardown released the
+                // role (the listener's cancel is async).
+                guard let self else {
+                    connection.cancel()
+                    return
+                }
+                connection.start(queue: self.queue)
+                self.mediaConnection = connection
+                self.receiveMedia(connection)
             }
             listener.start(queue: queue)
         } catch {

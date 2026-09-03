@@ -682,43 +682,28 @@ final class LyraCastTrustSession {
         }
     }
 
-    // Re-dials the cast logi conn on the still-alive phys conn after the
-    // phone released it. Crucially this keeps the adopted mitrustservice
-    // server socket alive: the phone drives the real 546/562 auth on the
-    // channel it already has to us, and killing it strands the unlock.
+    // Live 2026-09-03: the in-place redial can never be answered on the
+    // current phone firmware. It dials an encrypted logi request on a FRESH
+    // logiConnId with no preceding sync_info, so the phone has no key state
+    // for that connId and drops it — 3/3 redials that morning blackholed
+    // for the full redial timeout (one on a phys conn still receiving
+    // keepalive frames; another also rode the freshly-adopted
+    // mitrustservice conn via adoptedSend, a different phys conn with
+    // different keys entirely). Every working recovery came from the
+    // fresh-session rebuild AFTER the timeout (ready in ~2s over LAN). A
+    // relay call's audio died in that 6s stall — the user hung up first.
+    // Fail fast so the runtime/driver rebuilds immediately; finishLocked
+    // still releases the adopted mitrustservice conn (the 52011
+    // zombie-unlock fix) and the mirror-flow/driver rebuild paths are
+    // unchanged.
     func redialCastChannel() {
         queue.async { [weak self] in
             guard let self, !self.cancelled, self.channelKeyCS != nil else {
                 DiagnosticsLog.warn("xiaomi.cast.trust_channel_redial_impossible")
                 return
             }
-            DiagnosticsLog.info("xiaomi.cast.trust_channel_redial")
-            // The phone rejects a logi request that reuses an already-
-            // released conn id (live 2026-08-11: lyra-conn-logi "invalided
-            // connection conflict local=1" — the redial went unanswered, the
-            // session failed, and the adopted mitrustservice socket died
-            // with it; the next unlock's 562 went into the phone's zombie
-            // conn and the auth came back code=1). Dial with a fresh id.
-            self.logiConnId = .random(in: 1...UInt32.max)
-            self.sendLogiConnRequest()
-            self.armRedialTimeout()
-        }
-    }
-
-    // A redial the phone never answers would otherwise stall until the 30s
-    // stage watchdog — and every mirror-flow retry resets that watchdog via
-    // progress(), so a phys conn the phone already tore down (it releases
-    // the cast logi conn ~6s after CLOSE_SCREEN, live 2026-08-04) zombied
-    // the session for as long as the user kept retrying. Fail the session
-    // fast: the runtime drops it and the flow builds a fresh one (full
-    // phys handshake), which the phone does answer.
-    var redialResponseTimeout: TimeInterval = 6
-
-    private func armRedialTimeout() {
-        queue.asyncAfter(deadline: .now() + redialResponseTimeout) { [weak self] in
-            guard let self, !self.cancelled, self.stage != .ready else { return }
-            DiagnosticsLog.warn("xiaomi.cast.trust_channel_redial_timeout stage=\(self.stage)")
-            self.fail("redial_timeout")
+            DiagnosticsLog.warn("xiaomi.cast.trust_channel_redial_unsupported")
+            self.fail("redial_unsupported")
         }
     }
 

@@ -70,6 +70,10 @@ public protocol LyraChannelDatagramPipe: AnyObject {
     var onNegotiated: ((UInt32, UInt32) -> Void)? { get set }
     var onMessage: ((Data, NWEndpoint) -> Void)? { get set }
     var boundPort: UInt16? { get }
+    // Client-mode knob mirrored from LyraChannelSocket: don't answer the
+    // peer's negotiation TLV (the relayCall dialer drives negotiation
+    // itself and a stray reply confuses the phone's channel server).
+    var suppressNegotiationReply: Bool { get set }
     func start(socketKey: Data, serverChannelId: UInt32) throws
     func connect(host: String, port: UInt16, socketKey: Data) throws
     func sendClientNegotiation(channelId: UInt32, version: UInt32, mtu: UInt32) throws
@@ -264,6 +268,10 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
     // Endpoint the peer's datagrams appear to arrive from (log surface only).
     public var peerHost = "127.0.0.1"
     public var peerPort: UInt16 = 40201
+    // Client-mode parity with LyraChannelSocket: skip the automatic
+    // negotiation reply (used by the relayCall dialer, which negotiates as
+    // the channel client).
+    public var suppressNegotiationReply = false
     // Set by connect(): the dialed Xiaomi channel port (the relay bridge
     // stamps it onto outbound envelopes so the phone can bind its local
     // forward).
@@ -541,15 +549,17 @@ public final class LyraVirtualChannelPipe: LyraChannelDatagramPipe, @unchecked S
         if selectedTag == 0, children.count >= 3 {
             let peerChannelId = children[0]
             let mtu = children[2]
-            let reply = LyraExpressTLV.oneOfNode(
-                tag: 0xFFFF,
-                selectedTag: 4,
-                child: LyraExpressTLV.containerNode(tag: 4, children: [
-                    LyraExpressTLV.int32Node(tag: 0, value: peerChannelId),
-                    LyraExpressTLV.int32Node(tag: 1, value: 0xFF00)
-                ])
-            )
-            sendPayloadOnQueue(reply)
+            if !suppressNegotiationReply {
+                let reply = LyraExpressTLV.oneOfNode(
+                    tag: 0xFFFF,
+                    selectedTag: 4,
+                    child: LyraExpressTLV.containerNode(tag: 4, children: [
+                        LyraExpressTLV.int32Node(tag: 0, value: peerChannelId),
+                        LyraExpressTLV.int32Node(tag: 1, value: 0xFF00)
+                    ])
+                )
+                sendPayloadOnQueue(reply)
+            }
             onNegotiated?(peerChannelId, mtu)
         } else if selectedTag == 4, !children.isEmpty {
             onNegotiated?(children[0], children.count > 1 ? children[1] : 0)

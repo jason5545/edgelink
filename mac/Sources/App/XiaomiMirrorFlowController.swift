@@ -160,11 +160,11 @@ final class XiaomiMirrorFlowController {
         if let existing = sessionProvider(), !existing.isChannelReady,
            existing.channelWasEstablishedBefore
         {
-            // The phone released the cast channel; re-dial just the cast logi
-            // conn on the same phys conn, keeping the adopted mitrustservice
-            // conn (and any in-flight auth on it) alive. A fresh mid-dial
-            // session (never established) is left alone — redialing it
-            // aborts the in-flight negotiation.
+            // The phone released the cast channel. The in-place redial is
+            // never answered on current firmware (live 2026-09-03), so this
+            // fails the session fast; the rebuild loop below replaces it.
+            // A fresh mid-dial session (never established) is left alone —
+            // finishing it aborts the in-flight negotiation.
             existing.redialCastChannel()
         } else if sessionProvider() == nil {
             sessionFactory("mirror_flow")

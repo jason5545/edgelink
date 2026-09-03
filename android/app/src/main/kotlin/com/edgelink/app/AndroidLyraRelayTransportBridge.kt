@@ -27,7 +27,9 @@ import java.net.InetSocketAddress
  *
  * Semantics mirror the Mac `LyraRelayTransportBridge` + the fake-phone roles
  * (`LyraPhoneMeshServer` / `LyraRelayCallRole` / `LyraCastRole`): indexed
- * mesh flows + one channel flow per peer, ordered datagrams, KCP sn/una +
+ * mesh flows + indexed channel flows (flow 0 is the shared cast/legacy
+ * channel, non-zero indexes are Mac-dialed relayCall dial channels),
+ * ordered datagrams, KCP sn/una +
  * acks preserved. Each mesh flow index binds its own UDP socket, so the
  * phone's Xiaomi mesh service sees a distinct peer per flow — the announce /
  * relayCall dial (flow 0) and the cast trust dial (flow 1) each get a fresh
@@ -74,6 +76,12 @@ class AndroidLyraRelayTransportBridge(
     // 2026-08-09: flows 480906435/735712576 flip-flopped within 300ms).
     private val retiredCastFlowIndexes = ArrayDeque<Int>()
     private val channelFlow = DatagramFlow(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, 0, scope, ::emitDatagram, log)
+    // Mac-dialed channel flows beyond flow 0: the Mac-initiated relayCall
+    // dial gets its own channel flow (and UDP socket) per dial, so it never
+    // shares the cast channel's peer endpoint. One dial channel at a time;
+    // a fresh index retires the previous dial's flow.
+    private val extraChannelFlows = HashMap<Int, DatagramFlow>()
+    private val retiredChannelFlowIndexes = ArrayDeque<Int>()
 
     // Per-flow traffic counters for the wrong-port watchdog: a cast dial
     // (flow 1) with outbound datagrams but zero inbound means the mesh target
@@ -81,6 +89,13 @@ class AndroidLyraRelayTransportBridge(
     data class MeshFlowStats(val flowIndex: Int, val outboundCount: Long, val inboundCount: Long)
 
     companion object {
+        // Mesh flow partitions: cast trust dials randomize below this floor,
+        // the Mac-initiated relayCall dial at/above it (Mac side:
+        // LyraRelayTransportBridge.dialFlowIndexFloor). The fresh-dial socket
+        // replacement retires only same-partition flows, so a relayCall dial
+        // never kills a streaming cast dial's socket (or the reverse).
+        const val DIAL_FLOW_INDEX_FLOOR = 1_000_000_001
+
         fun handles(type: String): Boolean =
             type == EnvelopeTypes.RELAY_MESH_DATAGRAM || type == EnvelopeTypes.RELAY_CHANNEL_DATAGRAM ||
                 type == EnvelopeTypes.RELAY_CHANNEL_LISTEN
@@ -111,23 +126,25 @@ class AndroidLyraRelayTransportBridge(
         when (type) {
             EnvelopeTypes.RELAY_MESH_DATAGRAM -> meshFlow(index, ensureStarted = true)?.deliver(data)
             EnvelopeTypes.RELAY_CHANNEL_DATAGRAM -> {
+                val flow = channelFlowFor(index) ?: return
                 val port = relayBody.p
                 if (port != null) {
                     // A Mac server channel answered on a port the phone
                     // dialed: deliver back to the phone's channel client.
-                    // (The channelFlow's own target wins the port on the
+                    // (The flow's own target wins the port on the
                     // astronomically unlikely collision with a snooped port.)
                     val reverse = synchronized(lock) { reverseChannelFlows[port] }
-                    if (reverse != null && port != channelFlow.currentTargetPort) {
+                    if (reverse != null && port != flow.currentTargetPort) {
                         reverse.deliver(data)
                         return
                     }
                     // Otherwise the Mac stamped the Xiaomi channel port it
-                    // dialed ("p"); bind (or rebind, when the cast channel
-                    // port differs from the relayCall one) before delivering.
-                    channelFlow.startOrRebind(channelTargetHost(), port)
+                    // dialed ("p"); bind (or rebind, when the relayCall dial
+                    // channel port differs from the cast one) this flow's
+                    // local forward before delivering.
+                    flow.startOrRebind(channelTargetHost(), port)
                 }
-                channelFlow.deliver(data)
+                flow.deliver(data)
             }
         }
     }
@@ -182,8 +199,33 @@ class AndroidLyraRelayTransportBridge(
             peerPortSnoopers.clear()
             reverseChannelFlows.values.forEach { it.stop() }
             reverseChannelFlows.clear()
+            extraChannelFlows.values.forEach { it.stop() }
+            extraChannelFlows.clear()
         }
         channelFlow.stop()
+    }
+
+    // Mac-dialed channel flows beyond flow 0. A previously unseen non-zero
+    // index is a fresh relayCall dial channel: it gets its own UDP socket
+    // (the cast channel keeps flow 0), the previous dial's flow is retired
+    // (one dial channel at a time), and zombie datagrams of retired flows
+    // are dropped instead of recreating the flow (same reasoning as
+    // retiredCastFlowIndexes).
+    private fun channelFlowFor(index: Int): DatagramFlow? = synchronized(lock) {
+        if (index == 0) return channelFlow
+        if (retiredChannelFlowIndexes.contains(index)) return null
+        if (!extraChannelFlows.containsKey(index)) {
+            val stale = extraChannelFlows.keys.toList()
+            stale.forEach { extraChannelFlows.remove(it)?.stop() }
+            if (stale.isNotEmpty()) {
+                retiredChannelFlowIndexes.addAll(stale)
+                while (retiredChannelFlowIndexes.size > 8) retiredChannelFlowIndexes.removeFirst()
+                log("xiaomi.relaybridge.android.channel_flow_replaced stale=$stale new=$index")
+            }
+        }
+        extraChannelFlows.getOrPut(index) {
+            DatagramFlow(EnvelopeTypes.RELAY_CHANNEL_DATAGRAM, index, scope, ::emitDatagram, log)
+        }
     }
 
     private fun meshFlow(index: Int, ensureStarted: Boolean): DatagramFlow? = synchronized(lock) {
@@ -192,20 +234,27 @@ class AndroidLyraRelayTransportBridge(
                 // Zombie datagram of an already-replaced cast dial: drop it.
                 return null
             }
-            // A previously unseen non-zero flow index is a fresh cast dial:
-            // the Mac randomizes the index per session because the Xiaomi
-            // mesh service ignores phys sync from a source endpoint it has
-            // seen before. Each flow owns one UDP socket (= one peer), so
-            // the previous cast flows' sockets must be dropped, not reused
-            // (live 2026-08-08: redials on the reused flow-1 socket got only
-            // KCP ACKs, never a phys sync reply).
-            val stale = meshFlows.keys.filter { it != 0 }
+            // A previously unseen non-zero flow index is a fresh dial in its
+            // partition: the Mac randomizes the index per session because the
+            // Xiaomi mesh service ignores phys sync from a source endpoint it
+            // has seen before. Each flow owns one UDP socket (= one peer), so
+            // the previous flows' sockets in the SAME partition must be
+            // dropped, not reused (live 2026-08-08: redials on the reused
+            // flow-1 socket got only KCP ACKs, never a phys sync reply).
+            // Cross-partition flows survive: a Mac-initiated relayCall dial
+            // (>= DIAL_FLOW_INDEX_FLOOR) must not kill a streaming cast
+            // dial's socket, and a cast redial must not kill an in-call
+            // relayCall dial.
+            val dialPartition = index >= DIAL_FLOW_INDEX_FLOOR
+            val stale = meshFlows.keys.filter {
+                it != 0 && (it >= DIAL_FLOW_INDEX_FLOOR) == dialPartition
+            }
             stale.forEach { meshFlows.remove(it)?.stop() }
             stale.forEach { peerPortSnoopers.remove(it) }
             if (stale.isNotEmpty()) {
                 retiredCastFlowIndexes.addAll(stale)
                 while (retiredCastFlowIndexes.size > 8) retiredCastFlowIndexes.removeFirst()
-                log("xiaomi.relaybridge.android.cast_flow_replaced stale=$stale new=$index")
+                log("xiaomi.relaybridge.android.mesh_flow_replaced dialPartition=$dialPartition stale=$stale new=$index")
             }
         }
         val flow = meshFlows.getOrPut(index) {
