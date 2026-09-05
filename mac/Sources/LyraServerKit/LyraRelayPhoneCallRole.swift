@@ -42,6 +42,17 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
     // while a (new) call was active.
     public private(set) var deviceInRelayClearedWhileCallActive = 0
 
+    // TeleService handleRelayDialRequest models placeCall with
+    // EXTRA_CALL_RELAYED=true, EXTRA_RELAY_ANSWERED=true,
+    // EXTRA_RELAY_DEVICE_ID=requestDeviceId (all set unconditionally on
+    // every DIAL — 2026-09-05 jadx analysis). Non-nil after the first dial.
+    public private(set) var placeCallExtras: [String: Any]?
+    // PhoneContinuityController.connectDistAudioDevice fired: call went
+    // ACTIVE while deviceInRelay was set (the phone switches call-audio
+    // routing to the Mac). Set true on sendUpdateCallState(4) or
+    // noteCallActive() while deviceInRelay is non-nil.
+    public private(set) var distAudioConnected = false
+
     // The dialer's mesh session key — the phone dials its return
     // (relayCall) channel on the same phys conn with it.
     public private(set) var sessionKey: SymmetricKey?
@@ -54,7 +65,14 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
     public private(set) var callActive = false
 
     public func noteCallActive() {
-        queue.async { self.callActive = true }
+        queue.async {
+            self.callActive = true
+            // PhoneContinuityController: call ACTIVE + deviceInRelay set
+            // → connectDistAudioDevice (or mConnectRelayAudio deferred).
+            if self.deviceInRelay != nil {
+                self.distAudioConnected = true
+            }
+        }
     }
 
     // The call ended on the phone. The pair release timer starts now; the
@@ -433,9 +451,14 @@ public final class LyraRelayPhoneCallRole: LyraServiceHandler {
         let address = object["address"] as? String ?? ""
         let deviceId = object["requestDeviceId"] as? String ?? ""
         dialRequests.append(DialRequest(address: address, requestDeviceId: deviceId))
-        // TeleService handleRelayDialRequest: setDeviceInRelay runs on every
-        // dial, unconditionally.
+        // TeleService handleRelayDialRequest: placeCall with relay extras
+        // + setDeviceInRelay runs on every dial, unconditionally.
         deviceInRelay = deviceId
+        placeCallExtras = [
+            "EXTRA_CALL_RELAYED": true,
+            "EXTRA_RELAY_ANSWERED": true,
+            "EXTRA_RELAY_DEVICE_ID": deviceId,
+        ]
         let json =
             "{\"hostDeviceName\":\"FakePhone\",\"address\":\"\(address)\"," +
             "\"callstate\":-1,\"code\":200,\"msg\":\"ok\",\"responseDeviceId\":\"4995163F\"}"

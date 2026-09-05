@@ -294,4 +294,170 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
         announcer?.stop()
         announcer = nil
     }
+
+    // MARK: - Outgoing dial (2026-09-05: pin coverage for the 90% case)
+
+    // Full chain for an outgoing call: Mac dials relayPhoneCall → phone
+    // records DIAL + sets deviceInRelay + placeCall extras → return
+    // relayCall channel comes up → update_call_state(4) ACTIVE flows back.
+    //
+    // Assertions: Mac sends ZERO operate requests during the entire dial
+    // chain (DIAL itself sets all the relay state — operate(0) during a
+    // dial hits the already-in-relay branch and is actively harmful);
+    // the answeredDeviceId pin is not touched (it was set once by the
+    // initial bootstrap and stays permanent).
+    func testOutgoingDialFullChainNoOperateSent() throws {
+        phone = try makePhone()
+        let role = LyraRelayPhoneCallRole()
+        role.releaseDelayAfterCallEnd = 0.5
+        role.onEvent = { print("[relaydial-mock] \($0)") }
+        phone.mesh.register(role)
+        let phonePort = try XCTUnwrap(phone.boundPort)
+
+        announcer = LyraMeshAnnouncer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        announcer?.start(host: "127.0.0.1", port: phonePort)
+
+        waitFor("Mac online in oracle") {
+            self.phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+
+        let dialer = LyraRelayCallDialer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        dialer.dial(number: "0987654321", host: "127.0.0.1", ports: [phonePort])
+
+        waitFor("dial request received") {
+            role.dialRequests.count == 1 && dialer.state == .done
+        }
+
+        // TeleService handleRelayDialRequest: placeCall with relay extras.
+        XCTAssertEqual(role.dialRequests.first?.address, "0987654321")
+        XCTAssertEqual(role.dialRequests.first?.requestDeviceId, "721572C3")
+        XCTAssertEqual(role.deviceInRelay, "721572C3")
+        XCTAssertNotNil(role.placeCallExtras)
+        XCTAssertEqual(role.placeCallExtras?["EXTRA_CALL_RELAYED"] as? Bool, true)
+        XCTAssertEqual(role.placeCallExtras?["EXTRA_RELAY_ANSWERED"] as? Bool, true)
+
+        // Phone dials return relayCall channel on the dial session key.
+        let sessionKey = try XCTUnwrap(role.sessionKey)
+        phone.relayCall.hangup(server: phone.mesh)
+        phone.relayCall.dial(server: phone.mesh, sessionKey: sessionKey)
+        waitFor("return channel up") { self.phone.relayCall.state == .channelUp }
+
+        // Call goes ACTIVE → phone pushes update_call_state(4).
+        role.noteCallActive()
+        phone.relayCall.sendUpdateCallState(4)
+        waitFor("update_call_state(4) acked") {
+            self.phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+
+        // The Mac's relay session must exist and see the call as active.
+        XCTAssertNotNil(LyraRelayCallSession.activeRelaySession)
+        XCTAssertTrue(LyraRelayCallSession.activeRelaySession?.isCallActive == true)
+
+        // CRITICAL: no operate requests were sent during the entire dial
+        // chain. operate(0) during a dial hits the already-in-relay branch
+        // (deviceInRelay already set by DIAL) and releases extras → 500.
+        XCTAssertTrue(
+            phone.relayCall.operateRequests.isEmpty,
+            "Mac must never send operate during a dial: \(phone.relayCall.operateRequests)"
+        )
+        // The answered device pin was not overwritten.
+        XCTAssertNil(phone.relayCall.answeredDeviceId)
+
+        dialer.stop()
+        announcer?.stop()
+        announcer = nil
+    }
+
+    // Regression lock: operate(0) during an outgoing call hits TeleService's
+    // already-in-relay branch (deviceInRelay was set by DIAL) → returns 500
+    // and releaseRelayExtra drops EXTRA_CALL_RELAYED for that address.
+    // Subsequent operate(0) for the same address also fails because the
+    // relayed connection no longer exists.
+    //
+    // This test proves the production code must NEVER send operate(0) from
+    // the dial path (LyraRelayCallDialer).
+    func testOperateDuringDialRejectedAndReleasesExtras() throws {
+        phone = try makePhone()
+        let role = LyraRelayPhoneCallRole()
+        role.releaseDelayAfterCallEnd = 0.5
+        role.onEvent = { print("[relaydial-mock] \($0)") }
+        phone.mesh.register(role)
+        let phonePort = try XCTUnwrap(phone.boundPort)
+
+        announcer = LyraMeshAnnouncer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        announcer?.start(host: "127.0.0.1", port: phonePort)
+
+        waitFor("Mac online in oracle") {
+            self.phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+
+        let dialer = LyraRelayCallDialer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        dialer.dial(number: "0987654321", host: "127.0.0.1", ports: [phonePort])
+
+        waitFor("dial complete") {
+            role.dialRequests.count == 1 && dialer.state == .done
+        }
+        XCTAssertEqual(role.deviceInRelay, "721572C3")
+
+        // Bring up return relayCall channel.
+        let sessionKey = try XCTUnwrap(role.sessionKey)
+        phone.relayCall.hangup(server: phone.mesh)
+        phone.relayCall.dial(server: phone.mesh, sessionKey: sessionKey)
+        waitFor("return channel up") { self.phone.relayCall.state == .channelUp }
+
+        role.noteCallActive()
+
+        // Model the relayed connection that DIAL established: in production
+        // placeCall sets EXTRA_CALL_RELAYED which makes isCallRelayed true;
+        // the mock relayCall role tracks this in relayedNumbers.
+        phone.relayCall.relayedNumbers.insert("0987654321")
+        // TeleService shares deviceInRelay across all relay handlers; the
+        // DIAL set it on the relayPhoneCall role, model the same on relayCall.
+        phone.relayCall.deviceInRelay = "721572C3"
+
+        // Mac (incorrectly) sends operate(0) during the outgoing call.
+        LyraRelayCallSession.noteIncomingCallAnswered(address: "0987654321")
+
+        waitFor("operate(0) received by phone") {
+            !self.phone.relayCall.operateRequests.isEmpty
+        }
+        waitFor("phone rejected 500 (already-in-relay)") {
+            LyraRelayCallSession.activeRelaySession?.lastOperateResponseCode == 500
+        }
+
+        // releaseRelayExtra cleared the relayed connection for this address.
+        XCTAssertFalse(
+            phone.relayCall.relayedNumbers.contains("0987654321"),
+            "relayedNumbers must be cleared after already-in-relay rejection"
+        )
+        // A subsequent operate(0) for the same address also fails: the
+        // relayed connection no longer exists (isCallRelayed is false).
+        LyraRelayCallSession.noteIncomingCallAnswered(address: "0987654321")
+        waitFor("second operate(0) also rejected") {
+            self.phone.relayCall.operateRequests.count == 2
+        }
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertEqual(
+            LyraRelayCallSession.activeRelaySession?.lastOperateResponseCode, 500,
+            "second operate must also fail after extras released"
+        )
+        // Pin was never refreshed (both rejections skipped saveDeviceAnswered).
+        XCTAssertNil(phone.relayCall.answeredDeviceId)
+
+        dialer.stop()
+        announcer?.stop()
+        announcer = nil
+    }
 }
