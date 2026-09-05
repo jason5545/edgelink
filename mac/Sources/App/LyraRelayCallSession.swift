@@ -50,6 +50,9 @@ final class LyraRelayCallSession {
     // Test/assertion surface: last relay://operate response code the phone
     // sent back (200 = answered + pinned, 500 = gate rejected).
     private(set) var lastOperateResponseCode: Int?
+    // True between update_call_state(4) ACTIVE and call_state_idle / terminal
+    // state. Used for the mid-call channel-loss diagnostic log only.
+    private(set) var isCallActive = false
 
     init(send: @escaping (LyraMeshPack.Frame, String) -> Void, channelTransport: LyraChannelDatagramPipe? = nil) {
         self.send = send
@@ -61,6 +64,12 @@ final class LyraRelayCallSession {
     }
 
     func teardown() {
+        if isCallActive {
+            DiagnosticsLog.warn(
+                "relaycall.channel_lost_mid_call connId=\(connId) — " +
+                    "audio routing will die, no protocol-level recovery"
+            )
+        }
         channelSocket?.stop()
         channelSocket = nil
     }
@@ -819,12 +828,15 @@ final class LyraRelayCallSession {
             // relay-channel release lands while no call is in flight
             // (LyraRelayCallDialer.callEnded).
             if parsed.method == "call_state_idle" {
+                isCallActive = false
                 LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
                 LyraRelayCallDialer.activeDialer?.callEnded()
             } else if let callState = parsed.jsonInt("callState") {
                 if callState == 4 {
+                    isCallActive = true
                     LyraMirrorCallRelaySession.activeSession?.setCallActive(true)
                 } else if callState == 0 || callState == 6 || callState == 7 {
+                    isCallActive = false
                     LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
                     LyraRelayCallDialer.activeDialer?.callEnded()
                 }

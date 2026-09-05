@@ -51,9 +51,9 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     }
 
     public private(set) var operateRequests: [OperateRequest] = []
-    public private(set) var relayedNumbers: Set<String> = []
+    public var relayedNumbers: Set<String> = []
     public private(set) var answeredDeviceId: String?
-    public private(set) var deviceInRelay: String?
+    public var deviceInRelay: String?
 
     private let identity: LyraPhoneIdentity
     // Relay-transport harness: the relayCall channel crosses the relay
@@ -294,7 +294,10 @@ public final class LyraRelayCallRole: LyraServiceHandler {
                     msg = "ok"
                     onEvent("relayCall operate answer, pinned device=\(requestDeviceId)")
                 } else {
-                    // Already-in-relay branch: releases extras, no pin refresh.
+                    // Already-in-relay branch: releaseRelayExtra drops
+                    // EXTRA_CALL_RELAYED for this address (TeleService
+                    // RelayMessageHandler.java:86); the pin is NOT refreshed.
+                    relayedNumbers.remove(address)
                     onEvent("relayCall operate answer rejected, already in relay")
                 }
             } else {
