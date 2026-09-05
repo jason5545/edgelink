@@ -963,10 +963,12 @@ final class LyraMeshResponder {
             LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac"),
             LyraTrustedDeviceInfo.Service(name: "cast", package: "com.xiaomi.mirror")
         ]
-        // Opt-in while call-relay is groundwork: advertising com.ios.phone
-        // makes the phone classify us as a relay/phone peer, which breaks the
-        // mirror cast channel (regression from f7a9466bc).
-        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
+        // Default ON since 2026-09-05 (see LyraMeshAnnouncer): the phone's
+        // relay filter exempts us only via the answered pin, and the pin is
+        // worthless if the relayCall service itself is not advertised. The
+        // f7a9466bc-era cast-channel regression is superseded by the
+        // announcer/responder insertion-order rules (AGENTS.md 2026-08-21).
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? true
         if relayCallEnabled {
             services.append(
                 LyraTrustedDeviceInfo.Service(

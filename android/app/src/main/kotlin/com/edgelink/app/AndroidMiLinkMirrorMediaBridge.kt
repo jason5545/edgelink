@@ -1451,16 +1451,3 @@ private fun rtspTransportValue(name: String, transport: String): String? {
 
 private fun String.forRTSPLog(): String =
     replace(Regex("\\s+"), " ").trim().take(180)
-
-private fun rtpSummary(data: ByteArray): String {
-    if (data.size < 12 || data[0].toInt() shr 6 != 2) {
-        return "format=unknown"
-    }
-    val payloadType = data[1].toInt() and 0x7f
-    val sequence = ((data[2].toInt() and 0xff) shl 8) or (data[3].toInt() and 0xff)
-    val timestamp = ((data[4].toLong() and 0xff) shl 24) or
-        ((data[5].toLong() and 0xff) shl 16) or
-        ((data[6].toLong() and 0xff) shl 8) or
-        (data[7].toLong() and 0xff)
-    return "format=rtp pt=$payloadType seq=$sequence ts=$timestamp payloadBytes=${data.size - 12}"
-}

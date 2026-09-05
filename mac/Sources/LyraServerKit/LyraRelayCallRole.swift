@@ -28,6 +28,32 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     public private(set) var logiResponseReceived = false
     public private(set) var peerPort: UInt16 = 0
     public private(set) var lastRingResponse: String?
+    public private(set) var lastOperateResponse: String?
+
+    // TeleService RelayServiceFilterUtils / handleRelayOperate model.
+    // A number becomes "relayed" once its ring request got a 200 response
+    // (EXTRA_CALL_RELAYED). operate(0) on a relayed call answers it and runs
+    // saveDeviceAnswered(requestDeviceId) — the pref_device_answered pin that
+    // exempts the device from the 2/4/11 relay type filter permanently.
+    // operate(0) while a device is already in relay takes TeleService's
+    // already-in-relay branch: it releases extras and FAILS (500), and the
+    // pin is NOT refreshed.
+    public struct OperateRequest: Equatable {
+        public var operateType: Int
+        public var address: String
+        public var requestDeviceId: String
+
+        public init(operateType: Int, address: String, requestDeviceId: String) {
+            self.operateType = operateType
+            self.address = address
+            self.requestDeviceId = requestDeviceId
+        }
+    }
+
+    public private(set) var operateRequests: [OperateRequest] = []
+    public private(set) var relayedNumbers: Set<String> = []
+    public private(set) var answeredDeviceId: String?
+    public private(set) var deviceInRelay: String?
 
     private let identity: LyraPhoneIdentity
     // Relay-transport harness: the relayCall channel crosses the relay
@@ -226,7 +252,69 @@ public final class LyraRelayCallRole: LyraServiceHandler {
         onEvent("relayCall uri rx \(text)")
         if text.contains("/response?") {
             lastRingResponse = text
+            // RING 200 → TeleService marks the connection EXTRA_CALL_RELAYED.
+            if text.hasPrefix("relay://ring:"), text.contains("\"code\":200"),
+               let address = Self.jsonString("address", in: text)
+            {
+                relayedNumbers.insert(address)
+                onEvent("relayCall connection relayed address=\(address)")
+            }
+            return
         }
+        if text.contains("/request?") {
+            handleRequestURI(text)
+        }
+    }
+
+    // MARK: - operate requests from the Mac (TeleService handleRelayOperate)
+
+    private func handleRequestURI(_ text: String) {
+        guard text.hasPrefix("relay://operate:") else { return }
+        let head = String(text.dropFirst("relay://operate:".count))
+        let methodId = String(head.prefix(while: { $0 != "/" }))
+        guard let query = text.split(separator: "?", maxSplits: 1).last,
+              let data = String(query).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        let operateType = object["operateType"] as? Int ?? -1
+        let address = object["address"] as? String ?? ""
+        let requestDeviceId = object["requestDeviceId"] as? String ?? ""
+        operateRequests.append(
+            OperateRequest(operateType: operateType, address: address, requestDeviceId: requestDeviceId)
+        )
+        // Gate: getLocalConnectionWithNumber(address) != nil && isCallRelayed.
+        var code = 500
+        var msg = "failed"
+        if relayedNumbers.contains(address) {
+            if operateType == 0 {
+                if deviceInRelay == nil {
+                    answeredDeviceId = requestDeviceId
+                    deviceInRelay = requestDeviceId
+                    code = 200
+                    msg = "ok"
+                    onEvent("relayCall operate answer, pinned device=\(requestDeviceId)")
+                } else {
+                    // Already-in-relay branch: releases extras, no pin refresh.
+                    onEvent("relayCall operate answer rejected, already in relay")
+                }
+            } else {
+                code = 200
+                msg = "ok"
+            }
+        } else {
+            onEvent("relayCall operate rejected, no relayed connection for \(address)")
+        }
+        let json =
+            "{\"code\":\(code),\"msg\":\"\(msg)\",\"address\":\"\(address)\"," +
+            "\"responseDeviceId\":\"4995163F\"}"
+        sendURI(method: "operate", id: UInt64(methodId) ?? 0, kind: "response", query: json)
+    }
+
+    private static func jsonString(_ key: String, in text: String) -> String? {
+        guard let range = text.range(of: "\"\(key)\":\"") else { return nil }
+        let rest = text[range.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
     }
 
     public func handleServiceMeshCommand(payload: Data, server: LyraPhoneMeshServer) -> Bool {

@@ -63,10 +63,24 @@ public final class LyraMirrorCallRelayRole {
     public private(set) var decryptedAACBytes = 0
     public private(set) var pesIVsSeen = 0
     public private(set) var lastError: String?
+    // Every SimpleEventMessage event value received, in arrival order (for
+    // stop-before-start ordering assertions).
+    public private(set) var simpleEventLog: [UInt32] = []
+    // Called with each decrypted ff02 PCM payload from the media plane
+    // (LAN listener or relayed uplink), in arrival order.
+    public var onDecryptedPCM: ((Data) -> Void)?
 
     // The phone's own audio-source endpoint info (its KeyData).
     public var phoneP2PIp = "127.0.0.1"
     public let phoneSourcePort = 7102
+
+    // The Android cloud bridge's phone-local RTSP sink server
+    // (LocalMiLinkRTSPSinkServer DEFAULT_LOCAL_SINK_RTSP_PORT). When the
+    // Mac's KeyData advertises this loopback endpoint, the real sink dial
+    // terminates on the phone itself — the mock dials nothing and treats
+    // the sink as established; the relayed uplink media is fed straight to
+    // the validator via ingestRelayedUplinkRTP(_:).
+    public static let phoneLocalRelaySinkPort: UInt16 = 15550
 
     private let phoneKey = P256.KeyAgreement.PrivateKey()
     private weak var cast: LyraCastRole?
@@ -146,6 +160,7 @@ public final class LyraMirrorCallRelayRole {
     }
 
     private func handleSimpleEvent(_ event: LyraCastSimpleEvent) {
+        simpleEventLog.append(event.event)
         switch event.event {
         case 23:  // MIRROR_CALL_KEY from the Mac
             guard let stringValue = event.stringValue,
@@ -228,6 +243,14 @@ public final class LyraMirrorCallRelayRole {
             return
         }
         guard state != .sinkStarting, state != .established else { return }
+        // The advertised endpoint is the phone-LOCAL cloud-bridge sink
+        // server: the real dial terminates on the phone (the bridge relays
+        // our media to it), so there is nothing for the mock to connect to.
+        if macKeyData.p2pIp == "127.0.0.1", port == Self.phoneLocalRelaySinkPort {
+            state = .established
+            onEvent("mirrorcall sink via phone-local relay bridge port=\(port)")
+            return
+        }
         connectSink(host: macKeyData.p2pIp, port: port)
     }
 
@@ -478,6 +501,16 @@ public final class LyraMirrorCallRelayRole {
         }
     }
 
+    // Relayed Mac→phone uplink (the cloud-bridge route): the RTP arrives
+    // via phone.relay.media envelopes instead of a LAN datagram, but the
+    // dialect the phone sink validates is identical — feed the same
+    // RTP/TS/PES/AESPART/ff02 validation pipeline.
+    public func ingestRelayedUplinkRTP(_ packet: Data) {
+        queue.async { [weak self] in
+            self?.ingestRTP(packet)
+        }
+    }
+
     private func ingestRTP(_ datagram: Data) {
         guard datagram.count > 12, (datagram[0] >> 6) == 2 else { return }
         let csrcCount = Int(datagram[0] & 0x0F)
@@ -578,6 +611,14 @@ public final class LyraMirrorCallRelayRole {
         }
         aacFrames += 1
         decryptedAACBytes += payload.count
+        // ff02 framing: payload length u32 LE at 8, PCM starts at 18.
+        let declared = Int(payload[8]) | Int(payload[9]) << 8
+            | Int(payload[10]) << 16 | Int(payload[11]) << 24
+        if payload.count >= 18 + declared {
+            onDecryptedPCM?(Data(payload[18..<18 + declared]))
+        } else {
+            onDecryptedPCM?(Data(payload[18...]))
+        }
         if aacFrames <= 3 || aacFrames % 50 == 0 {
             onEvent("mirrorcall pcm frame=\(aacFrames) bytes=\(payload.count)")
         }

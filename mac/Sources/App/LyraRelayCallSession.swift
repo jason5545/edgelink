@@ -47,6 +47,9 @@ final class LyraRelayCallSession {
     private var transKey = Data()
     private var peerChannelId: UInt64 = 0
     private var methodCounter: UInt64 = 0
+    // Test/assertion surface: last relay://operate response code the phone
+    // sent back (200 = answered + pinned, 500 = gate rejected).
+    private(set) var lastOperateResponseCode: Int?
 
     init(send: @escaping (LyraMeshPack.Frame, String) -> Void, channelTransport: LyraChannelDatagramPipe? = nil) {
         self.send = send
@@ -838,9 +841,45 @@ final class LyraRelayCallSession {
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
         case ("wantRelay", "request"):
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
+        case ("operate", "response"):
+            lastOperateResponseCode = parsed.jsonInt("code")
+            DiagnosticsLog.info(
+                "xiaomi.relaycall.operate_response code=\(lastOperateResponseCode ?? -1)"
+            )
         default:
             DiagnosticsLog.info("xiaomi.relaycall.uri_unhandled \(text.prefix(160))")
         }
+    }
+
+    // The user answered an incoming call on the Mac. Rides the official
+    // TeleService relay semantics: relay://operate {operateType:0} answers the
+    // relayed connection phone-side (EXTRA_RELAY_ANSWERED=true → the phone
+    // switches call-audio routing to us) and, critically, runs
+    // saveDeviceAnswered(our deviceId) — the pref_device_answered pin that is
+    // the ONLY exemption from the 2/4/11 relay type filter our deviceType 14
+    // fails (2026-09-05 root cause: without the pin the phone never enters
+    // us into the filtered relay map, never builds the relay channel, and
+    // never routes call audio; the counterparty hears silence).
+    //
+    // Gate phone-side: a relayed connection for `address` must exist (the
+    // phone ringed us over this channel first). Without it the phone answers
+    // 500 and nothing happens — the bootstrap dead-end for unpinned phones.
+    static func noteIncomingCallAnswered(address: String) {
+        guard let session = activeRelaySession else {
+            DiagnosticsLog.info("xiaomi.relaycall.operate_skip no_relay_session")
+            return
+        }
+        session.sendOperateAnswer(address: address)
+    }
+
+    private func sendOperateAnswer(address: String) {
+        methodCounter += 1
+        let escapedAddress = address.replacingOccurrences(of: "\"", with: "\\\"")
+        let json =
+            "{\"operateType\":0,\"address\":\"\(escapedAddress)\"," +
+            "\"requestDeviceId\":\"\(Self.responseDeviceId)\"}"
+        let uri = "relay://operate:\(methodCounter)/request?\(json)"
+        sendChannelText(uri)
     }
 
     private func respond(to request: RelayURI, fields: [String: String]) {

@@ -48,6 +48,9 @@ final class LyraMirrorCallRelayTests: XCTestCase {
         continueAfterFailure = false
         LyraMirrorCallRelaySession.resetPendingCallState()
         LyraMirrorCallRelaySession.phoneMirrorCallEngaged = false
+        LyraMirrorCallRelaySession.engagementCallId = nil
+        LyraMirrorCallRelaySession.lanPhoneReachable = { false }
+        LyraMirrorCallRelaySession.onRelayUplinkPacket = nil
         let defaults = UserDefaults.standard
         for key in Self.defaultsKeys {
             savedValues[key] = defaults.object(forKey: key)
@@ -70,6 +73,9 @@ final class LyraMirrorCallRelayTests: XCTestCase {
         relay = nil
         LyraMirrorCallRelaySession.resetPendingCallState()
         LyraMirrorCallRelaySession.phoneMirrorCallEngaged = false
+        LyraMirrorCallRelaySession.engagementCallId = nil
+        LyraMirrorCallRelaySession.lanPhoneReachable = { false }
+        LyraMirrorCallRelaySession.onRelayUplinkPacket = nil
         LyraMirrorCallRelaySession.onPhoneSourceEndpointChanged = nil
         let defaults = UserDefaults.standard
         for key in Self.defaultsKeys {
@@ -530,5 +536,234 @@ final class LyraMirrorCallRelayTests: XCTestCase {
         waitFor("mirror-call key exchange on the rebuilt channel") {
             relayB.state == .keyExchanged
         }
+    }
+
+    // Live 2026-09-05 (Mac-dialed call, remote side hears nothing): the
+    // phone's Mirror app idle-releases the cast trust channel ~5-7s after
+    // each establishment (MirrorCallService never registers a channel
+    // keeper), and each rebuilt session's start() sent the orphan-stop
+    // event 25 — which on the real phone tears down the HEALTHY mid-call
+    // MirrorCallService source+sink (G.Z stops both). Every ~7s flap killed
+    // the call media. A same-call rebuild (pendingCallId == the engaged
+    // callId) must skip the 25 and just re-send 23/24/31 (duplicates are
+    // idempotent no-ops phone-side); the pending call identity is set
+    // directly here, exactly what the driver's setCallActive wiring writes.
+    func testMidCallChannelReleaseRebuildSkipsOrphanStopAndKeepsPhoneMedia() throws {
+        LyraMirrorCallRelaySession.pendingCallId = "call-A"
+        try bringUpCastChannel()
+        let relayA = try XCTUnwrap(self.relay)
+        let session = try XCTUnwrap(self.session)
+
+        relayA.sendMirrorCallKey()
+        waitFor("key exchange") { relayA.state == .keyExchanged }
+        session.notifyMirrorCallActive(true)
+        waitFor("sink start on the first session") {
+            relayA.callStartCount == 1 && relayA.sinkStartPort != nil
+        }
+        waitFor("engaged for call-A") {
+            LyraMirrorCallRelaySession.phoneMirrorCallEngaged
+                && LyraMirrorCallRelaySession.engagementCallId == "call-A"
+        }
+
+        // Three release → rebuild cycles (the phone's ~7s idle auto-release
+        // cadence): no rebuilt session may send event 25, each must re-send
+        // 23 (the fresh role learns the Mac KeyData) and re-send 24/31.
+        for cycle in 1...3 {
+            let oldSession = try XCTUnwrap(self.session)
+            let oldPhone = try XCTUnwrap(self.phone)
+            oldPhone.cast.releaseCastChannel()
+            waitFor("cycle \(cycle): channel released by the phone") { !oldSession.isChannelReady }
+            oldPhone.stop()
+
+            meshPort += 1
+            // The driver still holds the pending drive for the ongoing call.
+            LyraMirrorCallRelaySession.pendingCallActive = true
+            LyraMirrorCallRelaySession.pendingCallId = "call-A"
+            try bringUpCastChannel()
+            let cycleRelay = try XCTUnwrap(self.relay)
+
+            waitFor("cycle \(cycle): Mac KeyData re-sent on the fresh channel") {
+                cycleRelay.macKeyData != nil
+            }
+            cycleRelay.sendMirrorCallKey()
+            waitFor("cycle \(cycle): 24/31 re-sent (phone-side no-op)") {
+                cycleRelay.callStartCount > 0 && cycleRelay.sinkStartPort != nil
+            }
+            XCTAssertEqual(
+                cycleRelay.callStopCount, 0,
+                "cycle \(cycle): same-call rebuild must not orphan-stop the healthy phone media"
+            )
+            XCTAssertEqual(LyraMirrorCallRelaySession.engagementCallId, "call-A")
+        }
+    }
+
+    // The flip side of the same-call gate: a STALE engagement from a
+    // previous call whose event 25 never went out (unclean channel death)
+    // must still get the stop-first resync on the next call's session
+    // (live 2026-09-03: the wedged phone source made the next call's RTSP
+    // SETUP fail 400) — event 25 before the new 24/31.
+    func testStaleEngagementFromPreviousCallStillGetsOrphanStop() throws {
+        LyraMirrorCallRelaySession.pendingCallId = "call-A"
+        try bringUpCastChannel()
+        let relayA = try XCTUnwrap(self.relay)
+        let session = try XCTUnwrap(self.session)
+
+        relayA.sendMirrorCallKey()
+        waitFor("key exchange") { relayA.state == .keyExchanged }
+        session.notifyMirrorCallActive(true)
+        waitFor("call-A engaged") {
+            relayA.callStartCount > 0 && relayA.sinkStartPort != nil
+                && LyraMirrorCallRelaySession.engagementCallId == "call-A"
+        }
+
+        // Unclean end: the channel dies without event 25.
+        let oldPhone = try XCTUnwrap(self.phone)
+        oldPhone.cast.releaseCastChannel()
+        waitFor("channel released") { !session.isChannelReady }
+        oldPhone.stop()
+        waitFor("engagement survives the channel death") {
+            LyraMirrorCallRelaySession.phoneMirrorCallEngaged
+        }
+
+        // A NEW call (call-B) builds the next session: stop-first resync.
+        meshPort += 1
+        LyraMirrorCallRelaySession.pendingCallActive = true
+        LyraMirrorCallRelaySession.pendingCallId = "call-B"
+        try bringUpCastChannel()
+        let relayB = try XCTUnwrap(self.relay)
+
+        waitFor("orphan stop for the stale call-A engagement") { relayB.callStopCount > 0 }
+        relayB.sendMirrorCallKey()
+        waitFor("call-B sink start after the resync") {
+            relayB.callStartCount > 0 && relayB.sinkStartPort != nil
+        }
+        let log = relayB.simpleEventLog
+        let stopIndex = try XCTUnwrap(log.firstIndex(of: 25), "expected event 25 in \(log)")
+        let startIndex = try XCTUnwrap(log.firstIndex(of: 24), "expected event 24 in \(log)")
+        XCTAssertLessThan(stopIndex, startIndex, "event 25 must precede the new 24/31: \(log)")
+        waitFor("engagement stamped for call-B") {
+            LyraMirrorCallRelaySession.engagementCallId == "call-B"
+        }
+    }
+
+    // Live 2026-09-05: over the cloud relay the Mac mic uplink must speak
+    // the phone sink's only dialect — the LyraMirrorCallAudioSource wire
+    // format (ff02-framed LPCM 8kHz mono in the 0x83 TS stream, AESPART
+    // first min(256,len)&~15 bytes AES-128-CBC with the event-23 ECDH
+    // key/IV, per-PES IV in PES_private_data, RTP byte1 = 0x60|33) carried
+    // in phone.relay.media envelopes to the Android bridge's phone-local
+    // sink server. The retired 48kHz AAC-in-TS plaintext uplink was never
+    // audible: the sink refuses to run without the ECDH key (jadx:
+    // "startAudioSink, mKey is null").
+    func testRelayUplinkSpeaksOfficialMirrorCallDialect() throws {
+        try bringUpCastChannel()
+        let relay = try XCTUnwrap(self.relay)
+        let session = try XCTUnwrap(session)
+        let mirrorCall = try XCTUnwrap(session.mirrorCallRelay)
+        let relayPort = LyraMirrorCallRelaySession.relaySinkAdvertisePort
+
+        let uplinkPackets = LockedBox<[Data]>([])
+        let decryptedPCM = LockedBox<[Data]>([])
+        relay.onDecryptedPCM = { pcm in decryptedPCM.with { $0.append(pcm) } }
+        LyraMirrorCallRelaySession.onRelayUplinkPacket = { packet in
+            uplinkPackets.with { $0.append(packet) }
+            relay.ingestRelayedUplinkRTP(packet)
+        }
+
+        mirrorCall.setAdvertiseEndpoint(("127.0.0.1", relayPort))
+        waitFor("relay media producer resolved (no local listener)") {
+            session.mirrorCallRelay?.audioSource == nil
+                && session.mirrorCallRelay?.relayMediaSource != nil
+        }
+        relay.sendMirrorCallKey()
+        waitFor("key exchange at the relay endpoint") {
+            relay.macKeyData?.p2pIp == "127.0.0.1" && relay.macKeyData?.port == Int(relayPort)
+        }
+        session.notifyMirrorCallActive(true)
+        waitFor("sink start at the advertised relay port") {
+            relay.callStartCount > 0 && relay.sinkStartPort == UInt32(relayPort)
+        }
+
+        let source = try XCTUnwrap(session.mirrorCallRelay?.relayMediaSource)
+        source.captureEnabled = false  // deterministic PCM: injected frames only
+        mirrorCall.setRelayMediaActive(true)
+        waitFor("relay media running") {
+            session.mirrorCallRelay?.relayMediaSource?.mediaRunning == true
+        }
+
+        // 8 kHz mono s16 ramp; 640 bytes = two 20 ms frames per write.
+        var sentPCM = Data()
+        var sample: Int16 = 0
+        for _ in 0..<10 {
+            var pcm = Data(count: 640)
+            pcm.withUnsafeMutableBytes { raw in
+                let samples = raw.bindMemory(to: Int16.self)
+                for i in 0..<320 {
+                    samples[i] = sample
+                    sample &+= 7
+                }
+            }
+            sentPCM.append(pcm)
+            source.write(pcm: pcm)
+        }
+        waitFor("relayed frames decrypted by the phone") { relay.aacFrames >= 3 }
+
+        // Wire-level shape of the first uplink packet: RTP v2, mirror-style
+        // byte1 (0x60|33), a whole 188-byte TS grid on the 0x1100 ES pid
+        // (first AU also carries PAT/PMT), PES private stream 0xbd.
+        let first = try XCTUnwrap(uplinkPackets.value.first)
+        XCTAssertEqual(first[0], 0x80)
+        XCTAssertEqual(first[1], 0x60 | 33)
+        XCTAssertEqual((first.count - 12) % 188, 0)
+        var sawESPID = false
+        for offset in stride(from: 12, to: first.count, by: 188) {
+            XCTAssertEqual(first[offset], 0x47, "TS sync byte at \(offset)")
+            let pid = (UInt16(first[offset + 1] & 0x1F) << 8) | UInt16(first[offset + 2])
+            if pid == 0x1100 {
+                sawESPID = true
+            } else {
+                XCTAssertTrue(pid == 0 || pid == 0x100, "unexpected TS pid \(String(pid, radix: 16))")
+            }
+        }
+        XCTAssertTrue(sawESPID, "no 0x1100 ES packet in the first uplink RTP")
+        XCTAssertNotNil(
+            first.range(of: Data([0x00, 0x00, 0x01, 0xBD])),
+            "no PES private-stream start code in the first uplink RTP"
+        )
+
+        // The role validated AESPART CBC with the event-23 ECDH key/IV and
+        // the per-PES IVs; the decrypted ff02 PCM must be the injected ramp.
+        XCTAssertGreaterThan(relay.pesIVsSeen, 0)
+        XCTAssertNil(relay.lastError)
+        let frames = decryptedPCM.value
+        XCTAssertGreaterThanOrEqual(frames.count, 3)
+        for index in 0..<3 {
+            XCTAssertEqual(
+                frames[index], sentPCM.subdata(in: index * 320..<(index + 1) * 320),
+                "decrypted PCM frame \(index) differs from the injected PCM"
+            )
+        }
+    }
+
+    // The session re-evaluates live-phone reachability at use time: a stale
+    // relay preference (the cloud bridge engaged while the phone was off
+    // the LAN) must not advertise 127.0.0.1:15550 to a phone that answers
+    // on the LAN — the KeyData advertises en0 + the local source port and
+    // the LAN listener stays up (mirror precedent 2026-08-13).
+    func testPreferRelayAdvertiseWithLANReachablePhoneKeepsLANAdvertise() throws {
+        LyraMirrorCallRelaySession.lanPhoneReachable = { true }
+        LyraMirrorCallRelaySession.preferRelayAdvertise = true
+        try bringUpCastChannel()
+        let relay = try XCTUnwrap(relay)
+        let session = try XCTUnwrap(session)
+        let relayPort = LyraMirrorCallRelaySession.relaySinkAdvertisePort
+
+        relay.sendMirrorCallKey()
+        waitFor("key exchange") { relay.state == .keyExchanged }
+        let macKeyData = try XCTUnwrap(relay.macKeyData)
+        XCTAssertNotEqual(macKeyData.p2pIp, "127.0.0.1")
+        XCTAssertNotEqual(macKeyData.port, Int(relayPort))
+        XCTAssertNotNil(session.mirrorCallRelay?.audioSource)
+        XCTAssertNil(session.mirrorCallRelay?.relayMediaSource)
     }
 }

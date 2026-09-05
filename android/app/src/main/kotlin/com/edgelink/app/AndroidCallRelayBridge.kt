@@ -200,7 +200,6 @@ object AndroidCallRelayBridge {
                 }
             }
             sendStatus("bridge_starting")
-            AndroidDistAudioUplinkForwarder.start(reason = startReason)
             try {
                 localBridge.run()
             } catch (error: CancellationException) {
@@ -213,7 +212,6 @@ object AndroidCallRelayBridge {
                 )
                 sendStatus("bridge_failed")
             } finally {
-                AndroidDistAudioUplinkForwarder.stop(reason = "bridge_exit")
                 sourceRTPQueue.close()
                 bridgeRTPQueue.close()
                 sourceRTPJob.cancelAndJoin()
@@ -267,7 +265,6 @@ object AndroidCallRelayBridge {
                 )
                 return
             }
-            AndroidDistAudioUplinkForwarder.handleSourceRTP(packet)
             localBridge.sendSourceRTP(packet)
         }
 
@@ -345,7 +342,23 @@ object AndroidCallRelayBridge {
         private var rtpPackets = 0
 
         suspend fun run() = coroutineScope {
-            val sinkServerJob = launch { sinkServer.run() }
+            // Isolate the sink server from this scope: a sink-side failure
+            // must never cancel the local_rtsp downlink leg mid-call.
+            val sinkServerJob = launch {
+                try {
+                    sinkServer.run()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    if (isActive) {
+                        EdgeLinkLog.warn(
+                            "callrelay.android.sink_rtsp_server_failed sessionId=$relaySessionId " +
+                                "error=${error.javaClass.simpleName}:${error.message.orEmpty()}",
+                            error
+                        )
+                    }
+                }
+            }
             val udp = DatagramSocket(null).apply {
                 reuseAddress = true
                 soTimeout = 2_000
@@ -861,11 +874,24 @@ object AndroidCallRelayBridge {
         }
     }
 
-    private class LocalMiLinkRTSPSinkServer(
+    internal class LocalMiLinkRTSPSinkServer(
         private val relaySessionId: String,
         private val listenPort: Int,
         private val statusHandler: suspend (String) -> Unit
     ) {
+        // Same JVM test seam as LocalMiLinkRTSPBridge.log: unit tests run the
+        // sink server on real loopback sockets, where EdgeLinkLog's
+        // android.util.Log backend is unavailable.
+        internal var log: (String) -> Unit = { EdgeLinkLog.info(it) }
+
+        // fingerprint lives on EdgeLinkLog too, whose object initializer
+        // starts a HandlerThread — JVM tests must swap this as well.
+        internal var fingerprint: (ByteArray) -> String = { EdgeLinkLog.fingerprint(it) }
+
+        // Actual bound port — tests pass listenPort=0 for an ephemeral bind.
+        internal val boundPort: Int
+            get() = serverSocket?.localPort ?: -1
+
         private val sendMutex = Mutex()
         private val pendingRTP = ArrayDeque<ByteArray>()
         private val pendingRequests = mutableMapOf<String, String>()
@@ -901,7 +927,7 @@ object AndroidCallRelayBridge {
                 bind(InetSocketAddress(listenPort))
             }
             serverSocket = server
-            EdgeLinkLog.info(
+            log(
                 "callrelay.android.sink_rtsp_listening sessionId=$relaySessionId " +
                     "host=0.0.0.0 port=$listenPort"
             )
@@ -917,7 +943,7 @@ object AndroidCallRelayBridge {
                 }
             } finally {
                 close()
-                EdgeLinkLog.info("callrelay.android.sink_rtsp_closed sessionId=$relaySessionId")
+                log("callrelay.android.sink_rtsp_closed sessionId=$relaySessionId")
             }
         }
 
@@ -960,7 +986,7 @@ object AndroidCallRelayBridge {
             udpSocket = udp
             rtcpSocket = rtcp
             resetControlState()
-            EdgeLinkLog.info(
+            log(
                 "callrelay.android.sink_rtsp_connected sessionId=$relaySessionId " +
                     "from=${client.inetAddress.hostAddress}:${client.port} " +
                     "rtpSourcePort=${udp.localPort} rtcpSourcePort=${rtcp.localPort}"
@@ -969,6 +995,14 @@ object AndroidCallRelayBridge {
             try {
                 sendOptionsIfNeeded()
                 readLoop(client)
+            } catch (error: java.io.IOException) {
+                // A dead client (live 2026-09-05: the phone RSTs the RTSP
+                // connection after a Mac event-25 TEARDOWN) must end only
+                // this client — the accept loop keeps serving reconnects.
+                log(
+                    "callrelay.android.sink_rtsp_client_ended sessionId=$relaySessionId " +
+                        "error=${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
             } finally {
                 sendMutex.withLock {
                     playing = false
@@ -983,7 +1017,7 @@ object AndroidCallRelayBridge {
                 socket = null
                 udpSocket = null
                 rtcpSocket = null
-                EdgeLinkLog.info("callrelay.android.sink_rtsp_disconnected sessionId=$relaySessionId")
+                log("callrelay.android.sink_rtsp_disconnected sessionId=$relaySessionId")
                 statusHandler("sink_rtsp_disconnected")
             }
         }
@@ -1050,12 +1084,12 @@ object AndroidCallRelayBridge {
             val bodyText = message.substringAfter("\r\n\r\n", "")
             val firstLine = headerText.lineSequence().firstOrNull().orEmpty()
             val cseq = rtspHeader("CSeq", headerText) ?: "?"
-            EdgeLinkLog.info(
+            log(
                 "callrelay.android.sink_rtsp_message dir=in firstLine=${firstLine.forRTSPLog()} " +
                     "cseq=${cseq.forRTSPLog()} bytes=${message.toByteArray(rtspCharset).size}"
             )
             if (bodyText.isNotBlank()) {
-                EdgeLinkLog.info(
+                log(
                     "callrelay.android.sink_rtsp_body dir=in firstLine=${firstLine.forRTSPLog()} " +
                         "preview=${bodyText.forRTSPLog()}"
                 )
@@ -1122,7 +1156,7 @@ object AndroidCallRelayBridge {
                 ?.let { sessionHeader = it }
             val status = rtspStatusCode(firstLine)
             if (status != null && status >= 300) {
-                EdgeLinkLog.warn(
+                log(
                     "callrelay.android.sink_rtsp_non_success request=$request status=$status " +
                         "firstLine=${firstLine.forRTSPLog()}"
                 )
@@ -1180,20 +1214,22 @@ object AndroidCallRelayBridge {
             }
             val sinkPort = sendMutex.withLock { destination?.port }
             if (sinkPort == null) {
-                EdgeLinkLog.warn(
+                log(
                     "callrelay.android.sink_rtsp_missing_rtp_port sessionId=$relaySessionId"
                 )
                 return
             }
             sentSelectedParameters = true
+            // Official miplaycast mirror-call dialect (Mac reference:
+            // LyraMirrorCallRelaySession M4): LPCM 8 kHz mono with AESPART —
+            // the phone sink AES-128-CBC-encrypts the first min(256, len)&~15
+            // bytes of each PES payload using the key from the cast-channel
+            // event-23 ECDH exchange. The bridge never sees the key; it
+            // forwards the RTP ciphertext unchanged.
             val body = listOf(
-                "wfd_video_formats: none",
-                // Match the last known-good Mac microphone path: ffmpeg emits
-                // AAC-LC in MPEG-TS and Cloudflare transports the RTP unchanged.
-                "wfd_audio_codecs: AAC 00000001 00",
-                "audio_sample_time_ms: 20",
+                "wfd_audio_codecs_v2: 0 3",
+                "wfd_type_encryp: 4 1 1 1 1",
                 "wfd_client_rtp_ports: RTP/AVP/UDP;unicast $sinkPort 0 mode=play",
-                "wfd_content_protection: none",
                 "wfd_presentation_url: rtsp://${preferredLocalIPv4Address() ?: "127.0.0.1"}:$listenPort/wfd1.0/streamid=0 none"
             ).joinToString("\r\n", postfix = "\r\n")
             sendRTSPRequest(
@@ -1246,7 +1282,7 @@ object AndroidCallRelayBridge {
                 if (destination != next) {
                     destination = next
                     rtcpDestination = InetSocketAddress(address, (port + 1).coerceAtMost(65_535))
-                    EdgeLinkLog.info(
+                    log(
                         "callrelay.android.sink_rtp_destination sessionId=$relaySessionId " +
                             "host=${address.hostAddress} port=$port rtcpPort=${rtcpDestination?.port} " +
                             "reason=$reason pending=${pendingRTP.size} " +
@@ -1302,7 +1338,7 @@ object AndroidCallRelayBridge {
             pendingRTP.addLast(packet)
             bufferedPackets += 1
             if (bufferedPackets == 1 || bufferedPackets % 100 == 0) {
-                EdgeLinkLog.info(
+                log(
                     "callrelay.android.sink_rtp_buffered sessionId=$relaySessionId reason=$reason " +
                         "pending=${pendingRTP.size} dropped=$droppedPackets bytes=${packet.size}"
                 )
@@ -1319,7 +1355,7 @@ object AndroidCallRelayBridge {
             while (pendingRTP.isNotEmpty()) {
                 sendRTPLocked(udp, target, pendingRTP.removeFirst())
             }
-            EdgeLinkLog.info(
+            log(
                 "callrelay.android.sink_rtp_flush sessionId=$relaySessionId reason=$reason flushed=$count"
             )
         }
@@ -1341,10 +1377,10 @@ object AndroidCallRelayBridge {
                 sendRTCPSenderReportIfDue()
             }
             if (rtpPackets == 1 || rtpPackets % 100 == 0) {
-                EdgeLinkLog.info(
+                log(
                     "callrelay.android.sink_rtp_out sessionId=$relaySessionId count=$rtpPackets " +
                         "to=${address.hostAddress}:${target.port} bytes=${packet.size} " +
-                        "${rtpSummary(packet)} fp=${EdgeLinkLog.fingerprint(packet)}"
+                        "${rtpSummary(packet)} fp=${fingerprint(packet)}"
                 )
             }
         }
@@ -1381,7 +1417,7 @@ object AndroidCallRelayBridge {
             }
             rtcpReportsSent += 1
             if (rtcpReportsSent <= 3 || rtcpReportsSent % 10 == 0) {
-                EdgeLinkLog.info(
+                log(
                     "callrelay.android.sink_rtcp_sr_out sessionId=$relaySessionId count=$rtcpReportsSent " +
                         "to=${address.hostAddress}:${target.port} rtpPackets=$rtpPackets " +
                         "octets=$rtpPayloadOctets rtpTimestamp=$lastRTPTimestamp"
@@ -1446,7 +1482,7 @@ object AndroidCallRelayBridge {
 
         private suspend fun sendRTSP(message: String, label: String) {
             val firstLine = message.substringBefore("\r\n")
-            EdgeLinkLog.info(
+            log(
                 "callrelay.android.sink_rtsp_message dir=out firstLine=${firstLine.forRTSPLog()} " +
                     "label=$label bytes=${message.toByteArray(rtspCharset).size}"
             )
@@ -1600,8 +1636,8 @@ private fun firstRTPPortToken(value: String): Int? {
 private fun String.forRTSPLog(): String =
     replace(Regex("\\s+"), " ").trim().take(180)
 
-private fun rtpSummary(data: ByteArray): String {
-    if (data.size < 12 || data[0].toInt() shr 6 != 2) {
+internal fun rtpSummary(data: ByteArray): String {
+    if (data.size < 12 || (data[0].toInt() and 0xff) ushr 6 != 2) {
         return "format=unknown"
     }
     val payloadType = data[1].toInt() and 0x7f

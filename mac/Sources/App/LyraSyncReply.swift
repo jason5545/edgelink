@@ -116,7 +116,7 @@ enum LyraSyncReply {
 
     private static func deviceInfoFrame(deviceIdHex: String, displayName: String) -> Data {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? true
         return LyraTrustedDeviceInfo.syncReplyDeviceInfoFrame(
             deviceName: displayName,
             deviceType: defaultDeviceType,

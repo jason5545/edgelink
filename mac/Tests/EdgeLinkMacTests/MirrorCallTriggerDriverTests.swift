@@ -12,10 +12,12 @@ final class MirrorCallTriggerDriverTests: XCTestCase {
         var hasCastSession = false
         var needsRedial = false
         var mirrorBusy = false
+        var lanReachable = false
         var ensureReasons: [String] = []
         var setCallActiveValues: [Bool] = []
+        var setCallActiveCallIds: [String?] = []
         var redialCount = 0
-        var relayAdvertiseCount = 0
+        var advertisePreferences: [Bool] = []
         var clearPendingCount = 0
     }
 
@@ -32,9 +34,13 @@ final class MirrorCallTriggerDriverTests: XCTestCase {
         driver.castChannelNeedsRedial = { spies.needsRedial }
         driver.isMirrorFlowBusy = { spies.mirrorBusy }
         driver.ensureChannel = { spies.ensureReasons.append($0) }
-        driver.setCallActive = { spies.setCallActiveValues.append($0) }
+        driver.setCallActive = { active, callId in
+            spies.setCallActiveValues.append(active)
+            spies.setCallActiveCallIds.append(callId)
+        }
         driver.redialChannel = { spies.redialCount += 1 }
-        driver.setRelayAdvertiseEndpoint = { spies.relayAdvertiseCount += 1 }
+        driver.lanPhoneReachable = { spies.lanReachable }
+        driver.setRelayAdvertisePreferred = { spies.advertisePreferences.append($0) }
         driver.clearPendingState = { spies.clearPendingCount += 1 }
         driver.now = { [weak self] in self?.currentDate ?? .distantPast }
         self.driver = driver
@@ -202,10 +208,47 @@ final class MirrorCallTriggerDriverTests: XCTestCase {
     func testCloudBridgeEngagedIsIdempotentUntilReset() {
         driver.handleCloudBridgeEngaged()
         driver.handleCloudBridgeEngaged()
-        XCTAssertEqual(spies.relayAdvertiseCount, 1)
+        XCTAssertEqual(spies.advertisePreferences, [true])
         driver.reset()
         driver.handleCloudBridgeEngaged()
-        XCTAssertEqual(spies.relayAdvertiseCount, 2)
+        XCTAssertEqual(spies.advertisePreferences, [true, true])
+    }
+
+    // The active drive carries the phone.call_status callId (the session's
+    // orphan-stop gate compares it against the engaged call); the terminal
+    // drive clears it.
+    func testActiveForwardsCallIdAndTerminalClearsIt() {
+        driver.handleCallStatus(state: "active", ongoingCallCount: 1, callId: "call-A")
+        driver.handleCallStatus(state: "disconnected", ongoingCallCount: 0)
+        XCTAssertEqual(spies.setCallActiveValues, [true, false])
+        XCTAssertEqual(spies.setCallActiveCallIds, ["call-A", nil])
+    }
+
+    // Live 2026-09-05: a LAN-reachable phone was advertised the cloud
+    // bridge's phone-local sink endpoint (127.0.0.1:15550) and the call
+    // media rode the flaky cloud bridge. When the phone answers on the LAN
+    // (mDNS live peer), engaging the cloud bridge must keep the LAN
+    // advertise (prefer relay = false); losing the peer mid-call flips to
+    // the relay endpoint, and a later sighting flips back.
+    func testLANReachablePhoneKeepsLANAdvertiseWhenCloudBridgeEngages() {
+        spies.lanReachable = true
+        driver.handleCloudBridgeEngaged()
+        XCTAssertEqual(spies.advertisePreferences, [false])
+
+        spies.lanReachable = false
+        driver.handlePhonePeerReachabilityChanged()
+        XCTAssertEqual(spies.advertisePreferences, [false, true])
+
+        spies.lanReachable = true
+        driver.handlePhonePeerReachabilityChanged()
+        XCTAssertEqual(spies.advertisePreferences, [false, true, false])
+    }
+
+    // Reachability changes are inert until the cloud bridge has engaged
+    // (a pure LAN call never touches the relay advertise).
+    func testPeerReachabilityChangeWithoutCloudBridgeDoesNothing() {
+        driver.handlePhonePeerReachabilityChanged()
+        XCTAssertTrue(spies.advertisePreferences.isEmpty)
     }
 
     // Per-call teardown clears the session's pending call state so the next

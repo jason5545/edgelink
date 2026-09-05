@@ -90,8 +90,12 @@ final class LyraMeshAnnouncer {
             LyraTrustedDeviceInfo.Service(name: "miShareBasic", package: "com.edgelink.mac"),
             LyraTrustedDeviceInfo.Service(name: "miLyraShareTransfer", package: "com.edgelink.mac")
         ]
-        // Opt-in while call-relay is groundwork (see LyraMeshResponder).
-        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? false
+        // Default ON since 2026-09-05: without the relayCall advertise the
+        // phone's filtered relay map never contains us (deviceType 14 fails
+        // its 2/4/11 type filter) and the whole call-relay chain is dead.
+        // The f7a9466bc-era cast-channel regression is covered by the
+        // announcer insertion-order rules (see AGENTS.md 2026-08-21).
+        let relayCallEnabled = UserDefaults.standard.object(forKey: "xiaomiRelayCallAdvertise") as? Bool ?? true
         if relayCallEnabled {
             services.append(
                 LyraTrustedDeviceInfo.Service(
