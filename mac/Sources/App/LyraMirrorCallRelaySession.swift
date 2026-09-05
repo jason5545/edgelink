@@ -23,12 +23,20 @@ import Network
 //     IV secret[16..32).
 //   - event 24 MIRROR_CALL_START / event 31 MIRROR_CALL_SINK_START (vUint32
 //     = source port) from us → phone sinks our audio source.
-//   - event 25 MIRROR_CALL_STOP on call end.
+//   - event 25 MIRROR_CALL_STOP on call end. Tears down the phone's
+//     MirrorCallService source+sink (G.Z stops both), so a same-call
+//     channel rebuild must NOT send it (live 2026-09-05) while a stale
+//     engagement from a previous call must (live 2026-09-03) — gated on
+//     pendingCallId == engagementCallId.
 //   - Media: miplaycast RTSP (same dialect as LyraDistAudioWFDServer),
 //     LPCM mode 3 (8 kHz mono — AudioFormats::mTable entry 3) as ff02-framed
 //     PCM in the 0x83 private TS stream, per-PES IV in PES_private_data,
 //     payload prefix min(256, len) & ~15 bytes AES-128-CBC (AESPART,
-//     Encrypt_Type 4).
+//     Encrypt_Type 4). Two routes: LAN-direct (the phone sink dials our
+//     RTSP listener) when the phone answers on the LAN, or relay media (no
+//     listener — RTP to onRelayUplinkPacket, riding the phone.relay.media
+//     envelope chain to the Android bridge's phone-local sink server) when
+//     it does not.
 final class LyraMirrorCallRelaySession {
     // The cast trust session assigns this when it owns a relay session; the
     // relayCall URI handler drives call state through it (same pattern as
@@ -48,6 +56,8 @@ final class LyraMirrorCallRelaySession {
     private static let pendingStateLock = NSLock()
     private static var pendingCallActiveLocked = false
     private static var preferRelayAdvertiseLocked = false
+    private static var pendingCallIdLocked: String?
+    private static var engagementCallIdLocked: String?
 
     static var pendingCallActive: Bool {
         get {
@@ -75,10 +85,48 @@ final class LyraMirrorCallRelaySession {
         }
     }
 
+    // Call identity (phone.call_status callId) of the pending active drive,
+    // written by the driver's setCallActive wiring alongside
+    // pendingCallActive. Cleared on the terminal drive and by
+    // resetPendingCallState(). start() compares it against engagementCallId
+    // to tell a same-call channel rebuild (skip the orphan stop — event 25
+    // tears down the phone's HEALTHY mid-call MirrorCallService source/sink,
+    // live 2026-09-05) from a stale engagement left by a previous call
+    // (keep the stop-first resync, live 2026-09-03).
+    static var pendingCallId: String? {
+        get {
+            pendingStateLock.lock()
+            defer { pendingStateLock.unlock() }
+            return pendingCallIdLocked
+        }
+        set {
+            pendingStateLock.lock()
+            pendingCallIdLocked = newValue
+            pendingStateLock.unlock()
+        }
+    }
+
+    // The callId this Mac last sent event 24/31 for. Cross-call memory: NOT
+    // cleared by resetPendingCallState() — a session dying mid-call leaves
+    // the phone's MirrorCallService source running for THIS call identity.
+    static var engagementCallId: String? {
+        get {
+            pendingStateLock.lock()
+            defer { pendingStateLock.unlock() }
+            return engagementCallIdLocked
+        }
+        set {
+            pendingStateLock.lock()
+            engagementCallIdLocked = newValue
+            pendingStateLock.unlock()
+        }
+    }
+
     static func resetPendingCallState() {
         pendingStateLock.lock()
         pendingCallActiveLocked = false
         preferRelayAdvertiseLocked = false
+        pendingCallIdLocked = nil
         pendingStateLock.unlock()
     }
 
@@ -108,6 +156,27 @@ final class LyraMirrorCallRelaySession {
     // it to the Android call-relay bridge as a source_rtsp hint.
     static var onPhoneSourceEndpointChanged: ((String, Int) -> Void)?
 
+    // Live-LAN probe for the media-route decision: the cloud bridge's
+    // phone-local sink endpoint (127.0.0.1:15550) is advertised only when
+    // the phone does NOT answer on the LAN (mirror precedent 2026-08-13;
+    // live 2026-09-05: a LAN-reachable phone got the relay advertise and the
+    // call media rode the flaky cloud bridge). EdgeLinkRuntime wires this to
+    // XiaomiMiShareDiscovery.hasLivePhonePeer (mDNS live peer, 120s
+    // freshness). That state is main-mutated, so the probe is only ever
+    // invoked on the main thread (see phoneOnLAN()).
+    static var lanPhoneReachable: () -> Bool = { false }
+
+    static func phoneOnLAN() -> Bool {
+        if Thread.isMainThread { return lanPhoneReachable() }
+        return DispatchQueue.main.sync { lanPhoneReachable() }
+    }
+
+    // Relay-mode uplink outlet: the relay media producer hands each RTP
+    // packet (the phone sink's AESPART ff02 LPCM dialect, one per 20 ms
+    // frame) here; EdgeLinkRuntime forwards it into the phone.relay.media
+    // envelope chain (routePhoneRelayUplinkPacket).
+    static var onRelayUplinkPacket: ((Data) -> Void)?
+
     // X.509 SPKI DER prefix for secp256r1 (26 bytes) + 65-byte X9.63 point.
     static let p256SPKIPrefix = Data([
         0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86,
@@ -129,6 +198,17 @@ final class LyraMirrorCallRelaySession {
     private var sharedSecret: Data?
     private var phoneKeyData: (ip: String, port: Int)?
     private(set) var audioSource: LyraMirrorCallAudioSource?
+    // Relay-media producer: exists only while the advertise resolves to the
+    // cloud bridge's phone-local sink endpoint. Same LyraMirrorCallAudioSource
+    // dialect as the LAN path (ff02 LPCM 8k, AESPART CBC with the event-23
+    // ECDH key — the sink refuses to run without it); the RTP goes to
+    // onRelayUplinkPacket instead of a UDP socket.
+    private(set) var relayMediaSource: LyraMirrorCallAudioSource?
+    // Cloud-bridge sink beat (EdgeLinkRuntime's phone.relay.media status
+    // events sink_ready/sink_rtsp_connected → true; sink_rtsp_disconnected/
+    // bridge_failed/bridge_stopped/source_stop → false), applied by
+    // applyRelayMediaStateLocked.
+    private var relayMediaActive = false
     // Advertise-endpoint override for the cloud-relay media route (see
     // relaySinkAdvertisePort). nil = advertise this Mac's en0 IPv4 + the
     // local audio source port (LAN-direct media).
@@ -148,13 +228,28 @@ final class LyraMirrorCallRelaySession {
         queue.async { [weak self] in
             guard let self else { return }
             self.startAudioSourceLocked()
-            // Stop-first resync: a previous session that sent 24/31 but
-            // never got to send 25 (channel release mid-call / at call end)
-            // left the phone's MirrorCallService source running and wedged.
+            // Stop-first resync for a STALE engagement: a previous call's
+            // session that sent 24/31 but never got to send 25 left the
+            // phone's MirrorCallService source running and wedged (live
+            // 2026-09-03: the next call's RTSP SETUP got 400 Bad Request).
+            // A SAME-call channel rebuild (the Mirror app's ~5-7s idle
+            // auto-release, live 2026-09-05) must NOT send 25: on the real
+            // phone it tears down the healthy mid-call source+sink (G.Z
+            // stops both), so every flap killed the call media.
             if Self.phoneMirrorCallEngaged {
-                Self.phoneMirrorCallEngaged = false
-                self.sendSimpleEventLocked(event: 25)
-                DiagnosticsLog.info("xiaomi.mirrorcall.orphan_stop_tx")
+                let sameCall = Self.engagementCallId != nil
+                    && Self.pendingCallId != nil
+                    && Self.engagementCallId == Self.pendingCallId
+                if sameCall {
+                    DiagnosticsLog.info(
+                        "xiaomi.mirrorcall.orphan_stop_skipped callId=\(Self.pendingCallId ?? "nil")"
+                    )
+                } else {
+                    Self.phoneMirrorCallEngaged = false
+                    Self.engagementCallId = nil
+                    self.sendSimpleEventLocked(event: 25)
+                    DiagnosticsLog.info("xiaomi.mirrorcall.orphan_stop_tx")
+                }
             }
             self.replyKeyDataLocked()
             Self.activeSession = self
@@ -179,6 +274,9 @@ final class LyraMirrorCallRelaySession {
             guard let self else { return }
             self.audioSource?.stop()
             self.audioSource = nil
+            self.relayMediaSource?.stop()
+            self.relayMediaSource = nil
+            self.relayMediaActive = false
             self.sharedSecret = nil
             self.callActive = false
             self.sinkStartSent = false
@@ -211,12 +309,7 @@ final class LyraMirrorCallRelaySession {
             phoneKeyData = (keyData.p2pIp, keyData.port)
             Self.activeSession = self
             startAudioSourceLocked()
-            if let secret = sharedSecret {
-                audioSource?.arm(
-                    mediaKey: Data(secret.prefix(16)),
-                    mediaIV: Data(secret.dropFirst(16).prefix(16))
-                )
-            }
+            armSourcesLocked()
             // The phone's own source endpoint (its KeyData p2pIp/port) is
             // the ONLY place the real port shows up: MirrorCallService's
             // getUnUsedPort walk skips occupied ports (+3 each), so the
@@ -241,9 +334,11 @@ final class LyraMirrorCallRelaySession {
             if callActive {
                 sendCallStartIfReadyLocked()
             }
+            applyRelayMediaStateLocked()
         case 25:  // MIRROR_CALL_STOP from the phone
             DiagnosticsLog.info("xiaomi.mirrorcall.phone_stop")
             audioSource?.stopMedia()
+            relayMediaSource?.stopMedia()
         default:
             break
         }
@@ -269,36 +364,37 @@ final class LyraMirrorCallRelaySession {
         sendSimpleEventLocked(event: 24)
         sendSimpleEventLocked(event: 31, uint32Value: UInt32(port))
         Self.phoneMirrorCallEngaged = true
+        Self.engagementCallId = Self.pendingCallId
         DiagnosticsLog.info(
             "xiaomi.mirrorcall.call_active sourcePort=\(port) " +
                 "advertise=\(advertisedEndpointLocked().map { "\($0.host):\($0.port)" } ?? "lan")"
         )
     }
 
-    // Cloud bridge engaged: advertise the phone-local sink endpoint
-    // (127.0.0.1:15550, see relaySinkAdvertisePort) instead of our own
-    // listener. With keys already exchanged this re-sends event 23 — the
-    // phone re-ECDHs against the unchanged local key, so the shared secret
-    // is stable — and re-arms the sink start for an active call so event
-    // 31 carries the new port.
+    // Media-route decision (cloud bridge engaged / peer reachability
+    // changed): nil advertises this Mac's en0 IPv4 + the local audio source
+    // port (LAN-direct media), the loopback tuple advertises the Android
+    // bridge's phone-local sink endpoint (127.0.0.1:15550, see
+    // relaySinkAdvertisePort). The resolution is re-evaluated against live
+    // LAN reachability, and with keys already exchanged this re-sends event
+    // 23 — the phone re-ECDHs against the unchanged local key, so the shared
+    // secret is stable — and re-arms the sink start for an active call so
+    // event 31 carries the new port.
     func setAdvertiseEndpoint(_ endpoint: (host: String, port: UInt16)?) {
         queue.async { [weak self] in
             guard let self else { return }
             self.advertiseEndpoint = endpoint
-            if endpoint != nil, let source = self.audioSource {
-                // The local listener is pointless once the advertised
-                // endpoint is phone-local (the uplink rides the
-                // secure-session envelope chain to the Android sink
-                // server instead).
-                source.stop()
-                self.audioSource = nil
-            }
-            guard endpoint != nil, self.sharedSecret != nil else { return }
+            // Swap the media producer for the resolved route (a mid-call
+            // flip to LAN re-creates the listener here; a flip to relay
+            // tears it down and keeps the envelope-chain producer).
+            self.startAudioSourceLocked()
+            guard self.sharedSecret != nil else { return }
             self.replyKeyDataLocked()
             if self.callActive {
                 self.sinkStartSent = false
                 self.sendCallStartIfReadyLocked()
             }
+            self.applyRelayMediaStateLocked()
         }
     }
 
@@ -314,20 +410,68 @@ final class LyraMirrorCallRelaySession {
                 // phone's event 23 asynchronously); the event-23 handler
                 // re-runs sendCallStartIfReadyLocked when the keys land.
                 self.sendCallStartIfReadyLocked()
+                self.applyRelayMediaStateLocked()
             } else {
                 self.sinkStartSent = false
                 self.sendSimpleEventLocked(event: 25)
                 Self.phoneMirrorCallEngaged = false
+                Self.engagementCallId = nil
+                self.relayMediaActive = false
                 self.audioSource?.stopMedia()
+                self.relayMediaSource?.stopMedia()
                 DiagnosticsLog.info("xiaomi.mirrorcall.call_inactive")
             }
         }
     }
 
+    // Cloud-bridge sink beats (EdgeLinkRuntime's phone.relay.media status):
+    // sink_ready/sink_rtsp_connected → true; sink_rtsp_disconnected/
+    // bridge_failed/bridge_stopped/source_stop → false. Media runs only
+    // while active && callActive && the advertise actually resolved to the
+    // relay endpoint (a LAN-advertised call never takes this path).
+    func setRelayMediaActive(_ active: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.relayMediaActive = active
+            self.applyRelayMediaStateLocked()
+        }
+    }
+
+    private func applyRelayMediaStateLocked() {
+        guard relayMediaActive, callActive, sharedSecret != nil,
+              resolvedRelayAdvertiseLocked() != nil, let source = relayMediaSource
+        else {
+            relayMediaSource?.stopMedia()
+            return
+        }
+        source.startRelayMedia()
+    }
+
     private func startAudioSourceLocked() {
-        // Relay-advertise mode carries the uplink over the secure-session
-        // envelope chain to the phone-local sink server; no local listener.
-        guard advertiseEndpoint == nil, !Self.preferRelayAdvertise else { return }
+        if resolvedRelayAdvertiseLocked() != nil {
+            // Relay media: no local RTSP listener — the phone's sink pulls
+            // from the Android bridge's phone-local server; our uplink
+            // producer speaks the sink's only dialect (ff02-framed LPCM 8k,
+            // AESPART CBC with the event-23 ECDH key) into the
+            // secure-session envelope chain.
+            if let source = audioSource {
+                source.stop()
+                audioSource = nil
+            }
+            if relayMediaSource == nil {
+                let source = LyraMirrorCallAudioSource()
+                source.relayPacketHandler = { packet in Self.onRelayUplinkPacket?(packet) }
+                relayMediaSource = source
+                armSourcesLocked()
+            }
+            applyRelayMediaStateLocked()
+            return
+        }
+        if let source = relayMediaSource {
+            relayMediaActive = false
+            source.stop()
+            relayMediaSource = nil
+        }
         guard audioSource == nil else { return }
         let source = LyraMirrorCallAudioSource()
         do {
@@ -338,13 +482,35 @@ final class LyraMirrorCallRelaySession {
         }
     }
 
-    // The endpoint the next event-23 KeyData advertises: the explicit relay
-    // override once set, else the driver's relay preference (the cloud bridge
-    // engaged before this session existed), else this Mac's en0 IPv4 + the
-    // local audio source port (LAN-direct media).
-    private func advertisedEndpointLocked() -> (host: String, port: UInt16)? {
+    private func armSourcesLocked() {
+        guard let sharedSecret else { return }
+        let key = Data(sharedSecret.prefix(16))
+        let iv = Data(sharedSecret.dropFirst(16).prefix(16))
+        audioSource?.arm(mediaKey: key, mediaIV: iv)
+        relayMediaSource?.arm(mediaKey: key, mediaIV: iv)
+    }
+
+    // The relay advertise endpoint when the media route is the cloud
+    // bridge's phone-local sink server, else nil. Re-evaluated at use time
+    // against live LAN reachability: a phone that answers on the LAN (mDNS
+    // live peer, 120s freshness) always takes LAN-direct media, even when a
+    // relay preference/override was written while it was off the LAN (live
+    // 2026-09-05: a LAN-reachable phone was advertised 127.0.0.1:15550 and
+    // the call media rode the flaky cloud bridge).
+    private func resolvedRelayAdvertiseLocked() -> (host: String, port: UInt16)? {
+        guard !Self.phoneOnLAN() else { return nil }
         if let advertiseEndpoint { return advertiseEndpoint }
         if Self.preferRelayAdvertise { return ("127.0.0.1", Self.relaySinkAdvertisePort) }
+        return nil
+    }
+
+    // The endpoint the next event-23 KeyData advertises: the resolved relay
+    // endpoint (explicit override, else the driver's relay preference — the
+    // cloud bridge engaged before this session existed), gated on the phone
+    // NOT answering on the LAN; else this Mac's en0 IPv4 + the local audio
+    // source port (LAN-direct media).
+    private func advertisedEndpointLocked() -> (host: String, port: UInt16)? {
+        if let relay = resolvedRelayAdvertiseLocked() { return relay }
         guard let port = audioSource?.port, port != 0 else { return nil }
         return (Self.primaryIPv4Address() ?? "", port)
     }
@@ -421,6 +587,12 @@ final class LyraMirrorCallRelaySession {
 // LyraDistAudioWFDServer dialect) + ff02 PCM MPEG-TS media plane with
 // AESPART CBC encryption. Mic capture at 8 kHz mono; tests inject PCM via
 // write(pcm:) directly.
+//
+// Two output modes: LAN-direct (RTSP listener + UDP media + RTCP SRs, the
+// phone sink dials us) and relay media (relayPacketHandler set — no
+// listener, no RTCP; the Android cloud bridge terminates the sink's RTSP
+// phone-side and sends its own SRs, and our RTP rides the secure-session
+// envelope chain to its phone-local sink server).
 final class LyraMirrorCallAudioSource {
     // nil until the phone's event-23 KeyData completes the ECDH exchange
     // (arm()); media frames are dropped while unarmed.
@@ -451,7 +623,14 @@ final class LyraMirrorCallAudioSource {
     private var tsContinuity: UInt8 = 0
     private var psiContinuity: UInt8 = 0
     private var auIndex: UInt64 = 0
-    private var mediaRunning = false
+    private(set) var mediaRunning = false
+
+    // Relay-media mode: when set, finished RTP packets go here instead of a
+    // media UDP connection. Assigned right after init, before any media run.
+    var relayPacketHandler: ((Data) -> Void)?
+    // Tests disable mic capture so write(pcm:) is the only PCM source (a
+    // live mic tap would interleave nondeterministic frames).
+    var captureEnabled = true
 
     private enum Stage {
         case awaitM1Response
@@ -502,7 +681,26 @@ final class LyraMirrorCallAudioSource {
         }
     }
 
+    // Relay-media producer mode (no RTSP listener, no RTCP — the Android
+    // cloud bridge terminates the phone sink's RTSP phone-side and sends its
+    // own RTCP SRs): PCM → ff02 → AESPART → PES/TS → RTP, one packet per
+    // 20 ms frame, delivered to relayPacketHandler. Requires the event-23
+    // ECDH arm — the phone sink always decrypts (jadx: "startAudioSink, mKey
+    // is null" guard), so the retired plaintext 48kHz AAC uplink was never
+    // audible (live 2026-09-05).
+    func startRelayMedia() {
+        queue.async { [weak self] in
+            guard let self, !self.mediaRunning, self.armed, self.mediaKey != nil else { return }
+            self.mediaRunning = true
+            self.startCaptureLocked()
+            DiagnosticsLog.info("xiaomi.mirrorcall.relay_media_start")
+        }
+    }
+
     private func stopMediaLocked() {
+        if mediaRunning, relayPacketHandler != nil {
+            DiagnosticsLog.info("xiaomi.mirrorcall.relay_media_stop packets=\(auIndex)")
+        }
         mediaRunning = false
         engine?.stop()
         engine?.inputNode.removeTap(onBus: 0)
@@ -795,6 +993,7 @@ final class LyraMirrorCallAudioSource {
     }
 
     private func startCaptureLocked() {
+        guard captureEnabled else { return }
         let engine = AVAudioEngine()
         self.engine = engine
         let input = engine.inputNode
@@ -875,6 +1074,10 @@ final class LyraMirrorCallAudioSource {
             DiagnosticsLog.info(
                 "xiaomi.mirrorcall.au_send n=\(auIndex) pcmBytes=\(pcm.count) rtpBytes=\(packet.count)"
             )
+        }
+        if let relayPacketHandler {
+            relayPacketHandler(packet)
+            return
         }
         mediaConnection?.send(content: packet, completion: .contentProcessed { [weak self] error in
             if let error {

@@ -55,7 +55,9 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
                      forKey: "xiaomiTrustCredCertHex")
         defaults.set(credKey.rawRepresentation.map { String(format: "%02x", $0) }.joined(),
                      forKey: "xiaomiTrustCredPrivHex")
-        defaults.set(true, forKey: "xiaomiRelayCallAdvertise")
+        // relayCall advertise is the production default now (the pin
+        // experiment 2026-09-05); resolve() must see it ON with no flag set.
+        defaults.removeObject(forKey: "xiaomiRelayCallAdvertise")
         // The mock phone signs AuthHandshake client_finished with its account
         // identity (Mijia cert fixture) — seed it like the production default.
         defaults.set(
@@ -183,6 +185,111 @@ final class LyraPhoneServerIntegrationTests: XCTestCase {
         phone.relayCall.sendRing(number: "0912345678")
         waitFor("ring response") {
             self.phone.relayCall.lastRingResponse?.contains("\"code\":200") == true
+        }
+        announcer?.stop()
+        announcer = nil
+    }
+
+    // 2026-09-05: the phone never switches call-audio routing for us because
+    // our deviceType 14 fails TeleService's relay filter (2/4/11) — the only
+    // exemption is the pref_device_answered pin, written ONLY by
+    // handleRelayOperate(operateType=0) when a relayed call is answered on
+    // the device. Reproduce: ring the Mac over the relayCall channel, answer
+    // the call Mac-side, and the phone must receive relay://operate
+    // {operateType:0} and pin our deviceId.
+    func testIncomingCallAnswerSendsOperateAnswerAndPhonePinsDevice() throws {
+        phone = try makePhone()
+        let phonePort = try XCTUnwrap(phone.boundPort)
+
+        announcer = LyraMeshAnnouncer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        announcer?.start(host: "127.0.0.1", port: phonePort)
+
+        waitFor("Mac online in oracle") {
+            self.phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        waitFor("relayCall channel up") {
+            self.phone.relayCall.state == .channelUp
+        }
+        phone.relayCall.sendRing(number: "0912345678")
+        waitFor("ring answered, connection relayed") {
+            self.phone.relayCall.relayedNumbers.contains("0912345678")
+        }
+
+        // The user answers the incoming call on the Mac UI.
+        LyraRelayCallSession.noteIncomingCallAnswered(address: "0912345678")
+
+        waitFor("operate(0) received by phone") {
+            self.phone.relayCall.operateRequests.contains(
+                LyraRelayCallRole.OperateRequest(
+                    operateType: 0, address: "0912345678", requestDeviceId: "721572C3"
+                )
+            )
+        }
+        waitFor("phone pins answered device") {
+            self.phone.relayCall.answeredDeviceId == "721572C3"
+        }
+        waitFor("operate response 200 back at the Mac") {
+            LyraRelayCallSession.activeRelaySession?.lastOperateResponseCode == 200
+        }
+        announcer?.stop()
+        announcer = nil
+    }
+
+    // The phone's gate: operate(0) without a relayed connection (no ring was
+    // ever sent, e.g. a fresh phone whose filter never included us) fails
+    // with 500 and must NOT pin. Sending it is still harmless — this is the
+    // bootstrap dead-end documented in AGENTS.md.
+    func testOperateAnswerWithoutRingRejectedAndNotPinned() throws {
+        phone = try makePhone()
+        let phonePort = try XCTUnwrap(phone.boundPort)
+
+        announcer = LyraMeshAnnouncer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        announcer?.start(host: "127.0.0.1", port: phonePort)
+
+        waitFor("Mac online in oracle") {
+            self.phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
+        }
+        XCTAssertTrue(phone.dialRelayCallIfOnline())
+        waitFor("relayCall channel up") {
+            self.phone.relayCall.state == .channelUp
+        }
+
+        LyraRelayCallSession.noteIncomingCallAnswered(address: "0912345678")
+
+        waitFor("operate(0) received by phone") {
+            !self.phone.relayCall.operateRequests.isEmpty
+        }
+        waitFor("operate rejected 500") {
+            LyraRelayCallSession.activeRelaySession?.lastOperateResponseCode == 500
+        }
+        XCTAssertNil(phone.relayCall.answeredDeviceId)
+        announcer?.stop()
+        announcer = nil
+    }
+
+    // Regression pin for the 2026-09-05 change: relayCall must be advertised
+    // by DEFAULT (no xiaomiRelayCallAdvertise flag) or the phone's filtered
+    // relay map never contains us and the whole call-relay chain is dead.
+    func testRelayCallAdvertisedByDefault() throws {
+        UserDefaults.standard.removeObject(forKey: "xiaomiRelayCallAdvertise")
+        phone = try makePhone()
+        let phonePort = try XCTUnwrap(phone.boundPort)
+
+        announcer = LyraMeshAnnouncer(
+            deviceIdHexProvider: { "721572C3" },
+            displayNameProvider: { "MacBook Pro" }
+        )
+        announcer?.start(host: "127.0.0.1", port: phonePort)
+
+        waitFor("Mac online with relayCall by default") {
+            self.phone.oracle.onlineDevices().contains { $0.device.hasService("relayCall") }
         }
         announcer?.stop()
         announcer = nil

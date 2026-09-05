@@ -15,9 +15,9 @@ import Foundation
 //
 // The drives are state-based, not exactly-once: the closures write
 // LyraMirrorCallRelaySession's pending state (pendingCallActive /
-// preferRelayAdvertise), which a session built AFTER the drive applies in
-// start() — firing into a nil activeSession used to drop the whole call's
-// audio (live 2026-09-02).
+// pendingCallId / preferRelayAdvertise), which a session built AFTER the
+// drive applies in start() — firing into a nil activeSession used to drop
+// the whole call's audio (live 2026-09-02).
 @MainActor
 final class MirrorCallTriggerDriver {
     var hasCastSession: () -> Bool = { false }
@@ -27,9 +27,18 @@ final class MirrorCallTriggerDriver {
     var castChannelNeedsRedial: () -> Bool = { false }
     var isMirrorFlowBusy: () -> Bool = { false }
     var ensureChannel: (String) -> Void = { _ in }
-    var setCallActive: (Bool) -> Void = { _ in }
+    // (active, callId): the callId is the phone.call_status identity of the
+    // call going active — the session's orphan-stop gate compares it against
+    // the call that last engaged the phone's MirrorCallService (a same-call
+    // channel rebuild must NOT send event 25, live 2026-09-05).
+    var setCallActive: (Bool, String?) -> Void = { _, _ in }
     var redialChannel: () -> Void = {}
-    var setRelayAdvertiseEndpoint: () -> Void = {}
+    // Live-LAN probe (mDNS phone peer, 120s freshness) for the media-route
+    // decision — wired to XiaomiMiShareDiscovery.hasLivePhonePeer.
+    var lanPhoneReachable: () -> Bool = { false }
+    // true = advertise the cloud bridge's phone-local sink endpoint
+    // (127.0.0.1:15550); false = LAN-direct (en0 + local source port).
+    var setRelayAdvertisePreferred: (Bool) -> Void = { _ in }
     var clearPendingState: () -> Void = {}
     var ensureMinInterval: TimeInterval = 3
     var now: () -> Date = Date.init
@@ -40,7 +49,7 @@ final class MirrorCallTriggerDriver {
     private static let ongoingStates: Set<String> = ["ringing", "dialing", "connecting", "active", "held"]
     private static let terminalStates: Set<String> = ["disconnected", "disconnecting", "ended", "all"]
 
-    func handleCallStatus(state: String, ongoingCallCount: Int) {
+    func handleCallStatus(state: String, ongoingCallCount: Int, callId: String? = nil) {
         if Self.ongoingStates.contains(state) {
             if !hasCastSession() {
                 ensureChannelThrottled(reason: "call_audio")
@@ -57,7 +66,7 @@ final class MirrorCallTriggerDriver {
             // Forwarded on every active status (details_changed repeats
             // them): the closure writes the pending state a late-built
             // session applies, and the session dedupes no-change drives.
-            setCallActive(true)
+            setCallActive(true, callId)
         }
         if Self.terminalStates.contains(state), ongoingCallCount == 0 {
             // stopPhoneCallRelayAudio (which resets this driver) runs inside
@@ -65,7 +74,7 @@ final class MirrorCallTriggerDriver {
             // the stop drive must reach the session even when this call
             // never went active here — LyraMirrorCallRelaySession dedupes a
             // stop for a call that never started.
-            setCallActive(false)
+            setCallActive(false, nil)
         }
     }
 
@@ -99,14 +108,31 @@ final class MirrorCallTriggerDriver {
         ensureChannel("call_audio_session_finished")
     }
 
-    // The Android cloud bridge's phone-local RTSP sink server is up: the
-    // Mac mic uplink reaches the phone's MirrorCallService sink through
-    // it, so the mirror-call KeyData must advertise that endpoint.
+    // The Android cloud bridge's phone-local RTSP sink server is up: over
+    // the relay the Mac mic uplink reaches the phone's MirrorCallService
+    // sink through it. The media route is re-resolved here: a LAN-reachable
+    // phone takes LAN-direct media (mirror precedent 2026-08-13) even with
+    // the bridge engaged — advertising 127.0.0.1:15550 to a LAN phone forced
+    // the media through the flaky cloud bridge (live 2026-09-05).
     func handleCloudBridgeEngaged() {
         guard !cloudBridgeEngaged else { return }
         cloudBridgeEngaged = true
-        setRelayAdvertiseEndpoint()
-        DiagnosticsLog.info("xiaomi.mirrorcall.advertise_relay")
+        applyAdvertisePreference()
+    }
+
+    // mDNS phone-peer sightings/removals mid-call (the discovery snapshot
+    // handler fires this): re-resolve the media route while the cloud bridge
+    // is engaged, so a phone moving on/off the LAN flips the advertise
+    // (setAdvertiseEndpoint re-sends event 23 and re-arms 24/31).
+    func handlePhonePeerReachabilityChanged() {
+        guard cloudBridgeEngaged else { return }
+        applyAdvertisePreference()
+    }
+
+    private func applyAdvertisePreference() {
+        let preferRelay = !lanPhoneReachable()
+        DiagnosticsLog.info("xiaomi.mirrorcall.advertise_relay prefer_relay=\(preferRelay)")
+        setRelayAdvertisePreferred(preferRelay)
     }
 
     func reset() {
