@@ -293,6 +293,31 @@ final class LyraRelayDialOverRelayTests: XCTestCase {
             outcomes.value == [false]
         }
     }
+
+    // Hangup mid-dial must kill the dial silently: reporting false at the
+    // later timeout would fire the runtime's bridge-dial fallback and place
+    // a ghost call AFTER the hangup (live 2026-09-06 15:14).
+    func testCancelPendingDialSuppressesOutcomeAndTimeout() async throws {
+        startDialer()
+        let dialer = try XCTUnwrap(self.dialer)
+        let savedTimeout = LyraRelayCallDialer.overallTimeout
+        LyraRelayCallDialer.overallTimeout = 1.5
+        defer { LyraRelayCallDialer.overallTimeout = savedTimeout }
+
+        let outcomes = LockedBox<[Bool]>([])
+        dialer.onDialOutcome = { sent in outcomes.with { $0.append(sent) } }
+        // Nothing listens on 127.0.0.1:9 — the dial sits in .idle forever.
+        dialer.dial(number: "800", host: "127.0.0.1", ports: [9])
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        dialer.cancelPendingDial()
+        await waitFor("dialer back to idle with host cleared", timeout: 10) {
+            dialer.state == .idle
+        }
+        // Wait past the original timeout deadline: no outcome may surface.
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertEqual(outcomes.value, [], "cancel must suppress the outcome entirely")
+    }
 }
 
 // MARK: - Loopback relay channel pair (worker stand-in; same shape as the

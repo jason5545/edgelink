@@ -95,17 +95,20 @@ class MiLinkPrivilegeHookPolicyTest {
     }
 
     @Test
-    fun noLongerHooksAudioMonitor() {
-        // The call uplink rides the native DistAudio/PHONERELAY paths; the
-        // in-process LSPosed feed inside audiomonitor, its fallback, and the
-        // root Shizuku injector were all removed, so the module must
-        // not load into com.miui.audiomonitor anymore.
-        assertFalse(
+    fun hooksAudioMonitorForDistRpcRetry() {
+        // The DAS lives in the audiomonitor process and drops
+        // openSpeaker/openMicrophone RPCs when the channel to the remote
+        // device is not up yet (setServiceForDevice → mRpcInt=null, no
+        // retry); the replay hook must load there (live 2026-09-06 15:28:
+        // whole call silent both ways on this race).
+        assertTrue(
             MiLinkPrivilegeHookPolicy.shouldHook(
                 packageName = "com.miui.audiomonitor",
                 processName = "com.miui.audiomonitor"
             )
         )
+        assertTrue(MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor("com.miui.audiomonitor"))
+        assertFalse(MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor("com.miui.audioservice"))
     }
 
     @Test

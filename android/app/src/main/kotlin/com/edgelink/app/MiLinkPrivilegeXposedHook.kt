@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
@@ -27,6 +28,7 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
     const val IN_CALL_UI_PACKAGE = "com.android.incallui"
     const val TELEPHONY_PACKAGE = "com.android.phone"
+    const val AUDIO_MONITOR_PACKAGE = "com.miui.audiomonitor"
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
@@ -62,7 +64,11 @@ internal object MiLinkPrivilegeHookPolicy {
             shouldHookAndroidSystem(packageName, processName) ||
             shouldHookMiShare(packageName, processName) ||
             shouldHookInCallUI(packageName) ||
-            shouldHookTeleService(packageName)
+            shouldHookTeleService(packageName) ||
+            shouldHookAudioMonitor(packageName)
+
+    fun shouldHookAudioMonitor(packageName: String?): Boolean =
+        packageName == AUDIO_MONITOR_PACKAGE
 
     fun shouldHookInCallUI(packageName: String?): Boolean =
         packageName == IN_CALL_UI_PACKAGE
@@ -171,6 +177,9 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         if (MiLinkPrivilegeHookPolicy.shouldHookTeleService(packageName)) {
             hookTeleServiceRelayAudioConnect(classLoader)
         }
+        if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(packageName)) {
+            hookAudioMonitorDistRpcRetry(classLoader)
+        }
     }
 
     // TeleService never arms mConnectRelayAudio for outgoing relay dials:
@@ -255,6 +264,121 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         return map.keys.joinToString(",") { key ->
             val info = key?.toString() ?: "null"
             info
+        }
+    }
+
+    // com.miui.audiomonitor DAS drops the openSpeaker/openMicrophone RPCs when
+    // the RPC channel to the remote device is not up yet:
+    // connectDistAudioDevice → DistRpcClient.setServiceForDevice(deviceId)
+    // only maps services already in DeviceToService (filled by
+    // onServiceConnected), and every rpc*() reads volatile mRpcInt and
+    // silently returns on null — no retry (live 2026-09-06 15:28: call went
+    // ACTIVE, connectDistAudioDevice ran 2s BEFORE the channel negotiated →
+    // "no RPC service to device" + "rpc service is null" → the phone muted
+    // itself while the Mac never got the RPCs: silent on both ends for the
+    // whole call). Stash the dropped open calls and replay them from
+    // onServiceConnected after re-running setServiceForDevice.
+    private class PendingDistRpc(
+        val method: Method,
+        val args: List<Any?>,
+        val stashedAtMs: Long
+    )
+
+    private fun hookAudioMonitorDistRpcRetry(classLoader: ClassLoader) {
+        runCatching {
+            val clientClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.message.DistRpcClient"
+            )
+            val hwInfoClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.data.DistHardwareInfo"
+            )
+            val rpcInterfaceClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.message.DistRpcInterface"
+            )
+            val rpcIntField = clientClass.getDeclaredField("mRpcInt").apply { isAccessible = true }
+            val setServiceForDevice =
+                resolveMethod(clientClass, "setServiceForDevice", String::class.java)
+            val rpcOpenSpeaker = resolveMethod(
+                clientClass, "rpcOpenSpeaker",
+                String::class.java, hwInfoClass,
+                Boolean::class.javaPrimitiveType!!, String::class.java,
+                Int::class.javaPrimitiveType!!, String::class.java
+            )
+            val rpcOpenMicrophone = resolveMethod(
+                clientClass, "rpcOpenMicrophone",
+                String::class.java, hwInfoClass, Boolean::class.javaPrimitiveType!!
+            )
+
+            val lock = Any()
+            val stashed = mutableListOf<PendingDistRpc>()
+            val stashTtlMs = 30_000L
+
+            fun currentRpc(client: Any): Any? = rpcIntField.get(client)
+
+            installHook(setServiceForDevice) { chain ->
+                val result = chain.proceed()
+                val client = chain.thisObject
+                if (client != null && currentRpc(client) == null) {
+                    log("audiomonitor dist rpc no service yet device=${chain.args.getOrNull(0)}")
+                }
+                result
+            }
+
+            fun stashIfDead(client: Any?, method: Method, args: List<Any?>): Boolean {
+                if (client == null || currentRpc(client) != null) return false
+                synchronized(lock) {
+                    stashed.removeAll { it.method.name == method.name }
+                    stashed.add(PendingDistRpc(method, args, SystemClock.elapsedRealtime()))
+                }
+                log("audiomonitor dist rpc stashed ${method.name}")
+                return true
+            }
+
+            installHook(rpcOpenSpeaker) { chain ->
+                if (stashIfDead(chain.thisObject, rpcOpenSpeaker, chain.args)) null
+                else chain.proceed()
+            }
+            installHook(rpcOpenMicrophone) { chain ->
+                if (stashIfDead(chain.thisObject, rpcOpenMicrophone, chain.args)) null
+                else chain.proceed()
+            }
+
+            installHook(
+                resolveMethod(clientClass, "onServiceConnected", rpcInterfaceClass, String::class.java)
+            ) { chain ->
+                val result = chain.proceed()
+                val client = chain.thisObject
+                val deviceId = chain.args.getOrNull(1) as? String
+                if (client != null && deviceId != null && currentRpc(client) == null) {
+                    runCatching { setServiceForDevice.invoke(client, deviceId) }
+                }
+                val replay: List<PendingDistRpc>
+                synchronized(lock) {
+                    val now = SystemClock.elapsedRealtime()
+                    stashed.removeAll { now - it.stashedAtMs > stashTtlMs }
+                    replay = stashed.toList()
+                    stashed.clear()
+                }
+                for (pending in replay) {
+                    if (client == null) break
+                    runCatching { pending.method.invoke(client, *pending.args.toTypedArray()) }
+                        .onSuccess {
+                            log("audiomonitor dist rpc replayed ${pending.method.name}")
+                        }
+                        .onFailure { error ->
+                            log(
+                                "audiomonitor dist rpc replay failed ${pending.method.name}: " +
+                                    "${error.javaClass.simpleName}: ${error.message}"
+                            )
+                        }
+                }
+                result
+            }
+        }.onFailure { error ->
+            log(
+                "failed to hook audiomonitor dist rpc retry: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
         }
     }
 

@@ -1540,7 +1540,8 @@ final class EdgeLinkRuntime: ObservableObject {
 
     @discardableResult
     func hangUpPhoneCall() -> String? {
-        sendPhoneAction(action: "hangup")
+        relayCallDialer?.cancelPendingDial()
+        return sendPhoneAction(action: "hangup")
     }
 
     /// 通話中即時送鍵（IVR）的唯一入口：每個按鍵各自一個 dtmf action。

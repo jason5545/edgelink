@@ -155,6 +155,24 @@ final class LyraRelayCallDialer {
         }
     }
 
+    // User hangup while a dial is still in flight: tear down without
+    // reporting an outcome — reporting false here would fire the bridge-dial
+    // fallback and place the call AFTER the hangup (live 2026-09-06 15:14:
+    // LAN dial black-holed, user hung up mid-dial, the timeout-driven
+    // fallback would have dialed anyway). .idle with host set IS in-flight:
+    // a black-holed phys sync never leaves .idle. A dial that already
+    // reached the phone (.done/.channelUp) is left alone — the envelope
+    // hangup covers it.
+    func cancelPendingDial() {
+        queue.async { [weak self] in
+            guard let self, self.host != nil, self.state != .done, self.state != .channelUp
+            else { return }
+            DiagnosticsLog.info("xiaomi.relaydial.cancel_pending state=\(self.state)")
+            self.outcomeReported = true
+            self.stopLocked()
+        }
+    }
+
     private var outcomeReported = false
 
     private(set) static var activeDialer: LyraRelayCallDialer?
