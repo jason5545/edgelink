@@ -330,6 +330,15 @@ object AndroidCallRelayBridge {
         )
         private var socket: Socket? = null
         private var writer: BufferedWriter? = null
+        // Port of the currently connected source RTSP control connection.
+        // A live hint with a different port means the phone restarted its
+        // MirrorCallService source (getUnUsedPort +3 walk) after a
+        // cast-channel flap; the abandoned server keeps answering RTSP and
+        // streams silence, so the bridge must follow the hint
+        // (live 2026-09-06 08:31: source 7120→7123 after the 52011 flap,
+        // bridge pinned to 7120 → downlink silence for the rest of the call).
+        @Volatile
+        private var connectedSourcePort: Int? = null
         private var udpSocket: DatagramSocket? = null
         private var tcpBuffer = ByteArray(0)
         private var nextCSeq = 1
@@ -387,6 +396,7 @@ object AndroidCallRelayBridge {
                         runCatching { socket?.close() }
                         writer = null
                         socket = null
+                        connectedSourcePort = null
                     }
                     if (currentCoroutineContext().isActive) {
                         delay(200)
@@ -410,13 +420,29 @@ object AndroidCallRelayBridge {
                 return
             }
             val normalizedHost = host?.trim()?.takeIf { it.isNotEmpty() }
-            if (socket != null) {
-                // The source is already connected — never tear down a live
-                // RTSP control connection on a late hint.
+            val current = socket
+            if (current != null) {
+                if (port == connectedSourcePort) {
+                    // Same source re-announced (e.g. a duplicate KeyData) —
+                    // never tear down a live RTSP control connection for it.
+                    log(
+                        "callrelay.android.local_rtsp_source_hint sessionId=$relaySessionId " +
+                            "host=${normalizedHost ?: "-"} port=$port ignored=already_connected"
+                    )
+                    return
+                }
+                // The hint moved: the phone restarted its source on a new
+                // port and the currently connected one is the abandoned
+                // server (still answering RTSP, streaming silence). Store
+                // the hint so it leads the next connect round, then drop
+                // the stale socket — the run loop reconnects immediately.
+                sourceEndpointHint = normalizedHost to port
                 log(
                     "callrelay.android.local_rtsp_source_hint sessionId=$relaySessionId " +
-                        "host=${normalizedHost ?: "-"} port=$port ignored=already_connected"
+                        "host=${normalizedHost ?: "-"} port=$port reconnect=hint_moved " +
+                        "was=$connectedSourcePort"
                 )
+                runCatching { current.close() }
                 return
             }
             sourceEndpointHint = normalizedHost to port
@@ -467,6 +493,7 @@ object AndroidCallRelayBridge {
                                 nextSocket.connect(InetSocketAddress(host, port), 1_500)
                                 nextSocket.soTimeout = 2_000
                                 socket = nextSocket
+                                connectedSourcePort = port
                                 writer = BufferedWriter(OutputStreamWriter(nextSocket.getOutputStream(), rtspCharset))
                                 log(
                                     "callrelay.android.local_rtsp_connected host=$host port=$port attempt=$attempt"

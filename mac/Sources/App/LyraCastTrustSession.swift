@@ -412,6 +412,28 @@ final class LyraCastTrustSession {
         }
     }
 
+    // Send for adopted DistAudio/DistHardware service conns. The phone's
+    // dial can arrive on an inbound connection (it dialed our listener —
+    // the 2026-08-27 miShare case) OR ride THIS session's own outbound
+    // phys conn (score-based reuse — live 2026-09-06 11:49: the DistAudio
+    // sync_info arrived from the phone's mesh port on our dialed
+    // connection; sendInboundAsync found no matching inbound connection
+    // and its try? silently black-holed every reply, the phone hit its
+    // ~15s kcp timeout and redialed, and the call's distaudio route never
+    // carried audio). Try the inbound connection first; when the arrival
+    // endpoint is not inbound, it IS this session's dial endpoint, so the
+    // session's own send reaches the phone through the arrival conn.
+    private func sendAdoptedServiceFrame(frame: LyraMeshPack.Frame, label: String, endpoint: NWEndpoint) {
+        do {
+            try socket.sendInbound(frame: frame, toEndpointDescription: endpoint.debugDescription)
+            DiagnosticsLog.info(
+                "xiaomi.cast.trust_tx label=\(label) to=inbound:\(endpoint.debugDescription)"
+            )
+        } catch {
+            send(frame: frame, label: label)
+        }
+    }
+
     // Coarse cross-queue gate (same convention as handlesAdoptedMitrust):
     // true while a phone-dialed mitrustservice conn is adopted and its
     // channel may still be open. The responder suppresses its plaintext
@@ -484,7 +506,7 @@ final class LyraCastTrustSession {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: 14,
+            deviceType: MijiaCertEnrollment.physDeviceType(),
             uidHash: "61F2",
             displayName: displayName,
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
@@ -1866,6 +1888,59 @@ final class LyraCastTrustSession {
                     sessionKey: MiTrustTicketStore.current().sessionKey
                 ) { [weak self] frame, label in
                     self?.send(frame: frame, label: label)
+                }
+            } else if Self.syncServiceName(of: syncInfoData) == LyraDistAudioRpcSession.serviceName {
+                // The phone's score-based phys-conn reuse can dial the
+                // DistAudio RPC service on THIS session's socket. Live
+                // 2026-09-05 19:35: the first dial reused the relay-dial
+                // phys conn whose Mac-side socket died with the trust
+                // session fail-fast rebuild; the retry then landed on the
+                // rebuilt session's socket and the catch-all below
+                // swallowed the sync_info — the DistAudio channel never
+                // established, the call audio route stayed EARPIECE and the
+                // far end heard only the phone's room mic (nothing). The
+                // announcer socket already adopts these dials; the cast
+                // socket must too.
+                DiagnosticsLog.info(
+                    "xiaomi.cast.distrpc_sync_info connId=\(logiConn.logiConnId) " +
+                        "peerNetId=\(logiConn.localNetId)"
+                )
+                LyraDistAudioRpcSession.adopt(
+                    syncInfoData: syncInfoData,
+                    logiConn: logiConn,
+                    endpoint: endpoint,
+                    sessionKey: MiTrustTicketStore.current().sessionKey,
+                    deviceIdHex: deviceIdHex,
+                    deviceName: displayName,
+                    // A relay-routed socket (or a relay-fed inbound conn)
+                    // makes the phone's channel client cross the bridge's
+                    // reverse listener — the channel must live on the bridge
+                    // pipe, not a real UDP socket (live 2026-09-05 20:01).
+                    channelBridge: (isRelayRouted || endpoint.debugDescription.contains("127.0.0.1"))
+                        ? (relayBridge ?? Self.activeRelayBridge())
+                        : nil
+                ) { [weak self] frame, label in
+                    self?.sendAdoptedServiceFrame(frame: frame, label: label, endpoint: endpoint)
+                }
+            } else if Self.syncServiceName(of: syncInfoData) == LyraDistHardwareSession.serviceName {
+                // Same score-based reuse for the distributed-hardware
+                // service (parity with the announcer socket's adoption).
+                DiagnosticsLog.info(
+                    "xiaomi.cast.disthw_sync_info connId=\(logiConn.logiConnId) " +
+                        "peerNetId=\(logiConn.localNetId)"
+                )
+                LyraDistHardwareSession.adopt(
+                    syncInfoData: syncInfoData,
+                    logiConn: logiConn,
+                    endpoint: endpoint,
+                    sessionKey: MiTrustTicketStore.current().sessionKey,
+                    deviceIdHex: deviceIdHex,
+                    deviceName: displayName,
+                    channelBridge: (isRelayRouted || endpoint.debugDescription.contains("127.0.0.1"))
+                        ? (relayBridge ?? Self.activeRelayBridge())
+                        : nil
+                ) { [weak self] frame, label in
+                    self?.sendAdoptedServiceFrame(frame: frame, label: label, endpoint: endpoint)
                 }
             } else {
                 handleSyncInfoResponse(syncInfoData, logiConn: logiConn)

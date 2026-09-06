@@ -22,6 +22,7 @@ final class LyraDistAudioRpcSession {
         sessionKey: SymmetricKey?,
         deviceIdHex: String,
         deviceName: String,
+        channelBridge: LyraRelayTransportBridge? = nil,
         send: @escaping (LyraMeshPack.Frame, String) -> Void
     ) -> LyraDistAudioRpcSession {
         if let existing = activeSession, existing.connId != logiConn.logiConnId {
@@ -31,6 +32,7 @@ final class LyraDistAudioRpcSession {
         let session = activeSession ?? LyraDistAudioRpcSession(send: send)
         session.deviceIdHex = deviceIdHex
         session.deviceName = deviceName
+        session.channelBridge = channelBridge
         activeSession = session
         session.handleSyncInfo(syncInfoData: syncInfoData, logiConn: logiConn, sessionKey: sessionKey)
         return session
@@ -45,7 +47,18 @@ final class LyraDistAudioRpcSession {
     private var responseSent = false
     private var peerPortAwaitingAck = false
     private var peerPortResponseSent = false
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
+    // Relay-routed adoptions: the phone's channel client follows the phys
+    // conn's transport, so a relay-fed dial makes it cross the relay bridge
+    // (reverse listener) — a real UDP socket port advertised in
+    // responseOfPeerPort is unreachable (live 2026-09-05 20:01: the phone
+    // dialed 127.0.0.1:<bridge reverse listener>, the Mac bridge had no
+    // pipe for the port, the RPC bind died on "physical conn heartbeat
+    // timeout" retries, openSpeaker/openMic were dropped with
+    // "rpc service is null", the DAS kept the phone mic muted and the far
+    // end heard nothing). Mirror of the mitrust channel's bridge pipe.
+    private var channelBridge: LyraRelayTransportBridge?
+    private var channelBridgePort: UInt16?
     private var transKey = Data()
     private var peerChannelId: UInt64 = 0
 
@@ -58,6 +71,11 @@ final class LyraDistAudioRpcSession {
     }
 
     func teardown() {
+        if let bridgePort = channelBridgePort {
+            channelBridge?.removeChannelPipe(port: bridgePort)
+            channelBridgePort = nil
+            channelBridge = nil
+        }
         channelSocket?.stop()
         channelSocket = nil
         stopAudioTransport()
@@ -632,7 +650,14 @@ final class LyraDistAudioRpcSession {
         guard channelSocket == nil else { return }
         transKey = key
         peerChannelId = channelId
-        let socket = LyraChannelSocket()
+        let socket: LyraChannelDatagramPipe
+        if let bridge = channelBridge {
+            let bridgePort = bridge.allocateChannelPort()
+            socket = bridge.channelPipe(port: bridgePort)
+            channelBridgePort = bridgePort
+        } else {
+            socket = LyraChannelSocket()
+        }
         socket.onMessage = { [weak self] message, _ in
             self?.handleChannelMessage(message)
         }
@@ -657,6 +682,10 @@ final class LyraDistAudioRpcSession {
         guard !peerPortAwaitingAck, !peerPortResponseSent,
               let port = channelSocket?.boundPort
         else { return }
+        // Out-of-band listener announcement rides the ordered send chain
+        // ahead of the responseOfPeerPort — the phone bridge's snooper is
+        // the fallback, not the primary (loss-fragile mid-ceremony).
+        channelBridge?.announceChannelListener(port: port)
         peerPortResponseSent = true
         var serverKey = Data(count: 32)
         serverKey.withUnsafeMutableBytes { buffer in
@@ -823,6 +852,12 @@ final class LyraDistAudioRpcSession {
     }
 
     private func startDownlinkClient(host: String, port: UInt16, keyBase64: String) {
+        if let existing = wfdClient, !existing.isStopped,
+           existing.matches(host: host, port: port, mediaKeyBase64: keyBase64)
+        {
+            DiagnosticsLog.info("xiaomi.distaudio.downlink_reuse ip=\(host) port=\(port)")
+            return
+        }
         wfdClient?.stop()
         let client = LyraDistAudioWFDClient(host: host, port: port, mediaKeyBase64: keyBase64)
         _ = client.prepareClientMediaPort()

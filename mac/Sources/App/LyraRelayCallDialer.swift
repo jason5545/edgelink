@@ -203,7 +203,7 @@ final class LyraRelayCallDialer {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: 14,
+            deviceType: MijiaCertEnrollment.physDeviceType(),
             uidHash: "61F2",
             displayName: displayNameProvider(),
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
@@ -798,7 +798,14 @@ final class LyraRelayCallDialer {
                         endpoint: endpoint,
                         sessionKey: meshSessionKey,
                         deviceIdHex: deviceIdHexProvider() ?? "",
-                        deviceName: displayNameProvider()
+                        deviceName: displayNameProvider(),
+                        // A relay-fed inbound conn (loopback endpoint) makes
+                        // the phone's channel client cross the bridge's
+                        // reverse listener — host the channel on the bridge
+                        // pipe (live 2026-09-05 20:01).
+                        channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }
@@ -819,7 +826,10 @@ final class LyraRelayCallDialer {
                         endpoint: endpoint,
                         sessionKey: meshSessionKey,
                         deviceIdHex: deviceIdHexProvider() ?? "",
-                        deviceName: displayNameProvider()
+                        deviceName: displayNameProvider(),
+                        channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }

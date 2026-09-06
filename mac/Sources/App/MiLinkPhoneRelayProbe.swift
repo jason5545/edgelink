@@ -2308,12 +2308,18 @@ final class MiLinkPhoneRelayProbe {
     }
 
     private func sourcePresentationHost() -> String {
+        // The debug override only applies while it still matches a live
+        // interface — a stale hotspot-era IP in the presentation URL sends
+        // the phone's sink to a dead address (see phoneRelayAdvertisedHost).
+        if let current = Self.preferredLocalIPv4Address(), !current.isEmpty {
+            return current
+        }
         if let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !override.isEmpty {
             return override
         }
-        return Self.preferredLocalIPv4Address() ?? "localhost"
+        return "localhost"
     }
 
     private func sourcePresentationURL() -> String {

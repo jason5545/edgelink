@@ -334,7 +334,15 @@ data class PhoneActionBody(
     val lanHost: String? = null,
     val lanPort: Int? = null,
     val lanProbePort: Int? = null,
-    val skipDial: Boolean? = null
+    val skipDial: Boolean? = null,
+    /**
+     * Mac 的 lyra device id。dial action 需要它把官方 handleRelayDialRequest
+     * 的 OUTGOING_CALL_EXTRAS 寫進 placeCall bundle：沒有 relay extras 的
+     * 雲橋撥號會被手機當成純本地通話——TeleService 不註冊 relay connection、
+     * InCallUI 維持 EARPIECE 路由與本地麥克風，與 MirrorCall 媒體平行出聲
+     * （2026-09-05 19:04 現場「兩邊都出聲」）。
+     */
+    val peerDeviceId: String? = null
 )
 
 @Serializable

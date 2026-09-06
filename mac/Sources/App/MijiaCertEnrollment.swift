@@ -149,7 +149,11 @@ enum MijiaEnrolledCertStore {
 
     // The enrolled cert is usable when it parses, is inside its validity
     // window (with margin), and its did still matches our current full device
-    // id (identity key or clone id rotation requires re-enrollment).
+    // id (identity key or clone id rotation requires re-enrollment). A CN
+    // device-type mismatch does NOT invalidate the cert here — it triggers an
+    // opportunistic re-enroll in refreshIfNeeded instead, so a failed
+    // re-enroll (e.g. expired token) never takes the working cert away from
+    // the flows that tolerate the stale type.
     static func usableCert(forDid did: String, now: Date = Date()) -> MijiaEnrolledCert? {
         guard let stored = load(), stored.did == did, let der = stored.certDER,
               let secCert = SecCertificateCreateWithData(nil, der as CFData)
@@ -158,6 +162,20 @@ enum MijiaEnrolledCertStore {
             return nil
         }
         return stored
+    }
+
+    // CN = lyra.<uid>.<did>.<deviceType>; the type is the trailing component.
+    static func certSubjectDeviceType(_ subject: String) -> UInt32? {
+        guard let last = subject.split(separator: ".").last else { return nil }
+        return UInt32(last)
+    }
+
+    static func certDeviceType(_ cert: MijiaEnrolledCert) -> UInt32? {
+        guard let der = cert.certDER,
+              let secCert = SecCertificateCreateWithData(nil, der as CFData),
+              let subject = SecCertificateCopySubjectSummary(secCert) as String?
+        else { return nil }
+        return certSubjectDeviceType(subject)
     }
 
     private static func baseQuery() -> [String: Any] {
@@ -362,7 +380,27 @@ struct MijiaURLSessionHTTPClient: MijiaIDMHTTPClient {
 // MARK: - Enrollment orchestrator
 
 enum MijiaCertEnrollment {
-    static let deviceType: UInt32 = 14
+    // Cert CN device type — must equal the announced tdi
+    // (LyraDeviceType.relayAcceptedFamily): the phone's same-account
+    // AccountPairHandshake rejects the channel when they disagree (live
+    // 2026-09-06 12:40: the distributedHardware dial failed with "expected
+    // device type 11, cert device type 14" → err 29063 → DAS reported
+    // -1001 → the relayed call's distaudio route never activated: no mute
+    // icon, far end heard the phone's room mic). Re-enroll after changing
+    // this constant — the type is baked into the signed cert CN.
+    static let deviceType: UInt32 = 11
+
+    // Phys-conn device info must present the enrolled cert's actual CN type:
+    // the phone rejects account-pair handshakes when phys and cert disagree
+    // ("expected device type 4, cert device type 14"). Falls back to the
+    // announced family type while no cert is enrolled.
+    static func physDeviceType(fallback: UInt32 = LyraDeviceType.relayAcceptedFamily) -> UInt32 {
+        guard let did = currentDid(shortDeviceIdHex: currentShortDeviceIdHex),
+              let cert = MijiaEnrolledCertStore.usableCert(forDid: did),
+              let type = MijiaEnrolledCertStore.certDeviceType(cert)
+        else { return fallback }
+        return type
+    }
 
     struct Outcome: Equatable, Sendable {
         var certDER: Data
@@ -481,9 +519,13 @@ enum MijiaCertEnrollment {
         UserDefaults.standard.string(forKey: "xiaomiTrustCloneDeviceId") ?? "721572C3"
     }
 
-    // Startup/periodic refresh: enroll only when the stored cert is missing,
-    // near expiry, or bound to a stale did. No-op without a provisioned token
-    // (UserDefaults injection stays the fallback path in that case).
+    // Startup/periodic refresh: enroll when the stored cert is missing, near
+    // expiry, bound to a stale did, or carries a stale CN device type (the
+    // phone's same-account checks reject stale types — 2026-09-06 disthw
+    // "expected device type 11, cert device type 14"). A failed re-enroll
+    // leaves the existing cert untouched so flows that tolerate the stale
+    // type keep working. No-op without a provisioned token (UserDefaults
+    // injection stays the fallback path in that case).
     @discardableResult
     static func refreshIfNeeded(
         devName: String,
@@ -494,8 +536,14 @@ enum MijiaCertEnrollment {
             DiagnosticsLog.info("mijia.enroll.skip reason=no-did")
             return false
         }
-        if MijiaEnrolledCertStore.usableCert(forDid: did) != nil {
-            return false
+        if let existing = MijiaEnrolledCertStore.usableCert(forDid: did) {
+            let existingType = MijiaEnrolledCertStore.certDeviceType(existing)
+            if existingType == nil || existingType == deviceType {
+                return false
+            }
+            DiagnosticsLog.info(
+                "mijia.enroll.reenroll staleType=\(existingType!) target=\(deviceType)"
+            )
         }
         guard let token = MijiaAccountTokenStore.load(), token.isComplete else {
             DiagnosticsLog.info("mijia.enroll.skip reason=no-token")

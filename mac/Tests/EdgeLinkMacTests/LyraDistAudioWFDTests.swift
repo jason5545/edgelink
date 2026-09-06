@@ -54,6 +54,25 @@ final class LyraDistAudioWFDTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    // MARK: - Downlink client reuse (duplicate openSpeaker)
+
+    // Live 2026-09-06: the phone re-issues openSpeaker ~1s apart
+    // (connectDistAudioDevice once at relay setup, again when the call goes
+    // ACTIVE) while its MiCastServer keeps streaming on the original TCP
+    // connection. The Mac must reuse the live client, not reconnect.
+    func testDownlinkClientMatchesOnlyIdenticalParamsAndStops() {
+        let keyB64 = Data((0..<16).map { $0 }).base64EncodedString()
+        let otherKeyB64 = Data((1...16).map { $0 }).base64EncodedString()
+        let client = LyraDistAudioWFDClient(host: "10.0.0.238", port: 8236, mediaKeyBase64: keyB64)
+        XCTAssertFalse(client.isStopped)
+        XCTAssertTrue(client.matches(host: "10.0.0.238", port: 8236, mediaKeyBase64: keyB64))
+        XCTAssertFalse(client.matches(host: "10.0.0.239", port: 8236, mediaKeyBase64: keyB64))
+        XCTAssertFalse(client.matches(host: "10.0.0.238", port: 8237, mediaKeyBase64: keyB64))
+        XCTAssertFalse(client.matches(host: "10.0.0.238", port: 8236, mediaKeyBase64: otherKeyB64))
+        client.stop()
+        XCTAssertTrue(client.isStopped)
+    }
+
     // MARK: - AES-ECB round trip
 
     func testECBRoundTrip() {
@@ -116,6 +135,41 @@ final class LyraDistAudioWFDTests: XCTestCase {
         XCTAssertEqual(pcmOut, [pcmA])
         decoder.feed(datagram: datagram(sn: 1, pcm: pcmB))  // fills → both flush
         XCTAssertEqual(pcmOut, [pcmA, pcmB, pcmC])
+    }
+
+    // Live 2026-09-05 21:03 ("語音被切掉，幾秒後接到切掉之後的內容"): a
+    // single lost segment stalled the receiver while 256 follow-ups
+    // buffered, and the 257th arrival (gap 257 > the window) resynced by
+    // DROPPING all buffered speech. The recovery delivers the contiguous
+    // pending run (only the one lost segment is skipped), and late
+    // retransmits are ignored instead of rewinding the stream.
+    func testDecoderRecoversPendingAudioOnWindowOverflowInsteadOfDropping() {
+        let key = Data(repeating: 0x42, count: 16)
+        let decoder = LyraDistAudioMediaDecoder(mediaKey: key)
+        var pcmOut: [Data] = []
+        decoder.onPCM = { pcmOut.append($0) }
+
+        func datagram(sn: UInt32) -> Data {
+            let pcm = makePCM(pattern: UInt16(truncatingIfNeeded: sn &+ 0x100), blocks: 4)
+            return makePushDatagram(conv: 7, ts: sn, sn: sn, tsPackets: makePESRun(
+                pesPayload: makeFF02(encrypted: DistAudioECB.encrypt(pcm, key: key)), packetLength: nil
+            ))
+        }
+
+        decoder.feed(datagram: datagram(sn: 0))  // initializes sn, delivered
+        XCTAssertEqual(pcmOut.count, 1)
+        for sn in UInt32(2)...UInt32(257) {      // buffer the pending window
+            decoder.feed(datagram: datagram(sn: sn))
+        }
+        XCTAssertEqual(pcmOut.count, 1, "in-window gaps must buffer, not deliver")
+        // sn=1 is lost; sn=258 overflows the 256-slot window (delta 258).
+        decoder.feed(datagram: datagram(sn: 258))
+        // Old behavior: resync dropped all pending → 2 payloads.
+        // Recovery: skip the lost sn=1, deliver 2...257 in order, then 258.
+        XCTAssertEqual(pcmOut.count, 258)
+        // A late retransmit of the lost segment must not rewind the stream.
+        decoder.feed(datagram: datagram(sn: 1))
+        XCTAssertEqual(pcmOut.count, 258, "late retransmit must be ignored")
     }
 
     func testDecoderHandlesTSSplitAcrossPushes() {

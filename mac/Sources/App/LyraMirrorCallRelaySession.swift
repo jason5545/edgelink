@@ -237,9 +237,24 @@ final class LyraMirrorCallRelaySession {
             // phone it tears down the healthy mid-call source+sink (G.Z
             // stops both), so every flap killed the call media.
             if Self.phoneMirrorCallEngaged {
-                let sameCall = Self.engagementCallId != nil
-                    && Self.pendingCallId != nil
-                    && Self.engagementCallId == Self.pendingCallId
+                // Same-call test. engagementCallId is stamped when 24/31 go
+                // out, from the pendingCallId of that moment. The relay
+                // callState=4 push (LyraRelayCallSession) can drive
+                // setCallActive(true) BEFORE the driver's phone.call_status
+                // active push writes pendingCallId (live 2026-09-05 18:16:
+                // 24/31 sent with pendingCallId still nil → engagementCallId
+                // stamped nil → the next flap's rebuild read "different
+                // call" and orphan-stopped the HEALTHY mid-call media; on
+                // the real phone event 24 cannot revive the source after
+                // G.Z stopped it). An engaged session with a nil
+                // engagementCallId but a live pendingCallId is therefore
+                // identity-pending THIS call, not a stale engagement.
+                let sameCall: Bool
+                if let engaged = Self.engagementCallId {
+                    sameCall = engaged == Self.pendingCallId
+                } else {
+                    sameCall = Self.pendingCallId != nil
+                }
                 if sameCall {
                     DiagnosticsLog.info(
                         "xiaomi.mirrorcall.orphan_stop_skipped callId=\(Self.pendingCallId ?? "nil")"
@@ -403,6 +418,13 @@ final class LyraMirrorCallRelaySession {
     func setCallActive(_ active: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
+            // The driver delivered the call identity; backfill the engagement
+            // stamp BEFORE the state guard — the relay callState=4 push may
+            // already have set callActive, in which case this drive returns
+            // below and the backfill would never run (live 2026-09-05 18:16).
+            if active, Self.phoneMirrorCallEngaged, Self.engagementCallId == nil {
+                Self.engagementCallId = Self.pendingCallId
+            }
             guard active != self.callActive else { return }
             self.callActive = active
             if active {
@@ -477,6 +499,12 @@ final class LyraMirrorCallRelaySession {
         do {
             try source.start()
             audioSource = source
+            // The advertise route can flip relay→LAN after the event-23 key
+            // exchange already armed the (now discarded) relay source — the
+            // fresh LAN source must be armed too or every sendAudioFrame
+            // hits the armed/key guard and zero uplink flows (live
+            // 2026-09-06 09:35: sink connected, capture running, au_send=0).
+            armSourcesLocked()
         } catch {
             DiagnosticsLog.error("xiaomi.mirrorcall.source_listen_failed", error)
         }

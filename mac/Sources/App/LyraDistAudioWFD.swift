@@ -233,6 +233,32 @@ final class LyraDistAudioWFDClient {
     private var localPort: UInt16 = 0
     private var mediaConnection: NWConnection?
     private var mediaDecoder: LyraDistAudioMediaDecoder?
+    private let stopLock = NSLock()
+    private var stoppedFlag = false
+
+    // The phone re-issues openSpeaker ~1s after connectDistAudioDevice (once
+    // when the relay call sets up, again when the call transitions ACTIVE);
+    // its MiCastServer keeps streaming on the original TCP connection
+    // (`miCastServer start: ret -1` on the repeat), so a matching duplicate
+    // must reuse the live client instead of reconnecting into silence.
+    var isStopped: Bool {
+        stopLock.lock()
+        defer { stopLock.unlock() }
+        return stoppedFlag
+    }
+
+    func matches(host: String, port: UInt16, mediaKeyBase64: String) -> Bool {
+        self.host == host && self.port == port
+            && mediaKey == (Data(base64Encoded: mediaKeyBase64) ?? Data())
+    }
+
+    // Periodic downlink decode stats (live 2026-09-05: call 2 streamed both
+    // directions for 53s but the decoded-audio plausibility was invisible —
+    // the per-packet dump is capped at 8, so silence-vs-garbage was
+    // indistinguishable in the log).
+    private var downlinkMaxAbs = 0
+    private var downlinkResyncs = 0
+    private var downlinkProgressScheduled = false
 
     init(host: String, port: UInt16, mediaKeyBase64: String) {
         self.host = host
@@ -258,6 +284,7 @@ final class LyraDistAudioWFDClient {
                     }
                     DiagnosticsLog.info("xiaomi.distaudio.downlink_ready \(self?.host ?? ""):\(self?.port ?? 0) local=\(self?.localIP ?? "?"):\(self?.localPort ?? 0)")
                 case .failed(let error):
+                    self?.markStopped()
                     DiagnosticsLog.warn("xiaomi.distaudio.downlink_end \(String(describing: error))")
                 case .cancelled:
                     DiagnosticsLog.warn("xiaomi.distaudio.downlink_end cancelled")
@@ -284,6 +311,13 @@ final class LyraDistAudioWFDClient {
             self.mediaListener?.cancel()
             self.player?.stop(reason: "client_stop")
         }
+        markStopped()
+    }
+
+    private func markStopped() {
+        stopLock.lock()
+        stoppedFlag = true
+        stopLock.unlock()
     }
 
     private func receive() {
@@ -509,13 +543,17 @@ final class LyraDistAudioWFDClient {
                         "prefix=\(pcm.prefix(16).map { String(format: "%02x", $0) }.joined())"
                 )
             }
+            self.downlinkMaxAbs = max(self.downlinkMaxAbs, maxAbsOf16Bit(pcm))
             self.player?.write(pcm)
         }
         decoder.onSendACK = { [weak self] packet in
             self?.mediaConnection?.send(content: packet, completion: .contentProcessed { _ in })
         }
-        decoder.onWarn = { message in
+        decoder.onWarn = { [weak self] message in
             DiagnosticsLog.warn(message)
+            if message.contains("kcp_resync") {
+                self?.downlinkResyncs += 1
+            }
         }
         decoder.onPushPayload = { [weak self] sn, payload in
             guard let self, self.mediaDumpRemaining > 0 else { return }
@@ -538,6 +576,40 @@ final class LyraDistAudioWFDClient {
         } catch {
             DiagnosticsLog.error("xiaomi.distaudio.downlink_media_listen_failed", error)
         }
+        scheduleDownlinkProgressLog()
+    }
+
+    // Every 5s while the media listener is up: decoded-PES/PCM counts plus
+    // the interval's peak amplitude (0 = decoded silence, plausible head
+    // values are tens-to-thousands). The point is to answer "did the Mac
+    // actually decode audible downlink audio" from the log alone.
+    private func scheduleDownlinkProgressLog() {
+        guard !downlinkProgressScheduled else { return }
+        downlinkProgressScheduled = true
+        queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self else { return }
+            downlinkProgressScheduled = false
+            guard stage != .closed else { return }
+            let maxAbs = downlinkMaxAbs
+            downlinkMaxAbs = 0
+            DiagnosticsLog.info(
+                "xiaomi.distaudio.downlink_progress pes=\(mediaDecoder?.pesCount ?? 0) " +
+                    "pcmBytes=\(mediaDecoder?.pcmBytesDelivered ?? 0) maxAbs=\(maxAbs) " +
+                    "resyncs=\(downlinkResyncs)"
+            )
+            scheduleDownlinkProgressLog()
+        }
+    }
+
+    private func maxAbsOf16Bit(_ pcm: Data) -> Int {
+        var maxAbs = 0
+        var offset = 0
+        while offset + 1 < pcm.count {
+            let sample = Int16(pcm[offset]) | (Int16(pcm[offset + 1]) << 8)
+            maxAbs = max(maxAbs, abs(Int(sample)))
+            offset += 2
+        }
+        return maxAbs
     }
 
     private func receiveMedia(_ connection: NWConnection) {
@@ -1495,14 +1567,32 @@ final class LyraDistAudioMediaDecoder {
             return
         }
         let delta = Int64(Int32(bitPattern: sn &- kcpExpectedSN))
-        if delta > 0, delta <= 256 {
+        if delta <= 0 {
+            // Late retransmit / duplicate of an already-delivered (or
+            // resynced-past) segment. Rewinding to it (the old behavior)
+            // dropped the whole pending window on every reorder burst.
+            return
+        }
+        if delta <= 256 {
             kcpPending[sn] = payload
             return
         }
-        // Large gap: resync on the newest segment rather than stall.
+        // The expected segment is lost and the 256-slot pending window
+        // overflowed. The buffered segments are valid speech (~2.5s):
+        // deliver the contiguous run from expected+1 — only the one lost
+        // segment is skipped — then continue from the newest arrival.
+        // The old behavior dropped all pending, so every single-segment
+        // loss cut the call for the full buffer window ("語音被切掉，幾秒
+        // 後接到的是切掉之後的內容", live 2026-09-05 21:03: gap=257 ×2).
         onWarn?(
-            "xiaomi.distaudio.downlink_kcp_resync sn=\(sn) expected=\(kcpExpectedSN) gap=\(delta)"
+            "xiaomi.distaudio.downlink_kcp_recover sn=\(sn) expected=\(kcpExpectedSN) " +
+                "gap=\(delta) buffered=\(kcpPending.count)"
         )
+        kcpExpectedSN &+= 1
+        while let buffered = kcpPending.removeValue(forKey: kcpExpectedSN) {
+            deliverMediaPayload(buffered, sn: kcpExpectedSN)
+            kcpExpectedSN &+= 1
+        }
         kcpPending.removeAll()
         kcpExpectedSN = sn &+ 1
         deliverMediaPayload(payload, sn: sn)

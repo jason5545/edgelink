@@ -55,6 +55,10 @@ public protocol LyraMeshDatagramPipe: AnyObject {
     func start(preferredPort: UInt16?) throws
     func stop()
     func send(frame: LyraMeshPack.Frame, to host: String, port: UInt16) throws
+    // Throwing inbound send: lets callers detect "the arrival endpoint is not
+    // an inbound connection" and fall back to another route, instead of the
+    // fire-and-forget variant's silent drop.
+    func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription: String) throws
     func sendInboundAsync(frame: LyraMeshPack.Frame, toEndpointDescription: String)
 }
 
@@ -165,6 +169,15 @@ public final class LyraVirtualMeshPipe: LyraMeshDatagramPipe, @unchecked Sendabl
         queue.async { [weak self] in
             guard let self, let encoded = try? LyraMeshPack.encode(frame) else { return }
             self.sendEncodedOnQueue(encoded)
+        }
+    }
+
+    // The virtual pipe is single-peer: every send crosses the same relay
+    // envelope regardless of "inbound" vs "outbound", so this never misses.
+    public func sendInbound(frame: LyraMeshPack.Frame, toEndpointDescription: String) throws {
+        let encoded = try LyraMeshPack.encode(frame)
+        queue.async { [weak self] in
+            self?.sendEncodedOnQueue(encoded)
         }
     }
 

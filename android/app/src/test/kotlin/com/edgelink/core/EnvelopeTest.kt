@@ -129,6 +129,16 @@ class EnvelopeTest {
         )
         assertEquals(null, legacyPhoneAction.b.lanHost)
         assertEquals(null, legacyPhoneAction.b.lanProbePort)
+        // The bridge-fallback dial carries the Mac's lyra device id so the
+        // Android placeCall writes the official handleRelayDialRequest
+        // relay extras (telecomm.EXTRA_CALL_RELAYED etc.); legacy bodies
+        // without the field decode as null.
+        val relayExtrasAction = EnvelopeCodec.decode<PhoneActionBody>(
+            """{"t":"phone.action","b":{"requestId":"call-2","action":"dial","number":"800","peerDeviceId":"721572C3"}}"""
+                .encodeToByteArray()
+        )
+        assertEquals("721572C3", relayExtrasAction.b.peerDeviceId)
+        assertEquals(null, legacyPhoneAction.b.peerDeviceId)
 
         val phoneResultBytes = EnvelopeCodec.encode(
             EnvelopeTypes.PHONE_ACTION_RESULT,

@@ -3,6 +3,14 @@ import Foundation
 public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
     public static let deviceTypePhone: UInt8 = 0x01
     public static let deviceTypeMacBook: UInt8 = 0x0e
+    // The mDNS discovery type is the DAS/InCallUI hardware type surface
+    // (TrustedDeviceInfo/tdi is separate and already 11): the InCallUI
+    // DistAudioDeviceProvider only accepts 2/4/11, so the discovery record
+    // must carry 11 or the relay audio route never registers (live
+    // 2026-09-05 20:53: tdi flipped to 11 but the DAS HardwareInfo still
+    // read 14 from this TXT). 11 stays in the Apple-family routing bucket
+    // (11–17 → j3/i.v()), so the MiShare router is unaffected.
+    public static let deviceTypeRelayAccepted: UInt8 = 0x0b
     static let meshPortOffsetInSuffix = 10
     private static let meshPortOffset = 3 + 4 + 2 + meshPortOffsetInSuffix
     private static let currentSameAccountProfileSuffix: [UInt8] = [
@@ -43,7 +51,7 @@ public struct XiaomiMiShareDiscoveryAppData: Equatable, Sendable {
     public static func build(
         deviceIdHex: String,
         displayName: String,
-        deviceType: UInt8 = Self.deviceTypeMacBook,
+        deviceType: UInt8 = Self.deviceTypeRelayAccepted,
         accountIdHex: String = "581F",
         meshPort: UInt16? = nil
     ) throws -> Data {

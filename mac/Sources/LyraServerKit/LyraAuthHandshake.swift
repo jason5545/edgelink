@@ -51,7 +51,7 @@ public enum LyraAuthHandshake {
         lengthDelimited(7, in: handshake) ?? lengthDelimited(6, in: handshake)
     }
 
-    static func gcmSeal(_ plaintext: Data, using key: SymmetricKey) -> Data? {
+    public static func gcmSeal(_ plaintext: Data, using key: SymmetricKey) -> Data? {
         guard let sealed = try? AES.GCM.seal(plaintext, using: key) else { return nil }
         var out = Data()
         out.append(contentsOf: sealed.nonce.withUnsafeBytes { Data($0) })

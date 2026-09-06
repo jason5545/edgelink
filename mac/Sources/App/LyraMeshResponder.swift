@@ -1591,6 +1591,9 @@ final class LyraMeshResponder {
                         sessionKey: reuseKey,
                         deviceIdHex: deviceIdHex,
                         deviceName: displayNameProvider(),
+                        channelBridge: endpointDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil,
                         send: send
                     )
                 } else {
@@ -1601,6 +1604,9 @@ final class LyraMeshResponder {
                         sessionKey: reuseKey,
                         deviceIdHex: deviceIdHex,
                         deviceName: displayNameProvider(),
+                        channelBridge: endpointDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil,
                         send: send
                     )
                 }
@@ -2150,7 +2156,7 @@ final class LyraMeshResponder {
         let osVersionString = "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: 14,
+            deviceType: MijiaCertEnrollment.physDeviceType(),
             uidHash: "61F2",
             displayName: displayNameProvider(),
             osVersion: osVersionString,
@@ -2198,6 +2204,9 @@ final class LyraMeshResponder {
                     sessionKey: reuseKey,
                     deviceIdHex: deviceIdHex,
                     deviceName: displayNameProvider(),
+                    channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                        ? LyraCastTrustSession.activeRelayBridge()
+                        : nil,
                     send: send
                 )
             } else {
@@ -2208,6 +2217,9 @@ final class LyraMeshResponder {
                     sessionKey: reuseKey,
                     deviceIdHex: deviceIdHex,
                     deviceName: displayNameProvider(),
+                    channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                        ? LyraCastTrustSession.activeRelayBridge()
+                        : nil,
                     send: send
                 )
             }

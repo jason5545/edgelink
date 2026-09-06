@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -56,6 +57,16 @@ class AndroidCallRelayBridgeTest {
     private fun startAcceptor(server: ServerSocket, accepted: AtomicReference<Socket?>) {
         thread(isDaemon = true) {
             runCatching { accepted.set(server.accept()) }
+        }
+    }
+
+    // Records true once the accepted socket hits EOF or errors — the
+    // observable signal that the bridge closed its client socket.
+    private fun startEofWatcher(socket: Socket?, eof: AtomicReference<Boolean>) {
+        socket ?: return
+        thread(isDaemon = true) {
+            val result = runCatching { socket.inputStream.read() }
+            eof.set(result.getOrNull() == -1 || result.isFailure)
         }
     }
 
@@ -139,15 +150,13 @@ class AndroidCallRelayBridgeTest {
     }
 
     @Test
-    fun sourceRtspHintIsIgnoredWhenSourceAlreadyConnected() = runBlocking {
-        // A hint arriving after the source connected must be logged and
-        // ignored — no reconnect, no dial towards the hinted port.
+    fun sourceRtspHintWithSamePortIsIgnoredWhenSourceAlreadyConnected() = runBlocking {
+        // A hint for the port the source is already connected to must be
+        // logged and ignored — no reconnect, no teardown.
         val primary = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
-        val other = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
         val primaryAccepted = AtomicReference<Socket?>()
-        val otherAccepted = AtomicReference<Socket?>()
+        val primaryEof = AtomicReference(false)
         startAcceptor(primary, primaryAccepted)
-        startAcceptor(other, otherAccepted)
         val logs = CopyOnWriteArrayList<String>()
         val bridge = makeBridge(listOf(primary.localPort), logs)
         val connect = launch(Dispatchers.IO) {
@@ -156,23 +165,71 @@ class AndroidCallRelayBridgeTest {
         try {
             assertTrue("primary accepts", waitFor { primaryAccepted.get() != null })
             connect.join()
+            startEofWatcher(primaryAccepted.get(), primaryEof)
 
-            bridge.addSourceEndpointHint("127.0.0.1", other.localPort)
+            bridge.addSourceEndpointHint("127.0.0.1", primary.localPort)
 
             assertTrue(
-                "hint receipt must be logged",
+                "same-port hint receipt must be logged as ignored",
                 logs.any {
                     it.contains("callrelay.android.local_rtsp_source_hint") &&
-                        it.contains("port=${other.localPort}") &&
+                        it.contains("port=${primary.localPort}") &&
                         it.contains("ignored=already_connected")
                 }
             )
             Thread.sleep(300)
-            assertNull("no dial towards the ignored hint", otherAccepted.get())
+            assertFalse(
+                "same-port hint must not close the live connection",
+                primaryEof.get()
+            )
         } finally {
             connect.cancelAndJoin()
             runCatching { primaryAccepted.get()?.close() }
-            runCatching { otherAccepted.get()?.close() }
+            runCatching { primary.close() }
+        }
+    }
+
+    @Test
+    fun sourceRtspHintWithMovedPortReconnectsWhenSourceAlreadyConnected() = runBlocking {
+        // The phone restarts its MirrorCallService source on a new port after
+        // every cast-channel flap (getUnUsedPort +3 walk); the abandoned
+        // server keeps answering RTSP while streaming silence. A hint with a
+        // different port must drop the stale connection so the run loop
+        // reconnects to the moved source (live 2026-09-06 08:31: source
+        // 7120→7123, bridge pinned to 7120 → downlink silence all call).
+        val primary = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+        val other = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+        val primaryAccepted = AtomicReference<Socket?>()
+        val primaryEof = AtomicReference(false)
+        startAcceptor(primary, primaryAccepted)
+        startAcceptor(other, AtomicReference<Socket?>())
+        val logs = CopyOnWriteArrayList<String>()
+        val bridge = makeBridge(listOf(primary.localPort), logs)
+        val connect = launch(Dispatchers.IO) {
+            runCatching { bridge.connectRTSPWithRetry() }
+        }
+        try {
+            assertTrue("primary accepts", waitFor { primaryAccepted.get() != null })
+            connect.join()
+            startEofWatcher(primaryAccepted.get(), primaryEof)
+
+            bridge.addSourceEndpointHint("127.0.0.1", other.localPort)
+
+            assertTrue(
+                "moved hint must be logged as a reconnect",
+                logs.any {
+                    it.contains("callrelay.android.local_rtsp_source_hint") &&
+                        it.contains("port=${other.localPort}") &&
+                        it.contains("reconnect=hint_moved")
+                }
+            )
+            assertTrue(
+                "moved hint must close the stale connection",
+                waitFor { primaryEof.get() }
+            )
+        } finally {
+            connect.cancelAndJoin()
+            runCatching { primaryAccepted.get()?.close() }
             runCatching { primary.close() }
             runCatching { other.close() }
         }

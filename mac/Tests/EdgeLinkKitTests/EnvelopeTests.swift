@@ -129,6 +129,22 @@ final class EnvelopeTests: XCTestCase {
         let legacyPhoneAction = try decoder.decode(Envelope<PhoneActionBody>.self, from: legacyPhoneActionData)
         XCTAssertNil(legacyPhoneAction.b.lanHost)
         XCTAssertNil(legacyPhoneAction.b.lanProbePort)
+        // The bridge-fallback dial carries the Mac's lyra device id so the
+        // Android placeCall can write the official handleRelayDialRequest
+        // relay extras (telecomm.EXTRA_CALL_RELAYED etc. — live 2026-09-05
+        // 19:04: without them the phone runs the call as a plain local
+        // call, EARPIECE route + local mic, "兩邊都出聲").
+        let relayExtrasActionData = Data(
+            #"{"t":"phone.action","b":{"requestId":"call-2","action":"dial","number":"800","peerDeviceId":"721572C3"}}"#.utf8
+        )
+        let relayExtrasAction = try decoder.decode(Envelope<PhoneActionBody>.self, from: relayExtrasActionData)
+        XCTAssertEqual(relayExtrasAction.b.peerDeviceId, "721572C3")
+        XCTAssertNil(legacyPhoneAction.b.peerDeviceId)
+        let encodedRelayExtras = try encoder.encode(
+            Envelope(t: EnvelopeType.phoneAction, b: relayExtrasAction.b)
+        )
+        let roundTripped = try decoder.decode(Envelope<PhoneActionBody>.self, from: encodedRelayExtras)
+        XCTAssertEqual(roundTripped.b.peerDeviceId, "721572C3")
 
         let phoneResultData = try encoder.encode(
             Envelope(

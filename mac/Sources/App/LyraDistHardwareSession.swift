@@ -24,6 +24,7 @@ final class LyraDistHardwareSession {
         sessionKey: SymmetricKey?,
         deviceIdHex: String,
         deviceName: String,
+        channelBridge: LyraRelayTransportBridge? = nil,
         send: @escaping (LyraMeshPack.Frame, String) -> Void
     ) -> LyraDistHardwareSession {
         if let existing = activeSession, existing.connId != logiConn.logiConnId {
@@ -33,6 +34,7 @@ final class LyraDistHardwareSession {
         let session = activeSession ?? LyraDistHardwareSession(send: send)
         session.deviceIdHex = deviceIdHex
         session.deviceName = deviceName
+        session.channelBridge = channelBridge
         activeSession = session
         session.handleSyncInfo(syncInfoData: syncInfoData, logiConn: logiConn, sessionKey: sessionKey)
         return session
@@ -47,7 +49,12 @@ final class LyraDistHardwareSession {
     private var responseSent = false
     private var peerPortAwaitingAck = false
     private var peerPortResponseSent = false
-    private var channelSocket: LyraChannelSocket?
+    private var channelSocket: LyraChannelDatagramPipe?
+    // Relay-routed adoptions need the bridge pipe (mirror of the DistAudio
+    // RPC session; the phone's channel client follows the phys conn's
+    // transport).
+    private var channelBridge: LyraRelayTransportBridge?
+    private var channelBridgePort: UInt16?
     private var transKey = Data()
     private var peerChannelId: UInt64 = 0
 
@@ -60,6 +67,11 @@ final class LyraDistHardwareSession {
     }
 
     func teardown() {
+        if let bridgePort = channelBridgePort {
+            channelBridge?.removeChannelPipe(port: bridgePort)
+            channelBridgePort = nil
+            channelBridge = nil
+        }
         channelSocket?.stop()
         channelSocket = nil
     }
@@ -623,7 +635,14 @@ final class LyraDistHardwareSession {
         guard channelSocket == nil else { return }
         transKey = key
         peerChannelId = channelId
-        let socket = LyraChannelSocket()
+        let socket: LyraChannelDatagramPipe
+        if let bridge = channelBridge {
+            let bridgePort = bridge.allocateChannelPort()
+            socket = bridge.channelPipe(port: bridgePort)
+            channelBridgePort = bridgePort
+        } else {
+            socket = LyraChannelSocket()
+        }
         socket.onMessage = { [weak self] message, _ in
             self?.handleChannelMessage(message)
         }
@@ -645,6 +664,7 @@ final class LyraDistHardwareSession {
         guard !peerPortAwaitingAck, !peerPortResponseSent,
               let port = channelSocket?.boundPort
         else { return }
+        channelBridge?.announceChannelListener(port: port)
         peerPortResponseSent = true
         var serverKey = Data(count: 32)
         serverKey.withUnsafeMutableBytes { buffer in

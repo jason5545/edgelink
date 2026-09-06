@@ -387,7 +387,20 @@ object AndroidShizukuSupport {
         )
     }
 
-    suspend fun placePhoneCall(context: Context, telUri: String): ShizukuOperationResult =
+    /**
+     * relayPeerDeviceId：非 null 時照官方 TeleService handleRelayDialRequest
+     * 的形狀寫 OUTGOING_CALL_EXTRAS（telecomm.EXTRA_CALL_RELAYED=true、
+     * EXTRA_RELAY_ANSWERED=true、EXTRA_RELAY_DEVICE_ID=<Mac lyra id>）。
+     * 沒有這組 extras 的 placeCall 會被手機當成純本地通話：connection 沒有
+     * relay 標記（RelayLog isCallRelayed: No / maybeRelayCall false）、
+     * InCallUI 維持 EARPIECE 路由與本地麥克風，與 MirrorCall 媒體平行出聲
+     * （2026-09-05 19:04 現場「兩邊都出聲」）。
+     */
+    suspend fun placePhoneCall(
+        context: Context,
+        telUri: String,
+        relayPeerDeviceId: String? = null
+    ): ShizukuOperationResult =
         withContext(Dispatchers.IO) {
             val appContext = context.applicationContext
             val permissionResult = ensurePhoneCallPermission(appContext)
@@ -410,13 +423,29 @@ object AndroidShizukuSupport {
                     success = false,
                     message = "phone:dial telecom_service_unavailable"
                 )
+            val placeCallExtras = Bundle().apply {
+                if (!relayPeerDeviceId.isNullOrEmpty()) {
+                    putBundle(
+                        "android.telecom.extra.OUTGOING_CALL_EXTRAS",
+                        Bundle().apply {
+                            putBoolean("telecomm.EXTRA_CALL_RELAYED", true)
+                            putBoolean("telecomm.EXTRA_RELAY_ANSWERED", true)
+                            putString("telecomm.EXTRA_RELAY_DEVICE_ID", relayPeerDeviceId)
+                        }
+                    )
+                }
+            }
             runCatching {
-                telecomManager.placeCall(Uri.parse(telUri), Bundle())
+                telecomManager.placeCall(Uri.parse(telUri), placeCallExtras)
             }.fold(
                 onSuccess = {
                     ShizukuOperationResult(
                         success = true,
-                        message = "phone:dial telecom_place_call"
+                        message = if (relayPeerDeviceId.isNullOrEmpty()) {
+                            "phone:dial telecom_place_call"
+                        } else {
+                            "phone:dial telecom_place_call relay_extras id=$relayPeerDeviceId"
+                        }
                     )
                 },
                 onFailure = { error ->

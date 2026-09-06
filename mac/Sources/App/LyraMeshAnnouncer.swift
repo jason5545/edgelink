@@ -216,11 +216,12 @@ final class LyraMeshAnnouncer {
         }
         physConnId = .random(in: 1...UInt32.max)
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        // Account-pair dials present the enrolled Mijia cert (CN device type
-        // 14); the phone rejects the handshake when the phys-conn device type
-        // disagrees ("expected device type 4, cert device type 14"). The
+        // Account-pair dials present the enrolled Mijia cert; the phone
+        // rejects the handshake when the phys-conn device type disagrees
+        // with the cert CN type ("expected device type 4, cert device type
+        // 14"), so the phys type tracks the cert's actual CN type. The
         // override-driven type (relay presentation) stays on the tdi payload.
-        let physDeviceType = Self.enrolledCertMaterial() != nil ? 14 : Self.announcedDeviceType
+        let physDeviceType = MijiaCertEnrollment.physDeviceType(fallback: Self.announcedDeviceType)
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
             deviceType: physDeviceType,
@@ -980,7 +981,14 @@ final class LyraMeshAnnouncer {
                         endpoint: endpoint,
                         sessionKey: meshSessionKey,
                         deviceIdHex: deviceIdHexProvider() ?? "",
-                        deviceName: displayNameProvider()
+                        deviceName: displayNameProvider(),
+                        // A relay-fed inbound conn (loopback endpoint) makes
+                        // the phone's channel client cross the bridge's
+                        // reverse listener — host the channel on the bridge
+                        // pipe (live 2026-09-05 20:01).
+                        channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }
@@ -1001,7 +1009,10 @@ final class LyraMeshAnnouncer {
                         endpoint: endpoint,
                         sessionKey: meshSessionKey,
                         deviceIdHex: deviceIdHexProvider() ?? "",
-                        deviceName: displayNameProvider()
+                        deviceName: displayNameProvider(),
+                        channelBridge: endpoint.debugDescription.contains("127.0.0.1")
+                            ? LyraCastTrustSession.activeRelayBridge()
+                            : nil
                     ) { [weak self] frame, label in
                         self?.send(frame: frame, label: label)
                     }

@@ -247,7 +247,7 @@ final class MijiaCertEnrollmentTests: XCTestCase {
         XCTAssertEqual(server.capturedHeaders?["MIOT-ENCRYPT-ALGORITHM"], "ENCRYPT-AES")
         XCTAssertEqual(server.capturedHeaders?["Cookie"], "cUserId=cuid;serviceToken=st")
         XCTAssertEqual(server.capturedBodyJSON?["did"] as? String, did)
-        XCTAssertEqual(server.capturedBodyJSON?["deviceType"] as? Int, 14)
+        XCTAssertEqual(server.capturedBodyJSON?["deviceType"] as? Int, 11)
         XCTAssertEqual(server.capturedBodyJSON?["preUid"] as? Int, 0)
         XCTAssertTrue(outcome.certSubject.contains("lyra.test-uid"))
         // The issued cert's pubkey must be the enrollment key's (enroll() checks).
@@ -310,6 +310,20 @@ final class MijiaCertEnrollmentTests: XCTestCase {
         let block = MiTrustTicketStore.current().certCredBlock()
         XCTAssertNotNil(block)
         XCTAssertTrue(block!.range(of: injectedCert) != nil)
+    }
+
+    // The stored cert's CN device type is parsed out of the trailing CN
+    // component so refreshIfNeeded can re-enroll on a type change (live
+    // 2026-09-06: disthw "expected device type 11, cert device type 14" →
+    // DAS -1001 → no call audio route) while the stale cert stays usable
+    // for flows that tolerate it if the re-enroll fails.
+    func testCertSubjectDeviceTypeParsing() {
+        XCTAssertEqual(MijiaEnrolledCertStore.certSubjectDeviceType("lyra.some-uid.some-did.14"), 14)
+        XCTAssertEqual(
+            MijiaEnrolledCertStore.certSubjectDeviceType("lyra.some-uid.some-did.11"), 11
+        )
+        XCTAssertNil(MijiaEnrolledCertStore.certSubjectDeviceType(""))
+        XCTAssertNil(MijiaEnrolledCertStore.certSubjectDeviceType("no-dots-here"))
     }
 }
 

@@ -25,6 +25,8 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_PACKAGE = "com.xiaomi.mirror"
     const val XIAOMI_MIRROR_PROCESS = "com.xiaomi.mirror"
     const val XIAOMI_MISHARE_PACKAGE = "com.miui.mishare.connectivity"
+    const val IN_CALL_UI_PACKAGE = "com.android.incallui"
+    const val TELEPHONY_PACKAGE = "com.android.phone"
     const val SYSTEM_SERVER_PROCESS = "system_server"
     const val SYSTEM_PROCESS = "system"
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
@@ -58,7 +60,15 @@ internal object MiLinkPrivilegeHookPolicy {
             shouldHookMainService(packageName, processName) ||
             shouldHookXiaomiMirror(packageName, processName) ||
             shouldHookAndroidSystem(packageName, processName) ||
-            shouldHookMiShare(packageName, processName)
+            shouldHookMiShare(packageName, processName) ||
+            shouldHookInCallUI(packageName) ||
+            shouldHookTeleService(packageName)
+
+    fun shouldHookInCallUI(packageName: String?): Boolean =
+        packageName == IN_CALL_UI_PACKAGE
+
+    fun shouldHookTeleService(packageName: String?): Boolean =
+        packageName == TELEPHONY_PACKAGE
 
     fun shouldHookMiShare(packageName: String?, processName: String?): Boolean =
         packageName == XIAOMI_MISHARE_PACKAGE
@@ -154,6 +164,188 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookMiShare(packageName, processName)) {
             hookMiShareLyraTrustInjection(classLoader)
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookInCallUI(packageName)) {
+            hookInCallUiDistAudioTypeFilter(classLoader)
+        }
+        if (MiLinkPrivilegeHookPolicy.shouldHookTeleService(packageName)) {
+            hookTeleServiceRelayAudioConnect(classLoader)
+        }
+    }
+
+    // TeleService never arms mConnectRelayAudio for outgoing relay dials:
+    // handleRelayDialRequest calls setDeviceInRelay synchronously right after
+    // placeCall, before the relayed Connection exists, so the
+    // getLocalConnectionCallRelayed() lookup inside setDeviceInRelay returns
+    // null and the flag is never set (PhoneContinuityController.java:1076-
+    // 1084). At ACTIVE the gate then logs "connectRelayAudio:false" and the
+    // official DistAudioDeviceProvider.connectDistAudioDevice never runs —
+    // the call keeps the phone's local mic/speaker (no mute icon) while our
+    // MirrorCall media runs in parallel (live 2026-09-06 09:35: deviceInRelay
+    // set, distaudio never engaged, earpiece route all call).
+    // Re-arm the official flag right before TeleService's ACTIVE-state
+    // evaluation so its own delayed connectDistAudioDevice path runs — no
+    // behavior change for non-relayed calls or when no device is in relay.
+    // Additionally force the TeleService provider's MiAudioManager
+    // registration + route enumeration: on international builds with InCallUI
+    // installed, isConnectDiscAudio() is false so onRelayStart never registers
+    // (live 2026-09-06 10:58: registerMiAudioManager never logged,
+    // connectDistAudioDevice silently no-ops on mMiAudioManager == null).
+    private fun hookTeleServiceRelayAudioConnect(classLoader: ClassLoader) {
+        runCatching {
+            val controllerClass = findTargetClass(
+                classLoader, "com.android.services.telephony.relay.phonecall.PhoneContinuityController"
+            )
+            val relayUtilsClass = findTargetClass(
+                classLoader, "com.android.services.telephony.relay.phonecall.RelayUtils\$Relay"
+            )
+            val providerClass = findTargetClass(
+                classLoader, "com.android.services.telephony.relay.phonecall.relayaudio.DistAudioDeviceProvider"
+            )
+            val getProviderInstance = resolveMethod(providerClass, "getInstance")
+            val registerMiAudioManager = resolveMethod(providerClass, "registerMiAudioManager")
+            val getAllDistAudioRoutes = resolveMethod(providerClass, "getAllDistAudioRoutes")
+            val getDistAudioRoutes = resolveMethod(providerClass, "getDistAudioRoutes")
+            val isCallRelayed = resolveMethod(
+                relayUtilsClass, "isCallRelayed", android.telecom.Connection::class.java
+            )
+            val isDeviceInRelay = resolveMethod(controllerClass, "isDeviceInRelay")
+            val connectFlag = controllerClass.getDeclaredField("mConnectRelayAudio")
+            connectFlag.isAccessible = true
+            installHook(
+                resolveMethod(
+                    controllerClass,
+                    "onRelayCallStateChanged",
+                    android.telecom.Connection::class.java
+                )
+            ) { chain ->
+                runCatching {
+                    val connection = chain.args.getOrNull(0) as? android.telecom.Connection
+                    val controller = chain.thisObject
+                    if (connection != null && controller != null &&
+                        isCallRelayed.invoke(null, connection) == true &&
+                        isDeviceInRelay.invoke(controller) == true
+                    ) {
+                        val provider = getProviderInstance.invoke(null)
+                        if (provider != null) {
+                            registerMiAudioManager.invoke(provider)
+                            getAllDistAudioRoutes.invoke(provider)
+                            val routes = getDistAudioRoutes.invoke(provider)
+                            log("teleservice distaudio routes=" + dumpDistAudioRoutes(routes))
+                        }
+                        if (connection.state == android.telecom.Connection.STATE_ACTIVE &&
+                            connectFlag.getBoolean(controller) == false
+                        ) {
+                            connectFlag.setBoolean(controller, true)
+                            log("re-armed connectRelayAudio for relayed active call")
+                        }
+                    }
+                }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("failed to hook teleservice relay audio connect: " +
+                "${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun dumpDistAudioRoutes(routes: Any?): String {
+        val map = routes as? Map<*, *> ?: return "null"
+        if (map.isEmpty()) return "empty"
+        return map.keys.joinToString(",") { key ->
+            val info = key?.toString() ?: "null"
+            info
+        }
+    }
+
+    // The InCallUI's DistAudioDeviceProvider hard-filters remote audio
+    // devices by deviceType 2/4/11. The Mac presents as an Apple-family
+    // type (14 on the DH framework's cached HardwareInfo — the type flip
+    // to 11 on the announce tdi + mDNS TXT does not propagate into the
+    // cross-device device map, live 2026-09-05 21:02), so
+    // RelayPresenter.connectRelayAudio() finds no route and the call audio
+    // stays on the DAS-muted local mic — the far end hears nothing while
+    // the full DistAudio uplink streams. Accept any paired remote type.
+    // Also trace the RelayPresenter → route-lookup chain: live 2026-09-06
+    // 10:58 the relayed call reached onRelayDeviceId with audioMode==2 but
+    // no route connect followed; these hooks dump the provider maps at each
+    // decision point so the next test call shows why.
+    private fun hookInCallUiDistAudioTypeFilter(classLoader: ClassLoader) {
+        runCatching {
+            val providerClass = findTargetClass(
+                classLoader, "com.android.incallui.relay.DistAudioDeviceProvider"
+            )
+            installHook(
+                resolveMethod(providerClass, "isDeviceSupportType", Int::class.javaPrimitiveType!!)
+            ) { chain ->
+                val deviceType = chain.args.getOrNull(0) as? Int
+                log("allowed dist audio device type=$deviceType")
+                true
+            }
+            hookInCallUiDistAudioTracing(classLoader, providerClass)
+        }.onFailure { error ->
+            log("failed to hook incallui dist audio type filter: " +
+                "${error.javaClass.simpleName}: ${error.message}")
+        }
+    }
+
+    private fun hookInCallUiDistAudioTracing(classLoader: ClassLoader, providerClass: Class<*>) {
+        runCatching {
+            val routesField = providerClass.getDeclaredField("mDistAudioRoutes").apply { isAccessible = true }
+            val infosField = providerClass.getDeclaredField("mDistAudioDeviceInfos").apply { isAccessible = true }
+            installHook(
+                resolveMethod(providerClass, "findAudioRouteByDeviceId", String::class.java)
+            ) { chain ->
+                val deviceId = chain.args.getOrNull(0) as? String
+                val result = chain.proceed()
+                val provider = chain.thisObject
+                val routes = runCatching { routesField.get(provider) as? Map<*, *> }.getOrNull()
+                val infos = runCatching { infosField.get(provider) as? Map<*, *> }.getOrNull()
+                log(
+                    "incallui findAudioRoute deviceId=$deviceId hit=${result != null} " +
+                        "routeKeys=${routes?.keys} infoKeys=${infos?.keys}"
+                )
+                result
+            }
+            installHook(resolveMethod(providerClass, "getAllDistAudioRoutes")) { chain ->
+                val result = chain.proceed()
+                val provider = chain.thisObject
+                val infos = runCatching { infosField.get(provider) as? Map<*, *> }.getOrNull()
+                val dump = infos?.entries?.joinToString(",") { (key, value) ->
+                    "$key(type=${runCatching { callTargetMethod(value!!, "c") }.getOrNull()})"
+                }
+                log("incallui getAllDistAudioRoutes devices=$dump")
+                result
+            }
+            installHook(resolveMethod(providerClass, "registerMiAudioManager")) { chain ->
+                val result = chain.proceed()
+                val manager = runCatching {
+                    providerClass.getDeclaredField("mMiAudioManager")
+                        .apply { isAccessible = true }.get(chain.thisObject)
+                }.getOrNull()
+                log("incallui registerMiAudioManager done managerNull=${manager == null}")
+                result
+            }
+        }.onFailure { error ->
+            log("failed to hook incallui dist audio tracing: " +
+                "${error.javaClass.simpleName}: ${error.message}")
+        }
+        runCatching {
+            val presenterClass = findTargetClass(
+                classLoader, "com.android.incallui.relay.RelayPresenter"
+            )
+            val callField = presenterClass.getDeclaredField("mCall").apply { isAccessible = true }
+            installHook(resolveMethod(presenterClass, "connectRelayAudio")) { chain ->
+                val call = runCatching { callField.get(chain.thisObject) }.getOrNull()
+                val extras = runCatching {
+                    callTargetMethod(call!!, "getRelayExtra") as? Bundle
+                }.getOrNull()
+                log("incallui connectRelayAudio entered extras=$extras")
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log("failed to hook incallui relay presenter: " +
+                "${error.javaClass.simpleName}: ${error.message}")
         }
     }
 

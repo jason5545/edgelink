@@ -519,6 +519,15 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
     // Native Xiaomi relay dial already placed the call — attach the audio
     // bridge without placing a second call.
     public let skipDial: Bool?
+    // The Mac's lyra device id, forwarded so the Android fallback dial can
+    // write the official handleRelayDialRequest OUTGOING_CALL_EXTRAS
+    // (telecomm.EXTRA_CALL_RELAYED / EXTRA_RELAY_ANSWERED /
+    // EXTRA_RELAY_DEVICE_ID). Without them the bridge-dialed call looks
+    // like a plain local call: no relay connection registration, InCallUI
+    // keeps the EARPIECE route and the local mic/speaker live (live
+    // 2026-09-05 19:04: "兩邊都出聲" — the phone played the call out loud
+    // while the MirrorCall media ran in parallel).
+    public let peerDeviceId: String?
 
     public init(
         requestId: String,
@@ -531,7 +540,8 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         lanHost: String? = nil,
         lanPort: Int? = nil,
         lanProbePort: Int? = nil,
-        skipDial: Bool? = nil
+        skipDial: Bool? = nil,
+        peerDeviceId: String? = nil
     ) {
         self.requestId = requestId
         self.action = action
@@ -544,6 +554,7 @@ public struct PhoneActionBody: Codable, Equatable, Sendable {
         self.lanPort = lanPort
         self.lanProbePort = lanProbePort
         self.skipDial = skipDial
+        self.peerDeviceId = peerDeviceId
     }
 }
 

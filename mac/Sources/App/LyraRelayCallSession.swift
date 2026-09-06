@@ -50,6 +50,17 @@ final class LyraRelayCallSession {
     // Test/assertion surface: last relay://operate response code the phone
     // sent back (200 = answered + pinned, 500 = gate rejected).
     private(set) var lastOperateResponseCode: Int?
+    // Number of an outgoing call placed through the cloud-bridge fallback
+    // (EdgeLink phone_action dial) instead of the official relay://dial.
+    // handleRelayDialRequest never runs for those, so the phone has only our
+    // placeCall extras (isCallRelayed=true) and never setDeviceInRelay →
+    // "connectRelayAudio:false" at ACTIVE, no distaudio routing (live
+    // 2026-09-06 08:31: RelayLog getDeviceInRelay=null for the whole call).
+    // The first update_call_state for the number proves the connection
+    // exists and is relayed; we then complete the setup with operate(0).
+    // Static so a mid-call relayCall channel rebuild still sees it.
+    static var pendingBridgeDialAddress: String?
+    private var bridgeDialOperateSent = false
     // True between update_call_state(4) ACTIVE and call_state_idle / terminal
     // state. Used for the mid-call channel-loss diagnostic log only.
     private(set) var isCallActive = false
@@ -829,6 +840,7 @@ final class LyraRelayCallSession {
             // (LyraRelayCallDialer.callEnded).
             if parsed.method == "call_state_idle" {
                 isCallActive = false
+                Self.pendingBridgeDialAddress = nil
                 LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
                 LyraRelayCallDialer.activeDialer?.callEnded()
             } else if let callState = parsed.jsonInt("callState") {
@@ -837,9 +849,11 @@ final class LyraRelayCallSession {
                     LyraMirrorCallRelaySession.activeSession?.setCallActive(true)
                 } else if callState == 0 || callState == 6 || callState == 7 {
                     isCallActive = false
+                    Self.pendingBridgeDialAddress = nil
                     LyraMirrorCallRelaySession.activeSession?.setCallActive(false)
                     LyraRelayCallDialer.activeDialer?.callEnded()
                 }
+                maybeSendBridgeDialOperate(parsed: parsed, callState: callState)
             }
             respond(to: parsed, fields: ["code": "200", "msg": "ok"])
         case ("update_call_info", "request"):
@@ -892,6 +906,31 @@ final class LyraRelayCallSession {
             "\"requestDeviceId\":\"\(Self.responseDeviceId)\"}"
         let uri = "relay://operate:\(methodCounter)/request?\(json)"
         sendChannelText(uri)
+    }
+
+    // Completes a bridge-fallback dial: the extras-only placeCall leaves the
+    // phone with isCallRelayed but no deviceInRelay (handleRelayDialRequest
+    // never ran), so TeleService skips connectDistAudioDevice at ACTIVE.
+    // relay://operate {operateType:0} from the pad role takes the
+    // not-in-relay branch phone-side: EXTRA_RELAY_ANSWERED=true +
+    // setDeviceInRelay(us) → mConnectRelayAudio → distaudio connects at
+    // ACTIVE, plus a saveDeviceAnswered pin refresh. performAnswer is a
+    // no-op on outgoing calls (isValidRingingCall guard).
+    // NEVER after a native relay dial: deviceInRelay is already us and
+    // operate(0) then hits the already-in-relay branch → releaseRelayExtra
+    // (strips our extras). Gated on the phone's own update_call_state for
+    // the same number so getLocalConnectionWithNumber/isCallRelayed pass.
+    private func maybeSendBridgeDialOperate(parsed: RelayURI, callState: Int) {
+        guard callState == 3 || callState == 4, !bridgeDialOperateSent,
+              let pending = Self.pendingBridgeDialAddress,
+              let address = parsed.jsonString("address")
+        else { return }
+        let pendingDigits = pending.filter(\.isNumber)
+        guard !pendingDigits.isEmpty, pendingDigits == address.filter(\.isNumber) else { return }
+        bridgeDialOperateSent = true
+        Self.pendingBridgeDialAddress = nil
+        DiagnosticsLog.info("xiaomi.relaycall.bridge_dial_operate_tx")
+        sendOperateAnswer(address: address)
     }
 
     private func respond(to request: RelayURI, fields: [String: String]) {

@@ -24,8 +24,13 @@ final class LyraDeviceTypeTests: XCTestCase {
         super.tearDown()
     }
 
-    func testDefaultIsAppleFamily() {
-        XCTAssertEqual(LyraDeviceType.resolve(), 14)
+    func testDefaultIsRelayAcceptedFamily() {
+        // Live 2026-09-05 20:25: with 14 the InCallUI DistAudioDeviceProvider
+        // (isDeviceSupportType: 2/4/11) never registers the Mac, so
+        // RelayPresenter.connectRelayAudio() no-ops and the call audio
+        // stays on the DAS-muted local mic — the far end hears nothing.
+        // 11 is the only Apple-family type both phone filters accept.
+        XCTAssertEqual(LyraDeviceType.resolve(), 11)
     }
 
     func testOverrideForcesPCClass() {
@@ -46,22 +51,22 @@ final class LyraDeviceTypeTests: XCTestCase {
         // The bucket boundaries are load-bearing — pin them so a future
         // refactor doesn't silently shift the meaning of "Apple family".
         XCTAssertEqual(LyraDeviceType.appleFamily, 14)
+        XCTAssertEqual(LyraDeviceType.relayAcceptedFamily, 11)
         XCTAssertEqual(LyraDeviceType.pcClass, 21)
     }
 
-    // Live 19:50 trace (commit 836316183 base) had type 14 + mDNS TXT
-    // already at 0x0e (deviceTypeMacBook). The phone surfaces that as
-    // "MacBook Pro" — pinned by XiaomiMiShareDiscoveryPayloadTests. The
-    // remaining leg of the chain is the announce/sync-push tdi value
-    // (this file); the union must read 14 for the device to land in the
-    // Apple bucket end-to-end.
-    func testDiscoveryPayloadAndResolverAgreeOnType14() throws {
+    // Both type surfaces must agree on the relay-accepted Apple-family
+    // value: the mDNS discovery TXT (the DAS/InCallUI hardware type) and
+    // the announce/sync-push tdi (the DevRepo trusted type). Live
+    // 2026-09-05 20:53: tdi alone at 11 left the DAS HardwareInfo at 14
+    // (read from the TXT) and the InCallUI filter still rejected the Mac.
+    func testDiscoveryPayloadAndResolverAgreeOnType11() throws {
         let data = try XiaomiMiShareDiscoveryAppData.build(
             deviceIdHex: "721572C3",
             displayName: "MacBook Pro"
         )
         let parsed = XiaomiMiShareDiscoveryAppData(data: data)
-        XCTAssertEqual(parsed.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeMacBook)
+        XCTAssertEqual(parsed.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeRelayAccepted)
         XCTAssertEqual(UInt32(parsed.deviceType ?? 0), LyraDeviceType.resolve())
     }
 }

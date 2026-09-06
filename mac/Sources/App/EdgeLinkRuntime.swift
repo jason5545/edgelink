@@ -1423,10 +1423,16 @@ final class EdgeLinkRuntime: ObservableObject {
                 if nativeSent {
                     // Native relay placed the call; attach the audio bridge
                     // without letting the phone place a second call.
+                    LyraRelayCallSession.pendingBridgeDialAddress = nil
                     _ = self.sendPhoneAction(action: "dial", number: number, skipDial: true)
                     DiagnosticsLog.info("phone.mac.bridge_dial_skip_dial native_relay_ok")
                     return
                 }
+                // The bridge dial carries the relay extras but cannot run
+                // handleRelayDialRequest, so the phone never setDeviceInRelay;
+                // the relayCall session completes the setup with operate(0)
+                // on the first update_call_state for this number.
+                LyraRelayCallSession.pendingBridgeDialAddress = number
                 DiagnosticsLog.info("phone.mac.bridge_dial_fallback native_relay_failed")
                 _ = self.sendPhoneAction(action: "dial", number: number)
             }
@@ -1475,19 +1481,27 @@ final class EdgeLinkRuntime: ObservableObject {
             ports = [phoneMeshPort]
             DiagnosticsLog.info("xiaomi.relaydial.route transport=relay port=\(phoneMeshPort)")
         } else {
+            // Live discovery first: it pins the phone's current IP (mDNS
+            // sighting). Endpoint history survives DHCP moves — entries keep
+            // the phone's old IP with its current ports, and the overwrite
+            // order below decides the dial target (live 2026-09-06 08:31:
+            // history tail 10.0.0.125 won over live 10.0.0.238, phys sync
+            // black-holed for the full 20s timeout → cloud fallback →
+            // TeleService never ran handleRelayDialRequest → no relay audio).
+            for endpoint in xiaomiMiShareDiscovery.currentPhoneMeshEndpoints() {
+                if host == nil { host = endpoint.host }
+                guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
+                ports.append(endpoint.port)
+            }
             var candidates = UserDefaults.standard.stringArray(forKey: "lyraPhoneMeshEndpointHistory") ?? []
             if let live = UserDefaults.standard.string(forKey: "lyraLastPhoneMeshEndpoint") {
                 candidates.insert(live, at: 0)
             }
             for description in candidates {
                 guard let parsed = LyraMeshResponder.parseEndpoint(description) else { continue }
-                host = parsed.host
-                if !ports.contains(parsed.port) { ports.append(parsed.port) }
-            }
-            for endpoint in xiaomiMiShareDiscovery.currentPhoneMeshEndpoints() {
-                if host == nil { host = endpoint.host }
-                guard endpoint.host == host, !ports.contains(endpoint.port) else { continue }
-                ports.append(endpoint.port)
+                if host == nil { host = parsed.host }
+                guard parsed.host == host, !ports.contains(parsed.port) else { continue }
+                ports.append(parsed.port)
             }
         }
         guard let host, !ports.isEmpty else {
@@ -3761,7 +3775,14 @@ final class EdgeLinkRuntime: ObservableObject {
                     lanHost: endpoint.lanHost,
                     lanPort: endpoint.lanPort,
                     lanProbePort: endpoint.lanProbePort,
-                    skipDial: skipDial ? true : nil
+                    skipDial: skipDial ? true : nil,
+                    // The bridge-dialed call must carry the official relay
+                    // dial extras (handleRelayDialRequest's
+                    // OUTGOING_CALL_EXTRAS shape) or the phone treats it as
+                    // a local call: EARPIECE route + live local mic/speaker
+                    // while our MirrorCall media runs in parallel (live
+                    // 2026-09-05 19:04, "兩邊都出聲").
+                    peerDeviceId: action == "dial" ? LyraRelayCallDialer.currentDeviceIdHex() : nil
                 )
                 self.pendingPhoneActions[requestId] = body
                 await self.sendPhoneActionBody(body, session: session)
@@ -6211,12 +6232,25 @@ final class EdgeLinkRuntime: ObservableObject {
     }
 
     private static func phoneRelayAdvertisedHost() -> String? {
-        if let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !override.isEmpty {
-            return override
+        // Same staleness rule as xiaomiMirrorAdvertisedHost: the debug
+        // override only applies while it still matches a live interface —
+        // a hotspot-era value outlives the hotspot and pushes the phone to
+        // a dead LAN candidate (live 2026-09-06 08:31: advertised
+        // 10.49.162.116 from an old hotspot while en0 was 10.0.0.191;
+        // the phone's probe failed and the downlink fell back to TURN).
+        let current = MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
+        let override = UserDefaults.standard.string(forKey: "phoneRelayProbeSourceHost")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let current, !current.isEmpty {
+            if let override, !override.isEmpty, override != current {
+                DiagnosticsLog.info(
+                    "phone.mac.relay.advertised_host_override_ignored " +
+                        "override=\(override) current=\(current)"
+                )
+            }
+            return current
         }
-        return MiLinkPhoneRelayProbe.preferredLocalIPv4Address()
+        return override?.isEmpty == false ? override : nil
     }
 
     private static func xiaomiMirrorAdvertisedHost() -> String? {

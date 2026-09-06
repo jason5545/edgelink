@@ -54,6 +54,12 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     public var relayedNumbers: Set<String> = []
     public private(set) var answeredDeviceId: String?
     public var deviceInRelay: String?
+    // Dial-payload overrides: the phone's score-based phys-conn reuse dials
+    // ANY of the Mac's advertised services on the same live phys conn (live
+    // 2026-09-05 19:35: com.miui.audiomonitor:DistAudioService). Set these to
+    // model a foreign service riding the quickConn sync_info shape.
+    public var dialServiceNameOverride: String?
+    public var dialServicePackageOverride: String?
 
     private let identity: LyraPhoneIdentity
     // Relay-transport harness: the relayCall channel crosses the relay
@@ -72,8 +78,16 @@ public final class LyraRelayCallRole: LyraServiceHandler {
     }
 
     // Dials the Mac's relayCall service over the established announce conn
-    // (sessionKey = the announce AuthHandshake session key).
-    public func dial(server: LyraPhoneMeshServer, sessionKey: SymmetricKey) {
+    // (sessionKey = the announce AuthHandshake session key). toHost/toPort
+    // override the peer endpoint — the phone's mesh server normally replies
+    // to the announcer's socket, but score-based phys-conn reuse can point
+    // the dial at ANY live Mac socket (e.g. the cast trust session's).
+    public func dial(
+        server: LyraPhoneMeshServer, sessionKey: SymmetricKey,
+        toHost: String? = nil, toPort: UInt16? = nil
+    ) {
+        let dialServiceName = dialServiceNameOverride ?? Self.relayServiceName
+        let dialServicePackage = dialServicePackageOverride ?? Self.servicePackage
         state = .dialing
         self.sessionKey = sessionKey
         connId = UInt32.random(in: 1...UInt32.max)
@@ -86,14 +100,14 @@ public final class LyraRelayCallRole: LyraServiceHandler {
         LyraProtoWriter.appendLengthDelimitedField(5, value: LyraPhoneIdentity.randomBytes(32), to: &peerPortRequest)
         var userInfo = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &userInfo)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(Self.servicePackage.utf8), to: &userInfo)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(dialServicePackage.utf8), to: &userInfo)
         LyraProtoWriter.appendLengthDelimitedField(
             3, value: Data(Self.colonHex(LyraPhoneIdentity.randomBytes(32)).utf8), to: &userInfo
         )
         LyraProtoWriter.appendLengthDelimitedField(10, value: peerPortRequest, to: &userInfo)
         var request = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &request)
-        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(Self.relayServiceName.utf8), to: &request)
+        LyraProtoWriter.appendLengthDelimitedField(2, value: Data(dialServiceName.utf8), to: &request)
         LyraProtoWriter.appendLengthDelimitedField(3, value: userInfo, to: &request)
         var connRequest = Data()
         LyraProtoWriter.appendVarintField(1, value: 1, to: &connRequest)
@@ -107,14 +121,14 @@ public final class LyraRelayCallRole: LyraServiceHandler {
         LyraProtoWriter.appendVarintField(1, value: 10000, to: &syncInfo)
         LyraProtoWriter.appendVarintField(2, value: 16, to: &syncInfo)
         LyraProtoWriter.appendVarintField(3, value: 1, to: &syncInfo)
-        LyraProtoWriter.appendLengthDelimitedField(4, value: Data(Self.relayServiceName.utf8), to: &syncInfo)
+        LyraProtoWriter.appendLengthDelimitedField(4, value: Data(dialServiceName.utf8), to: &syncInfo)
         LyraProtoWriter.appendLengthDelimitedField(5, value: identity.uidFeatureInfo(), to: &syncInfo)
         if let encCred = identity.encryptedLocalCred(using: sessionKey) {
             LyraProtoWriter.appendLengthDelimitedField(6, value: encCred, to: &syncInfo)
         }
         LyraProtoWriter.appendLengthDelimitedField(8, value: quickConn, to: &syncInfo)
         let inner = LogiConnInnerFrame(frameType: 5, payload: .syncInfo(syncInfo))
-        server.sendLogi(connId: connId, inner: inner)
+        server.sendLogi(connId: connId, inner: inner, toHost: toHost, port: toPort)
 
         // The peer-port answer arrives as a plaintext packType-5 command.
         let previousHandler = server.plaintextCommandHandler

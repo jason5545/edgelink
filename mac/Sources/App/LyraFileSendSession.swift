@@ -222,7 +222,7 @@ final class LyraFileSendSession {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let deviceInfo = LyraDeviceInfo(
             deviceId: deviceIdHex,
-            deviceType: 14,
+            deviceType: MijiaCertEnrollment.physDeviceType(),
             uidHash: "61F2",
             displayName: displayName,
             osVersion: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",

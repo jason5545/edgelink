@@ -321,6 +321,34 @@ final class LyraMirrorCallRelayTests: XCTestCase {
         XCTAssertNil(session.mirrorCallRelay?.audioSource)
     }
 
+    // Live 2026-09-06 09:35: the first KeyData went out while the advertise
+    // was still relay-loopback (sourcePort=0), then the route flipped to
+    // LAN — the fresh LAN audio source was never armed (armSourcesLocked
+    // only ran in the relay branch and on event 23), so sendAudioFrame's
+    // armed guard dropped every frame: sink connected, capture running,
+    // au_send=0 for the whole call. The LAN branch must arm the new source
+    // from the already-exchanged shared secret.
+    func testAdvertiseFlipToLANArmsFreshAudioSource() throws {
+        try bringUpCastChannel()
+        let relay = try XCTUnwrap(relay)
+        let session = try XCTUnwrap(session)
+        let mirrorCall = try XCTUnwrap(session.mirrorCallRelay)
+        let relayPort = LyraMirrorCallRelaySession.relaySinkAdvertisePort
+
+        mirrorCall.setAdvertiseEndpoint(("127.0.0.1", relayPort))
+        waitFor("local audio source torn down") { session.mirrorCallRelay?.audioSource == nil }
+
+        relay.sendMirrorCallKey()
+        waitFor("key exchange over the relay advertise") {
+            relay.macKeyData?.p2pIp == "127.0.0.1" && relay.macKeyData?.port == Int(relayPort)
+        }
+
+        mirrorCall.setAdvertiseEndpoint(nil)
+        waitFor("LAN source recreated and armed from the existing keys") {
+            session.mirrorCallRelay?.audioSource?.armed == true
+        }
+    }
+
     // The call went active BEFORE the cast channel finished negotiating
     // (live 2026-09-02: the driver's exactly-once gate fired into a nil
     // activeSession and the whole call stayed silent): the pending drive
@@ -595,6 +623,73 @@ final class LyraMirrorCallRelayTests: XCTestCase {
             )
             XCTAssertEqual(LyraMirrorCallRelaySession.engagementCallId, "call-A")
         }
+    }
+
+    // Live 2026-09-05 18:16 (Mac-dialed call, one-way silence): the relay
+    // callState=4 push (LyraRelayCallSession) drove setCallActive(true)
+    // BEFORE the driver's phone.call_status active push stamped
+    // pendingCallId, so event 24/31 went out with engagementCallId stamped
+    // from a NIL pendingCallId. The next same-call flap rebuild then read
+    // "different call" and sent the orphan-stop 25 — which on the real
+    // phone tears down the HEALTHY mid-call source+sink, and event 24
+    // cannot revive the source afterwards (G.W's started-guard stays true).
+    // The fix: an engaged session with nil engagementCallId but a live
+    // pendingCallId is identity-pending THIS call (skip the stop), and the
+    // driver's setCallActive backfills the stamp once the identity lands.
+    func testRelayDrivenEngagementBeforeDriverStampSkipsOrphanStopOnRebuild() throws {
+        // Race precondition: no driver identity yet (the previous tests leak
+        // their statics — clear them to model the fresh call).
+        LyraMirrorCallRelaySession.pendingCallActive = false
+        LyraMirrorCallRelaySession.pendingCallId = nil
+        LyraMirrorCallRelaySession.engagementCallId = nil
+        LyraMirrorCallRelaySession.phoneMirrorCallEngaged = false
+        try bringUpCastChannel()
+        let relayA = try XCTUnwrap(self.relay)
+        let session = try XCTUnwrap(self.session)
+
+        relayA.sendMirrorCallKey()
+        waitFor("key exchange") { relayA.state == .keyExchanged }
+        // The relay callState=4 path engages WITHOUT any call identity.
+        session.notifyMirrorCallActive(true)
+        waitFor("24/31 sent with identity still pending") {
+            relayA.callStartCount > 0 && relayA.sinkStartPort != nil
+        }
+        waitFor("engaged, engagementCallId still nil") {
+            LyraMirrorCallRelaySession.phoneMirrorCallEngaged
+                && LyraMirrorCallRelaySession.engagementCallId == nil
+        }
+
+        // The driver catches up (phone.call_status active): stamps the
+        // pendingCallId and drives setCallActive(true) — already-active, so
+        // the state guard returns early; the backfill must still run.
+        LyraMirrorCallRelaySession.pendingCallId = "call-A"
+        LyraMirrorCallRelaySession.activeSession?.setCallActive(true)
+        waitFor("engagement stamped by the driver backfill") {
+            LyraMirrorCallRelaySession.engagementCallId == "call-A"
+        }
+
+        // Same-call flap + rebuild: no orphan stop, media stays up.
+        let oldPhone = try XCTUnwrap(self.phone)
+        oldPhone.cast.releaseCastChannel()
+        waitFor("channel released by the phone") { !session.isChannelReady }
+        oldPhone.stop()
+
+        meshPort += 1
+        LyraMirrorCallRelaySession.pendingCallActive = true
+        LyraMirrorCallRelaySession.pendingCallId = "call-A"
+        try bringUpCastChannel()
+        let cycleRelay = try XCTUnwrap(self.relay)
+
+        waitFor("Mac KeyData re-sent on the fresh channel") { cycleRelay.macKeyData != nil }
+        cycleRelay.sendMirrorCallKey()
+        waitFor("24/31 re-sent (phone-side no-op)") {
+            cycleRelay.callStartCount > 0 && cycleRelay.sinkStartPort != nil
+        }
+        XCTAssertEqual(
+            cycleRelay.callStopCount, 0,
+            "identity-pending same-call rebuild must not orphan-stop the healthy phone media"
+        )
+        XCTAssertEqual(LyraMirrorCallRelaySession.engagementCallId, "call-A")
     }
 
     // The flip side of the same-call gate: a STALE engagement from a

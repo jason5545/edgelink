@@ -60,7 +60,12 @@ class AndroidPhoneCallController(context: Context) {
         }
         val telUri = "tel:$number"
         return runCatching {
-            AndroidShizukuSupport.placePhoneCall(appContext, telUri)
+            // Bridge-fallback dials must look identical to TeleService's
+            // handleRelayDialRequest: without the relay extras the phone
+            // runs the call as a plain local call (EARPIECE + local mic
+            // while our MirrorCall media streams in parallel — live
+            // 2026-09-05 19:04 "兩邊都出聲").
+            AndroidShizukuSupport.placePhoneCall(appContext, telUri, body.peerDeviceId)
         }.fold(
             onSuccess = { result ->
                 EdgeLinkLog.info(

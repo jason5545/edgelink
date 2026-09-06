@@ -36,7 +36,7 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         let payload = XiaomiMiShareDiscoveryAppData(data: data)
 
         XCTAssertEqual(payload.deviceIdHex, "A1B2C3D4")
-        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeMacBook)
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeRelayAccepted)
         XCTAssertEqual(payload.accountIdHex, "581F")
         XCTAssertEqual(payload.displayName, "EdgeLink Mac")
         XCTAssertEqual(
@@ -57,7 +57,7 @@ final class XiaomiMiShareDiscoveryPayloadTests: XCTestCase {
         let payload = XiaomiMiShareDiscoveryAppData(data: data)
 
         XCTAssertEqual(payload.deviceIdHex, "721572C3")
-        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeMacBook)
+        XCTAssertEqual(payload.deviceType, XiaomiMiShareDiscoveryAppData.deviceTypeRelayAccepted)
         XCTAssertEqual(payload.accountIdHex, "61F2")
         XCTAssertEqual(payload.displayName, "MacBook Pro")
     }
