@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 import XCTest
 
 // Mock-based coverage for the distaudio WFD patch: the miplaycast 3.1.x
@@ -81,6 +82,93 @@ final class LyraDistAudioWFDTests: XCTestCase {
         let encrypted = DistAudioECB.encrypt(pcm, key: key)
         XCTAssertNotEqual(encrypted.prefix(16), pcm.prefix(16))
         XCTAssertEqual(DistAudioECB.decrypt(encrypted, key: key), pcm)
+    }
+
+    // MARK: - Uplink direct feed
+
+    // Regression for the 2026-09-06 uplink fix: the phone's native
+    // MiPlayCastClient receives our RTP/TS uplink but never hands frames to
+    // the SDK (the 0x100707/mIsPhoneRelay-gated shared-memory hop), so every
+    // 20ms PCM frame must ALSO reach the audiomonitor hook's UDP listener
+    // as one raw 656-byte AES-128-ECB datagram. Drives the sender through
+    // the engine-free seam (startNetwork + enqueueCapturedPCM).
+    func testUplinkDirectFeedSendsRawCipherFramesAlongsideRTP() throws {
+        XCTAssertEqual(LyraDistAudioUplink.directFeedPort, 45671)
+        let key = Data((0..<16).map { UInt8($0 &* 5 &+ 11) })
+        let feed = try UDPDatagramCollector(port: LyraDistAudioUplink.directFeedPort)
+        defer { feed.stop() }
+        let rtp = try UDPDatagramCollector(port: 0)
+        defer { rtp.stop() }
+        // A plain UDP socket released immediately after bind(0) frees its
+        // port deterministically — a cancelled NWListener lingers long
+        // enough for the uplink's requiredLocalEndpoint bind to EADDRINUSE.
+        let localPort = Self.freeUDPPort()
+
+        let uplink = LyraDistAudioUplink(
+            host: "127.0.0.1", port: rtp.boundPort, localPort: localPort, mediaKey: key
+        )
+        uplink.startNetwork()
+        defer { uplink.stop() }
+
+        // 3 full 640B frames with distinct contents, plus a 960B chunk
+        // (1.5 frames) to pin the carry-split: exactly one more frame now,
+        // the last half-frame stays buffered.
+        var frames: [Data] = []
+        for f in 0..<3 {
+            frames.append(Data((0..<640).map { UInt8(($0 &+ f &* 37) & 0xFF) }))
+        }
+        var chunk = frames[0] + frames[1] + frames[2]
+        let half = Data((0..<960).map { UInt8(($0 &+ 200) & 0xFF) })
+        chunk.append(half)
+        uplink.enqueueCapturedPCM(chunk)
+
+        XCTAssertTrue(feed.waitForDatagrams(4), "feed datagrams: \(feed.count)")
+        XCTAssertEqual(feed.count, 4)
+        let expectedFrames = frames + [Data(half.prefix(640))]
+        for (index, frame) in expectedFrames.enumerated() {
+            guard let datagram = feed.datagram(at: index) else {
+                XCTFail("missing feed datagram \(index)")
+                continue
+            }
+            XCTAssertEqual(datagram.count, 656, "frame \(index) must be one ECB cipher block chain")
+            XCTAssertEqual(
+                DistAudioECB.decrypt(datagram, key: key), frame,
+                "frame \(index) must decrypt back to the captured PCM"
+            )
+        }
+
+        // The RTP/TS uplink still flows next to the feed (first packet
+        // carries the ff03 announce + PAT/PMT + PES). Byte 1 is the
+        // production dialect byte 0x61 as verified on-device.
+        XCTAssertTrue(rtp.waitForDatagrams(1), "rtp packets: \(rtp.count)")
+        guard let rtpPacket = rtp.datagram(at: 0) else {
+            XCTFail("missing rtp packet")
+            return
+        }
+        XCTAssertEqual(rtpPacket.first, 0x80)
+        XCTAssertEqual(rtpPacket.dropFirst().first, 0x61)
+    }
+
+    private static func freeUDPPort() -> UInt16 {
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr = in_addr(s_addr: INADDR_LOOPBACK.bigEndian)
+        addr.sin_port = 0
+        var bindAddr = sockaddr()
+        memcpy(&bindAddr, &addr, MemoryLayout<sockaddr_in>.size)
+        XCTAssertEqual(Darwin.bind(fd, &bindAddr, socklen_t(MemoryLayout<sockaddr_in>.size)), 0)
+        var out = sockaddr_in()
+        var outLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &out) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                XCTAssertEqual(Darwin.getsockname(fd, sa, &outLen), 0)
+            }
+        }
+        Darwin.close(fd)
+        return UInt16(bigEndian: out.sin_port)
     }
 
     // MARK: - Media decoder (mock phone packets)
@@ -333,5 +421,78 @@ final class LyraDistAudioWFDTests: XCTestCase {
             (UInt32(data[offset + 1]) << 8) |
             (UInt32(data[offset + 2]) << 16) |
             (UInt32(data[offset + 3]) << 24)
+    }
+}
+
+// Minimal UDP datagram collector for the direct-feed contract test: one
+// NWListener, per-sender NWConnections, all received datagrams in arrival
+// order.
+private final class UDPDatagramCollector {
+    private(set) var boundPort: UInt16 = 0
+    private var listener: NWListener?
+    private var connections: [NWConnection] = []
+    private var received: [Data] = []
+    private let queue = DispatchQueue(label: "UDPDatagramCollector")
+    private let readySemaphore = DispatchSemaphore(value: 0)
+
+    var count: Int {
+        queue.sync { received.count }
+    }
+
+    init(port: UInt16) throws {
+        let listener = try NWListener(
+            using: .udp,
+            on: port == 0 ? .any : NWEndpoint.Port(rawValue: port)!
+        )
+        self.listener = listener
+        listener.stateUpdateHandler = { [weak self] state in
+            if case .ready = state {
+                // Already on `queue` — set synchronously so the semaphore
+                // never unblocks before boundPort is visible.
+                self?.boundPort = self?.listener?.port?.rawValue ?? 0
+                self?.readySemaphore.signal()
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            self.queue.async {
+                self.connections.append(connection)
+                connection.start(queue: self.queue)
+                self.receiveLoop(connection)
+            }
+        }
+        listener.start(queue: queue)
+        XCTAssertEqual(readySemaphore.wait(timeout: .now() + 5), .success)
+        XCTAssertNotEqual(boundPort, 0)
+    }
+
+    func datagram(at index: Int) -> Data? {
+        queue.sync { index < received.count ? received[index] : nil }
+    }
+
+    func waitForDatagrams(_ count: Int, timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if self.count >= count { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return self.count >= count
+    }
+
+    func stop() {
+        queue.sync {
+            listener?.cancel()
+            for connection in connections { connection.cancel() }
+        }
+    }
+
+    private func receiveLoop(_ connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, _ in
+            guard let self else { return }
+            self.queue.async {
+                if let data { self.received.append(data) }
+                self.receiveLoop(connection)
+            }
+        }
     }
 }

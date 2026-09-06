@@ -1014,7 +1014,43 @@ final class LyraDistAudioUplink {
         self.mediaKey = mediaKey
     }
 
+    // The phone's native MiPlayCastClient receives our RTP/TS uplink but
+    // never hands frames to the SDK (the 0x100707/mIsPhoneRelay-gated
+    // shared-memory hop), so the telephony AudioTrack starves. The
+    // audiomonitor LSPosed hook listens on this port and feeds each raw
+    // cipher frame straight into DistAudioStream.playCastAudioData.
+    // The phone's reported mesh port list rotates through ephemeral ports
+    // (15550/15551/26466/…/60260, and 45671 too — live 2026-09-06 19:00),
+    // and our announcer/dialer phys-sync sweeps every reported port, so no
+    // fixed port is ever sweep-free. The hook's size filter drops those
+    // 141-byte mesh frames (they are the `badSize` counter — noise, not a
+    // fault). The only hard requirement is that the bind wins at
+    // audiomonitor start; if the phone's mesh service ever holds 45671
+    // first, the hook logs a bind failure and the feed stays dark.
+    // Internal (not private) so the test suite can pin the port contract.
+    static let directFeedPort: UInt16 = 45671
+    private var directFeed: NWConnection?
+    private var directFeedSent = 0
+    private var directFeedFailures = 0
+
     func start() {
+        startNetwork()
+        // A/B probe: /tmp/edgelink-distaudio-no-rtcp disables the RTCP
+        // socket + SRs. Every round so far, the phone's RTP delivery
+        // dies the instant its SECOND kWhatRTPConnect fires (whichever
+        // leg — RTP or RTCP — is second), so test whether the RTCP
+        // connect notification is what corrupts the RTP session.
+        if Self.debugNoRTCP() {
+            DiagnosticsLog.info("xiaomi.distaudio.uplink_rtcp_disabled_by_debug")
+        } else {
+            startRTCP()
+        }
+        startCapture()
+    }
+
+    // The network half of start(), split out so tests can drive frames
+    // through the sender without an AVAudioEngine (no mic on test runners).
+    func startNetwork() {
         let parameters = NWParameters.udp
         // Send from the declared server_port so packets match the SETUP
         // transport (without this NWConnection uses an ephemeral port).
@@ -1036,17 +1072,18 @@ final class LyraDistAudioUplink {
             }
         }
         connection.start(queue: queue)
-        // A/B probe: /tmp/edgelink-distaudio-no-rtcp disables the RTCP
-        // socket + SRs. Every round so far, the phone's RTP delivery
-        // dies the instant its SECOND kWhatRTPConnect fires (whichever
-        // leg — RTP or RTCP — is second), so test whether the RTCP
-        // connect notification is what corrupts the RTP session.
-        if Self.debugNoRTCP() {
-            DiagnosticsLog.info("xiaomi.distaudio.uplink_rtcp_disabled_by_debug")
-        } else {
-            startRTCP()
+        let feed = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: Self.directFeedPort)!,
+            using: NWParameters.udp
+        )
+        self.directFeed = feed
+        feed.stateUpdateHandler = { state in
+            if case .ready = state {
+                DiagnosticsLog.info("xiaomi.distaudio.uplink_direct_feed_ready port=\(Self.directFeedPort)")
+            }
         }
-        startCapture()
+        feed.start(queue: queue)
     }
 
     static func debugNoRTCP() -> Bool {
@@ -1126,7 +1163,8 @@ final class LyraDistAudioUplink {
         queue.async { [weak self] in
             DiagnosticsLog.info(
                 "xiaomi.distaudio.uplink_stop taps=\(self?.tapInvocations ?? 0) buffers=\(self?.captureBuffers ?? 0) " +
-                    "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0)"
+                    "sent=\(self?.sentPackets ?? 0) failures=\(self?.sendFailures ?? 0) " +
+                    "directFeed=\(self?.directFeedSent ?? 0)/\(self?.directFeedFailures ?? 0)"
             )
             self?.engine?.stop()
             self?.engine?.inputNode.removeTap(onBus: 0)
@@ -1135,6 +1173,8 @@ final class LyraDistAudioUplink {
             self?.rtcpTimer = nil
             self?.rtcpConnection?.cancel()
             self?.rtcpConnection = nil
+            self?.directFeed?.cancel()
+            self?.directFeed = nil
             self?.connection?.cancel()
         }
     }
@@ -1271,6 +1311,13 @@ final class LyraDistAudioUplink {
                     "nonzero=\(nonzero) maxAbs=\(maxAbs)"
             )
         }
+        enqueueCapturedPCM(pcm)
+    }
+
+    // Frame splitter shared by the audio tap and tests: every 640-byte
+    // (20ms) chunk becomes one RTP/TS packet plus one raw cipher datagram
+    // to the phone's hook listener.
+    func enqueueCapturedPCM(_ pcm: Data) {
         pcmCarry.append(pcm)
         while pcmCarry.count >= Self.pcmFrameBytes {
             let frame = pcmCarry.prefix(Self.pcmFrameBytes)
@@ -1288,6 +1335,22 @@ final class LyraDistAudioUplink {
     // stream entirely (pipeline stalled after ~10 RTP packets).
     private func sendAudioFrame(_ pcm: Data) {
         let cipher = DistAudioECB.encrypt(pcm, key: mediaKey)
+        // Bypass for the phone's gated native delivery: raw cipher frame
+        // straight to the audiomonitor hook listener (see directFeedPort).
+        directFeed?.send(content: cipher, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                self.directFeedFailures += 1
+            } else {
+                self.directFeedSent += 1
+                if self.directFeedSent == 1 || self.directFeedSent % 500 == 0 {
+                    DiagnosticsLog.info(
+                        "xiaomi.distaudio.uplink_direct_feed sent=\(self.directFeedSent) " +
+                            "failures=\(self.directFeedFailures)"
+                    )
+                }
+            }
+        })
         var tsPackets: [Data] = []
         if frameIndex == 0 {
             // ff03 announce (as observed on the phone's downlink): PES

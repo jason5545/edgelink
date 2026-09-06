@@ -3,6 +3,8 @@ package com.edgelink.app
 import android.content.Context
 import android.content.ContentProvider
 import android.content.Intent
+import android.media.AudioRecord
+import android.media.AudioTrack
 import android.os.Binder
 import android.os.Bundle
 import android.os.Handler
@@ -10,6 +12,9 @@ import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import kotlin.concurrent.thread
 import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
@@ -34,6 +39,17 @@ internal object MiLinkPrivilegeHookPolicy {
     const val XIAOMI_MIRROR_CAST_FRAME_ACTION = "com.edgelink.app.XIAOMI_MIRROR_CAST_FRAME"
     const val XIAOMI_MIRROR_CAST_FRAME_EXTRA = "frame"
     const val FAKE_MIRROR_REMOTE_ID = "edgelink-mac-mi-pad"
+
+    // DistAudio uplink direct-feed listener port (audiomonitor hook). The
+    // Mac side (LyraDistAudioUplink.directFeedPort) must carry the same
+    // value — pinned by tests on both sides.
+    const val DIST_AUDIO_DIRECT_FEED_PORT = 45671
+
+    // One feed datagram = one 20ms 16kHz mono PCM frame encrypted as
+    // AES-128-ECB/PKCS7 (640B PCM → 656B cipher). Anything else landing on
+    // the port is the Mac's phys-sync sweep (141-byte Lyra mesh frames
+    // among others) and must be dropped.
+    fun isDistAudioFeedFrameSize(length: Int): Boolean = length >= 16 && length % 16 == 0
 
     private val mirrorPhoneProviderMethods = setOf(
         "getAliveBinder",
@@ -179,6 +195,9 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
         if (MiLinkPrivilegeHookPolicy.shouldHookAudioMonitor(packageName)) {
             hookAudioMonitorDistRpcRetry(classLoader)
+            hookAudioMonitorStreamStop(classLoader)
+            hookAudioMonitorStreamReconnect(classLoader)
+            hookAudioMonitorDirectUplinkFeed(classLoader)
         }
     }
 
@@ -267,17 +286,25 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
         }
     }
 
-    // com.miui.audiomonitor DAS drops the openSpeaker/openMicrophone RPCs when
-    // the RPC channel to the remote device is not up yet:
-    // connectDistAudioDevice → DistRpcClient.setServiceForDevice(deviceId)
-    // only maps services already in DeviceToService (filled by
-    // onServiceConnected), and every rpc*() reads volatile mRpcInt and
-    // silently returns on null — no retry (live 2026-09-06 15:28: call went
-    // ACTIVE, connectDistAudioDevice ran 2s BEFORE the channel negotiated →
-    // "no RPC service to device" + "rpc service is null" → the phone muted
-    // itself while the Mac never got the RPCs: silent on both ends for the
-    // whole call). Stash the dropped open calls and replay them from
-    // onServiceConnected after re-running setServiceForDevice.
+    // com.miui.audiomonitor DAS drops the openSpeaker/openMicrophone/
+    // startSpeakerStream/startMicStream RPCs when the RPC channel to the
+    // remote device is not up yet: connectDistAudioDevice →
+    // DistRpcClient.setServiceForDevice(deviceId) only maps services already
+    // in DeviceToService (filled by onServiceConnected), and every rpc*()
+    // reads volatile mRpcInt and silently returns on null — no retry, and
+    // the channel itself is only (re)built by the discovery-driven
+    // onServiceOnline → bindService path, which can lag the call by tens of
+    // seconds or not fire at all (live 2026-09-06 15:28: channel up 2s
+    // after connect → RPCs lost; live 2026-09-06 16:28: no channel for the
+    // whole 14s call, stash TTL 30s expired 3s before the channel came up →
+    // phone muted itself, Mac got nothing). Stash all four dropped calls
+    // and replay them when the service appears — onServiceConnected, a
+    // successful setServiceForDevice, or the 1s retry loop reattaching
+    // mRpcInt from DeviceToService; the loop also force-reruns bindService()
+    // from the cached TrustedDeviceInfo every 5s while the discovery path
+    // stalls. A fresh rpc*() that can proceed supersedes any stashed call of
+    // the same name, so stale ports/keys from a dead call are never replayed
+    // into a new one.
     private class PendingDistRpc(
         val method: Method,
         val args: List<Any?>,
@@ -295,75 +322,62 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
             val rpcInterfaceClass = findTargetClass(
                 classLoader, "com.miui.audiomonitor.distaudio.message.DistRpcInterface"
             )
+            val trustedDeviceInfoClass = findTargetClass(
+                classLoader, "com.xiaomi.continuity.networking.TrustedDeviceInfo"
+            )
             val rpcIntField = clientClass.getDeclaredField("mRpcInt").apply { isAccessible = true }
+            val deviceToServiceField =
+                clientClass.getDeclaredField("DeviceToService").apply { isAccessible = true }
+            val deviceInfoField =
+                clientClass.getDeclaredField("mDeviceInfo").apply { isAccessible = true }
             val setServiceForDevice =
                 resolveMethod(clientClass, "setServiceForDevice", String::class.java)
-            val rpcOpenSpeaker = resolveMethod(
-                clientClass, "rpcOpenSpeaker",
-                String::class.java, hwInfoClass,
-                Boolean::class.javaPrimitiveType!!, String::class.java,
-                Int::class.javaPrimitiveType!!, String::class.java
-            )
-            val rpcOpenMicrophone = resolveMethod(
-                clientClass, "rpcOpenMicrophone",
-                String::class.java, hwInfoClass, Boolean::class.javaPrimitiveType!!
+            val bindService = resolveMethod(clientClass, "bindService", trustedDeviceInfoClass)
+            val rpcMethods = listOf(
+                resolveMethod(
+                    clientClass, "rpcOpenSpeaker",
+                    String::class.java, hwInfoClass,
+                    Boolean::class.javaPrimitiveType!!, String::class.java,
+                    Int::class.javaPrimitiveType!!, String::class.java
+                ),
+                resolveMethod(
+                    clientClass, "rpcOpenMicrophone",
+                    String::class.java, hwInfoClass, Boolean::class.javaPrimitiveType!!
+                ),
+                resolveMethod(clientClass, "rpcStartSpeakerStream", String::class.java),
+                resolveMethod(clientClass, "rpcStartMicStream", String::class.java)
             )
 
             val lock = Any()
             val stashed = mutableListOf<PendingDistRpc>()
-            val stashTtlMs = 30_000L
+            val stashTtlMs = 90_000L
+            val maxServiceRetryAttempts = 30
+            val mainHandler = Handler(Looper.getMainLooper())
 
             fun currentRpc(client: Any): Any? = rpcIntField.get(client)
+            fun serviceFor(client: Any, deviceId: String): Any? =
+                (deviceToServiceField.get(client) as? Map<*, *>)?.get(deviceId)
+            fun cachedDevice(client: Any, deviceId: String): Any? =
+                (deviceInfoField.get(client) as? Map<*, *>)?.get(deviceId)
 
-            installHook(setServiceForDevice) { chain ->
-                val result = chain.proceed()
-                val client = chain.thisObject
-                if (client != null && currentRpc(client) == null) {
-                    log("audiomonitor dist rpc no service yet device=${chain.args.getOrNull(0)}")
-                }
-                result
-            }
-
-            fun stashIfDead(client: Any?, method: Method, args: List<Any?>): Boolean {
-                if (client == null || currentRpc(client) != null) return false
-                synchronized(lock) {
-                    stashed.removeAll { it.method.name == method.name }
-                    stashed.add(PendingDistRpc(method, args, SystemClock.elapsedRealtime()))
-                }
-                log("audiomonitor dist rpc stashed ${method.name}")
-                return true
-            }
-
-            installHook(rpcOpenSpeaker) { chain ->
-                if (stashIfDead(chain.thisObject, rpcOpenSpeaker, chain.args)) null
-                else chain.proceed()
-            }
-            installHook(rpcOpenMicrophone) { chain ->
-                if (stashIfDead(chain.thisObject, rpcOpenMicrophone, chain.args)) null
-                else chain.proceed()
-            }
-
-            installHook(
-                resolveMethod(clientClass, "onServiceConnected", rpcInterfaceClass, String::class.java)
-            ) { chain ->
-                val result = chain.proceed()
-                val client = chain.thisObject
-                val deviceId = chain.args.getOrNull(1) as? String
-                if (client != null && deviceId != null && currentRpc(client) == null) {
-                    runCatching { setServiceForDevice.invoke(client, deviceId) }
-                }
+            fun drainStash(client: Any, why: String) {
                 val replay: List<PendingDistRpc>
                 synchronized(lock) {
                     val now = SystemClock.elapsedRealtime()
-                    stashed.removeAll { now - it.stashedAtMs > stashTtlMs }
+                    val expired = stashed.filter { now - it.stashedAtMs > stashTtlMs }
+                    expired.forEach { log("audiomonitor dist rpc stash expired ${it.method.name}") }
+                    stashed.removeAll(expired)
                     replay = stashed.toList()
                     stashed.clear()
                 }
                 for (pending in replay) {
-                    if (client == null) break
+                    if (currentRpc(client) == null) {
+                        synchronized(lock) { stashed.add(pending) }
+                        continue
+                    }
                     runCatching { pending.method.invoke(client, *pending.args.toTypedArray()) }
                         .onSuccess {
-                            log("audiomonitor dist rpc replayed ${pending.method.name}")
+                            log("audiomonitor dist rpc replayed ${pending.method.name} why=$why")
                         }
                         .onFailure { error ->
                             log(
@@ -372,11 +386,453 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
                             )
                         }
                 }
+            }
+
+            fun scheduleServiceRetry(client: Any, deviceId: String, attempt: Int) {
+                if (attempt > maxServiceRetryAttempts) {
+                    log("audiomonitor dist rpc retry exhausted device=$deviceId")
+                    return
+                }
+                mainHandler.postDelayed({
+                    runCatching {
+                        if (currentRpc(client) != null) return@runCatching
+                        val service = serviceFor(client, deviceId)
+                        if (service != null) {
+                            rpcIntField.set(client, service)
+                            log(
+                                "audiomonitor dist rpc reattached device=$deviceId " +
+                                    "attempt=$attempt"
+                            )
+                            drainStash(client, "reattach")
+                        } else {
+                            if (attempt % 5 == 0) {
+                                val cached = cachedDevice(client, deviceId)
+                                log(
+                                    "audiomonitor dist rpc retry attempt=$attempt " +
+                                        "device=$deviceId cached=${cached != null}"
+                                )
+                                if (cached != null) {
+                                    runCatching { bindService.invoke(client, cached) }
+                                }
+                            }
+                            scheduleServiceRetry(client, deviceId, attempt + 1)
+                        }
+                    }
+                }, 1000)
+            }
+
+            installHook(setServiceForDevice) { chain ->
+                val result = chain.proceed()
+                val client = chain.thisObject
+                val deviceId = chain.args.getOrNull(0) as? String
+                if (client != null && deviceId != null) {
+                    if (currentRpc(client) == null) {
+                        log("audiomonitor dist rpc no service yet device=$deviceId")
+                        val cached = cachedDevice(client, deviceId)
+                        if (cached != null) {
+                            log("audiomonitor dist rpc force rebind device=$deviceId")
+                            runCatching { bindService.invoke(client, cached) }
+                        }
+                        scheduleServiceRetry(client, deviceId, 1)
+                    } else {
+                        drainStash(client, "setServiceForDevice")
+                    }
+                }
+                result
+            }
+
+            // Response watchdog: the DAS RPC layer has no retransmit for a
+            // request that leaves the phone but never gets answered (live
+            // 2026-09-06 18:44: distrpc channel rode the relay-fed cast
+            // phys conn while it rebuilt; openMicrophone went out between
+            // two delivered RPCs and was never answered → no
+            // postOpenMicrophone → no startMicStream → uplink dead for the
+            // whole call while downlink played fine). Re-send an open* RPC
+            // with no postOpen* response within 4s, up to 3 resends;
+            // duplicate open* is idempotent on the remote side (healthy
+            // calls already receive it twice from the dual providers).
+            val distAudioObjectClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.message.DistAudioObject"
+            )
+            val audioManagerClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.service.IDistAudioManager"
+            )
+            val openResponsePost = mapOf(
+                "rpcOpenSpeaker" to "postOpenSpeaker",
+                "rpcOpenMicrophone" to "postOpenMicrophone"
+            )
+            val lastOpenResponseAtMs = HashMap<String, Long>()
+            for ((rpcName, postName) in openResponsePost) {
+                installHook(
+                    resolveMethod(audioManagerClass, postName, distAudioObjectClass)
+                ) { chain ->
+                    synchronized(lock) {
+                        lastOpenResponseAtMs[rpcName] = SystemClock.elapsedRealtime()
+                    }
+                    chain.proceed()
+                }
+            }
+            fun armOpenResponseWatchdog(
+                client: Any,
+                method: Method,
+                args: List<Any?>,
+                sentAt: Long,
+                resend: Int
+            ) {
+                mainHandler.postDelayed({
+                    val answered = synchronized(lock) {
+                        (lastOpenResponseAtMs[method.name] ?: 0L) >= sentAt
+                    }
+                    if (answered || currentRpc(client) == null) {
+                        return@postDelayed
+                    }
+                    if (resend >= 3) {
+                        log("audiomonitor dist rpc watchdog exhausted ${method.name}")
+                        return@postDelayed
+                    }
+                    log("audiomonitor dist rpc watchdog resend ${method.name} attempt=$resend")
+                    val resentAt = SystemClock.elapsedRealtime()
+                    runCatching { method.invoke(client, *args.toTypedArray()) }
+                        .onFailure { error ->
+                            log(
+                                "audiomonitor dist rpc watchdog resend failed " +
+                                    "${method.name}: ${error.javaClass.simpleName}: " +
+                                    error.message
+                            )
+                        }
+                    armOpenResponseWatchdog(client, method, args, resentAt, resend + 1)
+                }, 4000)
+            }
+
+            for (method in rpcMethods) {
+                installHook(method) { chain ->
+                    val client = chain.thisObject
+                    if (client == null || currentRpc(client) == null) {
+                        synchronized(lock) {
+                            stashed.removeAll { it.method.name == method.name }
+                            stashed.add(
+                                PendingDistRpc(
+                                    method, chain.args.toList(), SystemClock.elapsedRealtime()
+                                )
+                            )
+                        }
+                        log("audiomonitor dist rpc stashed ${method.name}")
+                        null
+                    } else {
+                        synchronized(lock) {
+                            stashed.removeAll { it.method.name == method.name }
+                        }
+                        val sentAt = SystemClock.elapsedRealtime()
+                        val result = chain.proceed()
+                        if (method.name in openResponsePost) {
+                            armOpenResponseWatchdog(
+                                client, method, chain.args.toList(), sentAt, 0
+                            )
+                        }
+                        result
+                    }
+                }
+            }
+
+            installHook(bindService) { chain ->
+                val deviceId = runCatching {
+                    trustedDeviceInfoClass.getMethod("getDeviceId")
+                        .invoke(chain.args.getOrNull(0)) as? String
+                }.getOrNull()
+                log("audiomonitor dist rpc bindService device=$deviceId")
+                chain.proceed()
+            }
+
+            installHook(
+                resolveMethod(clientClass, "onServiceDisconnect", String::class.java)
+            ) { chain ->
+                log("audiomonitor dist rpc service disconnected device=${chain.args.getOrNull(0)}")
+                chain.proceed()
+            }
+
+            installHook(
+                resolveMethod(clientClass, "onServiceConnected", rpcInterfaceClass, String::class.java)
+            ) { chain ->
+                val result = chain.proceed()
+                val client = chain.thisObject
+                val deviceId = chain.args.getOrNull(1) as? String
+                log("audiomonitor dist rpc service connected device=$deviceId")
+                if (client != null && deviceId != null && currentRpc(client) == null) {
+                    runCatching { setServiceForDevice.invoke(client, deviceId) }
+                }
+                if (client != null && currentRpc(client) != null) {
+                    drainStash(client, "serviceConnected")
+                }
                 result
             }
         }.onFailure { error ->
             log(
                 "failed to hook audiomonitor dist rpc retry: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    // DistAudioStream.stop()/release() take the stream's monitor, but
+    // AudioUplinkThread.startRecord() holds that same monitor for its entire
+    // read loop — so once the uplink is streaming, stop() blocks forever and
+    // the AudioRecord (source=VOICE_DOWNLINK) leaks: every call leaves a
+    // zombie capture that keeps reading muted frames after hangup (live
+    // 2026-09-06: session 8761 from the 16:23 call still reading at 16:36,
+    // MiPlayCastServer "action write don't operate, state:12" write storm),
+    // and the next call's fresh AudioRecord gets silence while the zombie
+    // holds the source (Mac saw pes flowing with pcmBytes=0 on the 16:29
+    // call). Replace stop() with a deadlock-free sequence — set the volatile
+    // status fields first so the threads exit, then stop the AudioRecord/
+    // AudioTrack directly (their stop() is safe from another thread and
+    // unblocks read()/write()) — and run the same sequence before the stock
+    // release() so its synchronized block finds the monitor free.
+    private fun hookAudioMonitorStreamStop(classLoader: ClassLoader) {
+        runCatching {
+            val streamClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.resource.DistAudioStream"
+            )
+            val upLinkField =
+                streamClass.getDeclaredField("mUpLinkStatus").apply { isAccessible = true }
+            val downLinkField =
+                streamClass.getDeclaredField("mDownLinkStatus").apply { isAccessible = true }
+            val recordField =
+                streamClass.getDeclaredField("mAudioRecord").apply { isAccessible = true }
+            val trackField =
+                streamClass.getDeclaredField("mAudioTrack").apply { isAccessible = true }
+
+            fun safeStop(stream: Any, why: String) {
+                upLinkField.setInt(stream, 3)
+                downLinkField.setInt(stream, 3)
+                val record = recordField.get(stream) as? AudioRecord
+                val track = trackField.get(stream) as? AudioTrack
+                if (record != null || track != null) {
+                    log(
+                        "audiomonitor dist stream safe stop why=$why " +
+                            "record=${record != null} track=${track != null}"
+                    )
+                }
+                if (record != null) runCatching { record.stop() }
+                if (track != null) runCatching { track.stop() }
+            }
+
+            installHook(resolveMethod(streamClass, "stop")) { chain ->
+                chain.thisObject?.let { safeStop(it, "stop") }
+                null
+            }
+            installHook(resolveMethod(streamClass, "release")) { chain ->
+                chain.thisObject?.let { safeStop(it, "release") }
+                chain.proceed()
+            }
+        }.onFailure { error ->
+            log(
+                "failed to hook audiomonitor dist stream stop: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    // TeleService and InCallUI each run their own connectDistAudioDevice()
+    // per call, and every connect unconditionally replaces mDistAudioStream
+    // with a fresh DistAudioStream — orphaning the previous one (its threads
+    // keep the AudioRecord; stock stop() can never free it, see above). With
+    // the stop deadlock fixed, stop+release the orphan before the reconnect
+    // proceeds so at most one stream owns the capture source at a time.
+    private fun hookAudioMonitorStreamReconnect(classLoader: ClassLoader) {
+        runCatching {
+            val managerClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.service.IDistAudioManager"
+            )
+            val streamClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.resource.DistAudioStream"
+            )
+            val routeClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.data.DistAudioRoute"
+            )
+            val streamField =
+                managerClass.getDeclaredField("mDistAudioStream").apply { isAccessible = true }
+            val streamStop = resolveMethod(streamClass, "stop")
+            val streamRelease = resolveMethod(streamClass, "release")
+            val upLinkField =
+                streamClass.getDeclaredField("mUpLinkStatus").apply { isAccessible = true }
+            val downLinkField =
+                streamClass.getDeclaredField("mDownLinkStatus").apply { isAccessible = true }
+            val recordField =
+                streamClass.getDeclaredField("mAudioRecord").apply { isAccessible = true }
+            val trackField =
+                streamClass.getDeclaredField("mAudioTrack").apply { isAccessible = true }
+            val startUplink = resolveMethod(streamClass, "startAudioUplinkStream")
+            val startDownlink = resolveMethod(streamClass, "startAudioDownlinkStream")
+            installHook(
+                resolveMethod(managerClass, "connectDistAudioDevice", routeClass)
+            ) { chain ->
+                val orphan = chain.thisObject?.let {
+                    runCatching { streamField.get(it) }.getOrNull()
+                }
+                val orphanUplinkLive = orphan != null &&
+                    runCatching { upLinkField.getInt(orphan) == 1 }.getOrDefault(false)
+                val orphanDownlinkLive = orphan != null &&
+                    runCatching { downLinkField.getInt(orphan) == 1 }.getOrDefault(false)
+                if (orphan != null) {
+                    log("audiomonitor dist stream orphan stop+release before reconnect")
+                    runCatching { streamStop.invoke(orphan) }
+                    runCatching { streamRelease.invoke(orphan) }
+                }
+                val result = chain.proceed()
+                // The replacement stream's stock start chain needs a fresh
+                // MiCastServer client connect (onConnected →
+                // startAudioUplinkStream) and a startMicStream RPC round-trip
+                // (MSG 7 → startAudioDownlinkStream). A mid-call duplicate
+                // connect gets neither: the Mac reuses its downlink TCP, and
+                // the phone's second connect wave skips startMicStream (live
+                // 2026-09-06 19:08: wave 4 was open*/startSpeakerStream only)
+                // — so both directions die ~1s in ("ringback, then silence").
+                // Restart whichever legs the orphan had live; both start*
+                // methods self-guard on status==1 so a later onConnected /
+                // MSG 7 on the fresh stream is a harmless no-op.
+                if (orphanUplinkLive || orphanDownlinkLive) {
+                    val fresh = chain.thisObject?.let {
+                        runCatching { streamField.get(it) }.getOrNull()
+                    }
+                    if (fresh != null && fresh !== orphan) {
+                        if (orphanUplinkLive &&
+                            runCatching { recordField.get(fresh) }.getOrNull() != null
+                        ) {
+                            runCatching { startUplink.invoke(fresh) }
+                            log("audiomonitor dist stream reconnect restart uplink")
+                        }
+                        if (orphanDownlinkLive &&
+                            runCatching { trackField.get(fresh) }.getOrNull() != null
+                        ) {
+                            runCatching { startDownlink.invoke(fresh) }
+                            log("audiomonitor dist stream reconnect restart downlink")
+                        }
+                    }
+                }
+                result
+            }
+        }.onFailure { error ->
+            log(
+                "failed to hook audiomonitor dist stream reconnect: " +
+                    "${error.javaClass.simpleName}: ${error.message}"
+            )
+        }
+    }
+
+    // The distaudio uplink's last hop is native: the Mac's RTP/TS stream
+    // reaches the phone's MiPlayCastClient runtime (audioOnInit/audioOnStart
+    // fire), but the runtime never hands decoded frames to the SDK — the
+    // shared-memory delivery is gated by IMirrorOption 0x100707
+    // (mIsPhoneRelay), whose only writer is Mirror.apk's PHONERELAY sink
+    // setup. So DistAudioStream.lstData stays empty, the telephony-pinned
+    // AudioTrack starves, and AudioFlinger removes it ~0.5s in ("prepareTracks_l
+    // BUFFER TIMEOUT ... in_call_music", live 2026-09-06 17:38:18.871) — the
+    // far end hears nothing for the whole call even though the Mac sends
+    // cleanly. Bypass the native gap: the Mac sends each encrypted 20ms PCM
+    // frame (the exact 656-byte AES-128-ECB/PKCS7 block the stock doPlay()
+    // decrypts with ResourceManager.remoteKey) as a raw UDP datagram to port
+    // 15570; this listener feeds them straight into the live DistAudioStream
+    // via playCastAudioData(), reusing the stock queue/decrypt/track path.
+    private fun hookAudioMonitorDirectUplinkFeed(classLoader: ClassLoader) {
+        runCatching {
+            val managerClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.service.IDistAudioManager"
+            )
+            val streamClass = findTargetClass(
+                classLoader, "com.miui.audiomonitor.distaudio.resource.DistAudioStream"
+            )
+            val instanceField =
+                managerClass.getDeclaredField("INSTANCE").apply { isAccessible = true }
+            val streamField =
+                managerClass.getDeclaredField("mDistAudioStream").apply { isAccessible = true }
+            val playCastAudioData = resolveMethod(
+                streamClass, "playCastAudioData",
+                ByteArray::class.java, Long::class.javaPrimitiveType!!
+            )
+            thread(name = "edgelink-distaudio-feed", isDaemon = true) {
+                runCatching {
+                    // No fixed port is ever free of the Mac's phys-sync
+                    // sweep (the phone's reported mesh port list rotates
+                    // through ephemeral ports, 45671 included — live
+                    // 2026-09-06 19:00). The size filter below drops those
+                    // 141-byte mesh frames; the only hard requirement is
+                    // winning the bind at audiomonitor start.
+                    val socket = DatagramSocket(MiLinkPrivilegeHookPolicy.DIST_AUDIO_DIRECT_FEED_PORT)
+                    log(
+                        "audiomonitor dist uplink feed listening " +
+                            "port=${MiLinkPrivilegeHookPolicy.DIST_AUDIO_DIRECT_FEED_PORT}"
+                    )
+                    val buffer = ByteArray(2048)
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    var received = 0L
+                    var fed = 0L
+                    var droppedNoStream = 0L
+                    var droppedBadSize = 0L
+                    var badSizeLogged = 0
+                    var lastStreamId = 0
+                    fun hexHead(data: ByteArray, count: Int): String =
+                        data.take(count).joinToString("") { "%02x".format(it) }
+                    while (true) {
+                        socket.receive(packet)
+                        received += 1
+                        val length = packet.length
+                        if (!MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(length)) {
+                            droppedBadSize += 1
+                            if (badSizeLogged < 10) {
+                                badSizeLogged += 1
+                                log(
+                                    "audiomonitor dist uplink feed bad size=$length " +
+                                        "from=${packet.address?.hostAddress}:${packet.port} " +
+                                        "head=${hexHead(packet.data, minOf(length, 8))}"
+                                )
+                            }
+                            continue
+                        }
+                        val manager = instanceField.get(null)
+                        val stream = manager?.let {
+                            runCatching { streamField.get(it) }.getOrNull()
+                        }
+                        if (stream == null) {
+                            droppedNoStream += 1
+                            continue
+                        }
+                        val streamId = System.identityHashCode(stream)
+                        if (streamId != lastStreamId) {
+                            lastStreamId = streamId
+                            log(
+                                "audiomonitor dist uplink feed stream instance=$streamId " +
+                                    "received=$received"
+                            )
+                        }
+                        val frame = packet.data.copyOf(length)
+                        runCatching {
+                            playCastAudioData.invoke(stream, frame, received * 20_000L)
+                        }.onSuccess {
+                            fed += 1
+                            if (fed == 1L || fed % 500L == 0L) {
+                                log(
+                                    "audiomonitor dist uplink feed progress fed=$fed " +
+                                        "received=$received noStream=$droppedNoStream " +
+                                        "badSize=$droppedBadSize"
+                                )
+                            }
+                        }.onFailure { error ->
+                            log(
+                                "audiomonitor dist uplink feed invoke failed: " +
+                                    "${error.javaClass.simpleName}: ${error.message}"
+                            )
+                        }
+                    }
+                }.onFailure { error ->
+                    log(
+                        "audiomonitor dist uplink feed died: " +
+                            "${error.javaClass.simpleName}: ${error.message}"
+                    )
+                }
+            }
+        }.onFailure { error ->
+            log(
+                "failed to hook audiomonitor dist uplink feed: " +
                     "${error.javaClass.simpleName}: ${error.message}"
             )
         }

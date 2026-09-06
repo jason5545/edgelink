@@ -173,4 +173,25 @@ class MiLinkPrivilegeHookPolicyTest {
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkPointer"))
         assertFalse(MiLinkPrivilegeHookPolicy.isAllowedMirrorPhoneProviderMethod("edgeLinkGlobal"))
     }
+
+    @Test
+    fun distAudioDirectFeedPortMatchesMacSide() {
+        // LyraDistAudioUplink.directFeedPort on the Mac must carry the same
+        // value — pinned there by LyraDistAudioWFDTests.
+        assertEquals(45671, MiLinkPrivilegeHookPolicy.DIST_AUDIO_DIRECT_FEED_PORT)
+    }
+
+    @Test
+    fun distAudioFeedFrameSizeAcceptsOnlyCipherBlocks() {
+        // One datagram = one 20ms 16kHz mono PCM16 frame (640B) encrypted
+        // as AES-128-ECB/PKCS7 → 656B.
+        assertTrue(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(656))
+        assertTrue(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(16))
+        assertFalse(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(0))
+        assertFalse(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(8))
+        // The Mac's phys-sync sweep frames (141B and 140B Lyra mesh
+        // packets) land on the port too and must be dropped.
+        assertFalse(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(141))
+        assertFalse(MiLinkPrivilegeHookPolicy.isDistAudioFeedFrameSize(140))
+    }
 }
