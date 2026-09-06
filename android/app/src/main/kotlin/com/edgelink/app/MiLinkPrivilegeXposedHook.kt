@@ -730,9 +730,10 @@ class MiLinkPrivilegeXposedHook(private val xposed: XposedInterface) {
     // far end hears nothing for the whole call even though the Mac sends
     // cleanly. Bypass the native gap: the Mac sends each encrypted 20ms PCM
     // frame (the exact 656-byte AES-128-ECB/PKCS7 block the stock doPlay()
-    // decrypts with ResourceManager.remoteKey) as a raw UDP datagram to port
-    // 15570; this listener feeds them straight into the live DistAudioStream
-    // via playCastAudioData(), reusing the stock queue/decrypt/track path.
+    // decrypts with ResourceManager.remoteKey) as a raw UDP datagram to the
+    // direct-feed port (DIST_AUDIO_DIRECT_FEED_PORT, pinned with the Mac side);
+    // this listener feeds them straight into the live DistAudioStream via
+    // playCastAudioData(), reusing the stock queue/decrypt/track path.
     private fun hookAudioMonitorDirectUplinkFeed(classLoader: ClassLoader) {
         runCatching {
             val managerClass = findTargetClass(
