@@ -1,6 +1,7 @@
-import Foundation
 import AVFoundation
 import Darwin
+import EdgeLinkKit
+import Foundation
 import Network
 
 struct MiLinkPhoneRelayPCMStats: Equatable {
@@ -104,7 +105,14 @@ final class MiLinkPhoneRelayProbe {
         let udpParameters = NWParameters.udp
         udpParameters.allowLocalEndpointReuse = true
 
-        let tcp = try NWListener(using: tcpParameters, on: endpointPort)
+        // Same LAN-interface pin as MacPhoneRelaySession for the phone-dialed
+        // TCP control port (Tailscale exit-node route hijack survival).
+        let lanBinding = LANEgressInterface.lanBoundListenerParameters(
+            tcpParameters,
+            port: endpointPort,
+            peerHostHint: LANPinnedPhoneIP.current()
+        )
+        let tcp = try NWListener(using: tcpParameters, on: lanBinding.listenPort)
         let udp = try NWListener(using: udpParameters, on: endpointPort)
         var rtpListeners: [UInt16: NWListener] = [:]
         for rtpPort in rtpProbePorts {
@@ -327,7 +335,9 @@ final class MiLinkPhoneRelayProbe {
         peerSourceRetryWorkItem?.cancel()
         peerSourceRetryWorkItem = nil
         let id = UUID()
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+        let tcpParameters = NWParameters.tcp
+        LANEgressInterface.bindToLANInterface(tcpParameters, destinationHost: host)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: tcpParameters)
         connections[id] = connection
         tcpStates[id] = TCPConnectionState(sendsGreetingOnReady: false, isPeerSourceConnection: true)
         peerSourceConnectionID = id
@@ -946,6 +956,7 @@ final class MiLinkPhoneRelayProbe {
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(anyIPv4), port: localPort)
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
         let connection = NWConnection(host: NWEndpoint.Host(host), port: remotePort, using: parameters)
         sourceRTPConnection = connection
         sourceRTPConnectionID = id

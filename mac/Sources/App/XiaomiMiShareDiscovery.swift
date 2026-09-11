@@ -277,6 +277,32 @@ final class XiaomiMiShareDiscovery: NSObject {
         }
     }
 
+    // Proof the phone answers on the LAN within the freshness window,
+    // independent of mDNS: any inbound mesh frame the responder/announcer
+    // heard from the phone's LAN address. Closes the mDNS-lag hole (live
+    // 2026-09-11: mirror flow picked the relay transport 6s before the
+    // mDNS sighting while announcer sync payloads had been flowing the
+    // whole time — the phone's RTSP server then refused the relay-driven
+    // mirror's LAN-direct media dial).
+    func hasRecentPhoneMeshContact(freshness: TimeInterval = 120) -> Bool {
+        let cutoff = Date().addingTimeInterval(-freshness)
+        if let responder = meshResponder, responder.lastLANPhoneContactAt >= cutoff {
+            return true
+        }
+        if let announcer = meshAnnouncer, announcer.lastLANPhoneContactAt >= cutoff {
+            return true
+        }
+        return false
+    }
+
+    // LAN reachability for transport selection: a fresh mDNS sighting OR
+    // recent actual mesh traffic with the phone over the LAN. Deliberately
+    // NOT pinned/persisted endpoints — after a WiFi→hotspot move those
+    // black-hole phys sync silently (live 2026-09-02/09-03).
+    func isLANPhoneReachable(freshness: TimeInterval = 120) -> Bool {
+        hasLivePhonePeer(freshness: freshness) || hasRecentPhoneMeshContact(freshness: freshness)
+    }
+
     func currentPhoneMeshEndpoints() -> [(host: String, port: UInt16)] {
         // When the EdgeLink phone's LAN-session IP is known, pin mesh traffic
         // to it — other HyperConnect phones on the network also answer phys

@@ -44,7 +44,15 @@ final class MacPhoneRelaySession {
         let udpParameters = NWParameters.udp
         udpParameters.allowLocalEndpointReuse = true
 
-        let tcp = try NWListener(using: tcpParameters, on: endpointPort)
+        // The phone dials this TCP control port over the LAN; pin it to the
+        // phone's interface when known so SYN-ACKs can't be routed into a
+        // tunnel (Tailscale exit node hijacks the LAN subnet's route).
+        let lanBinding = LANEgressInterface.lanBoundListenerParameters(
+            tcpParameters,
+            port: endpointPort,
+            peerHostHint: LANPinnedPhoneIP.current()
+        )
+        let tcp = try NWListener(using: tcpParameters, on: lanBinding.listenPort)
         let udp = try NWListener(using: udpParameters, on: endpointPort)
         var rtpListeners: [UInt16: NWListener] = [:]
         for rtpPort in rtpListenPorts {
@@ -163,6 +171,7 @@ final class MacPhoneRelaySession {
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(anyIPv4), port: localPort)
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: destination.host)
         let connection = NWConnection(host: NWEndpoint.Host(destination.host), port: remotePort, using: parameters)
         connection.stateUpdateHandler = { state in
             switch state {

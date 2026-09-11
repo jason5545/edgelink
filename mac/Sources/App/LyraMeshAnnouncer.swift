@@ -36,6 +36,16 @@ final class LyraMeshAnnouncer {
     private var meshSessionKey: SymmetricKey?
     private var announceTimer: DispatchSourceTimer?
     private var lastActivity = Date.distantPast
+
+    // Same LAN-proof as LyraMeshResponder.lastLANPhoneContactAt: inbound
+    // frames from the phone's LAN address only (the announcer socket also
+    // sees relay-fed adopted-mitrust frames from 127.0.0.1, which must NOT
+    // count as LAN reachability). lastActivity alone can't serve — it is
+    // anchored at handshake start, before the phone has answered anything.
+    private var lastLANPhoneContact = Date.distantPast
+    var lastLANPhoneContactAt: Date {
+        queue.sync { lastLANPhoneContact }
+    }
     private static let staleTimeout: TimeInterval = 20
     // A handshake stalled this long (no inbound frame) means a datagram was
     // dropped mid-flow — the mesh transport ACKs but never retransmits, so
@@ -205,6 +215,7 @@ final class LyraMeshAnnouncer {
         authServerEphPub = Data()
         meshSessionKey = nil
         lastActivity = .distantPast
+        lastLANPhoneContact = .distantPast
     }
 
     private func sendPhysSyncRequest() {
@@ -865,6 +876,14 @@ final class LyraMeshAnnouncer {
 
     private func handle(frame: LyraMeshPack.Frame, endpoint: NWEndpoint, reply: LyraMeshSocket.ReplyHandler) {
         lastActivity = Date()
+        if let parsed = LyraMeshResponder.parseEndpoint(endpoint.debugDescription),
+           LANEgressInterface.lanInterface(
+               forDestination: parsed.host,
+               interfaces: LANEgressInterface.currentLocalInterfaces()
+           ) != nil
+        {
+            lastLANPhoneContact = Date()
+        }
         if port == 0, let endpointPort = Self.endpointPort(endpoint), candidatePorts.contains(endpointPort) {
             port = endpointPort
             candidatePorts = [endpointPort]

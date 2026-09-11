@@ -256,6 +256,9 @@ final class EdgeLinkRuntime: ObservableObject {
         pairingStore = try? ApplicationSupportPairingStore()
         registrar = WorkerDeviceRegistrar(baseURL: workerBaseURL)
         relayTransport = RelayTransport(endpoint: relayURL)
+        // Warm the LAN-interface directory before any phone dial needs it:
+        // LAN-bound egress (Tailscale exit-node survival) reads this cache.
+        LANEgressInterface.warmUp()
         pairingTransport = PairingTransport(baseURL: workerBaseURL, webSocketURL: pairingWebSocketURL)
         turnCredentialClient = TurnCredentialClient(baseURL: workerBaseURL)
         presenceClient = PresenceClient(baseURL: workerBaseURL)
@@ -345,7 +348,7 @@ final class EdgeLinkRuntime: ObservableObject {
             self?.lyraCastTrustSession?.redialCastChannel()
         }
         mirrorCallTrigger.lanPhoneReachable = { [weak self] in
-            self?.xiaomiMiShareDiscovery.hasLivePhonePeer() ?? false
+            self?.xiaomiMiShareDiscovery.isLANPhoneReachable() ?? false
         }
         mirrorCallTrigger.setRelayAdvertisePreferred = { preferRelay in
             LyraMirrorCallRelaySession.preferRelayAdvertise = preferRelay
@@ -360,7 +363,7 @@ final class EdgeLinkRuntime: ObservableObject {
         // (phoneOnLAN()): the discovery peer table is main-mutated.
         LyraMirrorCallRelaySession.lanPhoneReachable = { [weak self] in
             MainActor.assumeIsolated {
-                self?.xiaomiMiShareDiscovery.hasLivePhonePeer() ?? false
+                self?.xiaomiMiShareDiscovery.isLANPhoneReachable() ?? false
             }
         }
         // Relay-mode call uplink (the phone sink's AESPART ff02 LPCM
@@ -1466,7 +1469,7 @@ final class EdgeLinkRuntime: ObservableObject {
         if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort(),
            LyraRelayTransportGlue.preferRelayMirrorTransport(
                relayBridgeAvailable: true,
-               lanPhoneReachable: xiaomiMiShareDiscovery.hasLivePhonePeer()
+               lanPhoneReachable: xiaomiMiShareDiscovery.isLANPhoneReachable()
            )
         {
             let dialMesh = bridge.meshFlow(
@@ -1772,14 +1775,15 @@ final class EdgeLinkRuntime: ObservableObject {
         if let bridge = lyraRelayBridge, let phoneMeshPort = Self.reportedPhoneMeshPort(),
            LyraRelayTransportGlue.preferRelayMirrorTransport(
                relayBridgeAvailable: true,
-               // Same rule as the call dialer (startNativeRelayDial): only a
-               // fresh mDNS sighting proves the phone answers on the LAN.
+               // Same rule as the call dialer (startNativeRelayDial): a
+               // fresh mDNS sighting OR recent LAN mesh traffic proves the
+               // phone answers on the LAN.
                // currentPhoneMeshEndpoints merges pinned/persisted entries
                // that survive a network switch and black-hole phys sync
                // silently (live 2026-09-03 relay call: 8 stale WiFi
                // endpoints, 30s physSync stalls, channel never came up
                // during the call).
-               lanPhoneReachable: xiaomiMiShareDiscovery.hasLivePhonePeer()
+               lanPhoneReachable: xiaomiMiShareDiscovery.isLANPhoneReachable()
            )
         {
             // Relay-connected and the phone is not on the LAN: the cast dial

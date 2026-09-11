@@ -92,7 +92,12 @@ public final class LyraChannelSocket: @unchecked Sendable {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw SocketError.listenerNotReady
         }
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
+        let parameters = NWParameters.udp
+        // Same Tailscale-hijack escape as LyraMeshSocket: LAN destinations
+        // bind to the interface owning the subnet, everything else keeps
+        // system routing.
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
         let id = ObjectIdentifier(connection)
         stateLock.lock()
         connections[id] = connection

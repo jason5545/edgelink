@@ -31,7 +31,18 @@ final class LANSessionListener: @unchecked Sendable {
                 DiagnosticsLog.warn("lan.mac.session_listen_failed invalid_port")
                 return
             }
-            let nextListener = try NWListener(using: .tcp, on: port)
+            // Under a tunnel-hijacked LAN route (Tailscale exit node) the
+            // phone's SYN reaches us but the SYN-ACK follows the routing
+            // table into the tunnel — bind to the LAN interface owning the
+            // pinned phone subnet so the handshake completes (no-op when the
+            // phone's whereabouts are unknown or off-LAN).
+            let parameters = NWParameters.tcp
+            let binding = LANEgressInterface.lanBoundListenerParameters(
+                parameters,
+                port: port,
+                peerHostHint: LANPinnedPhoneIP.current()
+            )
+            let nextListener = try NWListener(using: parameters, on: binding.listenPort)
             nextListener.service = NWListener.Service(name: serviceName, type: Self.serviceType)
             stateLock.withLock {
                 listener = nextListener

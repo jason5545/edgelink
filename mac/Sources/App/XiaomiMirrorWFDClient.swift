@@ -108,7 +108,10 @@ final class XiaomiMirrorWFDClient {
         }
         self.stage = .connecting
         self.lastProgress = Date()
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
+        let parameters = NWParameters.tcp
+        // RTSP dial to the phone must survive a tunnel-hijacked LAN route.
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
         self.connection = connection
         connection.stateUpdateHandler = { [weak self] state in
             self?.queue.async {

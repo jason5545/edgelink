@@ -686,7 +686,9 @@ final class XiaomiMirrorRTSPDiagnosticSource: @unchecked Sendable {
         scheduleAutoStop(lifetime: lifetime)
 
         let id = UUID()
-        let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: endpointPort, using: .tcp)
+        let tcpParameters = NWParameters.tcp
+        LANEgressInterface.bindToLANInterface(tcpParameters, destinationHost: trimmedHost)
+        let connection = NWConnection(host: NWEndpoint.Host(trimmedHost), port: endpointPort, using: tcpParameters)
         var state = RTSPConnectionState()
         state.mode = "active_client"
         state.activeClientHost = trimmedHost
@@ -2967,6 +2969,9 @@ private final class XiaomiMirrorTimerSyncClient {
             )
             return
         }
+        // Timesync requests are raw sendto to the phone — same Tailscale
+        // route-hijack escape as the MPT socket.
+        LANEgressInterface.bindToLANInterface(socketFD: fd, destinationHost: host)
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         socketFD = fd
@@ -3388,6 +3393,7 @@ private final class XiaomiMirrorRTPMediaSender {
         let parameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localPort)
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: destinationHost)
         let connection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remotePort, using: parameters)
         self.connection = connection
         encoder.onFrame = { [weak self] frame in
@@ -3412,6 +3418,7 @@ private final class XiaomiMirrorRTPMediaSender {
             let rtcpParameters = NWParameters.udp
             rtcpParameters.allowLocalEndpointReuse = true
             rtcpParameters.requiredLocalEndpoint = .hostPort(host: "0.0.0.0", port: localRTCPPort)
+            LANEgressInterface.bindToLANInterface(rtcpParameters, destinationHost: destinationHost)
             let rtcpConnection = NWConnection(host: NWEndpoint.Host(destinationHost), port: remoteRTCPPort, using: rtcpParameters)
             self.rtcpConnection = rtcpConnection
             rtcpConnection.stateUpdateHandler = { [weak self] state in
@@ -3451,6 +3458,12 @@ private final class XiaomiMirrorRTPMediaSender {
             )
             return
         }
+
+        // The sink's KCP ACKs (and the source's media) leave via raw sendto:
+        // under a tunnel-hijacked LAN route they would disappear into utun
+        // and the phone would retransmit its window forever (live 2026-09-11:
+        // sink receive wedged at una=128, ~100% duplicates, frozen video).
+        LANEgressInterface.bindToLANInterface(socketFD: fd, destinationHost: destinationHost)
 
         var reuse: Int32 = 1
         _ = withUnsafePointer(to: &reuse) { pointer in

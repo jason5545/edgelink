@@ -1035,7 +1035,9 @@ final class LyraFileSendSession {
 
     private func openExpressConnections(port: UInt16) {
         for index in 0..<expressConnCount {
-            let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+            let parameters = NWParameters.tcp
+            LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
+            let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
             connection.stateUpdateHandler = { state in
                 DiagnosticsLog.info("xiaomi.mishare.send_express_conn_\(index) state=\(String(describing: state))")
             }

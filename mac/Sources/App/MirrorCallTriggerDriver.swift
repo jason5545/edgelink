@@ -34,7 +34,7 @@ final class MirrorCallTriggerDriver {
     var setCallActive: (Bool, String?) -> Void = { _, _ in }
     var redialChannel: () -> Void = {}
     // Live-LAN probe (mDNS phone peer, 120s freshness) for the media-route
-    // decision — wired to XiaomiMiShareDiscovery.hasLivePhonePeer.
+    // decision — wired to XiaomiMiShareDiscovery.isLANPhoneReachable.
     var lanPhoneReachable: () -> Bool = { false }
     // true = advertise the cloud bridge's phone-local sink endpoint
     // (127.0.0.1:15550); false = LAN-direct (en0 + local source port).

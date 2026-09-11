@@ -677,17 +677,31 @@ final class LyraMirrorCallAudioSource {
         }
     }
 
-    var port: UInt16? { listener?.port?.rawValue }
+    // The LAN-pinned listener reports port 0 (the port lives in its required
+    // local endpoint), so the binding's effective port wins when present.
+    private var bindingEffectivePort: UInt16?
+    var port: UInt16? { bindingEffectivePort ?? listener?.port?.rawValue }
 
     func start() throws {
-        let listener = try NWListener(using: .tcp, on: .any)
+        // The phone dials this RTSP control port over the LAN; pin it to the
+        // phone's interface when known so a tunnel-hijacked route table
+        // (Tailscale exit node) can't eat the handshake. Ephemeral port is
+        // preserved — .any stays .any, only the interface/address scope in.
+        let parameters = NWParameters.tcp
+        let binding = LANEgressInterface.lanBoundListenerParameters(
+            parameters,
+            port: .any,
+            peerHostHint: LANPinnedPhoneIP.current()
+        )
+        bindingEffectivePort = binding.effectivePort
+        let listener = try NWListener(using: parameters, on: binding.listenPort)
         self.listener = listener
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
         listener.start(queue: queue)
         var waited = 0
-        while (listener.port?.rawValue ?? 0) == 0, waited < 100 {
+        while (bindingEffectivePort ?? listener.port?.rawValue ?? 0) == 0, waited < 100 {
             Thread.sleep(forTimeInterval: 0.01)
             waited += 1
         }
@@ -697,6 +711,7 @@ final class LyraMirrorCallAudioSource {
         queue.async { [weak self] in
             self?.listener?.cancel()
             self?.listener = nil
+            self?.bindingEffectivePort = nil
             self?.connection?.cancel()
             self?.connection = nil
             self?.stopMediaLocked()
@@ -931,6 +946,11 @@ final class LyraMirrorCallAudioSource {
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { return "" }
         defer { close(fd) }
+        // The route-based source-address lookup must aim out the LAN
+        // interface: with a tunnel-hijacked LAN route the unbound probe
+        // resolves to the tailnet address and gets advertised to a phone
+        // that can't reach it.
+        LANEgressInterface.bindToLANInterface(socketFD: fd, destinationHost: peerHost ?? "127.0.0.1")
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(8236).bigEndian
@@ -961,6 +981,7 @@ final class LyraMirrorCallAudioSource {
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: pendingServerPort)!
         )
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: peerHost)
         let media = NWConnection(
             host: NWEndpoint.Host(peerHost), port: NWEndpoint.Port(rawValue: clientMediaPort)!,
             using: parameters
@@ -981,6 +1002,7 @@ final class LyraMirrorCallAudioSource {
         rtcpParameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: pendingServerPort &+ 1)!
         )
+        LANEgressInterface.bindToLANInterface(rtcpParameters, destinationHost: peerHost ?? "127.0.0.1")
         let rtcp = NWConnection(
             host: NWEndpoint.Host(peerHost ?? "127.0.0.1"),
             port: NWEndpoint.Port(rawValue: clientMediaPort &+ 1)!,

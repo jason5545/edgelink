@@ -269,10 +269,15 @@ final class LyraDistAudioWFDClient {
     func start() {
         queue.async { [weak self] in
             guard let self else { return }
+            let parameters = NWParameters.tcp
+            // Downlink TCP dial to the phone: LAN destinations bind to the
+            // subnet-owning interface so a tunnel-hijacked route table
+            // (Tailscale exit node) can't black-hole the flow.
+            LANEgressInterface.bindToLANInterface(parameters, destinationHost: self.host)
             let connection = NWConnection(
                 host: NWEndpoint.Host(self.host),
                 port: NWEndpoint.Port(rawValue: self.port)!,
-                using: .tcp
+                using: parameters
             )
             self.connection = connection
             connection.stateUpdateHandler = { [weak self] state in
@@ -650,17 +655,31 @@ final class LyraDistAudioWFDServer {
         self.mediaKey = Data(base64Encoded: mediaKeyBase64) ?? Data()
     }
 
-    var port: UInt16? { listener?.port?.rawValue }
+    // Same LAN-pin port readback as the mirrorcall listener: NWListener
+    // reports 0 once the port lives in the required local endpoint.
+    private var bindingEffectivePort: UInt16?
+    var port: UInt16? { bindingEffectivePort ?? listener?.port?.rawValue }
 
     func start() throws {
-        let listener = try NWListener(using: .tcp, on: .any)
+        // The phone dials this uplink control port over the LAN; pin it to
+        // the phone's interface when known (Tailscale exit-node hijack makes
+        // wildcard-listener SYN-ACKs disappear into the tunnel). Ephemeral
+        // port preserved — .any stays .any.
+        let parameters = NWParameters.tcp
+        let binding = LANEgressInterface.lanBoundListenerParameters(
+            parameters,
+            port: .any,
+            peerHostHint: LANPinnedPhoneIP.current()
+        )
+        bindingEffectivePort = binding.effectivePort
+        let listener = try NWListener(using: parameters, on: binding.listenPort)
         self.listener = listener
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
         listener.start(queue: queue)
         var waited = 0
-        while listener.port == nil, waited < 100 {
+        while (bindingEffectivePort ?? listener.port?.rawValue) == nil, waited < 100 {
             Thread.sleep(forTimeInterval: 0.01)
             waited += 1
         }
@@ -670,6 +689,7 @@ final class LyraDistAudioWFDServer {
         queue.async { [weak self] in
             guard let self else { return }
             self.listener?.cancel()
+            self.bindingEffectivePort = nil
             for connection in self.connections { connection.cancel() }
             self.connections.removeAll()
             self.uplink?.stop()
@@ -890,6 +910,9 @@ final class LyraDistAudioWFDServer {
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { return "" }
         defer { close(fd) }
+        // Same Tailscale route-hijack escape as the mirrorcall probe: the
+        // source address for a utun-routed lookup would be the tailnet IP.
+        LANEgressInterface.bindToLANInterface(socketFD: fd, destinationHost: peerHost ?? "10.0.0.126")
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(8236).bigEndian
@@ -1057,6 +1080,7 @@ final class LyraDistAudioUplink {
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: localPort)!
         )
+        LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
         let connection = NWConnection(
             host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: parameters
         )
@@ -1072,10 +1096,12 @@ final class LyraDistAudioUplink {
             }
         }
         connection.start(queue: queue)
+        let feedParameters = NWParameters.udp
+        LANEgressInterface.bindToLANInterface(feedParameters, destinationHost: host)
         let feed = NWConnection(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: Self.directFeedPort)!,
-            using: NWParameters.udp
+            using: feedParameters
         )
         self.directFeed = feed
         feed.stateUpdateHandler = { state in
@@ -1095,6 +1121,7 @@ final class LyraDistAudioUplink {
         rtcpParameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host("0.0.0.0"), port: NWEndpoint.Port(rawValue: localPort &+ 1)!
         )
+        LANEgressInterface.bindToLANInterface(rtcpParameters, destinationHost: host)
         let rtcp = NWConnection(
             host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port &+ 1)!, using: rtcpParameters
         )

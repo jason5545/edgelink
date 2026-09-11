@@ -64,6 +64,33 @@ final class LyraMeshResponder {
     private var peerChannelId: UInt32 = 0
     private var channelNegotiationStarted = false
     private var lastEndpointDescription: String?
+
+    // Proof the phone answers on the LAN right now: updated on every
+    // inbound frame whose source sits inside a non-tunnel interface's
+    // subnet (relay-fed loopback and tailnet sources are excluded). This
+    // is the reachability signal that closes the mDNS-freshness gap —
+    // mDNS sightings lag behind route changes (Tailscale exit node slows
+    // the phone's advert refresh), while the announcer/responder keep
+    // talking to the phone over the LAN the whole time (live 2026-09-11:
+    // mirror flow picked the relay transport 6s before the mDNS sighting
+    // even though LAN mesh traffic had been flowing for minutes).
+    private let lanPhoneContactLock = NSLock()
+    private var lastLANPhoneContact = Date.distantPast
+    var lastLANPhoneContactAt: Date {
+        lanPhoneContactLock.withLock { lastLANPhoneContact }
+    }
+
+    private func noteLANPhoneContact(host: String) {
+        guard LANEgressInterface.lanInterface(
+            forDestination: host,
+            interfaces: LANEgressInterface.currentLocalInterfaces()
+        ) != nil else {
+            return
+        }
+        lanPhoneContactLock.withLock {
+            lastLANPhoneContact = Date()
+        }
+    }
     private var announceTimer: DispatchSourceTimer?
     private let announceQueue = DispatchQueue(label: "edgelink.lyra.announce")
     private var pathMonitor: NWPathMonitor?
@@ -342,6 +369,7 @@ final class LyraMeshResponder {
         // target: with a pinned LAN IP, other HyperConnect devices on the
         // network must not redirect our announce into the void.
         if let parsed = Self.parseEndpoint(endpoint.debugDescription), Self.isExpectedPhoneHost(parsed.host) {
+            noteLANPhoneContact(host: parsed.host)
             lastEndpointDescription = endpoint.debugDescription
             // Post-roam the phone redials from its NEW phys port (often
             // auth-reuse, no fresh sync-auth): refresh the learned sync
@@ -863,14 +891,30 @@ final class LyraMeshResponder {
         expressDataKey = key
 
         do {
-            let listener = try NWListener(using: .tcp, on: .any)
+            // The phone dials this express data port over LAN TCP — pin it to
+            // the phone's LAN interface when known so a tunnel-hijacked route
+            // table can't eat the handshake (ephemeral port preserved: .any
+            // stays .any, only the interface/address are scoped).
+            let parameters = NWParameters.tcp
+            let binding = LANEgressInterface.lanBoundListenerParameters(
+                parameters,
+                port: .any,
+                peerHostHint: currentPhoneEndpoint()?.host ?? LANPinnedPhoneIP.current()
+            )
+            let listener = try NWListener(using: parameters, on: binding.listenPort)
             listener.newConnectionHandler = { [weak self] connection in
                 self?.acceptExpressConnection(connection)
             }
             listener.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
                 DiagnosticsLog.info("xiaomi.mishare.express_listener_state state=\(String(describing: state))")
-                guard case .ready = state, let port = listener.port?.rawValue, port != 0 else {
+                // The LAN-pinned listener's port lives in the required local
+                // endpoint (NWListener.port reports 0 there) — take it from
+                // the binding instead.
+                guard case .ready = state,
+                      let port = binding.effectivePort ?? listener.port?.rawValue,
+                      port != 0
+                else {
                     return
                 }
                 let tlv = LyraExpressTLV.handshakeEventFrame(dataPort: UInt32(port), key: key)

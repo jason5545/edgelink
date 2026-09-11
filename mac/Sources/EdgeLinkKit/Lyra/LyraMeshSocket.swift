@@ -131,10 +131,15 @@ public final class LyraMeshSocket: @unchecked Sendable {
         if let existing = outboundConnections[key] {
             connection = existing
         } else {
+            let parameters = NWParameters.udp
+            // Phone-bound datagrams must not follow a tunnel-hijacked route
+            // table (Tailscale exit node pulls the LAN subnet into utun):
+            // bind egress to the LAN interface owning this subnet.
+            LANEgressInterface.bindToLANInterface(parameters, destinationHost: host)
             let newConnection = NWConnection(
                 host: NWEndpoint.Host(host),
                 port: nwPort,
-                using: .udp
+                using: parameters
             )
             outboundConnections[key] = newConnection
             newConnection.start(queue: queue)

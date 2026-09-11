@@ -1,3 +1,4 @@
+import EdgeLinkKit
 import Foundation
 import Network
 
@@ -33,7 +34,16 @@ final class LANTransport: @unchecked Sendable {
                 DiagnosticsLog.warn("lan.mac.probe_start_failed invalid_port")
                 return
             }
-            let nextListener = try NWListener(using: .tcp, on: port)
+            // Same Tailscale-hijack escape as LANSessionListener: pin the
+            // probe listener to the LAN interface when the phone's subnet is
+            // known, so SYN-ACKs don't disappear into the tunnel.
+            let parameters = NWParameters.tcp
+            let binding = LANEgressInterface.lanBoundListenerParameters(
+                parameters,
+                port: port,
+                peerHostHint: LANPinnedPhoneIP.current()
+            )
+            let nextListener = try NWListener(using: parameters, on: binding.listenPort)
             stateLock.withLock {
                 listener = nextListener
                 probeReady = false
