@@ -210,6 +210,8 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
     private var pendingClipboardBlobId: String? = null
     private var pendingClipboardBlobCallback: ((Boolean) -> Unit)? = null
     private var pendingClipboardBlobTimeoutJob: Job? = null
+    @Volatile
+    private var pendingClipboardBlobUserInitiated = false
     private val notificationPresenter = AndroidNotificationPresenter(appContext)
     private val smsSync = AndroidSmsSync(appContext, settingsStore)
     private val photoSync = AndroidPhotoSync(appContext, settingsStore)
@@ -349,6 +351,9 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         },
         onClipboardSetApplied = {
             refreshClipboardHistory()
+        },
+        onClipboardImageReceived = { body ->
+            autoApplyRemoteClipboardImage(body)
         },
         onPhotoRequest = { body ->
             handlePhotoRequest(body)
@@ -2279,6 +2284,28 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
+    // Inbound image clipboards are applied automatically (Universal Clipboard
+    // semantics): the wire clipboardSet carries only the thumbnail, so fetch
+    // the original blob on arrival; handleClipboardBlobChunk applies it.
+    private fun autoApplyRemoteClipboardImage(body: ClipboardSetBody) {
+        val source = body.sourceDeviceId ?: "remote"
+        val id = "$source#${body.ts}-0"
+        scope.launch(Dispatchers.IO) {
+            val blob = clipboardHistoryStore.loadBlob(id)
+            if (blob != null && blob.data.isNotEmpty()) {
+                EdgeLinkLog.info("clipboard.android.remote_image_apply_local id=$id")
+                clipboardSync.applyRemoteImage(blob.data, blob.mime)
+                return@launch
+            }
+            if (!peerCapabilityBlob) {
+                EdgeLinkLog.info("clipboard.android.remote_image_no_blob_capability id=$id")
+                return@launch
+            }
+            EdgeLinkLog.info("clipboard.android.remote_image_autofetch id=$id")
+            requestClipboardBlob(id, userInitiated = false) { }
+        }
+    }
+
     private fun refreshClipboardHistory() {
         scope.launch(Dispatchers.IO) {
             val items = clipboardHistoryStore.recent(limit = 50)
@@ -2286,15 +2313,22 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
         }
     }
 
-    fun requestClipboardBlob(id: String, onComplete: (Boolean) -> Unit) {
+    fun requestClipboardBlob(id: String, userInitiated: Boolean = true, onComplete: (Boolean) -> Unit) {
         if (!peerCapabilityBlob || session == null) {
             EdgeLinkLog.info("clipboard.android.blob_request_unsupported id=$id")
+            onComplete(false)
+            return
+        }
+        // An auto-fetch never preempts a fetch the user explicitly asked for.
+        if (pendingClipboardBlobId != null && pendingClipboardBlobUserInitiated && !userInitiated) {
+            EdgeLinkLog.info("clipboard.android.blob_autofetch_deferred id=$id")
             onComplete(false)
             return
         }
         cancelPendingClipboardBlob(success = false, reason = "superseded")
         clipboardBlobReassembler.reset()
         pendingClipboardBlobId = id
+        pendingClipboardBlobUserInitiated = userInitiated
         pendingClipboardBlobCallback = onComplete
         sendEnvelope(EnvelopeTypes.CLIPBOARD_BLOB_REQUEST, ClipboardBlobRequestBody(id = id))
         EdgeLinkLog.info("clipboard.android.blob_request_sent id=$id")
@@ -2382,6 +2416,7 @@ class EdgeLinkController(context: Context) : EdgeLinkActions {
             EdgeLinkLog.info("clipboard.android.blob_request_failed reason=$reason")
         }
         pendingClipboardBlobId = null
+        pendingClipboardBlobUserInitiated = false
         clipboardBlobReassembler.reset()
         val callback = pendingClipboardBlobCallback
         pendingClipboardBlobCallback = null
@@ -2927,6 +2962,7 @@ private class AndroidCommandDispatcher(
     private val onClipboardBlobRequest: (ClipboardBlobRequestBody) -> Unit = {},
     private val onClipboardBlobChunk: (ClipboardBlobChunkBody) -> Unit = {},
     private val onClipboardSetApplied: () -> Unit = {},
+    private val onClipboardImageReceived: (ClipboardSetBody) -> Unit = {},
     private val onPhotoRequest: (PhotoRequestBody) -> Unit = {},
     private val onPhotoAck: (PhotoAckBody) -> Unit = {},
     private val onPhotoSyncRequest: () -> Unit = {},
@@ -3010,6 +3046,9 @@ private class AndroidCommandDispatcher(
                         )
                     )
                     clipboardHistoryStore.prune()
+                }
+                if (kind == ClipboardKind.IMAGE) {
+                    onClipboardImageReceived(body)
                 }
                 onClipboardSetApplied()
                 null

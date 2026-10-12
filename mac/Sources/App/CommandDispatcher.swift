@@ -33,6 +33,7 @@ final class CommandDispatcher {
     private let onClipboardBlobRequest: @Sendable (ClipboardBlobRequestBody) -> Void
     private let onClipboardBlobChunk: @Sendable (ClipboardBlobChunkBody) -> Void
     private let onClipboardSetApplied: @Sendable () -> Void
+    private let onClipboardImage: @Sendable (ClipboardSetBody) -> Void
     private let photoSyncService: MacPhotoSyncService?
     private let onPhotoStatus: @Sendable (PhotoStatusBody) -> Void
     private let decoder = JSONDecoder()
@@ -70,6 +71,7 @@ final class CommandDispatcher {
         onClipboardBlobRequest: @escaping @Sendable (ClipboardBlobRequestBody) -> Void = { _ in },
         onClipboardBlobChunk: @escaping @Sendable (ClipboardBlobChunkBody) -> Void = { _ in },
         onClipboardSetApplied: @escaping @Sendable () -> Void = {},
+        onClipboardImage: @escaping @Sendable (ClipboardSetBody) -> Void = { _ in },
         photoSyncService: MacPhotoSyncService? = nil,
         onPhotoStatus: @escaping @Sendable (PhotoStatusBody) -> Void = { _ in }
     ) {
@@ -104,6 +106,7 @@ final class CommandDispatcher {
         self.onClipboardBlobRequest = onClipboardBlobRequest
         self.onClipboardBlobChunk = onClipboardBlobChunk
         self.onClipboardSetApplied = onClipboardSetApplied
+        self.onClipboardImage = onClipboardImage
         self.photoSyncService = photoSyncService
         self.onPhotoStatus = onPhotoStatus
     }
@@ -154,6 +157,9 @@ final class CommandDispatcher {
                 )
                 store.append(item)
                 store.prune()
+            }
+            if kind == .image {
+                onClipboardImage(body)
             }
             onClipboardSetApplied()
             return nil

@@ -99,7 +99,7 @@ class AndroidClipboardSync(context: Context) {
         }
 
         val computedHash = if (kind == ClipboardKind.IMAGE) {
-            hash("\u0001" + (thumbnailBase64 ?: ""))
+            imageContentHash(blobData, thumbnailBase64)
         } else if (blobData != null) {
             ClipboardBlobTransfer.sha256Hex(blobData)
         } else {
@@ -136,15 +136,13 @@ class AndroidClipboardSync(context: Context) {
     }
 
     fun applyRemoteImage(data: ByteArray, mime: String?) {
-        val bitmap = BitmapFactory.decodeStream(ByteArrayInputStream(data)) ?: run {
+        BitmapFactory.decodeStream(ByteArrayInputStream(data)) ?: run {
             EdgeLinkLog.info("clipboard.android.remote_image_undecodable bytes=${data.size}")
             return
         }
-        val thumbnail = ClipboardThumbnailGenerator.thumbnailBase64(bitmap) ?: run {
-            EdgeLinkLog.info("clipboard.android.remote_image_thumbnail_failed bytes=${data.size}")
-            return
-        }
-        val computedHash = hash("\u0001" + thumbnail)
+        // Content hash keeps the applied image stable across the next
+        // pollLocalClip: the FileProvider URI reads back these exact bytes.
+        val computedHash = ClipboardBlobTransfer.sha256Hex(data)
         val extension = when (mime) {
             "image/jpeg" -> "jpg"
             "image/gif" -> "gif"
@@ -183,6 +181,16 @@ class AndroidClipboardSync(context: Context) {
         private const val TEXT_WIRE_MAX_BYTES = 48 * 1024
         private const val TEXT_STORE_MAX_BYTES = 256 * 1024
         private const val TEXT_PREVIEW_MAX_BYTES = 16 * 1024
+
+        // Prefer content bytes: thumbnail output differs between the apply and
+        // poll paths, so a thumbnail-derived hash can flap and re-broadcast our
+        // own applied image back to the peer.
+        fun imageContentHash(blobData: ByteArray?, thumbnailBase64: String?): String =
+            if (blobData != null) {
+                ClipboardBlobTransfer.sha256Hex(blobData)
+            } else {
+                hash("\u0001" + (thumbnailBase64 ?: ""))
+            }
 
         fun hash(text: String): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(text.encodeToByteArray())

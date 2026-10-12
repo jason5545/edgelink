@@ -21,12 +21,18 @@ final class ClipboardSync {
     private static let textStoreMaxBytes = 256 * 1024
     private static let textPreviewMaxBytes = 16 * 1024
 
-    private var lastChangeCount = NSPasteboard.general.changeCount
+    private let pasteboard: NSPasteboard
+    private var lastChangeCount: Int
     private var suppressedHash: String?
     private var protectedOutboundHashes: [String: Date] = [:]
 
+    init(pasteboard: NSPasteboard = .general) {
+        self.pasteboard = pasteboard
+        lastChangeCount = pasteboard.changeCount
+    }
+
     func pollLocalClip() -> ClipboardSnapshot? {
-        let pasteboard = NSPasteboard.general
+        let pasteboard = pasteboard
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return nil }
         lastChangeCount = current
@@ -83,7 +89,14 @@ final class ClipboardSync {
 
         let hash: String
         if kind == .image {
-            hash = Self.hash("\u{1}" + (thumbnailBase64 ?? ""))
+            // Content-hash the image bytes when available: thumbnail encoders
+            // differ between the apply and poll paths, so a thumbnail-derived
+            // hash can flap and re-broadcast our own applied image.
+            if let blobData {
+                hash = ClipboardBlobTransfer.sha256Hex(blobData)
+            } else {
+                hash = Self.hash("\u{1}" + (thumbnailBase64 ?? ""))
+            }
         } else if blobData != nil {
             hash = Self.hash(stringText)
         } else {
@@ -111,22 +124,27 @@ final class ClipboardSync {
     }
 
     func applyRemoteImage(_ data: Data, mime: String?) {
-        guard let thumbnail = ClipboardThumbnailGenerator.thumbnailBase64(for: data) else {
+        guard ClipboardThumbnailGenerator.thumbnailBase64(for: data) != nil else {
             DiagnosticsLog.info("clipboard.mac.remote_image_undecodable bytes=\(data.count)")
             return
         }
-        let hash = Self.hash("\u{1}" + thumbnail)
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
+        // Always write PNG: the next poll then reads back the exact bytes we
+        // wrote and the content hash stays stable. Writing TIFF would poll back
+        // as a re-encoded PNG with different bytes and re-broadcast to the peer.
+        let pngData: Data
         if mime == "image/png" {
-            pasteboard.setData(data, forType: .png)
+            pngData = data
         } else if let image = NSImage(data: data),
-                  let tiff = image.tiffRepresentation {
-            pasteboard.setData(tiff, forType: .tiff)
+                  let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) {
+            pngData = png
         } else {
-            pasteboard.setData(data, forType: .png)
+            pngData = data
         }
-        suppressedHash = hash
+        pasteboard.clearContents()
+        pasteboard.setData(pngData, forType: .png)
+        suppressedHash = ClipboardBlobTransfer.sha256Hex(pngData)
         lastChangeCount = pasteboard.changeCount
     }
 
@@ -145,11 +163,10 @@ final class ClipboardSync {
 
     func applyRemoteText(_ text: String, hash remoteHash: String) {
         let hash = remoteHash.isEmpty ? Self.hash(text) : remoteHash
-        guard hash != Self.hash(NSPasteboard.general.string(forType: .string) ?? "") else {
+        guard hash != Self.hash(pasteboard.string(forType: .string) ?? "") else {
             suppressedHash = hash
             return
         }
-        let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         suppressedHash = hash
@@ -159,12 +176,11 @@ final class ClipboardSync {
     func setLocalTextWithoutPublishing(_ text: String) {
         let hash = Self.hash(text)
         protectOutbound(hash)
-        guard hash != Self.hash(NSPasteboard.general.string(forType: .string) ?? "") else {
+        guard hash != Self.hash(pasteboard.string(forType: .string) ?? "") else {
             suppressedHash = hash
-            lastChangeCount = NSPasteboard.general.changeCount
+            lastChangeCount = pasteboard.changeCount
             return
         }
-        let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         suppressedHash = hash

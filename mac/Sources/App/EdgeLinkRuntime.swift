@@ -96,6 +96,7 @@ final class EdgeLinkRuntime: ObservableObject {
     private var pendingClipboardBlobId: String?
     private var pendingClipboardBlobCompletion: ((Bool) -> Void)?
     private var pendingClipboardBlobTimeout: Task<Void, Never>?
+    private var pendingClipboardBlobUserInitiated = false
     @Published private(set) var clipboardHistoryItems: [ClipboardHistoryItemBody] = []
     @Published private(set) var clipboardHistoryStatus = ""
     @Published private(set) var fetchingClipboardBlobId: String?
@@ -4563,6 +4564,11 @@ final class EdgeLinkRuntime: ObservableObject {
                             self?.refreshClipboardHistory()
                         }
                     },
+                    onClipboardImage: { [weak self] body in
+                        Task { @MainActor in
+                            self?.handleRemoteClipboardImage(body)
+                        }
+                    },
                     photoSyncService: photoSyncService,
                     onPhotoStatus: { [weak self] status in
                         Task { @MainActor in
@@ -5050,15 +5056,41 @@ final class EdgeLinkRuntime: ObservableObject {
         }
     }
 
-    func requestClipboardBlob(id: String, completion: @escaping (Bool) -> Void) {
+    // Inbound image clipboards are applied automatically (Universal Clipboard
+    // semantics): the wire clipboardSet carries only the thumbnail, so fetch
+    // the original blob on arrival; handleClipboardBlobChunk applies it.
+    private func handleRemoteClipboardImage(_ body: ClipboardSetBody) {
+        let source = body.sourceDeviceId ?? "remote"
+        let id = "\(source)#\(body.ts)-0"
+        if let blob = clipboardHistoryStore?.loadBlob(id: id), !blob.data.isEmpty {
+            DiagnosticsLog.info("clipboard.mac.remote_image_apply_local id=\(id)")
+            clipboardSync.applyRemoteImage(blob.data, mime: blob.mime)
+            return
+        }
+        guard peerCapabilityBlob else {
+            DiagnosticsLog.info("clipboard.mac.remote_image_no_blob_capability id=\(id)")
+            return
+        }
+        DiagnosticsLog.info("clipboard.mac.remote_image_autofetch id=\(id)")
+        requestClipboardBlob(id: id, userInitiated: false) { _ in }
+    }
+
+    func requestClipboardBlob(id: String, userInitiated: Bool = true, completion: @escaping (Bool) -> Void) {
         guard peerCapabilityBlob, let session = currentSession else {
             DiagnosticsLog.info("clipboard.mac.blob_request_unsupported id=\(id)")
+            completion(false)
+            return
+        }
+        // An auto-fetch never preempts a fetch the user explicitly asked for.
+        if pendingClipboardBlobId != nil, pendingClipboardBlobUserInitiated, !userInitiated {
+            DiagnosticsLog.info("clipboard.mac.blob_autofetch_deferred id=\(id)")
             completion(false)
             return
         }
         cancelPendingClipboardBlob(success: false, reason: "superseded")
         clipboardBlobReassembler.reset()
         pendingClipboardBlobId = id
+        pendingClipboardBlobUserInitiated = userInitiated
         fetchingClipboardBlobId = id
         pendingClipboardBlobCompletion = completion
         let body = ClipboardBlobRequestBody(id: id)
@@ -5156,6 +5188,7 @@ final class EdgeLinkRuntime: ObservableObject {
         }
         pendingClipboardBlobId = nil
         fetchingClipboardBlobId = nil
+        pendingClipboardBlobUserInitiated = false
         clipboardBlobReassembler.reset()
         let completion = pendingClipboardBlobCompletion
         pendingClipboardBlobCompletion = nil
