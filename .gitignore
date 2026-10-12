@@ -9,6 +9,7 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
+.perch/
 
 .gradle/
 build/
